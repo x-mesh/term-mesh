@@ -85,6 +85,47 @@ final class AppLaunchEnvironmentTests: XCTestCase {
             ])
         )
     }
+
+    func testPeerAutoStartIgnoresPreferenceUnderXCTestButKeepsExplicitPath() {
+        let xctest = ["XCTestConfigurationFilePath": "/tmp/config.xctestconfiguration"]
+        let normal = ["HOME": "/Users/example"]
+        let preferencePath = "/tmp/preference.sock"
+        let cases: [(name: String, environment: [String: String], preferenceEnabled: Bool, expected: String?)] = [
+            ("XCTest ignores the preference", xctest, true, nil),
+            (
+                "XCTest keeps the explicit path",
+                xctest.merging(["TERMMESH_PEER_SERVER_PATH": "/tmp/env.sock"]) { $1 },
+                true,
+                "/tmp/env.sock"
+            ),
+            (
+                "XCTest keeps the legacy explicit path",
+                xctest.merging(["TERMMESH_DEBUG_PEER_SERVER_PATH": "/tmp/legacy.sock"]) { $1 },
+                false,
+                "/tmp/legacy.sock"
+            ),
+            ("normal launch follows the preference", normal, true, preferencePath),
+            ("normal launch without the preference stays stopped", normal, false, nil),
+            (
+                "explicit path wins over the preference",
+                normal.merging(["TERMMESH_PEER_SERVER_PATH": "/tmp/env.sock"]) { $1 },
+                true,
+                "/tmp/env.sock"
+            ),
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                PeerHostCoordinator.autoStartSocketPath(
+                    environment: testCase.environment,
+                    preferenceEnabled: testCase.preferenceEnabled,
+                    preferencePath: preferencePath
+                ),
+                testCase.expected,
+                testCase.name
+            )
+        }
+    }
 }
 
 @MainActor
