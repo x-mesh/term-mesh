@@ -544,10 +544,41 @@ final class TermMeshDaemon: ObservableObject {
     static let watchdogFailureThreshold = 3
     static let watchdogRespawnIntervalNanos: UInt64 = 30 * 1_000_000_000
 
-    /// Cap on the appended daemon log before it is truncated on the next
-    /// spawn. Sized for weeks of ordinary output (a busy session writes a
-    /// few MB) while bounding what an append-only file in /tmp can grow to.
+    /// Size past which the next spawn moves the daemon log to `<log>.1`. The
+    /// daemon writes without a limit while it runs (about 71 MB in 20 hours
+    /// at the default filter), so this bounds the number of generations, not
+    /// the size of one.
     static let daemonLogMaxBytes: Int64 = 50 * 1024 * 1024
+
+    enum DaemonLogOpen: Equatable {
+        case appended(fd: Int32)
+        case rotated(fd: Int32, bytes: Int64)
+        case rotationFailed(fd: Int32, errno: Int32)
+        case openFailed(errno: Int32)
+    }
+
+    /// Opens the daemon log for appending and keeps one previous generation.
+    /// Emptying a log over the cap erased the record of why the previous
+    /// daemon stopped, so it moves to `<log>.1` instead. The name is
+    /// predictable in sticky /tmp: `O_NOFOLLOW` refuses a symlink at the log
+    /// path, and `rename` replaces a symlink at `<log>.1` without following
+    /// it. A failed rename keeps appending to the old file rather than
+    /// truncating it.
+    static func openDaemonLog(path: String, maxBytes: Int64) -> DaemonLogOpen {
+        let flags = O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW
+        let fd = open(path, flags, 0o644)
+        guard fd >= 0 else { return .openFailed(errno: errno) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size > maxBytes else { return .appended(fd: fd) }
+        guard rename(path, path + ".1") == 0 else {
+            return .rotationFailed(fd: fd, errno: errno)
+        }
+        let freshFD = open(path, flags, 0o644)
+        let freshErrno = errno
+        close(fd)
+        guard freshFD >= 0 else { return .openFailed(errno: freshErrno) }
+        return .rotated(fd: freshFD, bytes: Int64(info.st_size))
+    }
 
     static func watchdogShouldRespawn(
         consecutiveFailures: Int,
@@ -797,23 +828,28 @@ final class TermMeshDaemon: ObservableObject {
             let logPath = tag.isEmpty ? "/tmp/term-meshd.log" : "/tmp/term-meshd-\(tag).log"
             // Append, never truncate: every launch used to REPLACE this file
             // (`createFile`), destroying exactly the evidence a "why was the
-            // daemon down" investigation needs. O_NOFOLLOW because the name
-            // is predictable in sticky /tmp — a pre-planted symlink must not
-            // redirect daemon output into an arbitrary file (open fails and
-            // the daemon logs to null instead). The size cap is what makes
-            // append-forever safe: one bounded truncation at the cap beats
-            // losing the log on every spawn, and beats filling /tmp.
-            let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o644)
+            // daemon down" investigation needs. Past the cap the log moves to
+            // one previous generation; see `openDaemonLog` for the /tmp rules.
             let logHandle: FileHandle?
-            if fd >= 0 {
-                var info = stat()
-                if fstat(fd, &info) == 0, info.st_size > Self.daemonLogMaxBytes {
-                    ftruncate(fd, 0)
-                }
+            switch Self.openDaemonLog(path: logPath, maxBytes: Self.daemonLogMaxBytes) {
+            case .appended(let fd):
                 logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-            } else {
+            case .rotated(let fd, let bytes):
+                logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+                RemoteWorkLog.infoOffMain(
+                    "Daemon log rotate: kept \(bytes) bytes of the previous daemon's log at \(logPath).1"
+                )
+            case .rotationFailed(let fd, let code):
+                logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
                 Logger.daemon.error(
-                    "could not open daemon log at \(logPath, privacy: .public) (errno \(errno, privacy: .public)) — daemon output goes to /dev/null"
+                    "could not rotate daemon log \(logPath, privacy: .public) (errno \(code, privacy: .public)); appending to it without truncating"
+                )
+                RemoteWorkLog.warningOffMain(
+                    "Daemon log rotate failed for \(logPath) (errno \(code)); appending to it without truncating"
+                )
+            case .openFailed(let code):
+                Logger.daemon.error(
+                    "could not open daemon log at \(logPath, privacy: .public) (errno \(code, privacy: .public)) — daemon output goes to /dev/null"
                 )
                 logHandle = nil
             }
