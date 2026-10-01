@@ -586,7 +586,7 @@ final class TermMeshDaemon: ObservableObject {
                         "not replacing daemon \(runningVersion ?? "unknown", privacy: .public) with \(Self.appMarketingVersion ?? "unknown", privacy: .public): live pid \(ownerPID, privacy: .public) (\(owner, privacy: .public)) owns it"
                     )
                     RemoteWorkLog.warningOffMain(
-                        "This machine's daemon \(runningVersion ?? "unknown") belongs to pid \(ownerPID) (\(owner)); keeping it instead of updating to \(Self.appMarketingVersion ?? "unknown"). Quit that app to let this one manage the daemon"
+                        "This machine's daemon \(runningVersion ?? "unknown") belongs to pid \(ownerPID) (\(owner)); keeping it instead of updating to \(Self.appMarketingVersion ?? "unknown") until that process exits"
                     )
                     return
                 }
