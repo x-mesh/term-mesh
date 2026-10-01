@@ -19,8 +19,9 @@ xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug
 ```
 
 This build does not put `term-meshd` in the app bundle. If you run it without a
-tag, the app uses the daemon that already runs on the socket. The app does not
-start or replace a daemon. To test a daemon change, use
+tag, the app uses the daemon that already runs on the socket. It does not start
+or replace a daemon unless `TERMMESH_DAEMON_BINARY_PATH`, `TERMMESH_PROJECT_DIR`,
+or `~/bin/term-meshd` supplies a binary. To test a daemon change, use
 `./scripts/reload.sh --tag <tag>`. If you set `TERMMESH_DAEMON_BINARY_PATH`,
 also set an isolated `TERMMESH_DAEMON_UNIX_PATH`. Otherwise, the app can replace
 the production daemon.
