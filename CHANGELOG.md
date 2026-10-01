@@ -4,6 +4,28 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.260.0] - 2026-10-01
+
+### Added
+
+- A new opt-in setting delivers leader messages to a local Claude leader through Claude Code's own session inbox, instead of typing them into the leader's prompt. It covers requests sent from the phone or web, `@leader` mentions and `team.leader.send`. A half-typed draft in the leader's prompt is kept, and no message waits on a missing Return. Turn it on with `defaults write com.termmesh.app claudeInbox.leader.enabled -bool true`. A leader term-mesh launches uses it after the team is recreated. A leader adopted with `/team-up` uses it after it next runs `tm-agent create --adopt`, `tm-agent wait` or `tm-agent leader request take`. Remote leaders, Codex and other CLIs are unchanged.
+- Mobile remote control gives the screen more room on a phone. The input starts at one line and grows as you type, Quick keys open from the ⌨ button, and the status line appears only when it has something to show. In Terminal mode, Send types the text and presses Enter in one step, and Send with an empty input presses Enter.
+
+### Fixed
+
+- A leader adopted with `/team-up` can take requests sent from the phone or web. These requests used to fail with `unauthorized`, because only leaders that term-mesh launches carried the request token. term-mesh now recognizes an adopted leader by its pane's terminal, also when the leader runs inside a shell wrapper or through Claude Code's tool runner. A leader started inside tmux or screen is not recognized.
+- An adopted team created with `--team <name>` now names that team in its leader's instructions, so the leader's `tm-agent` commands reach it.
+- Codex started by hand in a term-mesh pane keeps that pane's identity, so `$rc on` exposes the right pane. Codex workers that term-mesh starts are unchanged.
+- A remote pane running Codex no longer freezes when the pane narrows, for example after zoom and unzoom, while a Korean, CJK or emoji character sits in its last column. A viewer only one column wide no longer freezes a pane that prints such a character. The host must run this version.
+- A development build or a unit-test run no longer replaces the daemon of the installed app, which could leave mobile remote control unreachable until the next manual restart. term-mesh replaces a running daemon only when its owner has released it or exited, claims the daemon before it replaces it, and no longer falls back to a daemon built in a source checkout.
+- The daemon log keeps the previous run as `term-meshd.log.1` instead of being emptied when it grows past 50 MB, so the reason a daemon stopped stays readable.
+- Settings > Mobile Remote Control shows the listener that the running daemon actually serves. When it differs from the setting, for example after term-mesh adopts a daemon started without the listener or when the listener fails to start, the card shows a warning and a Restart Daemon button. The same address written differently no longer counts as a difference.
+- Restart Daemon in Settings no longer reports the new daemon as unreadable, and repeated refreshes no longer queue behind a daemon that does not answer.
+- A message sent from the phone to a terminal that has not started yet, such as one in a workspace that the Mac has not shown, now runs when the terminal starts. It used to wait for the next message.
+- The first `browser.eval` right after a browser opens no longer waits 10 seconds and fails. A browser command that waits on its page no longer holds other clients' browser commands. It reports `not_found` if its browser closes in the meantime, and it keeps its result when its workspace moves to another window.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.259.0] - 2026-09-30
 
 ### Added
