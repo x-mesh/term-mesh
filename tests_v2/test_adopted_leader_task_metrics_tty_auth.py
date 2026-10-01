@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Adopted leaders may read task metrics from their own TTY; sibling panes may not."""
+"""Adopted leaders authenticate metrics and durable requests by their pane's PTY.
+
+A caller passes when its own or an ancestor's controlling terminal is the
+leader pane's PTY, so a nested PTY (shell wrappers) and a process with no
+controlling terminal (an agent's tool runner) inside the pane both pass.
+Sibling panes never do.
+"""
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -25,6 +32,37 @@ def _wait_text(path: Path, timeout: float = 10.0) -> str:
             pass
         time.sleep(0.05)
     raise termmeshError(f"timed out waiting for {path}")
+
+
+def _wait_contains(path: Path, needle: str, timeout: float = 10.0) -> str:
+    deadline = time.time() + timeout
+    text = ""
+    while time.time() < deadline:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            text = ""
+        if needle in text:
+            return text
+        time.sleep(0.05)
+    raise termmeshError(f"timed out waiting for {needle!r} in {path}: {text!r}")
+
+
+def _succeeded(output: str) -> bool:
+    return re.search(r'"ok"\s*:\s*true', output) is not None
+
+
+# An interactive shell makes each job a process-group leader, and setsid()
+# refuses a group leader, so detach in a forked child.
+DETACH = """\
+import os, sys
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os.execvp(sys.argv[1], sys.argv[1:])
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"""
 
 
 def _surface_ids(client: termmesh, workspace_id: str) -> list[str]:
@@ -66,6 +104,13 @@ def main() -> int:
                     f"failed to create a distinct sibling terminal: "
                     f"leader={leader_surface} sibling={sibling_surface}"
                 )
+            # A non-Claude adopted leader gets its policy directive typed into
+            # the pane five seconds after team.create, with Return sent after
+            # the text. A command typed in between would join the directive's
+            # line, so capture it before anything else runs in the pane.
+            directive = root / "leader.directive"
+            client.send_surface(leader_surface, f"cat > {shlex.quote(str(directive))}\n")
+            _wait_text(directive)
             client._call("team.create", {
                 "team_name": team,
                 "leader_mode": "adopted",
@@ -82,6 +127,9 @@ def main() -> int:
                 }],
             })
             try:
+                _wait_contains(directive, f"/tmp/term-mesh-leader-{team}.md", timeout=20.0)
+                client.send_key_surface(leader_surface, "ctrl-c")
+
                 leader_tty = root / "leader.tty"
                 sibling_tty = root / "sibling.tty"
                 _run_in_surface(client, leader_surface, "tty", leader_tty)
@@ -89,10 +137,11 @@ def main() -> int:
                 if leader_tty.read_text().strip() == sibling_tty.read_text().strip():
                     raise termmeshError("leader and sibling unexpectedly share one controlling TTY")
 
-                args = (
+                tm = (
                     f"env -u TERMMESH_LEADER_REQUEST_TOKEN {shlex.quote(str(cli))} "
-                    f"--team {shlex.quote(team)} task metrics"
+                    f"--team {shlex.quote(team)}"
                 )
+                args = f"{tm} task metrics"
                 leader_output = _run_in_surface(
                     client, leader_surface, args, root / "leader.metrics"
                 )
@@ -107,10 +156,82 @@ def main() -> int:
                     )
                 if "unauthorized" not in sibling_output.lower():
                     raise termmeshError(f"sibling pane bypassed TTY authorization: {sibling_output!r}")
+
+                take_missing = f"{tm} leader request take e2e-missing-request"
+                output = _run_in_surface(client, leader_surface, take_missing, root / "leader.take-missing")
+                if "not_found" not in output or "unauthorized" in output.lower():
+                    raise termmeshError(f"adopted leader take was not authorized: {output!r}")
+                output = _run_in_surface(client, sibling_surface, take_missing, root / "sibling.take-missing")
+                if "unauthorized" not in output.lower():
+                    raise termmeshError(f"sibling pane took a durable request: {output!r}")
+
+                leader_device = leader_tty.read_text().strip()
+                nested_tty = _run_in_surface(
+                    client, leader_surface, "script -q /dev/null tty", root / "nested.tty"
+                ).strip()
+                if not nested_tty.startswith("/dev/") or nested_tty == leader_device:
+                    raise termmeshError(f"script did not give the caller its own PTY: {nested_tty!r}")
+                output = _run_in_surface(
+                    client, leader_surface, f"script -q /dev/null {take_missing}", root / "nested.take-missing"
+                )
+                if "not_found" not in output or "unauthorized" in output.lower():
+                    raise termmeshError(f"caller on a nested PTY in the leader pane was rejected: {output!r}")
+
+                detach = root / "detach.py"
+                detach.write_text(DETACH)
+                detached = f"{shlex.quote(sys.executable)} {shlex.quote(str(detach))}"
+                # `tty` names stdin, which the detached child still shares with
+                # the pane; ps reports the controlling terminal itself.
+                output = _run_in_surface(
+                    client, leader_surface, f"{detached} sh -c 'ps -o tty= -p $$'", root / "detached.tty"
+                )
+                if output.strip() != "??":
+                    raise termmeshError(f"detached caller still has a controlling terminal: {output!r}")
+                output = _run_in_surface(
+                    client, leader_surface, f"{detached} {take_missing}", root / "detached.take-missing"
+                )
+                if "not_found" not in output or "unauthorized" in output.lower():
+                    raise termmeshError(f"caller without a controlling terminal was rejected: {output!r}")
+
+                # The wake is pasted into the leader pane; a shell would run it,
+                # so capture it with cat and keep the request queued.
+                wake_file = root / "leader.wake"
+                client.send_surface(leader_surface, f"cat > {shlex.quote(str(wake_file))}\n")
+                _wait_text(wake_file)
+                request_id = f"e2e-adopted-{uuid.uuid4().hex[:8]}"
+                content = f"adopted leader e2e request {request_id}"
+                sent = client._call("team.leader.send", {
+                    "team_name": team, "text": content, "request_id": request_id,
+                }) or {}
+                if sent.get("stored") is not True or sent.get("wake_dispatched") is not True:
+                    raise termmeshError(f"durable request was not stored and dispatched: {sent!r}")
+                wake = _wait_contains(wake_file, f"leader request take {request_id}")
+                client.send_key_surface(leader_surface, "ctrl-c")
+                if not re.search(rf"--team '?{re.escape(team)}'? leader request take", wake):
+                    raise termmeshError(f"adopted leader wake does not name its team: {wake!r}")
+
+                output = _run_in_surface(
+                    client, sibling_surface, f"{tm} leader request take {request_id}", root / "sibling.take"
+                )
+                if "unauthorized" not in output.lower():
+                    raise termmeshError(f"sibling pane took the queued request: {output!r}")
+                output = _run_in_surface(client, leader_surface, f"{tm} leader request list", root / "leader.list")
+                if not _succeeded(output) or request_id not in output:
+                    raise termmeshError(f"adopted leader could not list its request: {output!r}")
+                output = _run_in_surface(
+                    client, leader_surface, f"{tm} leader request take {request_id}", root / "leader.take"
+                )
+                if not _succeeded(output) or content not in output:
+                    raise termmeshError(f"adopted leader could not take its request: {output!r}")
+                output = _run_in_surface(
+                    client, leader_surface, f"{tm} leader request complete {request_id}", root / "leader.complete"
+                )
+                if not _succeeded(output):
+                    raise termmeshError(f"adopted leader could not complete its request: {output!r}")
             finally:
                 client.team_destroy(team)
 
-    print("PASS: adopted leader metrics uses live TTY identity and rejects sibling panes")
+    print("PASS: adopted leader metrics and durable requests use the pane's PTY ancestry and reject sibling panes")
     return 0
 
 

@@ -238,6 +238,15 @@ y, n, 1–9, ↑, ↓, Tab, Ctrl-C), 리더면 최근 request 상태. 상태 저
 | native agent surface (NDJSON) | transcript 텍스트 (`team.read` native 경로와 동일) | `Input.keys` | 해당 없음 | 1 |
 | peer host surface (로컬 mirror 없음) | 원격 host의 같은 listener | 같음 | 같음 | 3 |
 
+리더 pane에 보낸 텍스트는 durable request로 저장되고, 리더는 wake 지시에 따라
+`tm-agent leader request take`로 요청을 가져간다. term-mesh가 띄운 리더는
+환경변수로 받은 요청 토큰으로 인증한다. `/team-up`으로 붙인 리더는 팀이 생기기
+전부터 떠 있어 토큰을 받을 수 없으므로, 호출한 프로세스나 그 조상 중 하나의 제어
+터미널이 리더 pane의 PTY인지로 인증한다. 다른 pane의 프로세스는 이 조건을 만족할 수
+없다. tmux나 screen 안에서 띄운 리더는 서버가 pane에서 분리되어 조상 사슬이
+끊기므로 durable request를 가져가지 못한다. 휴대폰 요청을 받을 리더는 pane에서
+직접 띄운다.
+
 GUI pane의 키는 이름을 `surface.send_key {key}`로 넘기고(앱 `sendNamedKey`가
 해석), daemon surface는 `key_bytes()`로 바이트를 만들어 `Input`으로 보낸다.
 `key_bytes()`는 `term-mesh-cli`에 있으므로 daemon과 공유하려면 `peer-proto`
