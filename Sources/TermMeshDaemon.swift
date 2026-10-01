@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Combine
 import os
@@ -405,20 +406,79 @@ final class TermMeshDaemon: ObservableObject {
         case replace
         case preserveLiveSurfaces(Int)
         case preserveUnknownInventory
+        case preserveLiveOwner(Int32)
+        case preserveUnreportedOwner
     }
 
+    /// The runtime owner `daemon.status` reports. A daemon that omits the
+    /// field, or sends a value that is not a usable pid, is `unreported`:
+    /// only an explicit JSON null means nobody owns it.
+    enum DaemonOwner: Equatable {
+        case unreported
+        case nobody
+        case pid(Int32)
+    }
+
+    struct DaemonStatusSnapshot: Equatable {
+        let version: String?
+        let owner: DaemonOwner
+        let liveProjectSurfaces: Int?
+    }
+
+    /// One `daemon.status` answer, read once so the owner that authorizes a
+    /// replacement is the owner of the same snapshot as its version.
+    static func daemonStatusSnapshot(from response: [String: Any]?) -> DaemonStatusSnapshot {
+        let version = (response?["version"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let surfaces = (response?["live_project_surfaces"] as? NSNumber)?.intValue
+        return DaemonStatusSnapshot(
+            version: version,
+            owner: daemonOwner(from: response),
+            liveProjectSurfaces: surfaces
+        )
+    }
+
+    static func daemonOwner(from response: [String: Any]?) -> DaemonOwner {
+        guard let response, let value = response["owner_pid"] else { return .unreported }
+        if value is NSNull { return .nobody }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              Double(number.int64Value) == number.doubleValue,
+              (2...Int64(Int32.max)).contains(number.int64Value)
+        else { return .unreported }
+        return .pid(Int32(number.int64Value))
+    }
+
+    /// The daemon's own liveness rule: EPERM still means the pid exists.
+    /// NSRunningApplication cannot decide this, because it returns nil for
+    /// an owner that is not an app.
+    static func processIsAlive(_ pid: Int32) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    /// A replacement stops the daemon for every app on its socket, so it needs
+    /// the owner's consent before the version or inventory is considered:
+    /// nobody owns it, this process owns it, or its owner is gone. A live
+    /// foreign owner blocks it in either version direction — the production
+    /// daemon was the older one when a unit-test host replaced it.
     static func automaticUpgradeDecision(
-        requiresUpgrade: Bool, replacementReady: Bool, liveProjectSurfaces: Int?
+        requiresUpgrade: Bool,
+        replacementReady: Bool,
+        owner: DaemonOwner,
+        selfPID: Int32,
+        isProcessAlive: (Int32) -> Bool,
+        liveProjectSurfaces: Int?
     ) -> AutomaticUpgradeDecision {
         guard requiresUpgrade, replacementReady else { return .preserveUnknownInventory }
+        switch owner {
+        case .unreported:
+            return .preserveUnreportedOwner
+        case .pid(let pid) where pid != selfPID && isProcessAlive(pid):
+            return .preserveLiveOwner(pid)
+        case .nobody, .pid:
+            break
+        }
         guard let liveProjectSurfaces else { return .preserveUnknownInventory }
         return liveProjectSurfaces == 0 ? .replace : .preserveLiveSurfaces(liveProjectSurfaces)
-    }
-
-    func liveProjectSurfaceCount() -> Int? {
-        guard let response = rpcCall(method: "daemon.status", params: [:]) as? [String: Any],
-              let count = response["live_project_surfaces"] as? NSNumber else { return nil }
-        return count.intValue
     }
 
     /// Whether the subscribe loop's consecutive connect failures warrant
@@ -457,19 +517,6 @@ final class TermMeshDaemon: ObservableObject {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
     }
 
-    /// Version of whatever daemon currently answers on the socket.
-    ///
-    /// Asks `daemon.status` rather than `ping`, which answers only `pong`.
-    /// A daemon too old to carry the field, or one that does not answer,
-    /// reports nil — treated as "unknown", never as a mismatch.
-    func runningDaemonVersion() -> String? {
-        guard let response = rpcCall(method: "daemon.status", params: [:]) as? [String: Any],
-              let version = response["version"] as? String,
-              !version.isEmpty
-        else { return nil }
-        return version
-    }
-
     /// Spawn the term-meshd daemon process if not already running.
     func startDaemon() {
         startDaemon(assertIntent: true)
@@ -496,7 +543,13 @@ final class TermMeshDaemon: ObservableObject {
 
             // Daemon from a previous app launch?
             if self.ping() {
-                let runningVersion = self.runningDaemonVersion()
+                // `daemon.status` rather than `ping`, which answers only
+                // `pong`. A daemon too old to carry a field, or one that does
+                // not answer, reports it missing — never a mismatch.
+                let status = Self.daemonStatusSnapshot(
+                    from: self.rpcCall(method: "daemon.status", params: [:]) as? [String: Any]
+                )
+                let runningVersion = status.version
                 let requiresUpgrade = Self.daemonRequiresUpgrade(
                     runningVersion: runningVersion,
                     appVersion: Self.appMarketingVersion
@@ -518,14 +571,24 @@ final class TermMeshDaemon: ObservableObject {
                         "This machine's daemon (\(runningVersion ?? "unknown")) is older than the app, but this build bundles no replacement — keeping the running daemon"
                     )
                 }
-                let upgradeDecision: AutomaticUpgradeDecision
-                if requiresUpgrade && replacementReady {
-                    upgradeDecision = Self.automaticUpgradeDecision(
-                        requiresUpgrade: requiresUpgrade, replacementReady: replacementReady,
-                        liveProjectSurfaces: self.liveProjectSurfaceCount()
+                let upgradeDecision = Self.automaticUpgradeDecision(
+                    requiresUpgrade: requiresUpgrade,
+                    replacementReady: replacementReady,
+                    owner: status.owner,
+                    selfPID: ProcessInfo.processInfo.processIdentifier,
+                    isProcessAlive: Self.processIsAlive,
+                    liveProjectSurfaces: status.liveProjectSurfaces
+                )
+                if case .preserveLiveOwner(let ownerPID) = upgradeDecision {
+                    let owner = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier
+                        ?? "a process that is not an app"
+                    Logger.daemon.warning(
+                        "not replacing daemon \(runningVersion ?? "unknown", privacy: .public) with \(Self.appMarketingVersion ?? "unknown", privacy: .public): live pid \(ownerPID, privacy: .public) (\(owner, privacy: .public)) owns it"
                     )
-                } else {
-                    upgradeDecision = .preserveUnknownInventory
+                    RemoteWorkLog.warningOffMain(
+                        "This machine's daemon \(runningVersion ?? "unknown") belongs to pid \(ownerPID) (\(owner)); keeping it instead of updating to \(Self.appMarketingVersion ?? "unknown"). Quit that app to let this one manage the daemon"
+                    )
+                    return
                 }
                 if upgradeDecision == .replace {
                     Logger.daemon.warning(
@@ -545,6 +608,11 @@ final class TermMeshDaemon: ObservableObject {
                         deferredLiveProjectSurfaceCount = count
                         Logger.daemon.warning(
                             "deferring daemon upgrade; \(count, privacy: .public) live peer surface(s) are still running"
+                        )
+                    } else if upgradeDecision == .preserveUnreportedOwner {
+                        deferredLiveProjectSurfaceCount = nil
+                        Logger.daemon.warning(
+                            "deferring daemon upgrade because the daemon does not report its owner"
                         )
                     } else {
                         deferredLiveProjectSurfaceCount = nil

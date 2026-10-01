@@ -89,23 +89,116 @@ final class DaemonLifetimeTests: XCTestCase {
     }
 
     func test_automaticUpgradeRequiresAuthoritativeEmptySurfaceInventory() {
-        XCTAssertEqual(
-            TermMeshDaemon.automaticUpgradeDecision(
-                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: 0
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: 0), .replace)
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: 5), .preserveLiveSurfaces(5))
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: nil), .preserveUnknownInventory)
+    }
+
+    // MARK: - Replacing a daemon another live process owns
+
+    private let selfPID: Int32 = 19240
+    private let foreignPID: Int32 = 85764
+
+    private func upgradeDecision(
+        runningVersion: String = "0.258.1",
+        appVersion: String = "0.259.0",
+        replacementReady: Bool = true,
+        owner: TermMeshDaemon.DaemonOwner,
+        aliveOwners: Set<Int32> = [],
+        liveProjectSurfaces: Int?
+    ) -> TermMeshDaemon.AutomaticUpgradeDecision {
+        TermMeshDaemon.automaticUpgradeDecision(
+            requiresUpgrade: TermMeshDaemon.daemonRequiresUpgrade(
+                runningVersion: runningVersion, appVersion: appVersion
             ),
-            .replace
+            replacementReady: replacementReady,
+            owner: owner,
+            selfPID: selfPID,
+            isProcessAlive: { aliveOwners.contains($0) },
+            liveProjectSurfaces: liveProjectSurfaces
+        )
+    }
+
+    /// 2026-09-30: an untagged DEV unit-test host (0.259.0) replaced the
+    /// production daemon (0.258.1) that the production app still owned.
+    func test_aLiveForeignOwnerBlocksReplacementInEitherVersionDirection() {
+        XCTAssertEqual(
+            upgradeDecision(owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 0),
+            .preserveLiveOwner(foreignPID)
         )
         XCTAssertEqual(
-            TermMeshDaemon.automaticUpgradeDecision(
-                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: 5
+            upgradeDecision(
+                runningVersion: "0.259.0", appVersion: "0.258.1",
+                owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 0
             ),
-            .preserveLiveSurfaces(5)
+            .preserveLiveOwner(foreignPID)
         )
+    }
+
+    func test_aLiveForeignOwnerOutranksLiveSurfaces() {
         XCTAssertEqual(
-            TermMeshDaemon.automaticUpgradeDecision(
-                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: nil
+            upgradeDecision(owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 3),
+            .preserveLiveOwner(foreignPID)
+        )
+    }
+
+    func test_anOwnerThatConsentsLetsTheUpgradeProceed() {
+        XCTAssertEqual(
+            upgradeDecision(owner: .pid(selfPID), aliveOwners: [selfPID], liveProjectSurfaces: 0),
+            .replace,
+            "this process already owns the daemon"
+        )
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: 0), .replace, "the previous app released it")
+        XCTAssertEqual(
+            upgradeDecision(owner: .pid(foreignPID), aliveOwners: [], liveProjectSurfaces: 0),
+            .replace,
+            "the previous app died without releasing it"
+        )
+    }
+
+    func test_anUnreportedOwnerNeverAuthorizesReplacement() {
+        XCTAssertEqual(upgradeDecision(owner: .unreported, liveProjectSurfaces: 0), .preserveUnreportedOwner)
+    }
+
+    func test_aMatchingVersionStillAdoptsWhateverOwnsTheDaemon() {
+        XCTAssertEqual(
+            upgradeDecision(
+                runningVersion: "0.259.0",
+                owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 0
             ),
             .preserveUnknownInventory
+        )
+    }
+
+    func test_statusOwnerDistinguishesNullFromAMissingOrUnusableValue() {
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: ["version": "0.259.0"]), .unreported)
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: nil), .unreported)
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: ["owner_pid": NSNull()]), .nobody)
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: ["owner_pid": NSNumber(value: 85764)]), .pid(85764))
+        for unusable: Any in [
+            "85764", NSNumber(value: 0), NSNumber(value: 1), NSNumber(value: -5),
+            NSNumber(value: Int64(Int32.max) + 1), NSNumber(value: 12.5), NSNumber(value: true),
+        ] {
+            XCTAssertEqual(
+                TermMeshDaemon.daemonOwner(from: ["owner_pid": unusable]),
+                .unreported,
+                "\(unusable)"
+            )
+        }
+    }
+
+    func test_statusSnapshotReadsTheWireFields() throws {
+        let json = #"{"pid": 29119, "version": "0.259.0", "owner_pid": 85764, "live_project_surfaces": 0}"#
+        let response = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.daemonStatusSnapshot(from: response),
+            TermMeshDaemon.DaemonStatusSnapshot(version: "0.259.0", owner: .pid(85764), liveProjectSurfaces: 0)
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.daemonStatusSnapshot(from: ["version": ""]),
+            TermMeshDaemon.DaemonStatusSnapshot(version: nil, owner: .unreported, liveProjectSurfaces: nil)
         )
     }
 
