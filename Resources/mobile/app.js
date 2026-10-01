@@ -4,7 +4,7 @@
 //   GET  /api/targets
 //   GET  /api/targets/{id}/screen?lines=N
 //   GET  /api/targets/{id}/requests        (leader targets)
-//   POST /api/targets/{id}/text {text, request_id}
+//   POST /api/targets/{id}/text {text, request_id, mode?, submit?}
 //   POST /api/targets/{id}/key  {key}
 // The host is the source of truth. Only the per-target Chat/Terminal view
 // preference is kept locally; screen and transcript data are always fetched.
@@ -43,6 +43,7 @@
     interrupt: $('interrupt'),
     composer: $('composer'),
     keys: $('keys'),
+    keysToggle: $('keys-toggle'),
     form: $('send-form'),
     text: $('text'),
     send: $('send'),
@@ -63,6 +64,8 @@
     toolNodes: {},       // tool entry id → {node, key}; shared across Activity bundles
     chatRunning: false,
     mode: 'terminal',
+    keysOpen: false,
+    sendStatusTimer: null,
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -72,9 +75,25 @@
     el.status.classList.toggle('error', !!isError);
   }
 
+  // A finished status clears itself so the line stops taking composer height;
+  // errors and in-progress text ("…") stay until the next action replaces them.
   function setSendStatus(text, isError) {
     el.sendStatus.textContent = text;
     el.sendStatus.classList.toggle('error', !!isError);
+    if (state.sendStatusTimer) {
+      window.clearTimeout(state.sendStatusTimer);
+      state.sendStatusTimer = null;
+    }
+    if (isError || !text || /…$/.test(text)) { return; }
+    state.sendStatusTimer = window.setTimeout(function () {
+      state.sendStatusTimer = null;
+      if (el.sendStatus.textContent === text) { el.sendStatus.textContent = ''; }
+    }, 3000);
+  }
+
+  function fitTextarea() {
+    el.text.style.height = 'auto';
+    el.text.style.height = (el.text.scrollHeight + el.text.offsetHeight - el.text.clientHeight) + 'px';
   }
 
   function requestId() {
@@ -297,7 +316,9 @@
     var paneReadOnly = isPaneReadOnly(t);
     el.composer.hidden = !has || paneReadOnly;
     el.requests.hidden = !(has && t.kind === 'leader');
-    el.keys.hidden = !has || isAgent(t) || agent || t.keys === 'none';
+    var keysAvailable = has && !isAgent(t) && !agent && t.keys !== 'none';
+    el.keysToggle.hidden = !keysAvailable;
+    el.keys.hidden = !keysAvailable || !state.keysOpen;
     el.viewSwitch.hidden = !has || !t.chat_capable;
     el.viewChat.disabled = !has || !t.chat_capable;
     el.viewChat.setAttribute('aria-pressed', String(agent));
@@ -953,7 +974,11 @@
     el.send.disabled = true;
     setSendStatus('sending…');
     var chatInput = isAgent(t) || isChat(t);
-    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', { text: text, request_id: id, mode: chatInput ? 'chat' : 'terminal' })
+    var body = { text: text, request_id: id, mode: chatInput ? 'chat' : 'terminal' };
+    // Send means Enter in a terminal: the daemon delivers text and Return as
+    // one turn so a separate Enter cannot race the paste.
+    if (!chatInput && t.kind === 'pane') { body.submit = true; }
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', body)
       .then(function (data) {
         if (chatInput) {
           setSendStatus(data.deduplicated ? 'already sent' : 'turn sent');
@@ -963,9 +988,10 @@
           if (data.request_replayed) { bits.push('replayed'); }
           setSendStatus(bits.join(' · '));
         } else {
-          setSendStatus(data.deduplicated ? 'already delivered' : 'typed');
+          setSendStatus(data.deduplicated ? 'already delivered' : 'submitted');
         }
         el.text.value = '';
+        fitTextarea();
         refreshNow();
       })
       .catch(function (err) {
@@ -976,9 +1002,9 @@
 
   function sendKey(key) {
     var t = state.selected;
-    if (!t) { return; }
+    if (!t) { return Promise.resolve(); }
     setSendStatus('key ' + key + '…');
-    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/key', { key: key })
+    return api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/key', { key: key })
       .then(function () {
         setSendStatus('sent ' + key);
         window.setTimeout(refreshNow, 250);
@@ -1032,11 +1058,28 @@
     sendKey(btn.getAttribute('data-key'));
   });
 
+  el.keysToggle.addEventListener('click', function () {
+    var stick = isAtBottom(el.screen);
+    state.keysOpen = !state.keysOpen;
+    el.keysToggle.setAttribute('aria-expanded', String(state.keysOpen));
+    el.keys.hidden = !state.keysOpen;
+    if (stick) { el.screen.scrollTop = el.screen.scrollHeight; }
+  });
+
+  el.text.addEventListener('input', fitTextarea);
+
   el.form.addEventListener('submit', function (ev) {
     ev.preventDefault();
     var text = el.text.value;
-    if (!text.trim()) { return; }
-    sendText(text);
+    if (text.trim()) {
+      sendText(text);
+      return;
+    }
+    // An empty send is a bare Enter, only where Enter means something.
+    var t = state.selected;
+    if (!t || t.kind !== 'pane' || isChat(t) || isPaneReadOnly(t)) { return; }
+    el.send.disabled = true;
+    sendKey('Enter').then(function () { el.send.disabled = false; });
   });
 
   el.text.addEventListener('keydown', function (ev) {
