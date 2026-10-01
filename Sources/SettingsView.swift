@@ -1994,14 +1994,18 @@ struct SettingsView: View {
     private static let mobileListenerRefreshQueue = DispatchQueue(
         label: "com.termmesh.settings.mobile-listener", qos: .userInitiated
     )
+    private static let mobileListenerRefreshes = LatestRequest()
 
     /// Off-main: `rpcCallRaw` blocks for up to its timeout, and the expected
     /// environment logs for a tagged build, so neither runs in a view body.
-    /// A serial queue lands replies in request order, so a slow read from
-    /// before a restart cannot overwrite the read made after it.
+    /// Only the newest refresh reads and lands: a slow read from before a
+    /// restart cannot overwrite the read made after it, and refreshes queued
+    /// behind a daemon that does not answer do not each wait out the timeout.
     private func refreshMobileListenerState() {
         let daemon = resolvedDaemon
+        let request = Self.mobileListenerRefreshes.begin()
         Self.mobileListenerRefreshQueue.async {
+            guard Self.mobileListenerRefreshes.isLatest(request) else { return }
             let reported = RemoteExposureStore.listenerState(
                 fromStatusReply: daemon?.rpcCallRaw(method: "remote.status", params: [:])
             )
@@ -2009,7 +2013,10 @@ struct SettingsView: View {
             let report: MobileListenerReport = reported.map {
                 .read($0, RemoteExposureStore.mobileListenerMismatch(expected: expected, reported: $0))
             } ?? .unreadable
-            DispatchQueue.main.async { mobileListenerReport = report }
+            DispatchQueue.main.async {
+                guard Self.mobileListenerRefreshes.isLatest(request) else { return }
+                mobileListenerReport = report
+            }
         }
     }
 
@@ -3169,6 +3176,25 @@ struct SettingsView: View {
 
     private func saveBrowserInsecureHTTPAllowlist() {
         browserInsecureHTTPAllowlist = browserInsecureHTTPAllowlistDraft
+    }
+}
+
+/// Numbers requests so a caller can drop work and replies that a newer request superseded.
+private final class LatestRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latest = 0
+
+    func begin() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        latest += 1
+        return latest
+    }
+
+    func isLatest(_ request: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return request == latest
     }
 }
 
