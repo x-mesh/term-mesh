@@ -469,3 +469,136 @@ final class SessionHostAdvertisementDecisionTests: XCTestCase {
     }
 
 }
+
+/// A spawn used to empty a daemon log over the cap, erasing the record of why
+/// the previous daemon stopped. These run real file-system calls in a private
+/// temporary directory, never against /tmp/term-meshd*.log.
+final class DaemonLogRotationTests: XCTestCase {
+    private var directory: URL!
+    private let cap: Int64 = 8
+
+    private var log: String { directory.appendingPathComponent("term-meshd.log").path }
+    private var generation: String { log + ".1" }
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DaemonLogRotationTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func put(_ text: String, at path: String) throws {
+        try Data(text.utf8).write(to: URL(fileURLWithPath: path))
+    }
+
+    private func contents(_ path: String) -> String? {
+        FileManager.default.contents(atPath: path).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    private func inode(_ path: String) throws -> UInt64 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        return try XCTUnwrap((attributes[.systemFileNumber] as? NSNumber)?.uint64Value)
+    }
+
+    private func inode(fd: Int32) -> UInt64 {
+        var info = stat()
+        XCTAssertEqual(fstat(fd, &info), 0)
+        return UInt64(info.st_ino)
+    }
+
+    private func open(_ maxBytes: Int64? = nil) -> TermMeshDaemon.DaemonLogOpen {
+        TermMeshDaemon.openDaemonLog(path: log, maxBytes: maxBytes ?? cap)
+    }
+
+    private func close(_ result: TermMeshDaemon.DaemonLogOpen) {
+        switch result {
+        case .appended(let fd), .rotated(let fd, _), .rotationFailed(let fd, _):
+            Darwin.close(fd)
+        case .openFailed:
+            break
+        }
+    }
+
+    func test_aLogAtTheCapKeepsAppending() throws {
+        try put("12345678", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .appended = result else { return XCTFail("\(result)") }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: generation))
+        XCTAssertEqual(contents(log), "12345678")
+    }
+
+    func test_aLogOverTheCapBecomesTheGenerationAndANewFileTakesTheWrites() throws {
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotated(let fd, let bytes) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(bytes, 9)
+        XCTAssertEqual(contents(generation), "123456789")
+        XCTAssertNotEqual(inode(fd: fd), try inode(generation))
+        XCTAssertEqual("next".withCString { Darwin.write(fd, $0, 4) }, 4)
+        XCTAssertEqual(contents(log), "next")
+    }
+
+    func test_anOlderGenerationIsReplaced() throws {
+        try put("old", at: generation)
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotated = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(contents(generation), "123456789")
+    }
+
+    func test_aSymlinkAtTheGenerationIsReplacedNotFollowed() throws {
+        let target = directory.appendingPathComponent("target").path
+        try put("keep", at: target)
+        try FileManager.default.createSymbolicLink(atPath: generation, withDestinationPath: target)
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotated = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(contents(target), "keep")
+        let type = try FileManager.default.attributesOfItem(atPath: generation)[.type] as? FileAttributeType
+        XCTAssertEqual(type, .typeRegular)
+        XCTAssertEqual(contents(generation), "123456789")
+    }
+
+    func test_aSymlinkAtTheLogPathIsRefused() throws {
+        let target = directory.appendingPathComponent("target").path
+        try put("keep", at: target)
+        try FileManager.default.createSymbolicLink(atPath: log, withDestinationPath: target)
+        let result = open(0)
+        defer { close(result) }
+        XCTAssertEqual(result, .openFailed(errno: ELOOP))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: generation))
+        XCTAssertEqual(contents(target), "keep")
+    }
+
+    /// Someone else's `.1` in sticky /tmp fails with EPERM, which needs a second
+    /// user to reproduce; a directory in the way takes the same failure path.
+    func test_aFailedRotationKeepsAppendingWithoutTruncating() throws {
+        try FileManager.default.createDirectory(atPath: generation, withIntermediateDirectories: true)
+        try put("x", at: generation + "/keep")
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotationFailed(let fd, let code) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(code, EISDIR)
+        XCTAssertEqual(contents(log), "123456789")
+        XCTAssertEqual(inode(fd: fd), try inode(log))
+    }
+
+    func test_aFreshLogIsNotRotatedAgain() throws {
+        try put("123456789", at: log)
+        close(open())
+        let generationInode = try inode(generation)
+        let second = open()
+        defer { close(second) }
+        guard case .appended = second else { return XCTFail("\(second)") }
+        XCTAssertEqual(try inode(generation), generationInode)
+        XCTAssertEqual(contents(generation), "123456789")
+    }
+}
