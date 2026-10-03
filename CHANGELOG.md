@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.262.0] - 2026-10-03
+
+### Fixed
+
+- A pane exposed with the mobile button now offers Chat as soon as Claude or Codex is running in it, instead of only after the first reply. Before this, a fresh session showed only the terminal until the agent answered once. The first message can now be sent from Chat.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.261.0] - 2026-10-03
 
 ### Added
