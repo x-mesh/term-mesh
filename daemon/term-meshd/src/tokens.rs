@@ -444,6 +444,23 @@ impl UsageTracker {
             .collect()
     }
 
+    /// Tracked sessions under one working directory as (session id, start
+    /// time), for explaining why a pane did not correlate to any of them.
+    pub fn sessions_in_cwd(&self, cwd: &str) -> Vec<(String, i64)> {
+        let state = self.state.lock().unwrap();
+        state
+            .sessions
+            .values()
+            .filter(|s| s.project_path == cwd)
+            .filter_map(|s| {
+                state
+                    .session_started_at
+                    .get(&s.session_id)
+                    .map(|&started| (s.session_id.clone(), started))
+            })
+            .collect()
+    }
+
     /// Panel → (current context tokens, model) for the context-window %
     /// display. Unlike `snapshot_by_panel` (lifetime accumulated totals),
     /// this is the *last* request's context occupancy, keyed by the same
