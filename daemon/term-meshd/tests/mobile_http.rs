@@ -1730,3 +1730,235 @@ async fn listener_serving_reports_whether_the_bind_held() {
     task.await.unwrap().unwrap();
     assert!(!remote::listener_serving());
 }
+
+#[test]
+fn command_catalog_reads_project_user_and_namespaced_plugin_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    let plugin = temp.path().join("plugin");
+    for dir in [
+        home.join(".claude/commands"),
+        project.join(".claude/commands/frontend"),
+        project.join(".claude/skills/deploy"),
+        plugin.join("skills/review"),
+        home.join(".claude/plugins"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(
+        home.join(".claude/commands/build.md"),
+        "---\ndescription: User build\n---\nPRIVATE BODY",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".claude/commands/build.md"),
+        "---\ndescription: 'Project build'\nargument-hint: [target]\n---\nPRIVATE BODY",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".claude/commands/frontend/component.md"),
+        "---\ndescription: Component\n---",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".claude/skills/deploy/SKILL.md"),
+        "---\nname: ship\ndescription: >\n  Deploy the app\n  to staging\n---\nPRIVATE BODY",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("skills/review/SKILL.md"),
+        "---\nname: quality:review\ndescription: Review code\n---",
+    )
+    .unwrap();
+    let (mut items, warning) =
+        http_mobile::mobile_command_catalog("claude", &project, &home, false).unwrap();
+    let (plugins, plugin_warning) = http_mobile::mobile_claude_plugin_items(&json!([
+        {"id":"quality@market","installPath":plugin,"enabled":true,"projectEnabled":true},
+        {"id":"disabled@market","installPath":plugin,"enabled":false}
+    ]));
+    assert!(plugin_warning.is_none());
+    items.extend(plugins);
+    assert!(warning.is_none());
+    let find = |name: &str| items.iter().find(|item| item.invocation == name).unwrap();
+    assert_eq!(find("/build").description, "Project build");
+    assert_eq!(find("/build").argument_hint, "[target]");
+    assert_eq!(find("/build").source, "project");
+    assert_eq!(find("/frontend:component").kind, "command");
+    assert_eq!(find("/ship").description, "Deploy the app to staging");
+    assert_eq!(find("/quality:review").source, "plugin");
+    assert!(!serde_json::to_string(&items)
+        .unwrap()
+        .contains("PRIVATE BODY"));
+    assert!(!serde_json::to_string(&items)
+        .unwrap()
+        .contains(temp.path().to_str().unwrap()));
+}
+
+#[test]
+fn claude_catalog_hides_non_invocable_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    for dir in [
+        project.join(".claude/skills/rc"),
+        project.join(".claude/skills/hidden"),
+        home.join(".claude/skills/.system/helper"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(
+        project.join(".claude/skills/rc/SKILL.md"),
+        "---\nname: rc\ndescription: Mobile control\n---",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".claude/skills/hidden/SKILL.md"),
+        "---\nname: hidden\nuser-invocable: false\n---",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".claude/skills/.system/helper/SKILL.md"),
+        "---\nname: helper\n---",
+    )
+    .unwrap();
+    let (items, _) = http_mobile::mobile_command_catalog("claude", &project, &home, false).unwrap();
+    assert!(items
+        .iter()
+        .any(|item| item.invocation == "/rc" && item.kind == "skill"));
+    assert!(items.iter().any(|item| item.invocation == "/helper"));
+    assert!(!items.iter().any(|item| item.invocation == "/hidden"));
+    assert!(items.iter().any(|item| item.invocation == "/model"));
+}
+
+#[test]
+fn native_catalog_disables_terminal_commands_but_keeps_skills_selectable() {
+    let temp = tempfile::tempdir().unwrap();
+    let skills = temp.path().join(".claude/skills/rc");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(skills.join("SKILL.md"), "---\nname: rc\n---").unwrap();
+    let (items, _) =
+        http_mobile::mobile_command_catalog("claude", temp.path(), temp.path(), true).unwrap();
+    assert!(
+        items
+            .iter()
+            .find(|item| item.invocation == "/rc")
+            .unwrap()
+            .selectable
+    );
+    let model = items
+        .iter()
+        .find(|item| item.invocation == "/model")
+        .unwrap();
+    assert!(!model.selectable);
+    assert!(!model.reason.is_empty());
+}
+
+#[test]
+fn command_catalog_handles_symlink_cycles_and_bad_metadata_visibly() {
+    let temp = tempfile::tempdir().unwrap();
+    let skills = temp.path().join(".claude/skills");
+    std::fs::create_dir_all(skills.join("broken")).unwrap();
+    std::os::unix::fs::symlink(&skills, skills.join("cycle")).unwrap();
+    std::fs::write(skills.join("broken/SKILL.md"), [0xff, 0xfe]).unwrap();
+    let (items, warning) =
+        http_mobile::mobile_command_catalog("claude", temp.path(), temp.path(), false).unwrap();
+    assert!(warning.is_some());
+    assert!(!items.iter().any(|item| item.kind == "skill"));
+}
+
+#[tokio::test]
+async fn command_endpoint_requires_auth_live_exposure_and_a_cli_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    let h = start_tailscale().await;
+    let unauthorized = http(h.addr, "GET", "/api/targets/pane-1/commands", &[], None).await;
+    assert_eq!(unauthorized.status, 403);
+    assert_eq!(get(&h, "/api/targets/missing/commands").await.status, 404);
+    expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
+    let shell = get(&h, "/api/targets/pane-1/commands").await;
+    assert_eq!(shell.status, 409);
+    assert_eq!(shell.error_code(), "commands_unavailable");
+}
+
+#[test]
+fn runtime_codex_skill_list_honors_enabled_state_and_preserves_namespaces() {
+    let result = json!({"data":[{"cwd":"/project","errors":[],"skills":[
+        {"name":"rc","description":"Mobile control","enabled":true,"scope":"repo","pluginId":null},
+        {"name":"xm:build","description":"Build","enabled":true,"scope":"user","pluginId":"xm@market"},
+        {"name":"disabled","enabled":false,"scope":"user"}
+    ]}]});
+    let (items, warning) = http_mobile::mobile_codex_skill_items(&result).unwrap();
+    assert!(warning.is_none());
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].invocation, "$rc");
+    assert_eq!(items[0].source, "project");
+    assert_eq!(items[1].invocation, "$xm:build");
+    assert_eq!(items[1].source, "plugin");
+    assert!(!serde_json::to_string(&items).unwrap().contains("/project"));
+    assert!(http_mobile::mobile_codex_skill_items(&json!({})).is_err());
+}
+
+#[tokio::test]
+async fn native_remote_catalog_does_not_read_the_local_skill_installation() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    let h = start_tailscale().await;
+    expose(&h, &app, "agent-1", TargetKind::Agent, KeysPolicy::Safe).await;
+    app.reply(
+        "team.status",
+        json!({"agents":[{"name":"worker-1","host":"ssh:peer"}]}),
+    );
+    let r = get(&h, "/api/targets/agent-1/commands").await;
+    assert_eq!(r.status, 409);
+    assert_eq!(r.error_code(), "remote_commands_unavailable");
+}
+
+#[tokio::test]
+#[ignore = "requires an installed Codex CLI"]
+async fn command_endpoint_reads_the_installed_codex_skill_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let skill = project.join(".agents/skills/mobile-catalog-fixture");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: mobile-catalog-fixture\ndescription: Catalog test\n---\nTest fixture",
+    )
+    .unwrap();
+    let app = FakeApp::spawn(dir.path());
+    let h = start_tailscale().await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "codex-1".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                cwd: project.to_string_lossy().into_owned(),
+                agent_cli: "codex".into(),
+                chat_capable: true,
+                session_id: Some("fixture-session".into()),
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+    let r = get(&h, "/api/targets/codex-1/commands").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let data = r.json();
+    let items = data["items"].as_array().unwrap();
+    assert!(items
+        .iter()
+        .any(|item| item["invocation"] == "$mobile-catalog-fixture"));
+    assert!(!items
+        .iter()
+        .any(|item| item["invocation"] == "/mobile-catalog-fixture"));
+    assert!(!r.body.contains("installPath"));
+    assert!(!r.body.contains(project.to_str().unwrap()));
+}
+

@@ -285,6 +285,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/app.css", get(css_handler))
         .route("/api/health", get(health_handler))
         .route("/api/targets", get(targets_handler))
+        .route("/api/targets/{surface_id}/commands", get(commands_handler))
         .route("/api/targets/{surface_id}/screen", get(screen_handler))
         .route("/api/targets/{surface_id}/requests", get(requests_handler))
         .route(
@@ -510,6 +511,585 @@ fn target_json(state: &MobileState, entry: &Entry) -> Value {
         "created_at": entry.created_at,
         "expires_at": entry.expires_at,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MobileCommand {
+    pub name: String,
+    pub invocation: String,
+    pub kind: &'static str,
+    pub description: String,
+    pub source: &'static str,
+    pub argument_hint: String,
+    pub selectable: bool,
+    pub reason: String,
+}
+
+const COMMAND_SCAN_LIMIT: usize = 4096;
+const COMMAND_METADATA_BYTES: u64 = 16 * 1024;
+
+fn command_metadata(path: &FsPath) -> std::io::Result<HashMap<String, String>> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(COMMAND_METADATA_BYTES)
+        .read_to_string(&mut text)?;
+    let mut values = HashMap::new();
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return Ok(values);
+    }
+    let mut multiline: Option<String> = None;
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(key) = &multiline {
+                let value = values.entry(key.clone()).or_insert_with(String::new);
+                if !value.is_empty() {
+                    value.push(' ');
+                }
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        multiline = None;
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !matches!(
+            key,
+            "name" | "description" | "argument-hint" | "user-invocable"
+        ) {
+            continue;
+        }
+        let value = value.trim();
+        if matches!(value, ">" | "|" | ">-" | "|-") {
+            multiline = Some(key.to_string());
+            values.insert(key.to_string(), String::new());
+        } else {
+            let value = if value.starts_with('"') {
+                serde_json::from_str::<String>(value).map_err(std::io::Error::other)?
+            } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+                value[1..value.len() - 1].replace("''", "'")
+            } else {
+                value.to_string()
+            };
+            values.insert(key.to_string(), value);
+        }
+    }
+    for (key, value) in &mut values {
+        let limit = if key == "description" { 600 } else { 160 };
+        *value = value.chars().take(limit).collect();
+    }
+    Ok(values)
+}
+
+fn command_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 160
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b':' | b'.'))
+}
+
+fn scan_mobile_commands(
+    root: &FsPath,
+    cli: &str,
+    kind: &'static str,
+    source: &'static str,
+    namespace: &str,
+    budget: &mut usize,
+    items: &mut HashMap<String, MobileCommand>,
+) -> std::io::Result<()> {
+    let mut stack = vec![(root.to_path_buf(), namespace.to_string(), 0usize)];
+    let mut visited = BTreeSet::new();
+    while let Some((dir, prefix, depth)) = stack.pop() {
+        if *budget == 0 {
+            return Err(std::io::Error::other("command scan limit reached"));
+        }
+        *budget -= 1;
+        let canonical = match fs::canonicalize(&dir) {
+            Ok(path) => path,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !visited.insert(canonical) {
+            continue;
+        }
+        let skill = dir.join("SKILL.md");
+        if kind == "skill" && skill.is_file() {
+            let meta = command_metadata(&skill)?;
+            if meta.get("user-invocable").is_some_and(|v| v == "false") {
+                continue;
+            }
+            let fallback = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let name = meta.get("name").map(String::as_str).unwrap_or(fallback);
+            let name = if prefix.is_empty() || name.starts_with(&format!("{prefix}:")) {
+                name.to_string()
+            } else {
+                format!("{prefix}:{name}")
+            };
+            if command_name_valid(&name) {
+                let invocation = format!("{}{name}", if cli == "codex" { '$' } else { '/' });
+                items.entry(invocation.clone()).or_insert(MobileCommand {
+                    name,
+                    invocation,
+                    kind,
+                    source,
+                    description: meta.get("description").cloned().unwrap_or_default(),
+                    argument_hint: meta.get("argument-hint").cloned().unwrap_or_default(),
+                    selectable: true,
+                    reason: String::new(),
+                });
+            }
+            continue;
+        }
+        let mut entries = fs::read_dir(&dir)?
+            .take(*budget + 1)
+            .collect::<Result<Vec<_>, _>>()?;
+        if entries.len() > *budget {
+            return Err(std::io::Error::other("command scan limit reached"));
+        }
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries.into_iter().rev() {
+            if *budget == 0 {
+                return Err(std::io::Error::other("command scan limit reached"));
+            }
+            *budget -= 1;
+            let path = entry.path();
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            if filename.starts_with('.') && filename != ".system" {
+                continue;
+            }
+            if path.is_dir() && depth < 5 {
+                let next = if kind == "command" {
+                    if prefix.is_empty() {
+                        filename
+                    } else {
+                        format!("{prefix}:{filename}")
+                    }
+                } else {
+                    prefix.clone()
+                };
+                stack.push((path, next, depth + 1));
+            } else if kind == "command" && path.extension().is_some_and(|ext| ext == "md") {
+                let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("");
+                let name = if prefix.is_empty() {
+                    stem.to_string()
+                } else {
+                    format!("{prefix}:{stem}")
+                };
+                if !command_name_valid(&name) {
+                    continue;
+                }
+                let meta = command_metadata(&path)?;
+                let invocation = format!("/{name}");
+                items.entry(invocation.clone()).or_insert(MobileCommand {
+                    name,
+                    invocation,
+                    kind,
+                    source,
+                    description: meta.get("description").cloned().unwrap_or_default(),
+                    argument_hint: meta.get("argument-hint").cloned().unwrap_or_default(),
+                    selectable: true,
+                    reason: String::new(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn mobile_command_catalog(
+    cli: &str,
+    cwd: &FsPath,
+    home: &FsPath,
+    native: bool,
+) -> Result<(Vec<MobileCommand>, Option<String>), ApiError> {
+    let mut items = HashMap::new();
+    let mut budget = COMMAND_SCAN_LIMIT;
+    let mut incomplete = false;
+    let mut roots = Vec::new();
+    if !matches!(cli, "claude" | "codex") {
+        return Err(ApiError::conflict(
+            "commands_unavailable",
+            "this CLI has no command catalog",
+        ));
+    }
+    if cli == "claude" {
+        if cwd.is_absolute() {
+            for ancestor in cwd.ancestors() {
+                roots.push((ancestor.join(".claude/skills"), "skill", "project"));
+                roots.push((ancestor.join(".claude/commands"), "command", "project"));
+                if ancestor.join(".git").exists() || ancestor == home {
+                    break;
+                }
+            }
+        }
+        roots.push((home.join(".claude/skills"), "skill", "user"));
+        roots.push((home.join(".claude/commands"), "command", "user"));
+    }
+    for (root, kind, source) in roots {
+        if scan_mobile_commands(&root, cli, kind, source, "", &mut budget, &mut items).is_err() {
+            incomplete = true;
+        }
+    }
+    let common = [
+        ("/model", "모델 선택"),
+        ("/compact", "대화 요약으로 컨텍스트 정리"),
+        ("/review", "코드 변경 검토"),
+        ("/skills", "스킬 목록 보기"),
+        ("/permissions", "실행 권한 설정"),
+        ("/mcp", "MCP 연결 보기"),
+        ("/init", "프로젝트 지침 생성"),
+        ("/plan", "계획 모드 사용"),
+        ("/resume", "이전 대화 이어가기"),
+    ];
+    let extra: &[(&str, &str)] = if cli == "claude" {
+        &[
+            ("/help", "사용할 수 있는 명령 보기"),
+            ("/cost", "토큰 사용량과 비용 보기"),
+            ("/clear", "대화 초기화"),
+            ("/context", "컨텍스트 사용량 보기"),
+            ("/effort", "추론 강도 선택"),
+            ("/plugin", "플러그인 관리"),
+            ("/status", "현재 상태 보기"),
+            ("/config", "설정 보기"),
+            ("/rewind", "이전 대화 지점으로 돌아가기"),
+        ]
+    } else {
+        &[
+            ("/status", "세션 상태와 사용량 보기"),
+            ("/new", "새 대화 시작"),
+            ("/diff", "파일 변경 보기"),
+            ("/fork", "현재 대화 분기"),
+            ("/mention", "파일을 컨텍스트에 추가"),
+            ("/apps", "앱 연결 보기"),
+        ]
+    };
+    for (invocation, description) in common.iter().chain(extra.iter()) {
+        items
+            .entry(invocation.to_string())
+            .or_insert(MobileCommand {
+                name: invocation.trim_start_matches('/').to_string(),
+                invocation: invocation.to_string(),
+                kind: "command",
+                source: "builtin",
+                description: description.to_string(),
+                argument_hint: String::new(),
+                selectable: !native,
+                reason: if native {
+                    "터미널 CLI에서 사용하는 명령입니다.".to_string()
+                } else {
+                    String::new()
+                },
+            });
+    }
+    let mut items: Vec<_> = items.into_values().collect();
+    items.sort_by(|a, b| a.invocation.cmp(&b.invocation));
+    Ok((
+        items,
+        incomplete.then(|| {
+            "일부 명령·스킬을 읽지 못했습니다. 목록을 다시 열어 재시도하세요.".to_string()
+        }),
+    ))
+}
+
+async fn commands_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+) -> ApiResult {
+    let entry = live_entry(&state, &surface_id).await?;
+    if !state.chat_capable(&entry) {
+        return Err(ApiError::conflict(
+            "commands_unavailable",
+            "this pane has no supported CLI session",
+        ));
+    }
+    let mut cli = state
+        .resolved_session(&entry)
+        .map(|s| s.cli)
+        .unwrap_or_else(|| entry.agent_cli.clone());
+    let mut cwd = PathBuf::from(&entry.cwd);
+    if entry.kind == TargetKind::Agent {
+        let roster = app_call(
+            &state,
+            &entry,
+            "team.status",
+            json!({"team_name":entry.team_name}),
+        )
+        .await?;
+        let agent = roster
+            .get("agents")
+            .and_then(Value::as_array)
+            .and_then(|agents| {
+                agents.iter().find(|agent| {
+                    agent.get("name").and_then(Value::as_str) == entry.agent_name.as_deref()
+                })
+            })
+            .ok_or_else(|| {
+                ApiError::conflict(
+                    "commands_unavailable",
+                    "agent command environment is unavailable",
+                )
+            })?;
+        if agent.get("host").is_some_and(|host| !host.is_null()) {
+            return Err(ApiError::conflict(
+                "remote_commands_unavailable",
+                "원격 에이전트의 명령·스킬 목록은 아직 조회할 수 없습니다.",
+            ));
+        }
+        if let Some(value) = agent.get("working_directory").and_then(Value::as_str) {
+            cwd = PathBuf::from(value);
+        }
+        if let Some(value) = agent.get("cli").and_then(Value::as_str) {
+            cli = value.to_string();
+        }
+    }
+    let home = home_dir()?;
+    let native = entry.kind != TargetKind::Pane;
+    let catalog_cli = cli.clone();
+    let catalog_cwd = cwd.clone();
+    let (mut items, mut warning) = tokio::task::spawn_blocking(move || {
+        mobile_command_catalog(&catalog_cli, &catalog_cwd, &home, native)
+    })
+    .await
+    .map_err(|_| ApiError::conflict("commands_unavailable", "command catalog failed"))??;
+    if cli == "codex" {
+        let result = codex_mobile_skills(&cwd).await?;
+        let (skills, skill_warning) = mobile_codex_skill_items(&result)?;
+        items.retain(|item| item.kind != "skill");
+        items.extend(skills);
+        warning = skill_warning;
+    } else {
+        let output = tokio::time::timeout(
+            Duration::from_secs(8),
+            tokio::process::Command::new("claude")
+                .args(["plugin", "list", "--json"])
+                .current_dir(&cwd)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        match output {
+            Ok(Ok(output)) if output.status.success() && output.stdout.len() <= 1024 * 1024 => {
+                if let Ok(plugins) = serde_json::from_slice::<Value>(&output.stdout) {
+                    let (plugins, plugin_warning) =
+                        tokio::task::spawn_blocking(move || mobile_claude_plugin_items(&plugins))
+                            .await
+                            .map_err(|_| {
+                                ApiError::conflict("commands_unavailable", "plugin catalog failed")
+                            })?;
+                    items.extend(plugins);
+                    if plugin_warning.is_some() {
+                        warning = plugin_warning;
+                    }
+                } else {
+                    warning = Some(
+                        "플러그인 목록을 읽지 못했습니다. 목록을 다시 열어 재시도하세요."
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {
+                warning = Some(
+                    "플러그인 목록을 조회하지 못했습니다. 목록을 다시 열어 재시도하세요."
+                        .to_string(),
+                )
+            }
+        }
+    }
+    items.sort_by(|a, b| a.invocation.cmp(&b.invocation));
+    items.dedup_by(|a, b| a.invocation == b.invocation);
+    Ok(Json(json!({"surface_id":surface_id,"items":items,"warning":warning})).into_response())
+}
+
+pub(crate) fn mobile_claude_plugin_items(plugins: &Value) -> (Vec<MobileCommand>, Option<String>) {
+    let mut items = HashMap::new();
+    let mut budget = COMMAND_SCAN_LIMIT;
+    let mut incomplete = false;
+    if let Some(plugins) = plugins.as_array() {
+        for plugin in plugins {
+            if plugin.get("enabled").and_then(Value::as_bool) != Some(true)
+                || plugin.get("projectEnabled").and_then(Value::as_bool) == Some(false)
+            {
+                continue;
+            }
+            let Some(id) = plugin.get("id").and_then(Value::as_str) else {
+                incomplete = true;
+                continue;
+            };
+            let Some(path) = plugin.get("installPath").and_then(Value::as_str) else {
+                incomplete = true;
+                continue;
+            };
+            let namespace = id.split('@').next().unwrap_or(id);
+            let root = FsPath::new(path);
+            let skills = if root.join("SKILL.md").is_file() {
+                root.to_path_buf()
+            } else {
+                root.join("skills")
+            };
+            if scan_mobile_commands(
+                &skills,
+                "claude",
+                "skill",
+                "plugin",
+                namespace,
+                &mut budget,
+                &mut items,
+            )
+            .is_err()
+            {
+                incomplete = true;
+            }
+            if scan_mobile_commands(
+                &root.join("commands"),
+                "claude",
+                "command",
+                "plugin",
+                namespace,
+                &mut budget,
+                &mut items,
+            )
+            .is_err()
+            {
+                incomplete = true;
+            }
+        }
+    } else {
+        incomplete = true;
+    }
+    (
+        items.into_values().collect(),
+        incomplete.then(|| "일부 플러그인의 명령·스킬을 읽지 못했습니다.".to_string()),
+    )
+}
+
+pub(crate) fn mobile_codex_skill_items(
+    result: &Value,
+) -> Result<(Vec<MobileCommand>, Option<String>), ApiError> {
+    let data = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ApiError::conflict("commands_unavailable", "Codex returned no skill catalog")
+        })?;
+    let mut items = Vec::new();
+    let mut incomplete = false;
+    for group in data {
+        if group
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            incomplete = true;
+        }
+        let Some(skills) = group.get("skills").and_then(Value::as_array) else {
+            incomplete = true;
+            continue;
+        };
+        for skill in skills.iter().take(COMMAND_SCAN_LIMIT) {
+            if skill.get("enabled").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(name) = skill.get("name").and_then(Value::as_str) else {
+                incomplete = true;
+                continue;
+            };
+            if !command_name_valid(name) {
+                incomplete = true;
+                continue;
+            }
+            let scope = skill.get("scope").and_then(Value::as_str).unwrap_or("");
+            let source = if skill.get("pluginId").is_some_and(|id| !id.is_null()) {
+                "plugin"
+            } else if scope == "repo" {
+                "project"
+            } else if scope == "system" {
+                "builtin"
+            } else {
+                "user"
+            };
+            items.push(MobileCommand {
+                name: name.to_string(),
+                invocation: format!("${name}"),
+                kind: "skill",
+                source,
+                description: skill
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(600)
+                    .collect(),
+                argument_hint: String::new(),
+                selectable: true,
+                reason: String::new(),
+            });
+        }
+        if skills.len() > COMMAND_SCAN_LIMIT {
+            incomplete = true;
+        }
+    }
+    Ok((
+        items,
+        incomplete
+            .then(|| "일부 스킬을 읽지 못했습니다. 목록을 다시 열어 재시도하세요.".to_string()),
+    ))
+}
+
+async fn codex_mobile_skills(cwd: &FsPath) -> Result<Value, ApiError> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut child = tokio::process::Command::new("codex")
+        .arg("app-server")
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| {
+            ApiError::conflict(
+                "commands_unavailable",
+                "Codex의 스킬 목록을 조회할 수 없습니다.",
+            )
+        })?;
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut input = child.stdin.take().ok_or_else(|| ApiError::conflict("commands_unavailable", "Codex input unavailable"))?;
+        let output = child.stdout.take().ok_or_else(|| ApiError::conflict("commands_unavailable", "Codex output unavailable"))?;
+        let mut output = BufReader::new(output);
+        for request in [
+            json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"term-mesh-mobile-catalog","version":"1.0"}}}),
+            json!({"method":"initialized"}),
+            json!({"id":2,"method":"skills/list","params":{"cwds":[cwd]}}),
+        ] {
+            let mut line = request.to_string(); line.push('\n');
+            input.write_all(line.as_bytes()).await
+                .map_err(|_| ApiError::conflict("commands_unavailable", "Codex catalog request failed"))?;
+        }
+        for _ in 0..128 {
+            let mut line = String::new();
+            if output.read_line(&mut line).await.map_err(|_| ApiError::conflict("commands_unavailable", "Codex catalog read failed"))? == 0 || line.len() > 2 * 1024 * 1024 { break; }
+            let reply: Value = serde_json::from_str(&line)
+                .map_err(|_| ApiError::conflict("commands_unavailable", "Codex catalog response is invalid"))?;
+            if reply.get("error").is_some() { return Err(ApiError::conflict("commands_unavailable", "Codex의 스킬 목록을 조회하지 못했습니다.")); }
+            if reply.get("id").and_then(Value::as_u64) == Some(2) {
+                return reply.get("result").cloned().ok_or_else(|| ApiError::conflict("commands_unavailable", "Codex catalog response is empty"));
+            }
+        }
+        Err(ApiError::conflict("commands_unavailable", "Codex catalog response is incomplete"))
+    }).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    result.map_err(|_| {
+        ApiError::conflict(
+            "commands_unavailable",
+            "스킬 목록 조회 시간이 초과되었습니다. 다시 시도하세요.",
+        )
+    })?
 }
 
 const SESSION_SCAN_LINES: usize = 5_000;

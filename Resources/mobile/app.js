@@ -48,6 +48,15 @@
     text: $('text'),
     send: $('send'),
     sendStatus: $('send-status'),
+    commandsToggle: $('commands-toggle'),
+    commandPicker: $('command-picker'),
+    commandSearch: $('command-search'),
+    commandClose: $('command-close'),
+    commandList: $('command-list'),
+    commandStatus: $('command-status'),
+    commandFilterAll: $('command-filter-all'),
+    commandFilterCommands: $('command-filter-commands'),
+    commandFilterSkills: $('command-filter-skills'),
   };
 
   var state = {
@@ -56,6 +65,7 @@
     pollTimer: null,
     fastPollTimer: null,
     inFlight: false,
+    targetsRequest: null,
     lastText: null,
     lastError: null,
     rowKeys: [],         // per-row render keys for incremental redraws
@@ -66,6 +76,15 @@
     mode: 'terminal',
     keysOpen: false,
     sendStatusTimer: null,
+    commandItems: [],
+    commandRows: [],
+    commandSelection: 0,
+    commandFilter: 'all',
+    commandGeneration: 0,
+    commandContext: '',
+    commandLoading: false,
+    commandError: null,
+    commandWarning: '',
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -281,11 +300,19 @@
   // ── targets ──────────────────────────────────────────────────────────
 
   function loadTargets() {
-    return api('GET', '/api/targets').then(function (data) {
+    if (state.targetsRequest) { return state.targetsRequest; }
+    state.targetsRequest = api('GET', '/api/targets').then(function (data) {
       state.targets = (data && data.targets) || [];
       renderTargets();
       return state.targets;
+    }).then(function (targets) {
+      state.targetsRequest = null;
+      return targets;
+    }, function (err) {
+      state.targetsRequest = null;
+      throw err;
     });
+    return state.targetsRequest;
   }
 
   function renderTargets() {
@@ -305,11 +332,20 @@
 
   function selectTarget(t, fromRender) {
     var changed = !state.selected || !t || state.selected.surface_id !== t.surface_id;
+    var capabilityChanged = !!(state.selected && state.selected.chat_capable) !== !!(t && t.chat_capable);
     state.selected = t || null;
     if (t) { el.target.value = t.surface_id; }
     var has = !!t;
-    if (changed) { state.mode = storedMode(t); }
+    if (changed || capabilityChanged) { state.mode = storedMode(t); }
     var agent = isChat(t);
+    var commandContext = t ? [t.surface_id, t.agent_cli, t.cwd, t.kind].join('|') : '';
+    var supportsCommands = agent && !isPaneReadOnly(t) && (t.agent_cli === 'claude' || t.agent_cli === 'codex');
+    el.commandsToggle.hidden = !supportsCommands;
+    if (!supportsCommands || state.commandContext !== commandContext) {
+      closeCommandPicker(false);
+      state.commandContext = commandContext;
+      state.commandItems = [];
+    }
     el.empty.hidden = has;
     el.screenWrap.hidden = !has || agent;
     el.chat.hidden = !agent;
@@ -341,13 +377,13 @@
     } else {
       setStatus('no exposed panes');
     }
-    if (changed) {
+    if (changed || capabilityChanged) {
       state.lastText = null;
       resetScreen();
       resetChat();
       el.requestsList.textContent = '';
       el.requestsCount.textContent = '';
-      if (!fromRender || has) { refreshNow(); }
+      if (!fromRender) { refreshNow(); }
     }
   }
 
@@ -360,6 +396,7 @@
     state.chatNodes = {};
     state.toolNodes = {};
     state.chatRunning = false;
+    el.chatState.classList.toggle('is-working', false);
     el.chatState.textContent = '';
     el.interrupt.hidden = true;
   }
@@ -831,6 +868,7 @@
     // `running` means the agent process is alive between turns; a turn in
     // progress is `in_flight` (or `thinking` while it reasons).
     state.chatRunning = !!(data && (data.in_flight || data.thinking));
+    el.chatState.classList.toggle('is-working', state.chatRunning);
     el.interrupt.hidden = !state.chatRunning || isPaneReadOnly(state.selected);
     var alive = !!(data && data.running);
     var where = state.selected && state.selected.cwd ? ' · ' + compactPath(state.selected.cwd) : '';
@@ -934,7 +972,11 @@
     if (state.inFlight) { return; }
     state.inFlight = true;
     el.refresh.disabled = true;
-    Promise.all([refreshScreen(), refreshChat(), refreshRequests()]).then(done, done);
+    loadTargets().then(function () {
+      return Promise.all([refreshScreen(), refreshChat(), refreshRequests()]);
+    }).catch(function (err) {
+      setStatus(describeError(err), true);
+    }).then(done, done);
     function done() {
       state.inFlight = false;
       el.refresh.disabled = false;
@@ -966,6 +1008,170 @@
   }
 
   // ── input ────────────────────────────────────────────────────────────
+
+  function closeCommandPicker(focusInput) {
+    el.commandPicker.hidden = true;
+    el.commandsToggle.setAttribute('aria-expanded', 'false');
+    el.commandSearch.setAttribute('aria-expanded', 'false');
+    el.text.setAttribute('aria-expanded', 'false');
+    el.text.removeAttribute('aria-activedescendant');
+    el.commandSearch.removeAttribute('aria-activedescendant');
+    state.commandGeneration++;
+    if (focusInput) { el.text.focus(); }
+  }
+
+  function openCommandPicker(query, focusSearch) {
+    if (el.commandsToggle.hidden) { return; }
+    var wasClosed = el.commandPicker.hidden;
+    el.commandPicker.hidden = false;
+    el.commandsToggle.setAttribute('aria-expanded', 'true');
+    el.commandSearch.setAttribute('aria-expanded', 'true');
+    el.text.setAttribute('aria-expanded', 'true');
+    el.commandSearch.value = query || '';
+    state.commandSelection = 0;
+    if (wasClosed) {
+      state.commandFilter = query && query.charAt(0) === '$' ? 'skill' : 'all';
+      loadCommandCatalog();
+    } else {
+      renderCommands();
+    }
+    if (focusSearch) { el.commandSearch.focus(); }
+  }
+
+  function loadCommandCatalog() {
+    var t = state.selected;
+    var generation = ++state.commandGeneration;
+    state.commandLoading = true;
+    state.commandError = null;
+    state.commandWarning = '';
+    state.commandItems = [];
+    renderCommands();
+    api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/commands')
+      .then(function (data) {
+        if (generation !== state.commandGeneration || el.commandPicker.hidden) { return; }
+        state.commandItems = data && Array.isArray(data.items) ? data.items : [];
+        state.commandWarning = data && data.warning ? data.warning : '';
+      })
+      .catch(function (err) {
+        if (generation !== state.commandGeneration) { return; }
+        state.commandError = err;
+      })
+      .then(function () {
+        if (generation !== state.commandGeneration) { return; }
+        state.commandLoading = false;
+        renderCommands();
+      });
+  }
+
+  function renderCommands() {
+    var query = el.commandSearch.value.trim().replace(/^[/$]/, '').toLowerCase();
+    state.commandRows = state.commandItems.filter(function (item) {
+      if (state.commandFilter !== 'all' && item.kind !== state.commandFilter) { return false; }
+      return !query || [item.name, item.invocation, item.description].join(' ').toLowerCase().indexOf(query) !== -1;
+    });
+    if (!state.commandRows[state.commandSelection] || state.commandRows[state.commandSelection].selectable === false) {
+      state.commandSelection = -1;
+      state.commandRows.some(function (item, index) {
+        if (item.selectable === false) { return false; }
+        state.commandSelection = index;
+        return true;
+      });
+    }
+    el.commandFilterAll.setAttribute('aria-pressed', String(state.commandFilter === 'all'));
+    el.commandFilterCommands.setAttribute('aria-pressed', String(state.commandFilter === 'command'));
+    el.commandFilterSkills.setAttribute('aria-pressed', String(state.commandFilter === 'skill'));
+    el.commandList.textContent = '';
+    el.commandList.setAttribute('aria-busy', String(state.commandLoading));
+    el.commandStatus.classList.toggle('error', !!state.commandError);
+    el.commandStatus.textContent = state.commandLoading ? '목록을 불러오는 중…'
+      : state.commandError ? '목록을 불러오지 못했습니다. ' + describeError(state.commandError)
+      : state.commandRows.length ? state.commandWarning
+      : query ? '검색 결과가 없습니다.' : '표시할 명령이나 스킬이 없습니다.';
+    if (state.commandError) {
+      var retry = document.createElement('button');
+      retry.type = 'button';
+      retry.textContent = '다시 시도';
+      retry.addEventListener('click', loadCommandCatalog);
+      el.commandStatus.appendChild(retry);
+    }
+    state.commandRows.forEach(function (item, index) {
+      var row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'command-option';
+      row.id = 'command-option-' + index;
+      row.setAttribute('role', 'option');
+      row.tabIndex = -1;
+      row.setAttribute('aria-selected', String(index === state.commandSelection));
+      row.setAttribute('aria-disabled', String(item.selectable === false));
+      row.disabled = item.selectable === false;
+      var name = document.createElement('span');
+      name.className = 'command-name';
+      name.textContent = item.invocation + (item.argument_hint ? ' ' + item.argument_hint : '');
+      var kind = document.createElement('span');
+      kind.className = 'command-kind';
+      kind.textContent = item.kind === 'skill' ? '스킬' : '명령';
+      var description = document.createElement('span');
+      description.className = 'command-description';
+      var scope = {builtin:'기본', project:'프로젝트', user:'사용자', plugin:'플러그인'}[item.source] || '';
+      description.textContent = (item.reason || item.description || '') + (scope ? ' · ' + scope : '');
+      row.appendChild(name);
+      row.appendChild(kind);
+      row.appendChild(description);
+      row.addEventListener('mousedown', function (ev) { ev.preventDefault(); });
+      row.addEventListener('click', function () { chooseCommand(index); });
+      el.commandList.appendChild(row);
+    });
+    if (state.commandSelection >= 0) {
+      var active = 'command-option-' + state.commandSelection;
+      el.commandSearch.setAttribute('aria-activedescendant', active);
+      el.text.setAttribute('aria-activedescendant', active);
+    } else {
+      el.commandSearch.removeAttribute('aria-activedescendant');
+      el.text.removeAttribute('aria-activedescendant');
+    }
+  }
+
+  function chooseCommand(index) {
+    var item = state.commandRows[index];
+    if (!item || item.selectable === false) { return; }
+    var draft = el.text.value;
+    var argumentsText = /^[/$]/.test(draft) ? draft.replace(/^[/$]\S*\s*/, '') : draft;
+    el.text.value = item.invocation + ' ' + argumentsText;
+    closeCommandPicker(true);
+    fitTextarea();
+    el.text.setSelectionRange(el.text.value.length, el.text.value.length);
+  }
+
+  function commandKeydown(ev) {
+    if (el.commandPicker.hidden || ev.isComposing) { return false; }
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closeCommandPicker(true);
+      return true;
+    }
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      if (state.commandRows.length) {
+        var step = ev.key === 'ArrowDown' ? 1 : -1;
+        for (var attempt = 0; attempt < state.commandRows.length; attempt++) {
+          state.commandSelection = (state.commandSelection + step + state.commandRows.length) % state.commandRows.length;
+          if (state.commandRows[state.commandSelection].selectable !== false) { break; }
+        }
+        renderCommands();
+        var row = el.commandList.children[state.commandSelection];
+        if (row) { row.scrollIntoView({block:'nearest'}); }
+      }
+      return true;
+    }
+    if ((ev.key === 'Enter' && !ev.metaKey && !ev.ctrlKey) || ev.key === 'Tab') {
+      if (state.commandRows.length) {
+        ev.preventDefault();
+        chooseCommand(state.commandSelection);
+        return true;
+      }
+    }
+    return false;
+  }
 
   function sendText(text) {
     var t = state.selected;
@@ -1027,7 +1233,7 @@
   });
 
   el.refresh.addEventListener('click', function () {
-    loadTargets().then(refreshNow, refreshNow);
+    refreshNow();
   });
 
   el.viewChat.addEventListener('click', function () { setMode('chat'); });
@@ -1066,10 +1272,30 @@
     if (stick) { el.screen.scrollTop = el.screen.scrollHeight; }
   });
 
-  el.text.addEventListener('input', fitTextarea);
+  el.commandsToggle.addEventListener('click', function () {
+    if (el.commandPicker.hidden) { openCommandPicker('', true); }
+    else { closeCommandPicker(true); }
+  });
+  el.commandClose.addEventListener('click', function () { closeCommandPicker(true); });
+  el.commandSearch.addEventListener('input', function () { state.commandSelection = 0; renderCommands(); });
+  el.commandSearch.addEventListener('keydown', commandKeydown);
+  [[el.commandFilterAll, 'all'], [el.commandFilterCommands, 'command'], [el.commandFilterSkills, 'skill']].forEach(function (filter) {
+    filter[0].addEventListener('click', function () {
+      state.commandFilter = filter[1];
+      state.commandSelection = 0;
+      renderCommands();
+    });
+  });
+  el.text.addEventListener('input', function (ev) {
+    fitTextarea();
+    if (ev.isComposing) { return; }
+    if (/^[/$]\S*$/.test(el.text.value)) { openCommandPicker(el.text.value, false); }
+    else { closeCommandPicker(false); }
+  });
 
   el.form.addEventListener('submit', function (ev) {
     ev.preventDefault();
+    closeCommandPicker(false);
     var text = el.text.value;
     if (text.trim()) {
       sendText(text);
@@ -1083,6 +1309,7 @@
   });
 
   el.text.addEventListener('keydown', function (ev) {
+    if (commandKeydown(ev)) { return; }
     // Cmd/Ctrl+Enter sends; plain Enter inserts a newline on phones.
     if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) {
       ev.preventDefault();
@@ -1095,7 +1322,7 @@
   });
 
   loadTargets()
-    .then(function () { startPolling(); })
+    .then(function () { refreshNow(); startPolling(); })
     .catch(function (err) {
       setStatus(describeError(err), true);
       el.empty.hidden = false;
