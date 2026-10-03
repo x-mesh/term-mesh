@@ -55,6 +55,21 @@
 </main>
 
 <footer id="composer" class="composer" hidden>
+  <section id="command-picker" class="command-picker" aria-label="명령·스킬 선택" hidden>
+    <div class="command-picker-head">
+      <strong>명령·스킬</strong>
+      <button id="command-close" type="button">닫기</button>
+    </div>
+    <input id="command-search" type="search" placeholder="이름이나 설명으로 검색" aria-label="명령·스킬 검색" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="command-list" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <div class="command-filters" role="group" aria-label="목록 필터">
+      <button id="command-filter-all" type="button" aria-pressed="true">전체</button>
+      <button id="command-filter-commands" type="button" aria-pressed="false">명령</button>
+      <button id="command-filter-skills" type="button" aria-pressed="false">스킬</button>
+    </div>
+    <div id="command-status" class="command-status" role="status" aria-live="polite"></div>
+    <div id="command-list" class="command-list" role="listbox" aria-label="명령·스킬 목록"></div>
+    <div class="command-hint">선택하면 입력창에 추가됩니다.</div>
+  </section>
   <div id="keys" class="keys-row" aria-label="quick keys" hidden>
     <button type="button" data-key="Enter">Enter</button>
     <button type="button" data-key="Escape">Esc</button>
@@ -70,8 +85,9 @@
     <button type="button" data-key="C-c" class="danger">^C</button>
   </div>
   <form id="send-form" class="send-form">
+    <button id="commands-toggle" type="button" class="icon" aria-controls="command-picker" aria-expanded="false" aria-label="명령·스킬 목록" title="명령·스킬 목록" hidden>/</button>
     <button id="keys-toggle" type="button" class="icon" aria-controls="keys" aria-expanded="false" aria-label="빠른 키" title="빠른 키" hidden>⌨</button>
-    <textarea id="text" rows="1" placeholder="메시지…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+    <textarea id="text" rows="1" placeholder="메시지…" aria-label="메시지" aria-controls="command-list" aria-expanded="false" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
     <button id="send" type="submit">보내기</button>
   </form>
   <div id="send-status" class="send-status muted"></div>
