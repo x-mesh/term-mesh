@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "ai-color-palette",
+        "value": "*",
+        "files": [
+          "Resources/mobile/index.html"
+        ],
+        "createdAt": "2026-10-03T09:41:37.183Z",
+        "reason": "Scoped command-picker extension preserves the existing mobile Aurora palette. git show HEAD:Resources/mobile/app.css confirms that the violet gradients predate this change; the approved task does not redesign that palette."
+      }
+    ]
+  }
+}
