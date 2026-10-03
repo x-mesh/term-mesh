@@ -4,6 +4,31 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.263.0] - 2026-10-04
+
+### Added
+
+- Mobile Chat can answer a Claude Code or Codex approval question. When the agent asks before running a command, Chat shows the question with its options as buttons. A button answers only while that same question is still on the terminal.
+- `/model` in mobile Chat opens a list of the models the CLI actually offers, with the current one marked, and switches the running session to the one you pick. Claude Code also lists the models that are scrolled out of its menu. The change applies to the current session only. A Codex model that has no reasoning step is saved as Codex's default, and Chat reports when that happens. Claude Code still accepts a model id that is not in the list, which it saves as the default.
+- `/effort` in mobile Chat opens a list of Claude Code's reasoning levels and applies the chosen level to the current session.
+- Commands that answer with a terminal menu, such as `/resume` or `/permissions`, switch the phone to the terminal view after they are sent. In Codex this applies to every built-in command except `/model`, `/compact` and `/init`.
+- While a turn runs, Chat shows the last lines the agent is writing on the terminal. Claude Code adds an answer to its chat log only after the answer is complete.
+- The output of a local command such as `/model` or `/cost` appears in Chat as a notice. Before, it was hidden or shown with raw tags.
+- Code blocks in Chat have a copy button. A "new message" button appears when a message arrives while you read earlier messages.
+- A turn that ends while the page is in a background browser tab adds ✓ to the tab title.
+- A tagged Debug build names itself in the page header, so it can be told apart from the installed app.
+
+### Fixed
+
+- Chat no longer shows "idle" while the agent is still working between two tool calls. A turn now counts as running from the chat log, from the agent's working indicator on screen, or from an approval question that waits for an answer.
+- A Claude Code or Codex session started again in the same folder no longer shows the previous session's conversation in Chat. The context-usage percentage also no longer counts the previous session.
+- The command list no longer drops commands and skills after a command file of more than 16 KiB that contains Korean or other multi-byte text.
+- The command list no longer warns that plugins could not be listed. The daemon now finds `claude` and `codex` in the user's install directories.
+- The new session view no longer shows an error before the first message. It now says that the session is waiting for that message.
+- Searching the command list now shows commands whose names match before commands whose descriptions match. For example, `/model` is listed first when you search for "model".
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.262.0] - 2026-10-03
 
 ### Fixed
