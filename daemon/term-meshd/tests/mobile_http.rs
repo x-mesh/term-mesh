@@ -1549,7 +1549,7 @@ async fn a_pane_running_a_cli_is_chat_capable_even_when_the_record_is_not() {
         Arc::new(|surface_id: &str| match surface_id {
             "panel-1" => Some(http_mobile::PaneSession {
                 cli: "claude".into(),
-                session_id: "sess-abc".into(),
+                session_id: Some("sess-abc".into()),
             }),
             _ => None,
         });
@@ -1596,6 +1596,57 @@ async fn an_unresolvable_pane_stays_terminal_only() {
     assert_eq!(target["chat_capable"], false);
 }
 
+/// A CLI that has started but not replied yet has no session file, so the
+/// resolver knows the pane runs it and nothing more. The switch must already
+/// be on the page, because the first turn is sent from Chat itself.
+#[tokio::test]
+async fn a_pane_whose_cli_has_no_session_yet_still_offers_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.list", json!({ "surfaces": [] }));
+    app.reply("surface.send_turn", json!({ "submitted": true }));
+    let resolver: http_mobile::SessionResolver = Arc::new(|_: &str| {
+        Some(http_mobile::PaneSession {
+            cli: "claude".into(),
+            session_id: None,
+        })
+    });
+    let h = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "panel-5".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let target = get(&h, "/api/targets").await.json()["targets"][0].clone();
+    assert_eq!(target["chat_capable"], true);
+    assert_eq!(target["agent_cli"], "claude");
+
+    let transcript = get(&h, "/api/targets/panel-5/transcript").await;
+    assert_eq!(transcript.status, 409, "{}", transcript.body);
+    assert_eq!(
+        transcript.json()["error"]["code"],
+        "session_unavailable",
+        "the page retries on this code instead of showing an error"
+    );
+
+    let chat = post(
+        &h,
+        "/api/targets/panel-5/text",
+        json!({ "text": "first turn", "mode": "chat", "request_id": "first-1" }),
+    )
+    .await;
+    assert_eq!(chat.status, 200, "{}", chat.body);
+}
+
 /// The other half of `a_pane_running_a_cli_is_chat_capable_even_when_the_record
 /// _is_not`: the page reads `chat_capable` off `/api/targets`, which the
 /// resolver answers, and then posts its turn to `/text`. Gating that POST on
@@ -1610,7 +1661,7 @@ async fn a_resolved_pane_accepts_a_chat_turn() {
         Arc::new(|surface_id: &str| match surface_id {
             "panel-3" => Some(http_mobile::PaneSession {
                 cli: "claude".into(),
-                session_id: "sess-xyz".into(),
+                session_id: Some("sess-xyz".into()),
             }),
             _ => None,
         });
@@ -1659,7 +1710,7 @@ async fn a_resolved_pane_forwards_interrupt_as_ctrl_c() {
     let resolver: http_mobile::SessionResolver = Arc::new(|surface_id: &str| match surface_id {
         "panel-4" => Some(http_mobile::PaneSession {
             cli: "claude".into(),
-            session_id: "sess-int".into(),
+            session_id: Some("sess-int".into()),
         }),
         _ => None,
     });

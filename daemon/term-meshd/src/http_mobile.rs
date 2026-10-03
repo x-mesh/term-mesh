@@ -145,7 +145,9 @@ pub fn parse_logins(raw: Option<&str>) -> BTreeSet<String> {
 /// The CLI session a pane is running.
 pub struct PaneSession {
     pub cli: String,
-    pub session_id: String,
+    /// None while the CLI is running but has written nothing a transcript
+    /// can be read from: a fresh session only appears after its first reply.
+    pub session_id: Option<String>,
 }
 
 /// Finds the session behind a surface whose exposure record carries none.
@@ -183,7 +185,7 @@ impl MobileState {
         {
             return Some(PaneSession {
                 cli: entry.agent_cli.clone(),
-                session_id: session_id.to_string(),
+                session_id: Some(session_id.to_string()),
             });
         }
         self.session_resolver.as_ref()?(&entry.surface_id)
@@ -2363,7 +2365,7 @@ async fn transcript_handler(
     // one is left exactly as it was.
     if entry.session_id.is_none() || entry.agent_cli.is_empty() {
         if let Some(session) = state.resolved_session(&entry) {
-            entry.session_id = Some(session.session_id);
+            entry.session_id = session.session_id.or(entry.session_id.take());
             entry.agent_cli = session.cli;
         }
     }

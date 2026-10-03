@@ -917,9 +917,11 @@ mod shutdown_budget_tests {
 /// owns the pane never sees it, so a pane exposed from the app arrived with no
 /// session and the phone hid the Chat/Terminal switch.
 ///
-/// `None` means this surface is not running a CLI we can follow right now —
-/// resolved per request, so starting or restarting a CLI is picked up without
-/// re-exposing the pane.
+/// `None` means this surface is not running a CLI we know. A CLI that is
+/// running but has no session to follow yet — a fresh one writes its session
+/// file only with its first reply — comes back with `session_id: None`, so
+/// the phone offers Chat before the first turn. Resolved per request, so
+/// starting or restarting a CLI is picked up without re-exposing the pane.
 fn mobile_session_resolver(
     pane_tracker: pane_tracker::PaneTracker,
     usage_tracker: tokens::UsageTracker,
@@ -927,9 +929,22 @@ fn mobile_session_resolver(
     // Built once: `new` only locates `~/.codex/sessions`, while the scan that
     // costs anything happens per call and is incremental.
     let codex = codex_tokens::CodexUsageTracker::new();
+    let last_outcome: std::sync::Mutex<std::collections::HashMap<String, String>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+    // Resolved on every poll, so only a change of outcome is worth a line.
+    let note = move |surface_id: &str, outcome: String| {
+        let mut seen = last_outcome.lock().unwrap();
+        if seen.get(surface_id) != Some(&outcome) {
+            tracing::info!("mobile session resolver: surface {surface_id}: {outcome}");
+            seen.insert(surface_id.to_string(), outcome);
+        }
+    };
     std::sync::Arc::new(move |surface_id: &str| {
         let panes = pane_tracker.snapshot();
-        let info = panes.get(surface_id)?;
+        let Some(info) = panes.get(surface_id) else {
+            note(surface_id, "no claude/codex process tagged with this panel".into());
+            return None;
+        };
         let correlation: Vec<(String, String, i64, u32)> = panes
             .iter()
             .map(|(panel_id, pane)| {
@@ -944,14 +959,41 @@ fn mobile_session_resolver(
         let session_id = match info.cli.as_str() {
             "claude" => usage_tracker
                 .sessions_by_panel(&correlation)
-                .remove(surface_id)?,
+                .remove(surface_id),
             "codex" => codex
-                .as_ref()?
-                .sessions_by_panel(&correlation)
-                .ok()?
-                .remove(surface_id)?,
-            _ => return None,
+                .as_ref()
+                .and_then(|c| c.sessions_by_panel(&correlation).ok())
+                .and_then(|mut m| m.remove(surface_id)),
+            other => {
+                note(surface_id, format!("unsupported cli {other:?}"));
+                return None;
+            }
         };
+        match &session_id {
+            Some(session_id) => note(
+                surface_id,
+                format!("resolved {} session {session_id}", info.cli),
+            ),
+            None => {
+                let same_cwd = panes.values().filter(|p| p.cwd == info.cwd).count();
+                let nearest_gap = (info.cli == "claude")
+                    .then(|| {
+                        usage_tracker
+                            .sessions_in_cwd(&info.cwd)
+                            .iter()
+                            .map(|(_, started)| (started - info.proc_start_unix).abs())
+                            .min()
+                    })
+                    .flatten();
+                note(
+                    surface_id,
+                    format!(
+                        "{} running, no session yet: cwd={} panes_in_cwd={} nearest_session_gap_secs={:?}",
+                        info.cli, info.cwd, same_cwd, nearest_gap
+                    ),
+                );
+            }
+        }
         Some(http_mobile::PaneSession {
             cli: info.cli.clone(),
             session_id,
