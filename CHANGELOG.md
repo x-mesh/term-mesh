@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.261.0] - 2026-10-03
+
+### Added
+
+- Mobile Chat includes a searchable command and skill picker. Open it with `/` or the list button, filter commands and skills, then select an item to insert its invocation without sending it. Codex skills use `$name`.
+- Mobile Chat shows a spinner during an active turn or while the agent thinks. The spinner disappears when the turn ends and does not rotate when reduced motion is enabled.
+
+### Fixed
+
+- A pane exposed with the mobile button switches to Chat when its Claude or Codex session becomes available. An explicit Terminal selection stays selected.
+- Message and skill-search inputs use a minimum font size of 16px to reduce automatic focus zoom on iPhone. Pinch zoom remains available.
+- Error text in the new command picker has sufficient contrast in light and dark themes.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.260.0] - 2026-10-01
 
 ### Added
