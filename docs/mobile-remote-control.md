@@ -280,6 +280,12 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 | GET | `/api/targets/{id}/transcript?limit=200` | agent만(아니면 409 `not_an_agent`) | `{running, thinking, in_flight, summary, total, entries: [{id, kind: said\|answered\|thought\|tool\|turn_ended\|notice, …}]}` (`team.agent.transcript`). entry는 id가 안정적이고 답변·tool 결과는 제자리에서 바뀌므로 페이지는 id별로 다시 그림 |
 | POST | `/api/targets/{id}/interrupt` | agent만 | 202 아님, 200 `{interrupted}` (`team.interrupt`) |
 | POST | `/api/targets/{id}/key` | `{key}` | 200 `{key, delivered}` |
+| GET | `/api/targets/{id}/models` | Claude/Codex를 띄운 terminal pane만(아니면 409 `model_unavailable`) | `{cli, current_model, custom, models: [{id, label, description, current}]}`. CLI의 `/model` 메뉴를 열어 한 바퀴 읽고 닫음 |
+| POST | `/api/targets/{id}/model` | `{model, save_default?, custom?}` | 200 `{cli, delivered, message, session_only}` |
+| GET | `/api/targets/{id}/prompt` | Claude/Codex terminal pane | `{prompt: null\|{question, context, options: [{index, label}], fingerprint}, preview: [line]}`. 화면 맨 아래의 승인 질문, 없으면 입력창 위 마지막 몇 줄(스트리밍 중인 답) |
+| POST | `/api/targets/{id}/prompt` | `{fingerprint, index}` | 200 `{answered}`. 같은 질문(fingerprint)이 아직 떠 있을 때만 숫자 키 하나를 보냄, 아니면 409 `prompt_gone` |
+| GET | `/api/targets/{id}/effort` | Claude terminal pane만(아니면 409 `effort_unavailable`) | `{levels, current}`. `/effort` 슬라이더를 열어 읽고 닫음 |
+| POST | `/api/targets/{id}/effort` | `{level, save_default?}` | 200 `{message, session_only}` |
 
 키 allowlist(`keys=safe`): `Enter`, `Escape`, `Tab`, `Backspace`, `Up`, `Down`, `Left`,
 `Right`, `y`, `n`, `1`–`9`, `C-c`(대소문자 정확히 일치). GUI pane 매핑(`http_mobile::gui_key`):
@@ -305,14 +311,48 @@ Return을 한 작업으로 보낸다. 별도 `/key Enter`가 끝나지 않은 �
 daemon과 페이지는 알 수 없고 화면 미러로만 확인한다. 이 surface의 첫 붙여넣기는 앱이
 출력이 멈출 때까지 최대 약 4초 미룬다. 둘 다 아니면 지금처럼 `surface.send_text`로 입력만 한다.
 
+모델 선택(`/models`, `/model`): 채팅 탭은 CLI의 `/model` 메뉴를 보여 주지 못하므로
+daemon이 모델을 바꾼다(`daemon/term-meshd/src/mobile_model.rs`).
+
+- 두 CLI 모두 모델 목록을 `/model` 메뉴 안에서만 보여 준다. daemon이
+  `surface.read_text`로 화면을 읽으며 메뉴를 키로 조작한다. 화살표마다 하이라이트 행을
+  확인하고(목록이 순환하므로 맹목 이동 금지), 한 바퀴 돌아 창 밖으로 스크롤된 행까지
+  읽는다. 화면 문구는 CLI별 `Tui` 프로필(`CODEX`, `CLAUDE`)에 고정돼 있고, 화면이 예상과
+  다르면 Escape로 메뉴를 닫고 실패한다.
+- 적용은 기본이 이번 세션만(`s`)이고 `save_default: true`이면 Enter(새 세션 기본값 저장).
+  Claude는 모델 목록에서 바로 적용한다. Codex는 `/model` 뒤 글자를 프롬프트로 보내므로
+  인라인 형식이 없고, 모델 다음 추론 강도 단계에서 Codex가 미리 고른 값을 둔 채 적용한다.
+  강도 단계가 없는 Codex 모델은 Codex가 즉시 기본값으로 저장하며 응답의
+  `session_only: false`가 이를 알린다.
+- Claude의 "직접 입력"(`custom: true`)만 메뉴 대신 `/model <id>` 한 줄을 `send_turn`으로
+  보낸다. id는 `[A-Za-z0-9._/:\[\]-]`만 허용하고(`-`로 시작 금지) 그 밖은 400
+  `invalid_model`. Claude는 이 경로로 고른 모델을 새 세션 기본값으로 저장한다.
+- 시작 전 조건: 입력창이 비어 있음(아니면 `composer_not_empty`), 응답 진행 중 아님
+  (`agent_busy`), 다른 메뉴가 열려 있지 않음(`popup_open`). 조작하는 동안 같은 pane의
+  `/text`와 `/key`는 409 `model_change_in_flight`.
+- Native Agent pane은 키를 받지 않으므로 지원하지 않는다. 명령 목록의 `/model`은
+  `action: "pick_model"`, Claude `/effort`는 `action: "pick_effort"`를 달고, 페이지는 입력창
+  대신 시트를 연다. 메뉴나 화면 출력으로 답하는 명령(Claude `/permissions`, `/resume`,
+  `/mcp`, `/config` 등, Codex는 `/compact`·`/init` 외 전부: Codex는 slash 명령 출력을
+  rollout에 남기지 않는다)은 `action: "terminal"`이고, 페이지는 보낸 뒤 터미널 보기로 바꾼다.
+
+승인 질문(`/prompt`): 두 CLI 모두 도구 실행 승인을 터미널 화면에만 묻는다. 페이지는 턴이
+진행 중이거나 세션 기록을 아직 못 찾은 동안 `/prompt`를 읽어, 질문이 있으면 선택지 카드를,
+없으면 입력창 위 마지막 줄을 미리보기로 보여 준다(Claude 답은 메시지가 끝나야 세션 기록에
+들어간다). 두 CLI 모두 숫자 키 하나로 바로 고르므로 daemon은 fingerprint가 같은지 확인한 뒤
+숫자만 보낸다. 화면 문구는 `PromptTui`(`CLAUDE_PROMPT`, `CODEX_PROMPT`)에 고정돼 있다.
+
+`/api/health`는 tagged Debug 앱이면 `tag`를 함께 준다. 같은 페이지를 다른 포트로 띄우는
+DEV 앱과 설치된 앱을 페이지 머리의 배지로 구분하기 위해서다.
+
 | 코드 | 경우 (`error.code`) |
 |---|---|
-| 400 | 잘못된 JSON, `lines` 범위 밖(`invalid_lines`), 빈 텍스트(`empty_text`), 잘못된 request_id(`invalid_request_id`) |
+| 400 | 잘못된 JSON, `lines` 범위 밖(`invalid_lines`), 빈 텍스트(`empty_text`), 잘못된 request_id(`invalid_request_id`), 잘못된 모델 id(`invalid_model`) |
 | 413 / 415 / 422 | 본문 64 KiB 초과 / `application/json` 아님 / 필수 필드 누락 (axum `Json` rejection 그대로) |
 | 403 | 신원 없음(`login_required`), allowlist 밖 login(`login_not_allowed`), `keys_disabled`, `key_not_allowed` |
 | 404 | 미노출·만료(`not_exposed`), app이 `not_found`를 답해 entry를 제거함(`target_gone`), 없는 route(`no_such_route`) |
 | 405 | route는 있으나 method가 다름 |
-| 409 | 리더가 아닌 대상의 `/requests`(`not_leader`), daemon 소유 surface(`not_readable`, Phase 3 전까지) |
+| 409 | 리더가 아닌 대상의 `/requests`(`not_leader`), daemon 소유 surface(`not_readable`, Phase 3 전까지), 승인 질문(`prompt_unavailable`, `prompt_gone`), effort(`effort_unavailable`), 모델 선택(`model_unavailable`, `model_change_in_flight`, `composer_not_empty`, `agent_busy`, `popup_open`, `unknown_model`, `screen_unrecognized`) |
 | 502 | app socket RPC 실패(`app_rpc_failed`) |
 | 503 | app socket 연결 불가(`app_unavailable`) |
 

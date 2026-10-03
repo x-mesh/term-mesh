@@ -6,6 +6,12 @@
 //   GET  /api/targets/{id}/requests        (leader targets)
 //   POST /api/targets/{id}/text {text, request_id, mode?, submit?}
 //   POST /api/targets/{id}/key  {key}
+//   GET  /api/targets/{id}/models         (terminal panes running Claude/Codex)
+//   POST /api/targets/{id}/model {model, save_default?, custom?}
+//   GET  /api/targets/{id}/prompt         (approval question + live preview)
+//   POST /api/targets/{id}/prompt {fingerprint, index}
+//   GET  /api/targets/{id}/effort         (Claude terminal panes)
+//   POST /api/targets/{id}/effort {level, save_default?}
 // The host is the source of truth. Only the per-target Chat/Terminal view
 // preference is kept locally; screen and transcript data are always fetched.
 
@@ -13,6 +19,10 @@
   'use strict';
 
   var POLL_MS = 2000;
+  var DONE_MARK = '✓ ';
+  var DONE_BUZZ_MS = 180;
+  var COPIED_MS = 1500;
+  var PROMPT_CONTEXT_SHOWN = 2;
   var SCREEN_LINES = 200;
   var BOTTOM_SLACK_PX = 24;
   // xterm-style 16-color palette; 16–231 is the 6x6x6 cube, 232–255 grays.
@@ -57,6 +67,22 @@
     commandFilterAll: $('command-filter-all'),
     commandFilterCommands: $('command-filter-commands'),
     commandFilterSkills: $('command-filter-skills'),
+    promptCard: $('prompt-card'),
+    promptQuestion: $('prompt-question'),
+    promptContext: $('prompt-context'),
+    promptOptions: $('prompt-options'),
+    promptStatus: $('prompt-status'),
+    buildTag: $('build-tag'),
+    chatLive: $('chat-live'),
+    chatJump: $('chat-jump'),
+    emptyApp: $('empty-app'),
+    modelPicker: $('model-picker'),
+    modelClose: $('model-close'),
+    modelTitle: $('model-title'),
+    modelStatus: $('model-status'),
+    modelList: $('model-list'),
+    modelCustom: $('model-custom'),
+    modelCustomId: $('model-custom-id'),
   };
 
   var state = {
@@ -337,6 +363,7 @@
     if (t) { el.target.value = t.surface_id; }
     var has = !!t;
     if (changed || capabilityChanged) { state.mode = storedMode(t); }
+    if (changed) { hidePrompt(); closeModelPicker(); }
     var agent = isChat(t);
     var commandContext = t ? [t.surface_id, t.agent_cli, t.cwd, t.kind].join('|') : '';
     var supportsCommands = agent && !isPaneReadOnly(t) && (t.agent_cli === 'claude' || t.agent_cli === 'codex');
@@ -595,6 +622,27 @@
   // literal, so nothing inside a span may be re-scanned for emphasis.
   var MD_INLINE = /`([^`]+)`|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([\s\S]+?)~~|\[([^\]\n]+)\]\(([^()\s]+)\)/;
 
+  // Selecting text inside a horizontally scrolling block on a phone is close
+  // to impossible, so code gets a copy button where the clipboard is usable.
+  function codeBlock(pre, text) {
+    if (!window.navigator || !window.navigator.clipboard) { return pre; }
+    var wrap = document.createElement('div');
+    wrap.className = 'md-code-wrap';
+    var copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'md-code-copy';
+    copy.textContent = '복사';
+    copy.addEventListener('click', function () {
+      window.navigator.clipboard.writeText(text).then(function () {
+        copy.textContent = '복사됨';
+        window.setTimeout(function () { copy.textContent = '복사'; }, COPIED_MS);
+      }, function () { copy.textContent = '복사 실패'; });
+    });
+    wrap.appendChild(pre);
+    wrap.appendChild(copy);
+    return wrap;
+  }
+
   function isTableRow(line) { return /^\s*\|.*\|\s*$/.test(line); }
   function isTableDelimiter(line) { return /^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/.test(line); }
 
@@ -716,7 +764,7 @@
         pre.className = 'md-code';
         if (fence[1]) { pre.setAttribute('data-lang', fence[1]); }
         pre.textContent = body.join('\n');
-        parent.appendChild(pre);
+        parent.appendChild(codeBlock(pre, body.join('\n')));
         continue;
       }
 
@@ -827,11 +875,12 @@
     var entries = (data && data.entries) || [];
     var items = groupChatEntries(entries);
     var stick = isAtBottom(el.chatList);
+    var grew = false;
     var seen = {};
     var seenTools = {};
     var prev = null;
     el.chatList.classList.toggle('empty', items.length === 0);
-    el.chatList.setAttribute('data-empty', items.length ? '' : 'No conversation yet');
+    el.chatList.setAttribute('data-empty', items.length ? '' : '아직 대화가 없어요');
     items.forEach(function (e) {
       var id = e.id || (e.kind + ':' + (e.text || e.headline || ''));
       seen[id] = true;
@@ -852,6 +901,7 @@
           el.chatList.appendChild(node);
         }
         state.chatNodes[id] = { node: node, key: key };
+        grew = true;
       }
       prev = node;
     });
@@ -867,7 +917,10 @@
     });
     // `running` means the agent process is alive between turns; a turn in
     // progress is `in_flight` (or `thinking` while it reasons).
+    var wasRunning = state.chatRunning && state.runningTarget === (state.selected && state.selected.surface_id);
     state.chatRunning = !!(data && (data.in_flight || data.thinking));
+    state.runningTarget = state.selected && state.selected.surface_id;
+    if (wasRunning && !state.chatRunning) { noticeTurnDone(); }
     el.chatState.classList.toggle('is-working', state.chatRunning);
     el.interrupt.hidden = !state.chatRunning || isPaneReadOnly(state.selected);
     var alive = !!(data && data.running);
@@ -876,6 +929,19 @@
       ? (data.thinking ? '생각 중…' : '작업 중…') + (data.summary ? ' · ' + data.summary : '')
       : (alive ? '대기 중' : '중지됨') + (data && data.summary ? ' · ' + data.summary : '')) + where;
     if (stick) { el.chatList.scrollTop = el.chatList.scrollHeight; }
+    else if (grew) { el.chatJump.hidden = false; }
+  }
+
+  // A finished turn is easy to miss with the phone face down or another tab
+  // open: mark the tab title and buzz once, until the page is looked at.
+  function noticeTurnDone() {
+    if (!document.hidden) { return; }
+    if (document.title.indexOf(DONE_MARK) !== 0) { document.title = DONE_MARK + document.title; }
+    if (window.navigator && typeof window.navigator.vibrate === 'function') { window.navigator.vibrate(DONE_BUZZ_MS); }
+  }
+
+  function clearTurnDone() {
+    if (document.title.indexOf(DONE_MARK) === 0) { document.title = document.title.slice(DONE_MARK.length); }
   }
 
   function refreshChat() {
@@ -886,6 +952,8 @@
         if (!isCurrentTarget(t)) { return; }
         renderChat(data);
         state.lastError = null;
+        if (t.kind === 'pane' && state.chatRunning && !isPaneReadOnly(t)) { refreshPrompt(t); }
+        else { hidePrompt(); }
         if (isChat(t)) {
           var access = isPaneReadOnly(t) ? 'chat transcript · read only' : 'chat';
           setStatus(access + ' · ' + (t.agent_name || t.agent_cli || 'agent') + ' · ' + new Date().toLocaleTimeString());
@@ -895,13 +963,100 @@
         if (!isCurrentTarget(t)) { return; }
         state.lastError = err;
         if (err.code === 'session_unavailable' && t.kind === 'pane') {
-          setStatus('chat session 준비 중 · 다음 poll에서 재시도', true);
+          // A CLI writes its session file only once the first turn starts,
+          // so a fresh session has nothing to show yet; that is not an error.
+          el.chatList.classList.toggle('empty', true);
+          el.chatList.setAttribute('data-empty', '새 세션이에요. 첫 메시지를 보내면 여기에 대화가 쌓여요.');
+          setStatus('새 세션 · 첫 메시지를 기다리는 중');
+          // Until the session file is found nothing says a turn is running,
+          // yet the first one can stream or stop on an approval: the screen
+          // is the only source, so keep reading it.
+          if (!isPaneReadOnly(t)) { refreshPrompt(t); }
           return;
         }
         if (isChat(t)) { setStatus(describeError(err), true); }
         if (err.code === 'not_exposed' || err.code === 'target_gone') {
           return loadTargets();
         }
+      });
+  }
+
+  // ── approval prompts ─────────────────────────────────────────────────
+  //
+  // A CLI asking "run this command?" shows the question only on the terminal
+  // screen; Chat would just read "working…" forever. While a turn runs the
+  // daemon reads the screen and the question is answered here.
+
+  function hidePrompt() {
+    el.promptCard.hidden = true;
+    el.chatLive.hidden = true;
+    state.promptFingerprint = null;
+  }
+
+  function showPreview(lines) {
+    var text = (lines || []).join('\n');
+    el.chatLive.textContent = text;
+    el.chatLive.hidden = !text;
+  }
+
+  function refreshPrompt(t) {
+    if (state.promptAnswering) { return; }
+    api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/prompt')
+      .then(function (data) {
+        if (!isCurrentTarget(t) || state.promptAnswering) { return; }
+        var prompt = data && data.prompt;
+        if (!prompt) {
+          el.promptCard.hidden = true;
+          state.promptFingerprint = null;
+          showPreview(data && data.preview);
+          return;
+        }
+        el.chatLive.hidden = true;
+        if (prompt.fingerprint === state.promptFingerprint) { return; }
+        state.promptFingerprint = prompt.fingerprint;
+        el.promptQuestion.textContent = prompt.question;
+        showPromptContext(prompt.context || [], false);
+        el.promptStatus.textContent = '';
+        el.promptOptions.textContent = '';
+        prompt.options.forEach(function (option) {
+          var button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = option.index + '. ' + option.label;
+          button.addEventListener('click', function () { answerPrompt(t, prompt.fingerprint, option.index); });
+          el.promptOptions.appendChild(button);
+        });
+        el.promptCard.hidden = false;
+      })
+      .catch(function () { hidePrompt(); });
+  }
+
+  // The CLI's dialog carries tips and wrapped fragments above the command;
+  // the last lines (what it does, then the command itself) are what decides
+  // the answer, and the rest is a tap away.
+  function showPromptContext(lines, expanded) {
+    var shown = expanded ? lines : lines.slice(-PROMPT_CONTEXT_SHOWN);
+    el.promptContext.textContent = (!expanded && lines.length > shown.length ? '… ' : '') + shown.join('\n');
+    state.promptContextLines = lines;
+    state.promptContextExpanded = expanded;
+  }
+
+  function answerPrompt(t, fingerprint, index) {
+    state.promptAnswering = true;
+    Array.prototype.forEach.call(el.promptOptions.children, function (button) { button.disabled = true; });
+    el.promptStatus.classList.toggle('error', false);
+    el.promptStatus.textContent = '보내는 중…';
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/prompt', { fingerprint: fingerprint, index: index })
+      .then(function () {
+        state.promptAnswering = false;
+        hidePrompt();
+        refreshChat();
+      })
+      .catch(function (err) {
+        state.promptAnswering = false;
+        if (err.code === 'prompt_gone') { hidePrompt(); refreshChat(); return; }
+        Array.prototype.forEach.call(el.promptOptions.children, function (button) { button.disabled = false; });
+        el.promptStatus.classList.toggle('error', true);
+        el.promptStatus.textContent = describeError(err);
       });
   }
 
@@ -986,7 +1141,12 @@
   function startPolling() {
     stopPolling();
     state.pollTimer = window.setInterval(function () {
-      if (document.hidden) { return; }
+      // Hidden pages stop polling, except for the transcript of a running
+      // turn: that is how a turn ending in a background tab gets noticed.
+      if (document.hidden) {
+        if (state.chatRunning && isChat(state.selected)) { refreshChat(); }
+        return;
+      }
       refreshNow();
     }, POLL_MS);
     // A running agent turn streams text; poll it twice as often.
@@ -1022,6 +1182,7 @@
 
   function openCommandPicker(query, focusSearch) {
     if (el.commandsToggle.hidden) { return; }
+    if (!el.modelPicker.hidden) { closeModelPicker(); }
     var wasClosed = el.commandPicker.hidden;
     el.commandPicker.hidden = false;
     el.commandsToggle.setAttribute('aria-expanded', 'true');
@@ -1063,12 +1224,28 @@
       });
   }
 
+  var COMMAND_RANK_NONE = 3;
+
+  // A name hit must outrank a description hit: "/model" would otherwise list
+  // /cso first because its description mentions "threat model".
+  function commandMatchRank(item, query) {
+    var name = String(item.name || '').toLowerCase();
+    if (name === query) { return 0; }
+    if (name.indexOf(query) === 0) { return 1; }
+    if (name.indexOf(query) !== -1 || String(item.invocation || '').toLowerCase().indexOf(query) !== -1) { return 2; }
+    return String(item.description || '').toLowerCase().indexOf(query) !== -1 ? COMMAND_RANK_NONE - 0.5 : COMMAND_RANK_NONE;
+  }
+
   function renderCommands() {
     var query = el.commandSearch.value.trim().replace(/^[/$]/, '').toLowerCase();
     state.commandRows = state.commandItems.filter(function (item) {
       if (state.commandFilter !== 'all' && item.kind !== state.commandFilter) { return false; }
-      return !query || [item.name, item.invocation, item.description].join(' ').toLowerCase().indexOf(query) !== -1;
+      return !query || commandMatchRank(item, query) < COMMAND_RANK_NONE;
     });
+    if (query) {
+      // Array.prototype.sort is stable, so ties keep the daemon's alphabetical order.
+      state.commandRows.sort(function (a, b) { return commandMatchRank(a, query) - commandMatchRank(b, query); });
+    }
     if (!state.commandRows[state.commandSelection] || state.commandRows[state.commandSelection].selectable === false) {
       state.commandSelection = -1;
       state.commandRows.some(function (item, index) {
@@ -1134,12 +1311,138 @@
   function chooseCommand(index) {
     var item = state.commandRows[index];
     if (!item || item.selectable === false) { return; }
+    if (item.action === 'pick_model' || item.action === 'pick_effort') {
+      closeCommandPicker(false);
+      openModelPicker(item.action === 'pick_effort' ? 'effort' : 'model');
+      return;
+    }
+    // Menus and screen output never reach Chat: once this command is sent,
+    // the terminal view is where its answer is.
+    state.terminalAfterSend = item.action === 'terminal' ? item.invocation : null;
     var draft = el.text.value;
     var argumentsText = /^[/$]/.test(draft) ? draft.replace(/^[/$]\S*\s*/, '') : draft;
     el.text.value = item.invocation + ' ' + argumentsText;
     closeCommandPicker(true);
     fitTextarea();
     el.text.setSelectionRange(el.text.value.length, el.text.value.length);
+  }
+
+  // ── model picker ─────────────────────────────────────────────────────
+  //
+  // `/model` opens a menu inside the terminal that Chat cannot show, so the
+  // daemon drives that menu key by key (it takes seconds) and the page only
+  // picks a row.
+
+  function closeModelPicker() {
+    el.modelPicker.hidden = true;
+    state.modelGeneration = (state.modelGeneration || 0) + 1;
+  }
+
+  function setModelStatus(text, isError) {
+    el.modelStatus.textContent = text;
+    el.modelStatus.classList.toggle('error', !!isError);
+  }
+
+  // The model and effort sheets share one picker: only where the rows come
+  // from and where a pick is posted differ.
+  var PICKERS = {
+    model: {
+      title: '모델 선택',
+      path: '/models',
+      rows: function (data) { return data; },
+      post: function (id, custom) { return ['/model', custom ? { model: id, custom: true } : { model: id }]; },
+    },
+    effort: {
+      title: '추론 강도',
+      path: '/effort',
+      rows: function (data) {
+        return {
+          current_model: data.current,
+          custom: false,
+          models: (data.levels || []).map(function (level) {
+            return { id: level, label: level, description: '', current: level === data.current };
+          }),
+        };
+      },
+      post: function (id) { return ['/effort', { level: id }]; },
+    },
+  };
+
+  function openModelPicker(kind) {
+    var t = state.selected;
+    if (!t) { return; }
+    var picker = PICKERS[kind || 'model'];
+    state.pickerKind = kind || 'model';
+    var generation = (state.modelGeneration || 0) + 1;
+    state.modelGeneration = generation;
+    el.modelPicker.hidden = false;
+    el.modelTitle.textContent = picker.title;
+    el.modelList.textContent = '';
+    el.modelCustom.hidden = true;
+    setModelStatus('터미널 메뉴를 읽는 중…');
+    api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + picker.path)
+      .then(function (raw) {
+        if (generation !== state.modelGeneration) { return; }
+        var data = picker.rows(raw);
+        setModelStatus(data.current_model ? '현재: ' + data.current_model : '');
+        el.modelCustom.hidden = !data.custom;
+        (data.models || []).forEach(function (model) {
+          var row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'command-option';
+          row.setAttribute('role', 'option');
+          row.setAttribute('aria-selected', String(!!model.current));
+          var name = document.createElement('span');
+          name.className = 'command-name';
+          name.textContent = model.label;
+          var tag = document.createElement('span');
+          tag.className = 'command-kind';
+          tag.textContent = model.current ? '현재' : '';
+          var description = document.createElement('span');
+          description.className = 'command-description';
+          description.textContent = model.description || '';
+          row.appendChild(name);
+          row.appendChild(tag);
+          row.appendChild(description);
+          row.addEventListener('click', function () { applyModel(model.id); });
+          el.modelList.appendChild(row);
+        });
+      })
+      .catch(function (err) {
+        if (generation !== state.modelGeneration) { return; }
+        setModelStatus('목록을 불러오지 못했습니다. ' + describeError(err), true);
+      });
+  }
+
+  function applyModel(id, custom) {
+    var t = state.selected;
+    if (!t || !id) { return; }
+    var generation = state.modelGeneration;
+    setModelPickerBusy(true);
+    setModelStatus(custom ? '바꾸는 중…' : '터미널 메뉴에서 바꾸는 중…');
+    var request = PICKERS[state.pickerKind || 'model'].post(id, custom);
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + request[0], request[1])
+      .then(function (data) {
+        setModelPickerBusy(false);
+        if (generation !== state.modelGeneration) { return; }
+        closeModelPicker();
+        var note = data.message || (request[0] + ' ' + id + ' 보냄');
+        note += data.session_only ? ' · 이 세션만' : ' · 기본값으로 저장됨';
+        setSendStatus(note);
+        if (isChat(t) || isAgent(t)) { refreshChat(); }
+      })
+      .catch(function (err) {
+        setModelPickerBusy(false);
+        if (generation !== state.modelGeneration) { return; }
+        setModelStatus('바꾸지 못했습니다. ' + describeError(err), true);
+      });
+  }
+
+  // A second tap while Codex's menu is being driven would only come back
+  // `model_change_in_flight` and overwrite the progress line.
+  function setModelPickerBusy(busy) {
+    Array.prototype.forEach.call(el.modelList.children, function (row) { row.disabled = busy; });
+    Array.prototype.forEach.call(el.modelCustom.querySelectorAll('button, input'), function (node) { node.disabled = busy; });
   }
 
   function commandKeydown(ev) {
@@ -1196,8 +1499,14 @@
         } else {
           setSendStatus(data.deduplicated ? 'already delivered' : 'submitted');
         }
+        var opensTerminal = state.terminalAfterSend && chatInput && text.indexOf(state.terminalAfterSend) === 0;
+        state.terminalAfterSend = null;
         el.text.value = '';
         fitTextarea();
+        if (opensTerminal) {
+          setMode('terminal');
+          setSendStatus('터미널에서 열었어요 · 채팅으로 돌아가려면 Chat 탭');
+        }
         refreshNow();
       })
       .catch(function (err) {
@@ -1243,6 +1552,19 @@
     el.jump.hidden = isAtBottom(el.screen);
   });
 
+  el.promptContext.addEventListener('click', function () {
+    showPromptContext(state.promptContextLines || [], !state.promptContextExpanded);
+  });
+
+  el.chatList.addEventListener('scroll', function () {
+    if (isAtBottom(el.chatList)) { el.chatJump.hidden = true; }
+  });
+
+  el.chatJump.addEventListener('click', function () {
+    el.chatList.scrollTop = el.chatList.scrollHeight;
+    el.chatJump.hidden = true;
+  });
+
   el.jump.addEventListener('click', function () {
     el.screen.scrollTop = el.screen.scrollHeight;
     el.jump.hidden = true;
@@ -1277,6 +1599,11 @@
     else { closeCommandPicker(true); }
   });
   el.commandClose.addEventListener('click', function () { closeCommandPicker(true); });
+  el.modelClose.addEventListener('click', function () { closeModelPicker(); el.text.focus(); });
+  el.modelCustom.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    applyModel(el.modelCustomId.value.trim(), true);
+  });
   el.commandSearch.addEventListener('input', function () { state.commandSelection = 0; renderCommands(); });
   el.commandSearch.addEventListener('keydown', commandKeydown);
   [[el.commandFilterAll, 'all'], [el.commandFilterCommands, 'command'], [el.commandFilterSkills, 'skill']].forEach(function (filter) {
@@ -1318,8 +1645,23 @@
   });
 
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { refreshNow(); }
+    if (!document.hidden) { clearTurnDone(); refreshNow(); }
   });
+
+  // Which app this page belongs to: a tagged Debug app serves the same page
+  // on another port, and without this a viewer cannot tell them apart.
+  api('GET', '/api/health')
+    .then(function (health) {
+      var where = window.location.host;
+      if (health && health.tag) {
+        el.buildTag.textContent = 'DEV ' + health.tag;
+        el.buildTag.hidden = false;
+        document.title = 'term-mesh DEV ' + health.tag;
+      }
+      el.emptyApp.textContent = (health && health.tag ? 'term-mesh DEV ' + health.tag : 'term-mesh') +
+        ' · ' + where + ' · 이 앱의 pane만 보입니다.';
+    })
+    .catch(function () {});
 
   loadTargets()
     .then(function () { refreshNow(); startPolling(); })

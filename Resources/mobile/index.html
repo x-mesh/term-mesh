@@ -15,6 +15,7 @@
     <span id="presence" class="presence" aria-hidden="true" hidden></span>
     <label class="target-label" for="target">
       <span class="brand">term-mesh</span>
+      <span id="build-tag" class="build-tag" hidden></span>
       <select id="target" aria-label="target pane"></select>
     </label>
     <div id="view-switch" class="view-switch" role="group" aria-label="view mode" hidden>
@@ -29,7 +30,12 @@
 <main id="main">
   <section id="empty" class="empty" hidden>
     <p>노출된 pane이 없습니다.</p>
-    <p>term-mesh pane 안에서 <code>/rc on</code>을 실행하세요.</p>
+    <p>폰에서 볼 pane 안에서 다음 중 하나를 실행하세요.</p>
+    <ul>
+      <li>Claude·Codex 입력창: <code>/rc on</code></li>
+      <li>셸: <code>tm-agent remote on --terminal</code></li>
+    </ul>
+    <p id="empty-app" class="muted"></p>
   </section>
 
   <section id="screen-wrap" class="screen-wrap" hidden>
@@ -39,6 +45,8 @@
 
   <section id="chat" class="chat" hidden>
     <div id="chat-list" class="chat-list" role="log" aria-live="polite"></div>
+    <pre id="chat-live" class="chat-live" aria-label="터미널 미리보기" hidden></pre>
+    <button id="chat-jump" type="button" class="jump chat-jump" hidden>↓ 새 메시지</button>
     <div class="chat-foot">
       <span id="chat-state" class="muted"></span>
       <button id="interrupt" type="button" class="danger" hidden>중단</button>
@@ -55,6 +63,12 @@
 </main>
 
 <footer id="composer" class="composer" hidden>
+  <section id="prompt-card" class="prompt-card" aria-label="승인 요청" aria-live="polite" hidden>
+    <strong id="prompt-question"></strong>
+    <pre id="prompt-context"></pre>
+    <div id="prompt-options" class="prompt-options"></div>
+    <div id="prompt-status" class="command-status" role="status"></div>
+  </section>
   <section id="command-picker" class="command-picker" aria-label="명령·스킬 선택" hidden>
     <div class="command-picker-head">
       <strong>명령·스킬</strong>
@@ -69,6 +83,18 @@
     <div id="command-status" class="command-status" role="status" aria-live="polite"></div>
     <div id="command-list" class="command-list" role="listbox" aria-label="명령·스킬 목록"></div>
     <div class="command-hint">선택하면 입력창에 추가됩니다.</div>
+  </section>
+  <section id="model-picker" class="command-picker" aria-label="모델 선택" hidden>
+    <div class="command-picker-head">
+      <strong id="model-title">모델 선택</strong>
+      <button id="model-close" type="button">닫기</button>
+    </div>
+    <div id="model-status" class="command-status" role="status" aria-live="polite"></div>
+    <div id="model-list" class="command-list" role="listbox" aria-label="모델 목록"></div>
+    <form id="model-custom" class="model-custom" hidden>
+      <input id="model-custom-id" type="text" placeholder="모델 id 직접 입력" aria-label="모델 id" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button type="submit">적용</button>
+    </form>
   </section>
   <div id="keys" class="keys-row" aria-label="quick keys" hidden>
     <button type="button" data-key="Enter">Enter</button>

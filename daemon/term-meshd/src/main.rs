@@ -13,6 +13,7 @@ mod gc;
 mod headless;
 mod http;
 mod http_mobile;
+pub(crate) use http_mobile::cli_path;
 mod monitor;
 mod pane_tracker;
 mod paste_cleanup;

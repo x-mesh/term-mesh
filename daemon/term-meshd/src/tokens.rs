@@ -486,6 +486,16 @@ impl UsageTracker {
     /// which session a panel is running.
     fn correlate_panels(&self, panes: &[(String, String, i64, u32)]) -> PanelCorrelation {
         const MAX_DIFF: i64 = 300;
+        // A CLI opens its session after it starts, so a session that began
+        // before the process did belongs to an earlier run in the same
+        // directory. Matching it anyway (the window used to be symmetric)
+        // handed a fresh pane the previous run's conversation until its own
+        // session arrived, and kept it after. The allowance covers the
+        // second-granular process start time.
+        const START_SKEW: i64 = 10;
+        let belongs = |started: i64, proc_start: i64| {
+            started >= proc_start - START_SKEW && started - proc_start <= MAX_DIFF
+        };
         let state = self.state.lock().unwrap();
 
         // (started_at, session_id, tokens) per cwd, sorted by (started_at, session_id).
@@ -537,14 +547,14 @@ impl UsageTracker {
                 .filter(|(started, _, _)| {
                     cwd_panes
                         .iter()
-                        .any(|&(_, proc_start, _)| (started - proc_start).abs() <= MAX_DIFF)
+                        .any(|&(_, proc_start, _)| belongs(*started, proc_start))
                 })
                 .collect();
             for (i, &(panel_id, proc_start, _pid)) in cwd_panes.iter().enumerate() {
                 let Some(&&(started, sid, tokens)) = relevant.get(i) else {
                     continue;
                 };
-                if (started - proc_start).abs() > MAX_DIFF {
+                if !belongs(started, proc_start) {
                     continue;
                 }
                 by_panel.insert(panel_id.to_string(), (sid.to_string(), tokens));
@@ -1288,6 +1298,49 @@ mod tests {
         let totals = tracker.snapshot_by_panel(&panes);
         assert_eq!(totals["panelA"].0, 100);
         assert_eq!(totals.len(), sessions.len());
+    }
+
+    /// A CLI restarted in the same directory must not inherit the session the
+    /// previous run left behind: it began before this process existed.
+    #[test]
+    fn a_restarted_cli_never_gets_the_previous_runs_session() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        let old = assistant_entry(
+            "sessOld",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(100, 50, 0, 0),
+        );
+        record_session_start(&mut state, &old);
+        process_line(&mut state, &old, &path);
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let restarted = vec![(
+            "panelNew".to_string(),
+            "/cwd/shared".to_string(),
+            base + 180,
+            7_u32,
+        )];
+        assert!(
+            tracker.sessions_by_panel(&restarted).is_empty(),
+            "no session until the new run writes its own"
+        );
+
+        let new = assistant_entry(
+            "sessNew",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:03:04.000Z"),
+            usage(10, 5, 0, 0),
+        );
+        {
+            let mut state = tracker.state.lock().unwrap();
+            record_session_start(&mut state, &new);
+            process_line(&mut state, &new, &path);
+        }
+        assert_eq!(tracker.sessions_by_panel(&restarted)["panelNew"], "sessNew");
     }
 
     /// A pane too far from any session gets no tokens, and must get no session
