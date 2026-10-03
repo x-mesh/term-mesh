@@ -666,6 +666,7 @@ body.chat-mode .send-status { margin-left: 2px; }
   min-height: 44px;
   padding: 10px;
   font: inherit;
+  font-size: max(16px, 1rem);
   color: var(--fg);
   background: var(--bg);
   border: 1px solid var(--line);
@@ -707,6 +708,7 @@ textarea {
   flex: 1;
   min-width: 0;
   font: inherit;
+  font-size: max(16px, 1rem);
   padding: 10px 11px;
   border: 1px solid var(--line);
   border-radius: 12px;
