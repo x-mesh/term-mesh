@@ -25,12 +25,13 @@ function element() {
     dispatch(name, event = {}) { listeners.get(name)?.({ preventDefault() {}, ...event }); },
     focus() {}, scrollIntoView() {}, removeAttribute() {},
     setSelectionRange() {},
+    querySelectorAll() { return []; },
     appendChild(child) { this.children.push(child); child.parentNode = this; },
     removeChild(child) { this.children = this.children.filter(item => item !== child); },
   };
 }
 
-function page(initial, saved = {}) {
+function page(initial, saved = {}, health = {}) {
   const nodes = new Map();
   const intervals = new Map();
   const storage = new Map(Object.entries(saved));
@@ -41,31 +42,43 @@ function page(initial, saved = {}) {
   let transcript = {entries: [], running: true};
   let commandError = false;
   let pendingCommands = null;
+  let prompt = null;
+  let preview = [];
+  let transcriptError = null;
+  let models = { cli: 'codex', custom: false, current_model: 'Jev Auto', models: [
+    { id: 'GLM 5', label: 'GLM 5', description: 'GLM', current: false },
+    { id: 'Jev Auto', label: 'Jev Auto', description: 'auto', current: true },
+  ] };
   let commands = [
     {name:'help', invocation:'/help', kind:'command', description:'도움말', source:'builtin', selectable:true},
     {name:'rc', invocation:'/rc', kind:'skill', description:'모바일 원격 제어', source:'user', selectable:true},
     {name:'deploy', invocation:'/deploy', kind:'skill', description:'배포 작업', source:'project', selectable:true},
   ];
+  const copied = [];
   const document = {
-    hidden: false, body: element(),
+    hidden: false, title: 'term-mesh', body: element(),
     getElementById(id) {
       if (!nodes.has(id)) nodes.set(id, element());
       return nodes.get(id);
     },
     createElement: element,
+    createTextNode(text) { const node = element(); node.textContent = text; return node; },
     addEventListener() {},
   };
   const window = {
     location: { pathname: '/t/pane-1' },
     history: { replaceState() {} },
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    navigator: { clipboard: { writeText: async text => { copied.push(text); } } },
     setInterval(callback, ms) { intervals.set(ms, callback); return ms; },
     clearInterval(ms) { intervals.delete(ms); },
     setTimeout() {}, clearTimeout() {},
   };
   const response = body => ({ ok: true, text: async () => JSON.stringify(body) });
-  const fetch = async url => {
+  const bodies = [];
+  const fetch = async (url, init) => {
     requests.push(url);
+    if (init && init.body) bodies.push([url, JSON.parse(init.body)]);
     if (url === '/api/targets') {
       if (targetsError) {
         const error = targetsError;
@@ -80,14 +93,31 @@ function page(initial, saved = {}) {
       if (pendingCommands) return pendingCommands;
       return response({items:commands});
     }
-    if (url.includes('/transcript')) return response(transcript);
+    if (url === '/api/health') return response({ ok: true, ...health });
+    if (url.includes('/transcript')) {
+      if (transcriptError) throw Object.assign(new Error('unavailable'), transcriptError);
+      return response(transcript);
+    }
+    if (url.endsWith('/prompt')) {
+      if (init && init.method === 'POST') { prompt = null; return response({ answered: 1 }); }
+      return response({ prompt, preview });
+    }
+    if (url.endsWith('/models')) return response(models);
+    if (url.endsWith('/effort')) {
+      if (init && init.method === 'POST') return response({ message: 'Set effort level to low (this session only)', session_only: true });
+      return response({ levels: ['low', 'medium', 'high'], current: 'high' });
+    }
+    if (url.endsWith('/model')) return response({ cli: models.cli, delivered: true, message: 'Model changed to glm-5 medium for this session only', session_only: true });
     return response({ text: 'shell screen' });
   };
   vm.runInNewContext(source, { document, window, fetch, console, URL, Date, Promise, Map, Set });
   return {
-    nodes, requests, storage,
+    nodes, requests, storage, bodies, document, copied,
     setCommands(next) { commands = next; },
     setTranscript(next) { transcript = next; },
+    setPrompt(next) { prompt = next; },
+    setPreview(next) { preview = next; },
+    failTranscript(error) { transcriptError = error; },
     failCommands() { commandError = true; },
     pauseCommands() {
       let resolve;
@@ -221,6 +251,183 @@ test('slash opens a searchable command and skill picker without sending', async 
   assert.equal(input.value, '/deploy ');
   assert.equal(app.nodes.get('command-picker').hidden, true);
   assert.equal(app.requests.some(url => url.endsWith('/text')), false);
+});
+
+test('picker ranks a name match above a description match', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.setCommands([
+    {name:'cso', invocation:'/cso', kind:'skill', description:'threat model audit', source:'user', selectable:true},
+    {name:'model', invocation:'/model', kind:'command', description:'모델 선택', source:'builtin', selectable:true},
+  ]);
+  app.nodes.get('commands-toggle').dispatch('click');
+  await settle();
+  app.nodes.get('command-search').value = '/model';
+  app.nodes.get('command-search').dispatch('input');
+  const rows = app.nodes.get('command-list').children;
+  assert.equal(rows.length, 2);
+  app.nodes.get('command-list').children[0].dispatch('click');
+  assert.equal(app.nodes.get('text').value, '/model ');
+});
+
+test('choosing /model opens the model sheet instead of typing the command', async () => {
+  const app = page([{ ...pane(true), agent_cli: 'codex' }]);
+  await settle();
+  app.setCommands([{name:'model', invocation:'/model', kind:'command', description:'모델 선택', source:'builtin', selectable:true, action:'pick_model'}]);
+  app.nodes.get('text').value = '';
+  app.nodes.get('commands-toggle').dispatch('click');
+  await settle();
+  app.nodes.get('command-list').children[0].dispatch('click');
+  await settle();
+  assert.equal(app.nodes.get('text').value, '', 'nothing is typed into the composer');
+  assert.equal(app.nodes.get('model-picker').hidden, false);
+  assert.ok(app.requests.some(url => url.endsWith('/models')));
+  const rows = app.nodes.get('model-list').children;
+  assert.equal(rows.length, 2);
+  rows[0].dispatch('click');
+  await settle();
+  assert.deepEqual(app.bodies.at(-1), ['/api/targets/pane-1/model', { model: 'GLM 5' }]);
+  assert.equal(app.nodes.get('model-picker').hidden, true);
+  assert.match(app.nodes.get('send-status').textContent, /이 세션만/);
+  assert.equal(app.requests.some(url => url.endsWith('/text')), false);
+});
+
+test('a running turn waiting on approval shows the question and answers it by number', async () => {
+  const app = page([pane(true)]);
+  app.setTranscript({ entries: [{ id: 'u1', kind: 'said', speaker: 'person', text: 'make b.txt' }], running: true, in_flight: true });
+  app.setPrompt({ question: 'Do you want to proceed?', context: ['Bash command', 'touch b.txt'], fingerprint: 'fp-1',
+    options: [{ index: 1, label: 'Yes' }, { index: 2, label: 'No' }] });
+  await settle();
+  app.tick();
+  await settle();
+  await settle();
+  assert.equal(app.nodes.get('prompt-card').hidden, false);
+  assert.equal(app.nodes.get('prompt-question').textContent, 'Do you want to proceed?');
+  assert.equal(app.nodes.get('prompt-context').textContent, 'Bash command\ntouch b.txt');
+  const buttons = app.nodes.get('prompt-options').children;
+  assert.equal(buttons.length, 2);
+  buttons[1].dispatch('click');
+  await settle();
+  assert.deepEqual(app.bodies.at(-1), ['/api/targets/pane-1/prompt', { fingerprint: 'fp-1', index: 2 }]);
+  assert.equal(app.nodes.get('prompt-card').hidden, true);
+});
+
+test('an idle chat never asks the terminal for a prompt', async () => {
+  const app = page([pane(true)]);
+  app.setTranscript({ entries: [], running: true, in_flight: false });
+  await settle();
+  app.tick();
+  await settle();
+  assert.equal(app.requests.some(url => url.endsWith('/prompt')), false);
+});
+
+test('choosing /effort opens the effort sheet and posts the level', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.setCommands([{name:'effort', invocation:'/effort', kind:'command', description:'추론 강도', source:'builtin', selectable:true, action:'pick_effort'}]);
+  app.nodes.get('commands-toggle').dispatch('click');
+  await settle();
+  app.nodes.get('command-list').children[0].dispatch('click');
+  await settle();
+  assert.ok(app.requests.some(url => url.endsWith('/effort')));
+  assert.equal(app.nodes.get('model-title').textContent, '추론 강도');
+  const rows = app.nodes.get('model-list').children;
+  assert.equal(rows.length, 3);
+  rows[0].dispatch('click');
+  await settle();
+  assert.deepEqual(app.bodies.at(-1), ['/api/targets/pane-1/effort', { level: 'low' }]);
+});
+
+test('a menu command is sent and the view switches to the terminal', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.setCommands([{name:'resume', invocation:'/resume', kind:'command', description:'이어가기', source:'builtin', selectable:true, action:'terminal'}]);
+  app.nodes.get('commands-toggle').dispatch('click');
+  await settle();
+  app.nodes.get('command-list').children[0].dispatch('click');
+  assert.equal(app.nodes.get('text').value, '/resume ');
+  app.nodes.get('send-form').dispatch('submit');
+  await settle();
+  await settle();
+  assert.equal(app.storage.get('term-mesh-view:pane-1'), 'terminal');
+  assert.equal(app.nodes.get('chat').hidden, true);
+});
+
+test('a tagged dev app names itself in the header', async () => {
+  const app = page([pane(true)], {}, { tag: 'mobmodel' });
+  await settle();
+  await settle();
+  assert.equal(app.nodes.get('build-tag').hidden, false);
+  assert.equal(app.nodes.get('build-tag').textContent, 'DEV mobmodel');
+});
+
+test('a fresh session reads as waiting for its first message, not as an error', async () => {
+  const app = page([pane(true)]);
+  app.failTranscript({ code: 'session_unavailable' });
+  await settle();
+  app.tick();
+  await settle();
+  assert.match(app.nodes.get('status').textContent, /첫 메시지/);
+  assert.equal(app.nodes.get('status').classList.contains('error'), false);
+});
+
+test('the first turn of a fresh session still shows the live screen', async () => {
+  const app = page([pane(true)]);
+  app.failTranscript({ code: 'session_unavailable' });
+  app.setPreview(['⏺ TCP slow start는']);
+  await settle();
+  app.tick();
+  await settle();
+  await settle();
+  assert.ok(app.requests.some(url => url.endsWith('/prompt')));
+  assert.equal(app.nodes.get('chat-live').hidden, false);
+});
+
+function find(node, predicate) {
+  if (predicate(node)) return node;
+  for (const child of node.children || []) {
+    const hit = find(child, predicate);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+test('a running turn shows what the terminal is streaming', async () => {
+  const app = page([pane(true)]);
+  app.setTranscript({ entries: [], running: true, in_flight: true });
+  app.setPreview(['⏺ Reading files', '✻ Thinking… (esc to interrupt)']);
+  await settle();
+  app.tick();
+  await settle();
+  await settle();
+  assert.equal(app.nodes.get('chat-live').hidden, false);
+  assert.match(app.nodes.get('chat-live').textContent, /Thinking/);
+});
+
+test('a turn that ends while the page is hidden marks the tab title', async () => {
+  const app = page([pane(true)]);
+  app.setTranscript({ entries: [], running: true, in_flight: true });
+  await settle();
+  app.tick();
+  await settle();
+  app.document.hidden = true;
+  app.setTranscript({ entries: [{ id: 'a1', kind: 'answered', text: 'done' }], running: true, in_flight: false });
+  app.tick();
+  await settle();
+  assert.ok(app.document.title.startsWith('✓ '), app.document.title);
+});
+
+test('code blocks in an answer get a copy button', async () => {
+  const app = page([pane(true)]);
+  app.setTranscript({ entries: [{ id: 'a1', kind: 'answered', text: 'run:\n```sh\nmake test\n```' }], running: true, in_flight: false });
+  await settle();
+  app.tick();
+  await settle();
+  const copy = find(app.nodes.get('chat-list'), node => node.className === 'md-code-copy');
+  assert.ok(copy, 'copy button rendered');
+  copy.dispatch('click');
+  await settle();
+  assert.deepEqual(app.copied, ['make test']);
 });
 
 test('Codex skill selection uses dollar invocation and preserves the draft', async () => {

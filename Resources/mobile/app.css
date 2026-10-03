@@ -96,6 +96,17 @@ body.chat-mode select { border: 0; background: transparent; padding-left: 0; fon
   font-weight: 600;
   white-space: nowrap;
 }
+.build-tag {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+}
+.empty ul { margin: 0 0 12px; padding-left: 1.2em; text-align: left; display: inline-block; }
 
 select {
   flex: 1;
@@ -299,6 +310,7 @@ body.chat-mode {
    so a gradient painted there rides up with the transcript and the colour is
    gone after one swipe. On the parent it stays pinned to the top of the view. */
 .chat {
+  position: relative;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -526,6 +538,28 @@ body.chat-mode #send {
 }
 .tool .tool-output { border-top: 1px solid rgba(255,255,255,0.08); padding-top: 9px; }
 
+.chat-live {
+  margin: 0;
+  padding: 6px 14px;
+  max-height: 6.5em;
+  overflow: hidden;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  border-top: 1px dashed var(--line-soft);
+}
+.chat-jump { bottom: 56px; }
+.md-code-wrap { position: relative; }
+.md-code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  min-height: 32px;
+  padding: 2px 10px;
+  font-size: 12px;
+  opacity: 0.85;
+}
 .chat-foot {
   display: flex;
   justify-content: space-between;
@@ -661,7 +695,32 @@ body.chat-mode .send-status { margin-left: 2px; }
 .command-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .command-picker-head strong { font-size: 15px; }
 .command-picker-head button { min-height: 44px; border: 0; background: transparent; }
-#command-search {
+.prompt-card {
+  max-width: 46rem;
+  margin: 0 auto 10px;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+}
+.prompt-card strong { display: block; font-size: 15px; }
+#prompt-context {
+  cursor: pointer;
+  margin: 8px 0;
+  max-height: 22dvh;
+  overflow: auto;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+#prompt-context:empty { display: none; }
+.prompt-options { display: grid; gap: 6px; }
+.prompt-options button { min-height: 44px; padding: 8px 12px; text-align: left; overflow-wrap: anywhere; }
+.prompt-options button:first-child { background: var(--accent-soft); border-color: var(--accent); }
+.model-custom { display: flex; gap: 6px; padding-top: 10px; }
+.model-custom button { min-height: 44px; flex: 0 0 auto; }
+#command-search, #model-custom-id {
   width: 100%;
   min-height: 44px;
   padding: 10px;

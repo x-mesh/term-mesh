@@ -6,8 +6,9 @@
 //! deduplication window; reads and writes are proxied to the app Unix socket
 //! that owns each surface.
 //!
-//! Depends only on `crate::remote` and `crate::app_socket` so
-//! `tests/mobile_http.rs` can include all three with `#[path]`.
+//! Depends only on `crate::remote`, `crate::app_socket` and its own
+//! `mobile_model` submodule so `tests/mobile_http.rs` can include them with
+//! `#[path]`.
 
 use axum::{
     body::Body,
@@ -34,6 +35,12 @@ use tokio::sync::watch;
 
 use crate::app_socket::{self, RpcFailure};
 use crate::remote::{self, Entry, KeysPolicy, SharedRegistry, TargetKind};
+
+#[path = "cli_path.rs"]
+pub(crate) mod cli_path;
+#[path = "mobile_model.rs"]
+mod mobile_model;
+use mobile_model::{DriveError, PaneDriver};
 
 pub const ENV_AUTH_MODE: &str = "TERM_MESH_MOBILE_AUTH";
 pub const ENV_ALLOWED_LOGINS: &str = "TERM_MESH_MOBILE_ALLOWED_LOGINS";
@@ -173,9 +180,40 @@ pub struct MobileState {
     /// Request ids are reserved while delivery is in flight and become
     /// deduplicable only after the app acknowledges the write.
     dedupe: Mutex<HashMap<String, (Instant, DedupeState)>>,
+    /// Surfaces whose model popup is being driven. Any other write would land
+    /// in the popup instead of the composer.
+    model_busy: Mutex<BTreeSet<String>>,
+}
+
+struct ModelLock<'a> {
+    state: &'a MobileState,
+    surface_id: String,
+}
+
+impl Drop for ModelLock<'_> {
+    fn drop(&mut self) {
+        self.state.model_busy.lock().unwrap().remove(&self.surface_id);
+    }
 }
 
 impl MobileState {
+    fn lock_model(&self, surface_id: &str) -> Result<ModelLock<'_>, ApiError> {
+        if !self.model_busy.lock().unwrap().insert(surface_id.to_string()) {
+            return Err(model_busy_error());
+        }
+        Ok(ModelLock {
+            state: self,
+            surface_id: surface_id.to_string(),
+        })
+    }
+
+    fn refuse_while_model_busy(&self, surface_id: &str) -> Result<(), ApiError> {
+        if self.model_busy.lock().unwrap().contains(surface_id) {
+            return Err(model_busy_error());
+        }
+        Ok(())
+    }
+
     /// The session this entry can show a transcript for, from the record when
     /// the exposing client knew it and from the daemon's own pane correlation
     /// when it did not.
@@ -225,6 +263,7 @@ pub fn new_state(
         registry,
         session_resolver,
         dedupe: Mutex::new(HashMap::new()),
+        model_busy: Mutex::new(BTreeSet::new()),
     })
 }
 
@@ -288,6 +327,16 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/targets", get(targets_handler))
         .route("/api/targets/{surface_id}/commands", get(commands_handler))
+        .route("/api/targets/{surface_id}/models", get(models_handler))
+        .route("/api/targets/{surface_id}/model", post(model_handler))
+        .route(
+            "/api/targets/{surface_id}/effort",
+            get(effort_handler).post(effort_set_handler),
+        )
+        .route(
+            "/api/targets/{surface_id}/prompt",
+            get(prompt_handler).post(prompt_answer_handler),
+        )
         .route("/api/targets/{surface_id}/screen", get(screen_handler))
         .route("/api/targets/{surface_id}/requests", get(requests_handler))
         .route(
@@ -480,6 +529,9 @@ async fn health_handler(State(state): State<SharedState>) -> Response {
         "auth_mode": state.config.auth.as_str(),
         "version": env!("CARGO_PKG_VERSION"),
         "listener": state.config.addr.to_string(),
+        // A tagged Debug app runs beside the installed one with an identical
+        // page; the tag is how a viewer tells which app they reached.
+        "tag": std::env::var("TERMMESH_TAG").ok().filter(|tag| !tag.is_empty()),
     }))
     .into_response()
 }
@@ -525,16 +577,31 @@ pub(crate) struct MobileCommand {
     pub argument_hint: String,
     pub selectable: bool,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
 }
 
 const COMMAND_SCAN_LIMIT: usize = 4096;
 const COMMAND_METADATA_BYTES: u64 = 16 * 1024;
 
 fn command_metadata(path: &FsPath) -> std::io::Result<HashMap<String, String>> {
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     File::open(path)?
         .take(COMMAND_METADATA_BYTES)
-        .read_to_string(&mut text)?;
+        .read_to_end(&mut bytes)?;
+    // The cap can split a multi-byte character in a longer file, which used
+    // to fail the whole scan root and drop every command after it. Only a
+    // character cut at the end is dropped; bytes that are not UTF-8 anywhere
+    // else still fail, so a broken file stays visible as a warning.
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default()
+        }
+        Err(error) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }
+    };
     let mut values = HashMap::new();
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
@@ -642,6 +709,7 @@ fn scan_mobile_commands(
                     description: meta.get("description").cloned().unwrap_or_default(),
                     argument_hint: meta.get("argument-hint").cloned().unwrap_or_default(),
                     selectable: true,
+                    action: None,
                     reason: String::new(),
                 });
             }
@@ -695,12 +763,32 @@ fn scan_mobile_commands(
                     description: meta.get("description").cloned().unwrap_or_default(),
                     argument_hint: meta.get("argument-hint").cloned().unwrap_or_default(),
                     selectable: true,
+                    action: None,
                     reason: String::new(),
                 });
             }
         }
     }
     Ok(())
+}
+
+/// What the page does with a built-in command instead of typing it: open a
+/// picker the daemon drives, or send it and switch to the terminal, because
+/// the command answers with a menu or screen output Chat never sees (Codex
+/// logs no slash-command output at all).
+fn builtin_action(cli: &str, invocation: &str) -> Option<&'static str> {
+    match (cli, invocation) {
+        (_, "/model") => Some("pick_model"),
+        ("claude", "/effort") => Some("pick_effort"),
+        (
+            "claude",
+            "/permissions" | "/mcp" | "/resume" | "/config" | "/plugin" | "/rewind" | "/status"
+            | "/help" | "/skills",
+        ) => Some("terminal"),
+        ("codex", "/compact" | "/init") => None,
+        ("codex", _) => Some("terminal"),
+        _ => None,
+    }
 }
 
 pub(crate) fn mobile_command_catalog(
@@ -781,6 +869,7 @@ pub(crate) fn mobile_command_catalog(
                 description: description.to_string(),
                 argument_hint: String::new(),
                 selectable: !native,
+                action: if native { None } else { builtin_action(cli, invocation) },
                 reason: if native {
                     "터미널 CLI에서 사용하는 명령입니다.".to_string()
                 } else {
@@ -868,6 +957,7 @@ async fn commands_handler(
         let output = tokio::time::timeout(
             Duration::from_secs(8),
             tokio::process::Command::new("claude")
+                .env("PATH", spawn_path())
                 .args(["plugin", "list", "--json"])
                 .current_dir(&cwd)
                 .kill_on_drop(true)
@@ -905,6 +995,379 @@ async fn commands_handler(
     items.sort_by(|a, b| a.invocation.cmp(&b.invocation));
     items.dedup_by(|a, b| a.invocation == b.invocation);
     Ok(Json(json!({"surface_id":surface_id,"items":items,"warning":warning})).into_response())
+}
+
+/// An app-launched daemon inherits a PATH without the user's bin dirs, so a
+/// bare `claude`/`codex` reached only the bundled wrapper, which then could not
+/// find the real CLI either: the catalog always warned that plugins failed.
+fn spawn_path() -> String {
+    cli_path::compose_agent_path("", &std::env::var("PATH").unwrap_or_default())
+}
+
+// ── model picker ────────────────────────────────────────────────────────
+
+const MODEL_SCREEN_LINES: u32 = 80;
+
+fn model_busy_error() -> ApiError {
+    ApiError::conflict(
+        "model_change_in_flight",
+        "모델을 바꾸는 중입니다. 잠시 후 다시 시도하세요.",
+    )
+}
+
+fn drive_error(error: DriveError) -> ApiError {
+    ApiError::conflict(error.code(), error.message())
+}
+
+struct AppDriver<'a> {
+    state: &'a MobileState,
+    entry: &'a Entry,
+    /// The app error behind the last `DriveError::Io`, kept so a dead app
+    /// still answers 503 `app_unavailable` instead of a generic conflict.
+    failure: Mutex<Option<ApiError>>,
+}
+
+impl<'a> AppDriver<'a> {
+    fn new(state: &'a MobileState, entry: &'a Entry) -> Self {
+        Self {
+            state,
+            entry,
+            failure: Mutex::new(None),
+        }
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value, DriveError> {
+        match app_call(self.state, self.entry, method, params).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let message = error.message.clone();
+                *self.failure.lock().unwrap() = Some(error);
+                Err(DriveError::Io(message))
+            }
+        }
+    }
+
+    fn api_error(&self, error: DriveError) -> ApiError {
+        match (&error, self.failure.lock().unwrap().take()) {
+            (DriveError::Io(_), Some(failure)) => failure,
+            _ => drive_error(error),
+        }
+    }
+}
+
+impl PaneDriver for AppDriver<'_> {
+    async fn read_screen(&self) -> Result<String, DriveError> {
+        let result = self
+            .call(
+                "surface.read_text",
+                json!({ "surface_id": self.entry.surface_id, "lines": MODEL_SCREEN_LINES, "scrollback": true }),
+            )
+            .await?;
+        Ok(result
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    async fn send_key(&self, key: &'static str) -> Result<(), DriveError> {
+        self.call(
+            "surface.send_key",
+            json!({ "surface_id": self.entry.surface_id, "key": key }),
+        )
+        .await
+        .map(drop)
+    }
+
+    async fn send_text(&self, text: &str) -> Result<(), DriveError> {
+        self.call(
+            "surface.send_text",
+            json!({ "surface_id": self.entry.surface_id, "text": text }),
+        )
+        .await
+        .map(drop)
+    }
+
+    async fn send_turn(&self, text: &str) -> Result<(), DriveError> {
+        self.call(
+            "surface.send_turn",
+            json!({ "surface_id": self.entry.surface_id, "text": text }),
+        )
+        .await
+        .map(drop)
+    }
+
+    async fn pause(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+/// A terminal pane running Claude or Codex, with its session filled in the
+/// same way `transcript_handler` does. Native agent panes take turns, not
+/// keys, so their popup cannot be driven.
+async fn model_target(state: &MobileState, surface_id: &str) -> Result<Entry, ApiError> {
+    cli_pane(state, surface_id, "model_unavailable").await
+}
+
+async fn cli_pane(
+    state: &MobileState,
+    surface_id: &str,
+    unavailable: &'static str,
+) -> Result<Entry, ApiError> {
+    let mut entry = live_entry(state, surface_id).await?;
+    if entry.kind != TargetKind::Pane {
+        return Err(ApiError::conflict(
+            unavailable,
+            "터미널 pane에서만 지원합니다.",
+        ));
+    }
+    if entry.keys == KeysPolicy::None {
+        return Err(ApiError::forbidden(
+            "keys_disabled",
+            "terminal input is disabled with keys=none",
+        ));
+    }
+    if entry.session_id.is_none() || entry.agent_cli.is_empty() {
+        if let Some(session) = state.resolved_session(&entry) {
+            entry.session_id = session.session_id.or(entry.session_id.take());
+            entry.agent_cli = session.cli;
+        }
+    }
+    if !matches!(entry.agent_cli.as_str(), "claude" | "codex") {
+        return Err(ApiError::conflict(
+            unavailable,
+            "this pane has no Claude or Codex session",
+        ));
+    }
+    Ok(entry)
+}
+
+async fn claude_pane(state: &MobileState, surface_id: &str) -> Result<Entry, ApiError> {
+    let entry = cli_pane(state, surface_id, "effort_unavailable").await?;
+    if entry.agent_cli != "claude" {
+        return Err(ApiError::conflict(
+            "effort_unavailable",
+            "Codex sets reasoning effort in its model picker",
+        ));
+    }
+    Ok(entry)
+}
+
+async fn effort_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+) -> ApiResult {
+    let entry = claude_pane(&state, &surface_id).await?;
+    let _lock = state.lock_model(&entry.surface_id)?;
+    let driver = AppDriver::new(&state, &entry);
+    let slider = mobile_model::read_effort(&driver)
+        .await
+        .map_err(|error| driver.api_error(error))?;
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "levels": slider.levels,
+        "current": slider.current,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct EffortBody {
+    level: String,
+    #[serde(default)]
+    save_default: bool,
+}
+
+async fn effort_set_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Json(body): Json<EffortBody>,
+) -> ApiResult {
+    let entry = claude_pane(&state, &surface_id).await?;
+    let _lock = state.lock_model(&entry.surface_id)?;
+    tracing::info!(
+        "mobile: effort {} by {} to {}",
+        body.level,
+        caller.0,
+        entry.surface_id
+    );
+    let driver = AppDriver::new(&state, &entry);
+    let change = mobile_model::set_effort(&driver, body.level.trim(), body.save_default)
+        .await
+        .map_err(|error| driver.api_error(error))?;
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "message": change.message,
+        "session_only": change.session_only,
+    }))
+    .into_response())
+}
+
+fn prompt_tui(entry: &Entry) -> &'static mobile_model::PromptTui {
+    if entry.agent_cli == "codex" {
+        &mobile_model::CODEX_PROMPT
+    } else {
+        &mobile_model::CLAUDE_PROMPT
+    }
+}
+
+/// The approval question a terminal CLI is waiting on, if any. Chat cannot
+/// show it: it lives only on the terminal screen.
+async fn prompt_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+) -> ApiResult {
+    let entry = cli_pane(&state, &surface_id, "prompt_unavailable").await?;
+    let driver = AppDriver::new(&state, &entry);
+    let screen = driver
+        .read_screen()
+        .await
+        .map_err(|error| driver.api_error(error))?;
+    let tui = prompt_tui(&entry);
+    let prompt = mobile_model::approval_prompt(tui, &screen);
+    let preview = if prompt.is_some() {
+        Vec::new()
+    } else {
+        mobile_model::screen_preview(tui, &screen)
+    };
+    Ok(Json(json!({ "surface_id": entry.surface_id, "prompt": prompt, "preview": preview }))
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct PromptAnswer {
+    fingerprint: String,
+    index: usize,
+}
+
+async fn prompt_answer_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Json(body): Json<PromptAnswer>,
+) -> ApiResult {
+    let entry = cli_pane(&state, &surface_id, "prompt_unavailable").await?;
+    let _lock = state.lock_model(&entry.surface_id)?;
+    tracing::info!(
+        "mobile: prompt option {} by {} to {}",
+        body.index,
+        caller.0,
+        entry.surface_id
+    );
+    let driver = AppDriver::new(&state, &entry);
+    mobile_model::answer_prompt(&driver, prompt_tui(&entry), &body.fingerprint, body.index)
+        .await
+        .map_err(|error| driver.api_error(error))?;
+    Ok(Json(json!({ "surface_id": entry.surface_id, "answered": body.index })).into_response())
+}
+
+fn model_tui(entry: &Entry) -> &'static mobile_model::Tui {
+    if entry.agent_cli == "codex" {
+        &mobile_model::CODEX
+    } else {
+        &mobile_model::CLAUDE
+    }
+}
+
+async fn models_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+) -> ApiResult {
+    let entry = model_target(&state, &surface_id).await?;
+    let _lock = state.lock_model(&entry.surface_id)?;
+    let driver = AppDriver::new(&state, &entry);
+    let models = mobile_model::list_models(&driver, model_tui(&entry))
+        .await
+        .map_err(|error| driver.api_error(error))?;
+    let current = models
+        .iter()
+        .find(|model| model.current)
+        .map(|model| model.label.clone());
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "cli": entry.agent_cli,
+        "current_model": current,
+        "custom": entry.agent_cli == "claude",
+        "models": models,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct ModelBody {
+    model: String,
+    #[serde(default)]
+    save_default: bool,
+    /// Claude only: an id the popup does not list, sent as `/model <id>`.
+    #[serde(default)]
+    custom: bool,
+}
+
+async fn model_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Json(body): Json<ModelBody>,
+) -> ApiResult {
+    let model = body.model.trim().to_string();
+    if model.is_empty() || model.chars().count() > 128 {
+        return Err(ApiError::bad_request("invalid_model", "model is required"));
+    }
+    let entry = model_target(&state, &surface_id).await?;
+    let _lock = state.lock_model(&entry.surface_id)?;
+    tracing::info!(
+        "mobile: model {model} by {} to {}",
+        caller.0,
+        entry.surface_id
+    );
+    let tui = model_tui(&entry);
+    let driver = AppDriver::new(&state, &entry);
+    if body.custom {
+        // Typed into the composer as a turn: anything but a bare id would
+        // reach the model as a prompt. Claude saves an inline pick as the
+        // default for new sessions.
+        if entry.agent_cli != "claude" {
+            return Err(ApiError::bad_request(
+                "invalid_model",
+                "only Claude takes a model id that is not in its list",
+            ));
+        }
+        if !mobile_model::valid_model_id(&model) {
+            return Err(ApiError::bad_request(
+                "invalid_model",
+                "model must be a single id such as claude-opus-4-1",
+            ));
+        }
+        let screen = driver
+            .read_screen()
+            .await
+            .map_err(|error| driver.api_error(error))?;
+        mobile_model::check_ready(tui, &screen).map_err(drive_error)?;
+        driver
+            .send_turn(&format!("/model {model}"))
+            .await
+            .map_err(|error| driver.api_error(error))?;
+        return Ok(Json(json!({
+            "surface_id": entry.surface_id,
+            "cli": entry.agent_cli,
+            "delivered": true,
+            "message": Value::Null,
+            "session_only": false,
+        }))
+        .into_response());
+    }
+    let change = mobile_model::select_model(&driver, tui, &model, body.save_default)
+        .await
+        .map_err(|error| driver.api_error(error))?;
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "cli": entry.agent_cli,
+        "delivered": true,
+        "message": change.message,
+        "session_only": change.session_only,
+    }))
+    .into_response())
 }
 
 pub(crate) fn mobile_claude_plugin_items(plugins: &Value) -> (Vec<MobileCommand>, Option<String>) {
@@ -1028,6 +1491,7 @@ pub(crate) fn mobile_codex_skill_items(
                     .collect(),
                 argument_hint: String::new(),
                 selectable: true,
+                action: None,
                 reason: String::new(),
             });
         }
@@ -1046,6 +1510,7 @@ async fn codex_mobile_skills(cwd: &FsPath) -> Result<Value, ApiError> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let mut child = tokio::process::Command::new("codex")
+        .env("PATH", spawn_path())
         .arg("app-server")
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -1400,6 +1865,45 @@ fn content_text(content: &Value, kinds: &[&str]) -> String {
     }
 }
 
+fn is_local_command_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<command-name>")
+        || text.starts_with("<local-command-stdout>")
+        || text.starts_with("<local-command-stderr>")
+        || text.starts_with("<local-command-caveat>")
+}
+
+fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim())
+}
+
+/// A slash command the CLI ran itself (`/model`, `/effort`, …) is logged as
+/// tagged text, not a turn: show the command and its output as a notice so a
+/// raw tag never reaches the page and the session does not read as waiting
+/// for a reply.
+fn local_command_notice(text: &str) -> Option<String> {
+    if text.trim_start().starts_with("<local-command-caveat>") {
+        return None;
+    }
+    let shown = if let Some(name) = tag_body(text, "command-name") {
+        let args = tag_body(text, "command-args").unwrap_or("");
+        if args.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} {args}")
+        }
+    } else {
+        tag_body(text, "local-command-stdout")
+            .or_else(|| tag_body(text, "local-command-stderr"))?
+            .to_string()
+    };
+    (!shown.is_empty()).then(|| bounded_text(&shown))
+}
+
 fn user_visible_text(text: String) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty()
@@ -1465,8 +1969,22 @@ pub(crate) fn claude_entries(lines: &[Value]) -> Vec<Value> {
         let id = row.get("uuid").and_then(Value::as_str).unwrap_or("");
         let message = row.get("message").unwrap_or(&Value::Null);
         let content = message.get("content").unwrap_or(&Value::Null);
+        if kind == "system" && row.get("subtype").and_then(Value::as_str) == Some("local_command") {
+            let text = row.get("content").and_then(Value::as_str).unwrap_or("");
+            if let Some(text) = local_command_notice(text) {
+                entries.push(json!({ "id": id, "kind": "notice", "text": text }));
+            }
+            continue;
+        }
         if kind == "user" {
-            if let Some(text) = user_visible_text(content_text(content, &["text"])) {
+            let text = content_text(content, &["text"]);
+            if is_local_command_text(&text) {
+                if let Some(text) = local_command_notice(&text) {
+                    entries.push(json!({ "id": id, "kind": "notice", "text": text }));
+                }
+                continue;
+            }
+            if let Some(text) = user_visible_text(text) {
                 entries
                     .push(json!({ "id": id, "kind": "said", "speaker": "person", "text": text }));
             }
@@ -1608,6 +2126,65 @@ pub(crate) fn codex_turn_in_flight(lines: &[Value]) -> Option<bool> {
     })
 }
 
+fn entries_in_flight(entries: &[Value]) -> bool {
+    entries.last().is_some_and(|entry| {
+        entry.get("kind").and_then(Value::as_str) == Some("said")
+            || (entry.get("kind").and_then(Value::as_str) == Some("tool")
+                && entry.get("running").and_then(Value::as_bool) == Some(true))
+    })
+}
+
+/// Whether Claude's log has a turn open: a prompt after the last turn end.
+///
+/// Claude writes `system/turn_duration` when a turn ends and nothing when one
+/// is cancelled before it answers, so an open turn is only trusted while the
+/// log is still being written (see `CLAUDE_OPEN_TURN_STALE`).
+pub(crate) fn claude_turn_in_flight(lines: &[Value]) -> Option<bool> {
+    lines.iter().rev().find_map(|row| {
+        match row.get("type").and_then(Value::as_str) {
+            Some("system") => (row.get("subtype").and_then(Value::as_str)
+                == Some("turn_duration"))
+            .then_some(false),
+            Some("user") => {
+                if row.get("isMeta").and_then(Value::as_bool) == Some(true) {
+                    return None;
+                }
+                let content = row.pointer("/message/content").unwrap_or(&Value::Null);
+                if content
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")))
+                {
+                    return None;
+                }
+                let text = content_text(content, &["text"]);
+                let text = text.trim_start();
+                if text.starts_with(CLAUDE_INTERRUPTED) {
+                    Some(false)
+                } else if text.is_empty() || is_local_command_text(text) {
+                    None
+                } else {
+                    Some(true)
+                }
+            }
+            _ => None,
+        }
+    })
+}
+
+const CLAUDE_INTERRUPTED: &str = "[Request interrupted";
+/// A turn writes tool calls, results and messages as it goes; an open turn
+/// with a log silent this long was most likely cancelled. The screen (its
+/// spinner, or an approval question) still marks a quiet turn as running.
+const CLAUDE_OPEN_TURN_STALE: Duration = Duration::from_secs(30);
+
+fn log_is_fresh(path: &FsPath, within: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age <= within)
+}
+
 fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
     let session_id = entry.session_id.as_deref().ok_or_else(|| {
         ApiError::conflict(
@@ -1637,15 +2214,9 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
     let in_flight = if entry.agent_cli == "codex" {
         codex_turn_in_flight(&lines)
     } else {
-        None
+        claude_turn_in_flight(&lines).map(|open| open && log_is_fresh(&path, CLAUDE_OPEN_TURN_STALE))
     }
-    .unwrap_or_else(|| {
-        entries.last().is_some_and(|entry| {
-            entry.get("kind").and_then(Value::as_str) == Some("said")
-                || (entry.get("kind").and_then(Value::as_str) == Some("tool")
-                    && entry.get("running").and_then(Value::as_bool) == Some(true))
-        })
-    });
+    .unwrap_or_else(|| entries_in_flight(&entries));
     Ok(json!({
         "running": true,
         "thinking": false,
@@ -2152,6 +2723,7 @@ async fn text_handler(
         }
     }
     let entry = live_entry(&state, &surface_id).await?;
+    state.refuse_while_model_busy(&entry.surface_id)?;
     tracing::info!(
         "mobile: text by {} to {} ({:?}, {} bytes)",
         caller.0,
@@ -2389,12 +2961,27 @@ async fn transcript_handler(
         .await?;
         let running = surface_roster_contains(&surfaces, &entry.surface_id);
         let session_entry = entry.clone();
-        let value =
+        let mut value =
             tokio::task::spawn_blocking(move || session_transcript(&session_entry, limit as usize))
                 .await
                 .map_err(|e| {
                     ApiError::conflict("session_unavailable", format!("session reader failed: {e}"))
                 })??;
+        // The log reads idle between a finished tool and the next step; the
+        // CLI's own working line on screen is the ground truth. A failed read
+        // leaves the log's answer standing.
+        if running && value.get("in_flight").and_then(Value::as_bool) == Some(false) {
+            let driver = AppDriver::new(&state, &entry);
+            if let Ok(screen) = driver.read_screen().await {
+                // An approval question halts both the log and the spinner
+                // while it waits for a person; it is still the same turn.
+                if mobile_model::screen_busy(model_tui(&entry), &screen)
+                    || mobile_model::approval_prompt(prompt_tui(&entry), &screen).is_some()
+                {
+                    value["in_flight"] = Value::Bool(true);
+                }
+            }
+        }
         (value, Some(running))
     };
     let pick = |k: &str| result.get(k).cloned().unwrap_or(Value::Null);
@@ -2516,6 +3103,7 @@ async fn key_handler(
 ) -> ApiResult {
     let key = body.key.trim();
     let entry = live_entry(&state, &surface_id).await?;
+    state.refuse_while_model_busy(&entry.surface_id)?;
     if entry.kind == TargetKind::Agent {
         return Err(ApiError::conflict(
             "not_a_terminal",
