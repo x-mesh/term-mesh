@@ -1670,7 +1670,7 @@ final class RemoteHostStore: ObservableObject {
         // clears `remoteSockPath` — it is part of the key.
         let hostKey = sidebarLeases[key]?.key ?? (hosts[key] ?? host).paneHostSpec.hostKey
         let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
-        let retiredPath = registry.disconnectTransport(for: hostKey)
+        let retiredPath = registry.disconnectTransport(for: hostKey, replacementFollows: true)
         if let lease = sidebarLeases.removeValue(forKey: key) {
             registry.release(lease)
         }

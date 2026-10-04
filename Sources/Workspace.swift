@@ -3501,15 +3501,18 @@ final class Workspace: Identifiable {
         }
         // Disconnect Host preserves this pane. Once a replacement lease is up,
         // move the parked relay onto it so the pane keeps its scrollback;
-        // only a relay that already ended is rebuilt the way the banner's
-        // explicit Reconnect does. Mirror panes stay under their controller's
-        // one-subscription reconnect path.
+        // a relay that already ended is rebuilt the way the banner's explicit
+        // Reconnect does, unless the host refused its surface — that pane
+        // keeps its banner (`PeerPaneSession.hostReconnectReattach`). Mirror
+        // panes stay under their controller's one-subscription reconnect path.
         session.requestHostReconnectReattach = { [weak self, weak panel, weak session] in
             guard let self, let panel, let session, self.peerMirror == nil else { return }
-            if let replacement = PeerPaneHostRegistry.shared.activeLease(forKey: session.lease.key),
-               session.retarget(to: replacement) {
-                return
-            }
+            let retargeted = PeerPaneHostRegistry.shared.activeLease(forKey: session.lease.key)
+                .map { session.retarget(to: $0) } ?? false
+            guard PeerPaneSession.hostReconnectReattach(
+                retargeted: retargeted,
+                surfaceWasRejected: session.relaySession.retargetedSurfaceWasRejected
+            ) == .rebuild else { return }
             Task { @MainActor in
                 await PeerClientCoordinator.shared.reconnectRemotePane(
                     oldSession: session, panelId: panel.id, workspace: self
