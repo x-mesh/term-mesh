@@ -4534,6 +4534,70 @@ final class PeerPaneSessionTests: XCTestCase {
         registry.release(restarting)
     }
 
+    /// A Connect made after Disconnect Host must not join the start the
+    /// disconnect overtook: that start is doomed, and joining it failed the
+    /// user's fresh Connect with "disconnected" for as long as the old ssh
+    /// took to come up. The callers already awaiting it still fail.
+    @MainActor
+    func test_registry_acquireAfterADisconnectDoesNotJoinTheOvertakenStart() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-disconnect-fresh.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        defer { registry.startDelayForTests = nil }
+        var startsSeen = 0
+        var releaseFirstStart = false
+        registry.startDelayForTests = { _ in
+            startsSeen += 1
+            if startsSeen == 1 {
+                while !releaseFirstStart { await Task.yield() }
+            }
+        }
+
+        let first = Task { @MainActor in try await registry.acquire(spec) }
+        while startsSeen == 0 { await Task.yield() }
+        let joined = Task { @MainActor in try await registry.acquire(spec) }
+        while registry.pendingWaiterCountForTests(for: key) < 2 { await Task.yield() }
+
+        XCTAssertNil(registry.disconnectTransport(for: key))
+        let freshTask = Task { @MainActor in try await registry.acquire(spec) }
+        // A Connect that wrongly joins the overtaken start would wait on it
+        // forever here, so look for its own start with a deadline instead.
+        let deadline = Date().addingTimeInterval(2)
+        while startsSeen < 2, Date() < deadline { await Task.yield() }
+        XCTAssertEqual(startsSeen, 2, "the Connect after the disconnect must start its own lease")
+        releaseFirstStart = startsSeen < 2
+        let fresh: PeerPaneHostLease
+        do {
+            fresh = try await freshTask.value
+        } catch {
+            releaseFirstStart = true
+            for task in [first, joined] { _ = try? await task.value }
+            return XCTFail("the Connect after the disconnect failed: \(error)")
+        }
+        XCTAssertTrue(registry.activeLease(forKey: key) === fresh)
+
+        releaseFirstStart = true
+        for task in [first, joined] {
+            do {
+                let lease = try await task.value
+                registry.release(lease)
+                XCTFail("callers of the overtaken start must still fail")
+            } catch PeerPaneHostAcquireError.hostDisconnected {}
+        }
+        XCTAssertTrue(
+            registry.activeLease(forKey: key) === fresh,
+            "the overtaken start landing late must not evict the fresh lease"
+        )
+        XCTAssertEqual(
+            registry.teardownCountForTests, teardownsBefore + 1,
+            "the overtaken start's lease is stopped; the fresh one is not"
+        )
+        registry.release(fresh)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
     /// Reconnect Host that starts nothing (it declined, or the replacement
     /// came up under another key) must not leave a waiter to build one.
     @MainActor

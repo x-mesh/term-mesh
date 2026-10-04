@@ -1998,6 +1998,12 @@ final class RemoteHostStore: ObservableObject {
         let registry = PeerPaneHostRegistry.shared
         let hostKey = sidebarLeases[key]?.key ?? host.paneHostSpec.hostKey
         PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
+        // Cancel the row's own start before the disconnect detaches it from
+        // the registry; afterwards there is nothing left to cancel and its ssh
+        // would run to completion before being torn down.
+        if let connectingKey = connectingLeaseKeys[key] {
+            registry.cancelPendingAcquire(for: connectingKey)
+        }
         let retiredPath = registry.disconnectTransport(for: hostKey)
 
         if let lease = sidebarLeases.removeValue(forKey: key) {
@@ -2009,9 +2015,6 @@ final class RemoteHostStore: ObservableObject {
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
         connectTasks[key] = nil
-        if let connectingKey = connectingLeaseKeys[key] {
-            registry.cancelPendingAcquire(for: connectingKey)
-        }
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
