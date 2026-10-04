@@ -4414,12 +4414,13 @@ final class PeerPaneSessionTests: XCTestCase {
         registry.release(restarting)
     }
 
-    /// Reconnect Host retires the lease and starts its replacement in one
-    /// call. An acquire that was joining the old lease's restart — a pane's
-    /// banner Reconnect, a team spawn — must go on to that replacement, not
-    /// fail with "disconnected" in the middle of the user's own reconnect.
+    /// Reconnect Host retires the lease and then starts the replacement. An
+    /// acquire that was joining the old lease's restart — a pane's banner
+    /// Reconnect, a team spawn — must end up on that replacement, and must not
+    /// start one itself: its spec may predate the change that retired the
+    /// lease (a repaired identity, an invalidated socket).
     @MainActor
-    func test_registry_restartWaiterFollowsAReconnectHostReplacement() async throws {
+    func test_registry_restartWaiterJoinsTheReconnectHostReplacementWithoutStartingOne() async throws {
         let registry = PeerPaneHostRegistry.shared
         let sockPath = "/tmp/psp-unit-\(getpid())-restart-reconnect.sock"
         let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
@@ -4428,28 +4429,168 @@ final class PeerPaneSessionTests: XCTestCase {
         defer {
             registry.livenessOverrideForTests = nil
             registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
             registry.hostTransportDidReplace = savedReplace
         }
         var announced = 0
         registry.hostTransportDidReplace = { _, _ in announced += 1 }
 
         let restarting = try await registry.acquire(spec)
+        var starts = 0
+        registry.startDelayForTests = { _ in starts += 1 }
+        var retired = false
         registry.livenessOverrideForTests = { $0 === restarting ? .waitForRestart : .usable }
         registry.restartWaitOverrideForTests = { _ in
             XCTAssertEqual(
                 registry.disconnectTransport(for: key, replacementFollows: true),
                 sockPath
             )
+            retired = true
             return false
         }
 
-        let replacement = try await registry.acquire(spec)
-        XCTAssertFalse(replacement === restarting)
-        XCTAssertTrue(registry.activeLease(forKey: key) === replacement)
-        XCTAssertEqual(announced, 1, "the waiter's lease is the replacement the parked panes are owed")
-        registry.release(replacement)
+        let waiter = Task { @MainActor in try await registry.acquire(spec) }
+        while !retired { await Task.yield() }
+        // Long enough for a waiter that wrongly starts its own lease to have
+        // done so; the follower below must be the first and only start.
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(starts, 0, "the waiter must not start the replacement")
+        XCTAssertNil(registry.activeLease(forKey: key))
+
+        let follower = try await registry.acquire(spec)
+        let joined = try await waiter.value
+        XCTAssertTrue(joined === follower, "the waiter must end up on the follower's lease")
+        XCTAssertEqual(starts, 1, "only the follower may start a lease")
+        XCTAssertEqual(announced, 1)
+
+        registry.release(joined)
+        registry.release(follower)
         registry.release(restarting)
         XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// Disconnect Host while the Reconnect Host replacement is still coming
+    /// up. Nothing is pooled yet, so the disconnect used to go unrecorded and
+    /// the start, kept alive by a joined waiter, pooled itself and reattached
+    /// the panes. Every caller of that start must now fail and nothing pool.
+    @MainActor
+    func test_registry_disconnectDuringAReplacementStartPoolsNothing() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-disconnect-midstart.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        let teardownsBefore = registry.teardownCountForTests
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        var announced = 0
+        registry.hostTransportDidReplace = { _, _ in announced += 1 }
+
+        let restarting = try await registry.acquire(spec)
+        var retired = false
+        registry.livenessOverrideForTests = { $0 === restarting ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            registry.disconnectTransport(for: key, replacementFollows: true)
+            retired = true
+            return false
+        }
+        var startHeld = false
+        var releaseStart = false
+        registry.startDelayForTests = { _ in
+            startHeld = true
+            while !releaseStart { await Task.yield() }
+        }
+
+        let waiter = Task { @MainActor in try await registry.acquire(spec) }
+        while !retired { await Task.yield() }
+        let follower = Task { @MainActor in try await registry.acquire(spec) }
+        while !startHeld { await Task.yield() }
+
+        XCTAssertNil(
+            registry.disconnectTransport(for: key),
+            "nothing is pooled mid-start, but the disconnect must still count"
+        )
+        releaseStart = true
+
+        for task in [waiter, follower] {
+            do {
+                let lease = try await task.value
+                registry.release(lease)
+                XCTFail("a start overtaken by Disconnect Host must not be handed out")
+            } catch PeerPaneHostAcquireError.hostDisconnected(let disconnected) {
+                XCTAssertEqual(disconnected, key)
+            }
+        }
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(announced, 0, "no replacement may be announced against the disconnect")
+        XCTAssertEqual(
+            registry.teardownCountForTests, teardownsBefore + 2,
+            "the retired lease and the discarded start are both stopped"
+        )
+        registry.release(restarting)
+    }
+
+    /// Reconnect Host that starts nothing (it declined, or the replacement
+    /// came up under another key) must not leave a waiter to build one.
+    @MainActor
+    func test_registry_restartWaiterGivesUpWhenNoReplacementStarts() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-nofollower.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.replacementJoinDeadlineForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        registry.hostTransportDidReplace = { _, _ in }
+        registry.replacementJoinDeadlineForTests = 0.3
+
+        let first = try await registry.acquire(spec)
+        var starts = 0
+        registry.startDelayForTests = { _ in starts += 1 }
+        registry.livenessOverrideForTests = { $0 === first ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            registry.disconnectTransport(for: key, replacementFollows: true)
+            return false
+        }
+        do {
+            let lease = try await registry.acquire(spec)
+            registry.release(lease)
+            XCTFail("a waiter with no replacement to join must give up")
+        } catch PeerPaneHostAcquireError.replacementUnavailable(let unavailable) {
+            XCTAssertEqual(unavailable, key)
+        }
+
+        registry.restartWaitOverrideForTests = { _ in
+            registry.disconnectTransport(for: key, replacementFollows: true)
+            registry.abandonPendingReplacement(for: key)
+            return false
+        }
+        let second = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === second ? .waitForRestart : .usable }
+        let abandonedAt = Date()
+        do {
+            let lease = try await registry.acquire(spec)
+            registry.release(lease)
+            XCTFail("an abandoned replacement must not be built by the waiter")
+        } catch PeerPaneHostAcquireError.replacementUnavailable {
+            XCTAssertLessThan(
+                Date().timeIntervalSince(abandonedAt), 0.25,
+                "an abandoned replacement ends the wait at once, not at the deadline"
+            )
+        }
+        XCTAssertEqual(starts, 1, "only the test's own acquire of `second` may start a lease")
+        XCTAssertNil(registry.activeLease(forKey: key))
+        registry.release(first)
+        registry.release(second)
     }
 
     /// A restart that does not come back is a dead lease.

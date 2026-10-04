@@ -303,7 +303,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         for session in sessions {
             session.prepareForHostTransportDisconnect(stopRelay: stopRelay)
         }
-        return sessions.count
+        // A pane whose surface the host refused stays on its banner and will
+        // not reattach (`PeerPaneSession.hostReconnectReattach`); counting it
+        // would promise a reattach that never happens.
+        return sessions.filter { !$0.relaySession.retargetedSurfaceWasRejected }.count
     }
 
     /// A pane preserved by a deliberate disconnect is reattached when its host
