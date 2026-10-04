@@ -151,16 +151,17 @@
   }
 
   var READ_TIMEOUT_MS = 10000;
+  var SEND_TIMEOUT_MS = 10000;
   var MENU_READ_TIMEOUT_MS = 30000;
 
-  function api(method, path, body, readTimeout) {
+  function api(method, path, body, timeoutMs) {
     var init = { method: method, headers: {}, credentials: 'same-origin' };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
     var timer = null;
-    var controller = method === 'GET' ? new window.AbortController() : null;
+    var controller = (method === 'GET' || timeoutMs !== undefined) ? new window.AbortController() : null;
     if (controller) { init.signal = controller.signal; }
     var request = fetch(path, init).then(function (res) {
       return res.text().then(function (raw) {
@@ -182,10 +183,12 @@
       request = new Promise(function (resolve, reject) {
         timer = window.setTimeout(function () {
           controller.abort();
-          var error = new Error('연결이 지연됩니다. 다시 연결을 시도합니다.');
-          error.code = 'read_timeout';
+          var error = new Error(method === 'GET'
+            ? '연결이 지연됩니다. 다시 연결을 시도합니다.'
+            : '전송 결과를 확인하지 못했습니다. 같은 메시지를 다시 보내 재시도하세요.');
+          error.code = method === 'GET' ? 'read_timeout' : 'send_timeout';
           reject(error);
-        }, readTimeout || READ_TIMEOUT_MS);
+        }, timeoutMs || READ_TIMEOUT_MS);
         read.then(resolve, reject);
       });
     }
@@ -201,6 +204,7 @@
   function describeError(err) {
     if (!err) { return 'error'; }
     switch (err.code) {
+      case 'send_timeout': return err.message;
       case 'login_required': return '인증 없음: Tailscale Serve를 통해 접속하세요';
       case 'login_not_allowed': return '이 tailnet 계정은 허용 목록에 없습니다';
       case 'not_exposed': return '이 pane은 더 이상 노출되지 않습니다 (/rc on)';
@@ -1531,7 +1535,7 @@
     // Send means Enter in a terminal: the daemon delivers text and Return as
     // one turn so a separate Enter cannot race the paste.
     if (!chatInput && t.kind === 'pane') { body.submit = true; }
-    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', body)
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', body, SEND_TIMEOUT_MS)
       .then(function (data) {
         state.pendingSend = null;
         if (!isCurrentTarget(t)) { return; }

@@ -739,3 +739,24 @@ test('a stalled menu read reports its own timeout', async () => {
   finish();
   await settle();
 });
+
+
+test('a stalled send releases the composer and keeps the retry ID', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  const finish = app.pauseText();
+  app.nodes.get('text').value = 'retry after timeout';
+  app.nodes.get('send-form').dispatch('submit');
+  app.expireReads();
+  await settle();
+  assert.equal(app.nodes.get('send').disabled, false);
+  assert.equal(app.nodes.get('text').value, 'retry after timeout');
+  assert.match(app.nodes.get('send-status').textContent, /전송 결과/);
+  app.nodes.get('send-form').dispatch('submit');
+  const sent = app.bodies.filter(([url]) => url.endsWith('/text'));
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0][1].request_id, sent[1][1].request_id);
+  finish();
+  await settle();
+  assert.equal(app.nodes.get('text').value, '');
+});
