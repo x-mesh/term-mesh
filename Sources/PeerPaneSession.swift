@@ -141,6 +141,10 @@ final class PeerPaneHostLease {
     /// still exist. Their later releases must not stop it a second time (or,
     /// more importantly, disturb a replacement lease for the same host).
     fileprivate var isTornDown = false
+    /// Torn down by Disconnect Host (or Reconnect Host) rather than retired
+    /// as dead. An acquire that was waiting on this lease's restart must not
+    /// treat the empty pool as a cue to build a replacement.
+    fileprivate var wasDisconnected = false
     /// Whether consumers may still recover through this lease. Exposes the
     /// lifecycle fact without allowing another file to mutate ownership.
     var canReconnectTransport: Bool { !isTornDown }
@@ -344,6 +348,19 @@ final class PeerPaneTransportRecovery {
 
 // MARK: - Registry
 
+enum PeerPaneHostAcquireError: Error, CustomStringConvertible {
+    /// The host was disconnected while this acquire waited for its tunnel
+    /// to restart.
+    case hostDisconnected(PeerPaneHostKey)
+
+    var description: String {
+        switch self {
+        case .hostDisconnected(let key):
+            return "\(key.shortLabel) was disconnected while its tunnel was restarting"
+        }
+    }
+}
+
 @MainActor
 final class PeerPaneHostRegistry {
     static let shared = PeerPaneHostRegistry()
@@ -445,6 +462,14 @@ final class PeerPaneHostRegistry {
                 let cameBack = await waitForRestart(of: lease, after: observed)
                 try Task.checkCancellation()
                 guard leases[key] === lease else {
+                    // A Disconnect Host during the wait leaves the pool empty
+                    // and the key marked for replacement. Building a lease now
+                    // would announce it as that replacement and reattach the
+                    // panes the user just disconnected — from a background
+                    // caller such as the wake sweep, with nobody asking.
+                    if lease.wasDisconnected, leases[key] == nil {
+                        throw PeerPaneHostAcquireError.hostDisconnected(key)
+                    }
                     // Replaced while we waited; take whatever is pooled now.
                     return try await acquire(spec)
                 }
@@ -617,6 +642,7 @@ final class PeerPaneHostRegistry {
         // Connect resumed them, and any other path left them parked under a
         // host the sidebar already showed as connected.
         replacingKeys.insert(key)
+        lease.wasDisconnected = true
         let sockPath = lease.hostSockPath
         teardown(lease)
         #if DEBUG
