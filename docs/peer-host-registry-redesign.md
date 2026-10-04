@@ -1,9 +1,13 @@
 # Peer host registry redesign: one state machine per host
 
-Status: proposal, fourth draft. Two cross-model panels reviewed earlier drafts:
-21 findings on the second and 38 on the third (all five models). This draft
-simplifies the mechanisms that produced the third draft's findings and fixes
-the explorer, whose terminal-state checks could never fire. The table at the
+Status: fourth draft, implemented as PR A (`PeerHostMachine`, `PeerHostShellCore`,
+and both explorer layers, not yet wired). The explorer found two defects in
+this draft; both are fixed below and listed under "Exhaustive check".
+
+Two cross-model panels reviewed earlier drafts: 21 findings on the second and
+38 on the third (all five models). This draft simplifies the mechanisms that
+produced the third draft's findings and fixes the explorer, whose terminal-state
+checks could never fire. The table at the
 end maps each finding cluster to its fix. Contract:
 [`peer-host-registry-invariants.md`](peer-host-registry-invariants.md).
 
@@ -151,7 +155,7 @@ the user's next Connect.
 ### Retire
 
 Retiring the pooled lease L (a dead verdict in `up` or `restarting`, a failed
-restart, or the last `release` while waiters remain):
+restart, or an `unusedCheck` that finds zero references while waiters remain):
 
 0. First compute `dependents = refsBeforeRetire > 0 || !waiters.isEmpty`. Do
    this **before** step 1 moves the references. After the move they read
@@ -174,14 +178,14 @@ Rule 4 applies before every row. Waiters are listed only where they change.
 | idle | `acquire(sweep / waiter)` | idle | `resume(w, .error(replacementUnavailable))` |
 | starting(a) | `acquire(any)` | + w | `armDeadline(w)` |
 | starting(a) | `startFinished(a, .lease(L))` | up(L, spec, refs = waiters) | `resume(each w, L)`; if `park`: `fireDidReplace(L)`, clear; then `queueUnusedCheck(L)`. **Every** pool queues the check. Retargeted panes `retain` through the queue first, so the check sees their references. With waiters it is a no-op, but one rule ("a pooled lease with zero references is stopped") is what the explorer checks. |
-| up(L) | `unusedCheck(L)`, refs 0, no waiters | idle | `stopTunnel(L)` |
-| up(L) | `unusedCheck(L)` otherwise | — | — |
+| up(L) / restarting(L) | `unusedCheck(L)`, refs 0, no waiters | idle | `stopTunnel(L)` |
+| restarting(L) | `unusedCheck(L)`, refs 0, waiters remain | retire | as above |
+| up(L) / restarting(L) | `unusedCheck(L)` otherwise | — | — |
 | starting(a) | `startFinished(a, .failure)` | idle | `resume(each w, .error)`; apply the park invariant (abandon `died` / `reconnect`, keep `userDisconnected`) |
 | starting(a, fresh / reconnect) | `cancel(w)` of its last waiter | idle | `cancelStart(a)`, `resume(w, .error(cancelled))`; apply the park invariant |
 | any | `cancel(w)` / `deadline(w)` otherwise | − w | `resume(w, .error(cancelled / replacementUnavailable))` |
 | up(L) / restarting(L) | `retain(L)` | refs + 1 | — |
-| up(L) | `release(L)` to 0, no waiters | idle | `stopTunnel(L)` |
-| restarting(L) | `release(L)` to 0, waiters remain | retire | as above |
+| up(L) / restarting(L) | `release(L)` | refs − 1 | at 0: `queueUnusedCheck(L)`. Never a stop in this transition (see the explorer findings). |
 | up(L) | `acquire(any)`, verdict usable | refs + 1 | `resume(w, L)` |
 | up(L) | `acquire(any)`, verdict restarting | restarting(L, new r) + w | `waitRestart(L, r)`, `armDeadline(w)` |
 | up(L) / restarting(L) | `acquire(any)`, verdict dead | retire, w joins | as above |
@@ -231,76 +235,173 @@ rebinding across a key change (an open item).
 
 ## Exhaustive check
 
-### Layer 1: the reducer
+Implemented in PR A as `PeerHostMachineExplorerTests`
+(`swift/PeerProto/Tests/PeerProtoTests/`). Both layers drive the real
+`PeerHostShellCore` and `PeerHostMachine`, not a model of them, so PR B's shell
+wraps the code that was checked. Run them in release mode; a failure prints the
+shortest event sequence that reaches it:
 
-A breadth-first search over machine states, with a visited set. Inputs come in
-two kinds.
+```
+swift test -c release -Xswiftc -enable-testing --package-path swift/PeerProto \
+  --filter PeerHostMachineExplorerTests
+```
 
-- **Internal** inputs are pending completions, armed deadlines, and queued
-  checks: `startFinished` success or failure per outstanding attempt,
-  `restartFinished` true or false, `deadline` for each armed waiter or token,
-  and a queued `unusedCheck`.
-- **Environment** inputs are acquires from each origin, with the current token,
-  a stale token, or none, stamped with the current or an older generation;
-  `retain` and `release`; each `disconnect` kind; `reconnectAbandoned` with and
-  without `movedTo`; `cancel` for each waiter; each verdict; and late events
-  for ids that were current earlier in the path.
+### The ghost ledger
 
-**Specs are modelled.** Every spec carries an epoch. The epoch advances when a
-lease is retired or a reconnect re-probes. A `startTunnel` must use one of
-rule 5's three sources, at its current epoch.
+The harness performs every effect and keeps what the shell and the panes would
+know:
 
-Bounds: one host key, 3 waiters, 3 attempts, 2 restarts, 2 tokens, two of
-each disconnect kind, and a depth of 14. Some inputs are only meaningful
-after an earlier event, so they must stay enabled after it:
+- panes holding each lease;
+- panes parked on a stopped lease;
+- acquires asked and not yet resolved, with the generation each was raised under;
+- armed deadlines;
+- pending start and restart completions, including cancelled ones;
+- each lease's health, which the core samples as the verdict.
 
-- An acquire with a stale token, after a second `.reconnect` mints a new one.
-  Otherwise the `reconnectSuperseded` row is never reached.
-- An acquire stamped with an older generation, after a second plain
-  disconnect.
+Retargeting is the handler's own behavior. `fireDidReplace` makes every parked
+pane `retain` the new lease and `release` its old one, through the core.
 
-**Every state is checked for:**
+### Inputs
 
-- the invariants above, including the park invariant;
-- every waiter having an armed deadline;
-- every outstanding attempt or restart having a pending completion;
-- the pooled lease's references being consistent with resumes, retains, and
-  releases;
-- every acquire in the path being resolved at most once.
+- **Internal:** `startFinished` (lease or failure) for each pending attempt,
+  including cancelled ones, so a late lease is reached. `restartFinished`
+  (back, unless the lease is dead, or gone) for each pending restart. The
+  deadline of each armed waiter or token.
+- **Environment:**
+  - an acquire from each origin;
+  - a user acquire with the current token or a stale one;
+  - an acquire *raised* now and delivered later, so its stamped generation or
+    token can go stale;
+  - a pane releasing the pooled lease;
+  - a parked pane closing;
+  - the pooled lease becoming restarting or dead;
+  - each disconnect kind;
+  - `reconnectAbandoned` with and without a key move, for every token minted;
+  - `cancel` for each waiter.
+- **Layer 2 only:** at every effect position of every transition, one
+  re-entrant call:
+  - a user or sweep acquire;
+  - an acquire followed by the lease dying before it is dequeued;
+  - a release;
+  - the lease dying;
+  - a plain disconnect;
+  - a Reconnect.
 
-**Every quiescent state is checked for liveness.** A quiescent state is one
-with no internal inputs pending, whatever the environment could still do. It
-must have:
+Specs are values that name their source: `user`, `stale` (every background
+waiter's), and `probed(t)` (the token holder's). Each `startTunnel` is checked
+against the cause and the state before it:
 
-- no waiters, attempts, or restarts;
-- `park` nil or `userDisconnected`;
-- no pooled lease with zero references.
+| Cause | Allowed spec |
+| --- | --- |
+| A user acquire from `idle` | The acquire's own spec |
+| The token holder from `awaitingReconnect` | The token holder's spec |
+| A retire | The retired lease's spec |
+| Anything else | None; a `stale` spec never starts |
 
-This replaces the third draft's "terminal state" check, which could never fire,
-because environment inputs are always enabled.
+### Checks
 
-### Layer 2: the shell
+**On each effect:**
 
-A model of the shell: pooled and shell-only references, the effect list, the
-event queue, and re-entrant calls during effects. A re-entrant call can be
-`retain`, `release`, `acquire`, or `disconnect`. Layer 2 explores where those
-calls land relative to the effect list. It checks:
+| Check | Rule |
+| --- | --- |
+| A `resume` resolves an acquire that is asked and unresolved. | 4 |
+| A lease handed out is pooled. | I1 |
+| A lease handed out goes to a waiter raised under the current generation. | I3 |
+| A lease handed out was not already dead when the acquire was dequeued. | 3 |
+| `stopTunnel` never reaches the lease that is pooled after the commit. | 2 |
+| `cancelStart` is caused only by a Cancel or a disconnect. | 7 |
+| `fireAbandoned` is caused only by a failed start, a Cancel, `reconnectAbandoned`, a Reconnect deadline, or Force Disconnect. A rule-6 regression would otherwise pass by abandoning eagerly. | 6 |
+| `fireDidReplace` has a debt to pay. | I7 |
 
-- that no `stopTunnel` reaches the *pooled* lease while its machine references
-  are above zero, other than a retire or a disconnect. A stop on a retired
-  lease with shell-only references is correct, because Disconnect Host
-  preserves panes.
-- that the queue drains;
-- that a shell-only `release` never produces a machine event.
+**In every state:**
+
+- the pooled lease's refs equal the panes holding it;
+- no pane holds a lease that is neither pooled nor parked;
+- parked panes imply a debt;
+- a `died` or `reconnect` debt has a start or an armed Reconnect deadline;
+- the machine's waiters are exactly the unresolved acquires, each with an
+  armed deadline and the current generation;
+- every current attempt, restart, and Reconnect wait has a pending completion
+  or deadline.
+
+**In every quiescent state** (no completion, deadline, or raised acquire
+pending): no waiters, and no pooled lease with zero refs.
+
+**Coverage.** Each layer lists the transition rows it must reach: every start
+purpose, every failure kind by cause, every park change, every abandon cause,
+late and unused stops, and every re-entrant call kind. A bound that stops
+reaching a row fails the test instead of passing on a smaller search.
+
+### Bounds and results
+
+Neither layer is depth-limited: each search runs until the bounded space
+closes.
+
+| Layer | Bounds | States | Closes at depth | Release build |
+| --- | --- | --- | --- | --- |
+| 1 | 3 waiters, 1 raised acquire in flight, 2 of each disconnect kind | 870,611 | 21 | ~31 s |
+| 2 (default) | 2 waiters, 1 in flight, 2 of each disconnect kind | 370,573 | 15 | ~55 s |
+| 2 (wider, manual) | 3 waiters, 1 in flight, 1 of each disconnect kind | 1,060,036 | 16 | ~190 s |
+| 2 (widest, manual) | 3 waiters, 1 in flight, 2 of each disconnect kind | 6,846,071 | 19 | ~24 min, 7.7 GB |
+
+All rows passed with no violation. The wider layer 2 bounds are run by editing
+`ExplorerBounds.layer2`; they are too slow for every test run.
+
+The guarantee is "no violation in any state reachable within these bounds",
+not "within N steps".
+
+### What the explorer found in the fourth draft
+
+Both were fixed in the machine and in the transition table above:
+
+1. **A zero-reference lease left pooled (layer 1, 7 events).** In `restarting`,
+   the waiter's deadline fired and the last pane released. The draft had no
+   row for that, so the phase stayed `restarting` with no references, and
+   `restartFinished(true)` pooled an orphan tunnel.
+2. **A retargeted pane stranded on a stopped lease (layer 2, 4 events).**
+   1. A Connect after Disconnect Host lands.
+   2. While its waiter is resumed, a release is raised.
+   3. That release reached zero refs and stopped the lease at once. The
+      retargeted pane's `retain` was still queued behind it.
+   4. The pane parked on a stopped lease. Its debt had just been paid, so it
+      stayed parked forever.
+
+   Reaching zero refs now only queues `unusedCheck`, so every `retain` queued
+   before it lands first.
+
+Two of the explorer's own judgments were too strict and were corrected:
+
+- A retire can now be caused by `unusedCheck`.
+- A retarget `retain` that lands after a disconnect stopped the lease is not a
+  defect. That pane is parked under the new debt, and the parked-forever check
+  verifies that.
 
 ### Gate
 
-PR A passes when both layers are green and mutating each of rules 1–8 makes at
-least one layer fail.
+`scripts/peer-host-machine-gate.py` runs both layers, then breaks one rule at a
+time and requires the named layer to fail with the named violation. It
+restores each source byte for byte.
 
-The guarantee is "no violation within these bounds". Every defect found so far
-needed at most two disconnects and six events. A failure prints the exact
-event sequence.
+- **Rule 1** cannot be broken in a synchronous core, so it is checked
+  structurally: no `async`, `await`, `Task`, `DispatchQueue`, or `Thread` in
+  the machine or the core, and `reduce` is static.
+- **Every other rule** has a mutant. Each one, and the layer and violation
+  that caught it on the PR A run:
+
+| Mutant | Caught by | Violations |
+| --- | --- | --- |
+| Rule 2: commit after the effects run | layer 1 | I1, rule 2 |
+| Rule 2: reduce re-entrant calls in the middle of an effect list | layer 2 | I1, I3 |
+| Rule 3: sample the verdict when the acquire is raised | layer 2 | rule 3 |
+| Rule 4: ignore an acquire raised before a disconnect | layer 1 | rule 4 |
+| Rule 4: treat a stale token as a plain acquire | layer 1 | rule 5 |
+| Rule 5: let a background waiter start from `idle` with its own spec | layer 1 | rule 5 |
+| Rule 6: read dependents after the references leave the pool | layer 1 | rule 6 |
+| Rule 7: a deadline cancels the start | layer 1 | rules 6, 7 |
+| Rule 7: admit a waiter without a deadline | layer 1 | rule 7 |
+| Rule 8: resume without counting the reference | layer 1 | rule 8 |
+| Park invariant: never abandon an unpayable debt | layer 1 | parked forever |
+| Zero references stop the lease at once (finding 2) | layer 2 | parked forever |
 
 ## Open items
 
@@ -329,7 +430,7 @@ These tests encode old behavior and are rewritten in PR B:
 | `test_cancelPendingAcquire_refusesWhileAnotherPaneIsWaiting` | Cancel is per waiter (rule 7). |
 | `test_registry_waitForRestartKeepsTheLeaseThatComesBack`, `test_registry_waitForRestartReplacesTheLeaseThatDoesNot` | A restart wait becomes the `restarting` phase. |
 | `test_registry_restartWaiterJoinsTheReconnectHostReplacementWithoutStartingOne`, `test_registry_restartWaiterGivesUpWhenNoReplacementStarts` | A `user` waiter is carried into `awaitingReconnect` and still receives the replacement, so #675's N1 outcome is kept. A background waiter is now resolved `replacementUnavailable` instead of joining: **that outcome flips**. `awaitingReconnect` has its own deadline. |
-| `test_registry_restartWaiterStartsFreshWhenTheLeaseWasOnlyReleased` | The last `release` with waiters still present now retires and starts a replacement with `L.spec`. |
+| `test_registry_restartWaiterStartsFreshWhenTheLeaseWasOnlyReleased` | The last `release` with waiters still present now retires, through `unusedCheck`, and starts a replacement with `L.spec`. |
 
 Every other registry test, the relay park and retarget tests, and the
 simulation run unchanged. Socket E2E for a release goes through `mac-sub`.
