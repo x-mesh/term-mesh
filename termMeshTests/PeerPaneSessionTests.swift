@@ -4661,8 +4661,8 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.pendingReplacementToken(for: key))
     }
 
-    /// A restart waiter joining a replacement that turns out dead must not
-    /// retire it and start one with its own, possibly stale, spec.
+    /// A restart waiter joining a replacement that turns out dead retires it
+    /// (I8) but must not start one with its own, possibly stale, spec (I5).
     @MainActor
     func test_registry_restartWaiterDoesNotStartOverADeadReplacement() async throws {
         let registry = PeerPaneHostRegistry.shared
@@ -4702,9 +4702,9 @@ final class PeerPaneSessionTests: XCTestCase {
             let lease = try await registry.acquire(spec)
             registry.release(lease)
             XCTFail("a waiter must not start over a dead replacement")
-        } catch PeerPaneHostAcquireError.replacementUnavailable {}
+        } catch PeerPaneHostAcquireError.replacementDied {}
         XCTAssertEqual(starts, 1, "only the follower may have started a lease")
-        XCTAssertTrue(registry.activeLease(forKey: key) === follower, "the waiter must not retire it")
+        XCTAssertNil(registry.activeLease(forKey: key), "the dead replacement must not stay pooled")
         if let follower { registry.release(follower) }
         registry.release(restarting)
     }
@@ -12259,5 +12259,332 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
             guard count > 0 else { throw Failure.syscall("write", errno) }
             offset += count
         }
+    }
+}
+
+/// Random interleavings of the registry's events, checked against the rules in
+/// `docs/peer-host-registry-invariants.md`. Each trial drives one host key
+/// through acquires, releases, Disconnect / Reconnect / Force Disconnect,
+/// cancels, and tunnel restarts and deaths, while holding starts and restart
+/// waits open and letting them go in random order. A failure names the
+/// invariant and the seed that broke it.
+@MainActor
+final class PeerHostRegistrySimulationTests: XCTestCase {
+    private struct SplitMix64: RandomNumberGenerator {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    private enum Outcome {
+        case lease
+        case disconnected
+        case unavailable
+        case other
+    }
+
+    private final class Call {
+        let startStep: Int
+        var endStep: Int?
+        var outcome: Outcome?
+        init(startStep: Int) { self.startStep = startStep }
+    }
+
+    private final class Gate {
+        var open = false
+        var cameBack = true
+    }
+
+    /// Everything one trial observes. A class so the registry's test hooks
+    /// and the spawned acquires share it by reference.
+    private final class Trial {
+        var step = 0
+        var calls: [Call] = []
+        var held: [PeerPaneHostLease] = []
+        var made: [PeerPaneHostLease] = []
+        var disconnects: [(step: Int, kind: String)] = []
+        var announced: Set<ObjectIdentifier> = []
+        var observedDead: Set<ObjectIdentifier> = []
+        var restarting: Set<ObjectIdentifier> = []
+        var dead: Set<ObjectIdentifier> = []
+        var startGates: [Gate] = []
+        var restartGates: [(gate: Gate, lease: PeerPaneHostLease)] = []
+        var violations: [String] = []
+    }
+
+    /// Relative weights of the events a trial picks from.
+    private struct Mix {
+        var acquire = 25, release = 13, disconnect = 7, reconnect = 8, force = 5
+        var cancel = 4, restart = 7, die = 5, openStart = 13, openRestart = 13
+
+        /// Many replacements that restart or die while restart waiters are
+        /// still joining them — the interleavings behind I5 and I8, which a
+        /// uniform mix reaches about once in thousands of trials.
+        static let replacementChurn = Mix(
+            acquire: 22, release: 8, disconnect: 2, reconnect: 16, force: 1,
+            cancel: 2, restart: 12, die: 14, openStart: 11, openRestart: 12
+        )
+    }
+
+    private static let trials: UInt64 = 1000
+    private static let stepsPerTrial = 30
+    /// Every wait in a trial is bounded, so a broken invariant fails the test
+    /// rather than hanging it.
+    private static let trialDeadlineSeconds: TimeInterval = 3
+    /// Stop once this many trials have broken something: enough to show every
+    /// invariant involved, without a broken registry stalling every remaining
+    /// trial until its deadline.
+    private static let failingTrialsToReport = 20
+
+    func test_registryKeepsItsInvariantsUnderRandomInterleavings() async throws {
+        await assertInvariantsHold(mix: Mix())
+    }
+
+    func test_registryKeepsItsInvariantsUnderReplacementChurn() async throws {
+        await assertInvariantsHold(mix: .replacementChurn)
+    }
+
+    private func assertInvariantsHold(mix: Mix) async {
+        // Every seed runs, and each invariant reports its first few
+        // breaks, so one noisy invariant cannot hide another.
+        var byInvariant: [String: [String]] = [:]
+        var failingTrials = 0
+        for seed in 1...Self.trials {
+            let violations = await runTrial(seed: seed, mix: mix)
+            if !violations.isEmpty { failingTrials += 1 }
+            if failingTrials > Self.failingTrialsToReport { break }
+            for violation in violations {
+                var invariant = String(violation.prefix(while: { $0 != " " }))
+                if violation.contains("Force Disconnect") { invariant += "-F" }
+                byInvariant[invariant, default: []].append(violation)
+            }
+        }
+        let report = byInvariant.keys.sorted().flatMap { invariant -> [String] in
+            let all = byInvariant[invariant] ?? []
+            return ["\(invariant): \(all.count) break(s)"] + all.prefix(3).map { "  " + $0 }
+        }
+        XCTAssertTrue(
+            byInvariant.isEmpty,
+            "registry invariants broken:\n" + report.joined(separator: "\n")
+        )
+    }
+
+    private func runTrial(seed: UInt64, mix: Mix) async -> [String] {
+        let registry = PeerPaneHostRegistry.shared
+        var rng = SplitMix64(state: seed)
+        let sockPath = "/tmp/psp-sim-\(getpid())-\(seed).sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let trial = Trial()
+        let hardStop = Date().addingTimeInterval(Self.trialDeadlineSeconds)
+
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.replacementJoinDeadlineForTests = nil
+            registry.leaseMadeForTests = nil
+            registry.deadLeaseObservedForTests = nil
+        }
+
+        registry.hostTransportWillRetire = { _ in }
+        registry.hostTransportDidReplace = { _, lease in
+            let id = ObjectIdentifier(lease)
+            if trial.announced.contains(id) {
+                trial.violations.append("I7 seed \(seed): one lease was announced as a replacement twice")
+            }
+            if registry.activeLease(forKey: key) !== lease {
+                trial.violations.append("I7 seed \(seed): the announced replacement is not the pooled lease")
+            }
+            trial.announced.insert(id)
+        }
+        registry.leaseMadeForTests = { trial.made.append($0) }
+        registry.deadLeaseObservedForTests = { trial.observedDead.insert(ObjectIdentifier($0)) }
+        registry.replacementJoinDeadlineForTests = 0.15
+        registry.livenessOverrideForTests = { lease in
+            let id = ObjectIdentifier(lease)
+            if trial.dead.contains(id) { return .dead }
+            if trial.restarting.contains(id) { return .waitForRestart }
+            return .usable
+        }
+        registry.startDelayForTests = { _ in
+            // Half the starts land at once, so replacements get pooled and
+            // can die while restart waiters are still on their way to them.
+            guard Bool.random(using: &rng) else { return }
+            let gate = Gate()
+            trial.startGates.append(gate)
+            while !gate.open, !Task.isCancelled, Date() < hardStop {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+        registry.restartWaitOverrideForTests = { lease in
+            let gate = Gate()
+            trial.restartGates.append((gate, lease))
+            while !gate.open, Date() < hardStop {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+            if gate.cameBack { trial.restarting.remove(ObjectIdentifier(lease)) }
+            return gate.cameBack
+        }
+
+        func spawnAcquire() {
+            let call = Call(startStep: trial.step)
+            trial.calls.append(call)
+            Task { @MainActor in
+                do {
+                    let lease = try await registry.acquire(spec)
+                    trial.held.append(lease)
+                    call.outcome = .lease
+                } catch PeerPaneHostAcquireError.hostDisconnected {
+                    call.outcome = .disconnected
+                } catch PeerPaneHostAcquireError.replacementUnavailable {
+                    call.outcome = .unavailable
+                } catch PeerPaneHostAcquireError.replacementDied {
+                    call.outcome = .unavailable
+                } catch {
+                    call.outcome = .other
+                }
+                call.endStep = trial.step
+                // I8 checked as each acquire finishes: a later acquire may
+                // retire the dead lease and hide that this one left it pooled.
+                if let pooled = registry.activeLease(forKey: key),
+                   trial.observedDead.contains(ObjectIdentifier(pooled)) {
+                    trial.violations.append(
+                        "I8 seed \(seed): an acquire from step \(call.startStep) judged the pooled lease dead and left it pooled"
+                    )
+                }
+            }
+        }
+
+        func releaseHeld(at index: Int) {
+            registry.release(trial.held.remove(at: index))
+        }
+
+        for _ in 0..<Self.stepsPerTrial {
+            trial.step += 1
+            let weights = [
+                mix.acquire, mix.release, mix.disconnect, mix.reconnect, mix.force,
+                mix.cancel, mix.restart, mix.die, mix.openStart, mix.openRestart,
+            ]
+            var roll = Int.random(in: 0..<weights.reduce(0, +), using: &rng)
+            var event = 0
+            while roll >= weights[event] {
+                roll -= weights[event]
+                event += 1
+            }
+            switch event {
+            case 0:
+                spawnAcquire()
+            case 1:
+                if !trial.held.isEmpty {
+                    releaseHeld(at: Int.random(in: 0..<trial.held.count, using: &rng))
+                }
+            case 2:
+                registry.disconnectTransport(for: key)
+                trial.disconnects.append((trial.step, "Disconnect Host"))
+            case 3:
+                registry.disconnectTransport(for: key, replacementFollows: true)
+                let token = registry.pendingReplacementToken(for: key)
+                if Bool.random(using: &rng) {
+                    spawnAcquire()
+                } else {
+                    registry.abandonPendingReplacement(for: key, token: token)
+                }
+            case 4:
+                // Force Disconnect as RemoteHostStore performs it on the
+                // registry: end the transport, then every connection closes
+                // and releases its reference.
+                registry.endTransportForForceDisconnect(for: key)
+                while !trial.held.isEmpty { releaseHeld(at: 0) }
+                trial.disconnects.append((trial.step, "Force Disconnect"))
+            case 5:
+                registry.cancelPendingAcquire(for: key)
+            case 6:
+                if let pooled = registry.activeLease(forKey: key) {
+                    trial.restarting.insert(ObjectIdentifier(pooled))
+                }
+            case 7:
+                if let pooled = registry.activeLease(forKey: key) {
+                    trial.dead.insert(ObjectIdentifier(pooled))
+                }
+            case 8:
+                let closed = trial.startGates.filter { !$0.open }
+                if !closed.isEmpty {
+                    closed[Int.random(in: 0..<closed.count, using: &rng)].open = true
+                }
+            default:
+                let closed = trial.restartGates.filter { !$0.gate.open }
+                if !closed.isEmpty {
+                    let pick = closed[Int.random(in: 0..<closed.count, using: &rng)]
+                    pick.gate.cameBack = Bool.random(using: &rng)
+                    pick.gate.open = true
+                }
+            }
+            for _ in 0..<3 { await Task.yield() }
+        }
+
+        // Let everything settle: open every gate until no acquire is left.
+        trial.step += 1
+        while trial.calls.contains(where: { $0.outcome == nil }), Date() < hardStop {
+            for gate in trial.startGates where !gate.open { gate.open = true }
+            for entry in trial.restartGates where !entry.gate.open {
+                entry.gate.cameBack = Bool.random(using: &rng)
+                entry.gate.open = true
+            }
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let unfinished = trial.calls.filter { $0.outcome == nil }.count
+        if unfinished > 0 {
+            trial.violations.append("I6 seed \(seed): \(unfinished) acquire(s) never finished")
+        }
+
+        // I3: no caller that was waiting before a disconnect ends up with a lease.
+        for call in trial.calls {
+            guard case .lease = call.outcome, let end = call.endStep else { continue }
+            if let disconnect = trial.disconnects.first(where: { call.startStep < $0.step && $0.step <= end }) {
+                trial.violations.append(
+                    "I3 seed \(seed): an acquire from step \(call.startStep) got a lease at step \(end), after the \(disconnect.kind) at step \(disconnect.step)"
+                )
+            }
+        }
+        // I4: an acquire is reported disconnected only if a disconnect landed while it ran.
+        for call in trial.calls {
+            guard case .disconnected = call.outcome, let end = call.endStep else { continue }
+            if !trial.disconnects.contains(where: { call.startStep < $0.step && $0.step <= end }) {
+                trial.violations.append(
+                    "I4 seed \(seed): an acquire from step \(call.startStep) failed as disconnected with no disconnect while it ran"
+                )
+            }
+        }
+        // I8: a lease judged dead is not left pooled.
+        if let pooled = registry.activeLease(forKey: key),
+           trial.observedDead.contains(ObjectIdentifier(pooled)) {
+            trial.violations.append("I8 seed \(seed): a lease judged dead was left in the pool")
+        }
+
+        // I1 / I2: once every holder releases, nothing stays pooled and every
+        // lease any start made has been torn down.
+        while !trial.held.isEmpty { releaseHeld(at: 0) }
+        if registry.activeLease(forKey: key) != nil {
+            trial.violations.append("I2 seed \(seed): a lease stayed pooled after every holder released it")
+        }
+        let leaked = trial.made.filter { $0.canReconnectTransport }.count
+        if leaked > 0 {
+            trial.violations.append("I1 seed \(seed): \(leaked) lease(s) were never torn down")
+        }
+        // Leave nothing for the next trial: a key left mid-replacement would
+        // otherwise carry its state into a later test using the same path.
+        registry.disconnectTransport(for: key)
+        return trial.violations
     }
 }

@@ -1876,6 +1876,11 @@ final class RemoteHostStore: ObservableObject {
             .filter { stableKey(for: $0) == key }
         let ordered = Self.forceDisconnectOrder(rows)
         let counts = coordinator.forceDisconnectCounts(for: Set(ordered.map(\.id)))
+        // Before anything below releases a reference: the registry has to
+        // learn this host was ended while the lease is still pooled, not
+        // after the last release has already let it go.
+        let hostKey = sidebarLeases[key]?.key ?? connectingLeaseKeys[key] ?? host.paneHostSpec.hostKey
+        PeerPaneHostRegistry.shared.endTransportForForceDisconnect(for: hostKey)
         for row in ordered {
             coordinator.disconnect(id: row.id)
         }
@@ -1891,8 +1896,8 @@ final class RemoteHostStore: ObservableObject {
         // inherit the cancel above, so an in-flight — or hung — ssh spawn
         // would outlive the force disconnect and leak its helper process.
         // Cancel it before dropping the key that identifies it.
-        if let hostKey = connectingLeaseKeys[key] {
-            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
+        if let connectingKey = connectingLeaseKeys[key], connectingKey != hostKey {
+            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: connectingKey)
         }
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()

@@ -353,6 +353,8 @@ enum PeerPaneHostAcquireError: Error, CustomStringConvertible {
     /// The lease this acquire waited on was retired and no replacement was
     /// started for it to join in time.
     case replacementUnavailable(PeerPaneHostKey)
+    /// The replacement this acquire joined was dead by the time it got there.
+    case replacementDied(PeerPaneHostKey)
 
     var description: String {
         switch self {
@@ -360,6 +362,8 @@ enum PeerPaneHostAcquireError: Error, CustomStringConvertible {
             return "\(key.shortLabel) was disconnected while this connection was waiting on it"
         case .replacementUnavailable(let key):
             return "\(key.shortLabel)'s tunnel was replaced and no new connection came up to join"
+        case .replacementDied(let key):
+            return "\(key.shortLabel)'s replacement tunnel died before this connection could use it"
         }
     }
 }
@@ -419,6 +423,13 @@ final class PeerPaneHostRegistry {
     var startDelayForTests: ((PeerPaneHostSpec) async -> Void)?
     /// Test-only: replaces `replacementJoinDeadlineSeconds`.
     var replacementJoinDeadlineForTests: TimeInterval?
+    /// Test-only: sees every lease a start makes, including ones that are
+    /// torn down without ever being pooled or handed out.
+    var leaseMadeForTests: ((PeerPaneHostLease) -> Void)?
+    /// Test-only: an acquire judged this pooled lease dead — `.dead`, or a
+    /// restart that did not bring it back. Invariant I8 says it must not stay
+    /// pooled after that.
+    var deadLeaseObservedForTests: ((PeerPaneHostLease) -> Void)?
     #endif
 
     /// Fires just before `acquire` tears down a pooled lease it judged dead,
@@ -507,11 +518,20 @@ final class PeerPaneHostRegistry {
                     lease.refCount += 1
                     return lease
                 }
-                guard mayStart else { throw PeerPaneHostAcquireError.replacementUnavailable(key) }
+                #if DEBUG
+                deadLeaseObservedForTests?(lease)
+                #endif
+                // Retired either way (I8): left pooled, a dead lease strands
+                // every consumer until some later acquire happens by. Only the
+                // start of a replacement is withheld from a joining waiter.
                 retireDeadLease(lease, key: key)
+                guard mayStart else { throw PeerPaneHostAcquireError.replacementDied(key) }
             case .dead:
-                guard mayStart else { throw PeerPaneHostAcquireError.replacementUnavailable(key) }
+                #if DEBUG
+                deadLeaseObservedForTests?(lease)
+                #endif
                 retireDeadLease(lease, key: key)
+                guard mayStart else { throw PeerPaneHostAcquireError.replacementDied(key) }
             }
         }
         if let startingLease = starting[key] {
@@ -522,7 +542,7 @@ final class PeerPaneHostRegistry {
                 }
             }
             let lease = try await awaitStart(startingLease, key: key)
-            return try adoptUnlessDisconnected(lease, startedAt: startingLease.disconnectGeneration, key: key)
+            return try await settleStart(lease, from: startingLease, spec: spec, mayStart: mayStart)
         }
         guard mayStart else { throw PeerPaneHostAcquireError.replacementUnavailable(key) }
         var startingLease = StartingLease(
@@ -533,7 +553,11 @@ final class PeerPaneHostRegistry {
                 // A start cancelled before its ssh spawns — by Cancel, or by a
                 // Disconnect Host that overtook it — has nothing to stop yet.
                 try Task.checkCancellation()
-                return try await Self.makeLease(spec: spec)
+                let made = try await Self.makeLease(spec: spec)
+                #if DEBUG
+                self?.leaseMadeForTests?(made)
+                #endif
+                return made
             },
             disconnectGeneration: disconnectGeneration(for: key),
             replacementToken: pendingReplacements[key]
@@ -557,7 +581,37 @@ final class PeerPaneHostRegistry {
             }
             throw error
         }
-        return try adoptUnlessDisconnected(lease, startedAt: startingLease.disconnectGeneration, key: key)
+        return try await settleStart(lease, from: startingLease, spec: spec, mayStart: true)
+    }
+
+    /// Hand out the lease a start produced, once this caller resumes.
+    ///
+    /// Every caller of one start resumes separately. Between the first, which
+    /// pools the lease, and a later one, the lease can be retired (Reconnect
+    /// Host, a dead retire, a last release). Pooling it again would hand out a
+    /// torn-down tunnel and announce it as a replacement a second time (I1,
+    /// I7), so that caller joins whatever replaced it instead.
+    private func settleStart(
+        _ lease: PeerPaneHostLease,
+        from startingLease: StartingLease,
+        spec: PeerPaneHostSpec,
+        mayStart: Bool
+    ) async throws -> PeerPaneHostLease {
+        let key = spec.hostKey
+        let generation = startingLease.disconnectGeneration
+        if generation == disconnectGeneration(for: key), lease.isTornDown {
+            // The finished start stays in `starting` until its creator resumes.
+            // Left there, the join below would rejoin it, get this same
+            // torn-down lease back without suspending, and recurse until the
+            // stack ran out.
+            if starting[key]?.id == startingLease.id {
+                starting[key] = nil
+            }
+            return try await joinReplacement(
+                for: spec, waitedOn: lease, waitedFrom: generation, mayStart: mayStart
+            )
+        }
+        return try adoptUnlessDisconnected(lease, startedAt: generation, key: key)
     }
 
     /// A start cancelled because Disconnect Host overtook it reports that
@@ -746,6 +800,15 @@ final class PeerPaneHostRegistry {
         starting[key] = nil
         startingLease.task.cancel()
         return true
+    }
+
+    /// What Force Disconnect does to the registry before its connections are
+    /// closed and their references released. It ends the host exactly as
+    /// Disconnect Host does (I3-F): without the disconnect recorded, the last
+    /// release reads as an ordinary one and a restart waiter — the wake sweep,
+    /// a team spawn — reopens ssh to the host the user just ended.
+    func endTransportForForceDisconnect(for key: PeerPaneHostKey) {
+        disconnectTransport(for: key)
     }
 
     #if DEBUG
