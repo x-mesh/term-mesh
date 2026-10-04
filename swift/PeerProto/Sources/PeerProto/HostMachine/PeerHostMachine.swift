@@ -273,8 +273,11 @@ extension PeerHostMachine {
                     retirePooledLease()
                 }
             case let .awaitingReconnect(token):
+                guard request.origin == .user else {
+                    return resume(id, .failure(.replacementUnavailable))
+                }
                 admit(waiter)
-                if request.token == token, request.origin == .user, let spec = request.spec {
+                if request.token == token, let spec = request.spec {
                     start(spec, .reconnect)
                 }
             }
