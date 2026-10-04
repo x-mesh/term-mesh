@@ -4948,6 +4948,52 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    func test_ownedReconnectParksOnRetiredLeaseOnlyWhileAReplacementIsAwaited() {
+        func step(
+            ownsSession: Bool = true, isTorndown: Bool = false,
+            isCurrentSession: Bool = true, hostLeaseIsActive: Bool,
+            awaiting: Bool
+        ) -> PeerRelaySession.OwnedReconnectStep {
+            PeerRelaySession.ownedReconnectStep(
+                ownsSession: ownsSession, isTorndown: isTorndown,
+                isCurrentSession: isCurrentSession,
+                hostLeaseIsActive: hostLeaseIsActive,
+                awaitingTransportReplacement: awaiting
+            )
+        }
+        XCTAssertEqual(step(hostLeaseIsActive: true, awaiting: false), .proceed)
+        XCTAssertEqual(step(hostLeaseIsActive: true, awaiting: true), .proceed)
+        XCTAssertEqual(
+            step(hostLeaseIsActive: false, awaiting: true), .park,
+            "a deliberately retired lease with a replacement expected must keep the helper alive"
+        )
+        XCTAssertEqual(
+            step(hostLeaseIsActive: false, awaiting: false), .stop,
+            "a retired lease nobody is replacing still ends the pane"
+        )
+        XCTAssertEqual(step(isTorndown: true, hostLeaseIsActive: false, awaiting: true), .stop)
+        XCTAssertEqual(step(isCurrentSession: false, hostLeaseIsActive: false, awaiting: true), .stop)
+        XCTAssertEqual(step(ownsSession: false, hostLeaseIsActive: false, awaiting: true), .stop)
+    }
+
+    func test_paneRetargetRequiresALiveReplacementForTheSameHost() {
+        XCTAssertTrue(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: true, sameLease: false, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: true, sameHost: true, sameLease: false, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: false, sameLease: false, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: true, sameLease: true, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: true, sameLease: false, replacementIsActive: false
+        ))
+    }
+
     @MainActor
     func test_registry_concurrentFirstAcquireYieldsOneLease() async throws {
         let registry = PeerPaneHostRegistry.shared
@@ -9629,6 +9675,139 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
 
         XCTAssertEqual(refreshCount, 0)
         await relay.stop()
+        _ = hostTask
+    }
+
+    /// Reconnect Host and post-wake tunnel replacement used to end every pane
+    /// on the retired tunnel: the loop saw an inactive lease, sent the helper
+    /// a Goodbye, and the mirror respawned each pane with empty scrollback.
+    /// Here the first host goes away under a retired lease, the loop must
+    /// park rather than end, and a retarget must bring the SAME relay back
+    /// through the replacement host's socket.
+    @MainActor
+    func test_parkedOwnedReconnectResumesThroughRetargetedTransport() async throws {
+        let suffix = "\(getpid())-\(UUID().uuidString.prefix(8))"
+        let retiredPath = "/tmp/peer-retarget-old-\(suffix).sock"
+        let replacementPath = "/tmp/peer-retarget-new-\(suffix).sock"
+        let retiredHost = AgentSurfaceMockHost(socketPath: retiredPath, capabilities: [])
+        let replacementHost = AgentSurfaceMockHost(socketPath: replacementPath, capabilities: [])
+        let retiredTask = try retiredHost.start()
+        let replacementTask = try replacementHost.start()
+        defer {
+            retiredHost.stop()
+            replacementHost.stop()
+        }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: retiredPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = retiredHost.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0,
+            mayReconnect: { leaseActive },
+            handler: { $0 }
+        )
+
+        let parked = expectation(description: "reconnect loop parked on the retired lease")
+        parked.assertForOverFulfill = false
+        let reconnected = expectation(description: "relay reattached through the replacement")
+        var reconnectedCount = 0
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        relay.onReconnected = {
+            reconnectedCount += 1
+            reconnected.fulfill()
+        }
+        var disconnectCount = 0
+        relay.onDisconnect = { disconnectCount += 1 }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        retiredHost.stop()
+        await fulfillment(of: [parked], timeout: 10)
+
+        XCTAssertEqual(relay.transportLiveness, .reconnecting)
+        XCTAssertEqual(reconnectedCount, 0)
+        XCTAssertEqual(disconnectCount, 0, "a parked pane must not end before its replacement arrives")
+
+        XCTAssertTrue(relay.retargetOwnedTransport(
+            hostSockPath: replacementPath,
+            hostKey: PeerPaneHostSpec.direct(sockPath: replacementPath).hostKey,
+            generation: 1,
+            mayReconnect: { true },
+            handler: { $0 }
+        ))
+        await fulfillment(of: [reconnected], timeout: 10)
+
+        XCTAssertEqual(relay.hostSockPath, replacementPath)
+        XCTAssertEqual(relay.transportLiveness, .live)
+        XCTAssertEqual(disconnectCount, 0)
+        await relay.stop()
+        _ = retiredTask
+        _ = replacementTask
+    }
+
+    /// The other exit from a park. A pane closed while waiting for a
+    /// replacement must still end its reconnect loop; a continuation nobody
+    /// resumes would hold the pump (and, for relay delivery, the helper
+    /// process) for the life of the app.
+    @MainActor
+    func test_parkedOwnedReconnectEndsWhenThePaneIsTornDown() async throws {
+        let socketPath = "/tmp/peer-retarget-teardown-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: socketPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0,
+            mayReconnect: { leaseActive },
+            handler: { $0 }
+        )
+        let parked = expectation(description: "reconnect loop parked on the retired lease")
+        parked.assertForOverFulfill = false
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        host.stop()
+        await fulfillment(of: [parked], timeout: 10)
+        XCTAssertTrue(relay.reconnectInFlightForTesting)
+
+        await relay.stop()
+        let deadline = Date().addingTimeInterval(5)
+        while relay.reconnectInFlightForTesting, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertFalse(
+            relay.reconnectInFlightForTesting,
+            "the parked reconnect loop never resumed after teardown"
+        )
+        XCTAssertEqual(relay.transportLiveness, .ended)
+        XCTAssertFalse(
+            relay.retargetOwnedTransport(
+                hostSockPath: socketPath,
+                hostKey: PeerPaneHostSpec.direct(sockPath: socketPath).hostKey,
+                generation: 1,
+                mayReconnect: { true },
+                handler: { $0 }
+            ),
+            "an ended relay has nothing left to move"
+        )
         _ = hostTask
     }
 

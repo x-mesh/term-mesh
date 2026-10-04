@@ -3499,12 +3499,17 @@ final class Workspace: Identifiable {
         session.requestPaneClose = { [weak self] in
             _ = self?.closePanel(panelId, force: true)
         }
-        // Disconnect Host preserves this pane. Once the sidebar establishes a
-        // replacement lease, rebuild the terminal against that lease exactly
-        // as the banner's explicit Reconnect action does. Mirror panes stay
-        // under their controller's one-subscription reconnect path.
+        // Disconnect Host preserves this pane. Once a replacement lease is up,
+        // move the parked relay onto it so the pane keeps its scrollback;
+        // only a relay that already ended is rebuilt the way the banner's
+        // explicit Reconnect does. Mirror panes stay under their controller's
+        // one-subscription reconnect path.
         session.requestHostReconnectReattach = { [weak self, weak panel, weak session] in
             guard let self, let panel, let session, self.peerMirror == nil else { return }
+            if let replacement = PeerPaneHostRegistry.shared.activeLease(forKey: session.lease.key),
+               session.retarget(to: replacement) {
+                return
+            }
             Task { @MainActor in
                 await PeerClientCoordinator.shared.reconnectRemotePane(
                     oldSession: session, panelId: panel.id, workspace: self
@@ -3571,6 +3576,15 @@ final class Workspace: Identifiable {
         session.relaySession.onReconnecting = { [weak panel] attempt in
             panel?.hostedView.showPeerDisconnectBanner(
                 reason: "Remote pane disconnected — reconnecting to \(hostLabel) (try \(attempt))…",
+                onReconnect: nil,
+                onClosePane: { [weak self] in
+                    _ = self?.closePanel(panelId, force: true)
+                }
+            )
+        }
+        session.relaySession.onAwaitingTransportReplacement = { [weak panel] in
+            panel?.hostedView.showPeerDisconnectBanner(
+                reason: "Remote pane paused — waiting for \(hostLabel) to reconnect",
                 onReconnect: nil,
                 onClosePane: { [weak self] in
                     _ = self?.closePanel(panelId, force: true)
