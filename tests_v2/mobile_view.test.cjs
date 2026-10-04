@@ -38,7 +38,12 @@ function page(initial, saved = {}, health = {}) {
   const requests = [];
   let targets = initial;
   let pendingTargets = null;
+  let pendingText = null;
+  let textError = false;
+  const timers = new Map();
+  let timerId = 0;
   let targetsError = null;
+  let pendingTargetsBody = null;
   let transcript = {entries: [], running: true};
   let commandError = false;
   let pendingCommands = null;
@@ -72,7 +77,9 @@ function page(initial, saved = {}, health = {}) {
     navigator: { clipboard: { writeText: async text => { copied.push(text); } } },
     setInterval(callback, ms) { intervals.set(ms, callback); return ms; },
     clearInterval(ms) { intervals.delete(ms); },
-    setTimeout() {}, clearTimeout() {},
+    AbortController,
+    setTimeout(callback, ms) { const id = ++timerId; timers.set(id, {callback, ms}); return id; },
+    clearTimeout(id) { timers.delete(id); },
   };
   const response = body => ({ ok: true, text: async () => JSON.stringify(body) });
   const bodies = [];
@@ -86,12 +93,18 @@ function page(initial, saved = {}, health = {}) {
         throw error;
       }
       if (pendingTargets) return pendingTargets;
+      if (pendingTargetsBody) return {ok:true, text:() => pendingTargetsBody};
       return response({ targets });
     }
     if (url.endsWith('/commands')) {
       if (commandError) { commandError = false; throw new Error('catalog unavailable'); }
       if (pendingCommands) return pendingCommands;
       return response({items:commands});
+    }
+    if (url.endsWith('/text')) {
+      if (textError) { textError = false; throw new Error('response lost'); }
+      if (pendingText) return pendingText;
+      return response({delivered:true});
     }
     if (url === '/api/health') return response({ ok: true, ...health });
     if (url.includes('/transcript')) {
@@ -113,6 +126,13 @@ function page(initial, saved = {}, health = {}) {
   vm.runInNewContext(source, { document, window, fetch, console, URL, Date, Promise, Map, Set });
   return {
     nodes, requests, storage, bodies, document, copied,
+    failText() { textError = true; },
+    expireReads() { for (const timer of [...timers.values()]) { if (timer.ms === 10000) timer.callback(); } },
+    pauseText() {
+      let resolve;
+      pendingText = new Promise(done => { resolve = done; });
+      return () => { pendingText = null; resolve(response({delivered:true})); };
+    },
     setCommands(next) { commands = next; },
     setTranscript(next) { transcript = next; },
     setPrompt(next) { prompt = next; },
@@ -127,6 +147,11 @@ function page(initial, saved = {}, health = {}) {
     setTargets(next) { targets = next; },
     failTargets() { targetsError = new Error('network unavailable'); },
     tick() { intervals.get(2000)(); },
+    pauseTargetsBody() {
+      let resolve;
+      pendingTargetsBody = new Promise(done => { resolve = done; });
+      return next => { pendingTargetsBody = null; resolve(JSON.stringify({targets:next})); };
+    },
     pauseTargets() {
       let resolve;
       pendingTargets = new Promise(done => { resolve = done; });
@@ -553,4 +578,116 @@ test('spinner is visible for read-only chat and resets when changing panes', asy
   app.nodes.get('target').value = 'pane-2';
   app.nodes.get('target').dispatch('change');
   assert.equal(app.nodes.get('chat-state').classList.contains('is-working'), false);
+});
+
+
+test('a delayed send preserves the next draft and rejects concurrent submissions', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  const finish = app.pauseText();
+  app.nodes.get('text').value = 'first';
+  app.nodes.get('send-form').dispatch('submit');
+  app.nodes.get('send-form').dispatch('submit');
+  assert.equal(app.bodies.filter(([url]) => url.endsWith('/text')).length, 1);
+  app.nodes.get('text').value = 'next draft';
+  finish();
+  await settle();
+  assert.equal(app.nodes.get('text').value, 'next draft');
+  assert.equal(app.nodes.get('send').disabled, false);
+});
+
+test('retrying the same message reuses its request ID', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.nodes.get('text').value = 'retry';
+  app.failText();
+  app.nodes.get('send-form').dispatch('submit');
+  await settle();
+  app.nodes.get('send-form').dispatch('submit');
+  await settle();
+  const sent = app.bodies.filter(([url]) => url.endsWith('/text'));
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0][1].request_id, sent[1][1].request_id);
+  assert.equal(app.nodes.get('text').value, '');
+});
+
+for (const [cli, command] of [['codex', '/model'], ['claude', '/model'], ['claude', '/effort']]) {
+  test(`typed ${cli} ${command} opens its picker`, async () => {
+    const app = page([{...pane(true), agent_cli:cli}]);
+    await settle();
+    app.nodes.get('text').value = command;
+    app.nodes.get('send-form').dispatch('submit');
+    await settle();
+    assert.equal(app.nodes.get('model-picker').hidden, false);
+    assert.equal(app.bodies.filter(([url]) => url.endsWith('/text')).length, 0);
+  });
+}
+
+test('a stalled read times out and a later poll recovers', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  const finish = app.pauseTargets();
+  app.tick();
+  assert.equal(app.nodes.get('refresh').disabled, true);
+  app.expireReads();
+  await settle();
+  assert.equal(app.nodes.get('refresh').disabled, false);
+  assert.match(app.nodes.get('status').textContent, /연결이 지연/);
+  finish([pane(true)]);
+  await settle();
+  app.tick();
+  await settle();
+  assert.equal(app.nodes.get('refresh').disabled, false);
+  assert.doesNotMatch(app.nodes.get('status').textContent, /연결이 지연/);
+});
+
+
+test('a stalled response body also times out', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  const finish = app.pauseTargetsBody();
+  app.tick();
+  await settle();
+  app.expireReads();
+  await settle();
+  assert.equal(app.nodes.get('refresh').disabled, false);
+  assert.match(app.nodes.get('status').textContent, /연결이 지연/);
+  finish([pane(true)]);
+  await settle();
+});
+
+test('editing a failed message allocates a new request ID', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.nodes.get('text').value = 'original';
+  app.failText();
+  app.nodes.get('send-form').dispatch('submit');
+  await settle();
+  app.nodes.get('text').value = 'edited';
+  app.nodes.get('send-form').dispatch('submit');
+  await settle();
+  const sent = app.bodies.filter(([url]) => url.endsWith('/text'));
+  assert.notEqual(sent[0][1].request_id, sent[1][1].request_id);
+});
+
+
+test('inline model arguments remain text input', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.nodes.get('text').value = '/model custom-id';
+  app.nodes.get('send-form').dispatch('submit');
+  await settle();
+  const sent = app.bodies.filter(([url]) => url.endsWith('/text'));
+  assert.equal(sent[0][1].text, '/model custom-id');
+  assert.equal(app.nodes.get('model-picker').hidden, true);
+});
+
+test('a native agent does not open the terminal model picker', async () => {
+  const app = page([{...pane(true), kind:'agent', agent_name:'worker'}]);
+  await settle();
+  app.nodes.get('text').value = '/model';
+  app.nodes.get('send-form').dispatch('submit');
+  await settle();
+  assert.equal(app.nodes.get('model-picker').hidden, true);
+  assert.equal(app.bodies.filter(([url]) => url.endsWith('/text')).length, 1);
 });
