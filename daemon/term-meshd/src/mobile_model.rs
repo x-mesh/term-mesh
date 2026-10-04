@@ -96,6 +96,7 @@ const SCROLL_MARKS: &[char] = &['↑', '↓'];
 const MESSAGE_MARKS: &[char] = &['•', '⎿'];
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
+const MENU_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(80);
 const MAX_LIST_STEPS: usize = 64;
 const OPEN_POPUP_TRAILING_LINES: usize = 1;
@@ -330,8 +331,13 @@ where
     D: PaneDriver,
 {
     let mut waited = Duration::ZERO;
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    let mut last = String::new();
     loop {
-        let screen = driver.read_screen().await?;
+        let screen = tokio::time::timeout_at(deadline, driver.read_screen())
+            .await
+            .map_err(|_| DriveError::Unrecognized(last.clone()))??;
+        last = last_line(&screen);
         if let Some(value) = accept(&screen) {
             return Ok(value);
         }
@@ -371,17 +377,29 @@ async fn step_down<D: PaneDriver>(
     .await
 }
 
-async fn close_popup<D: PaneDriver>(driver: &D, tui: &Tui) {
-    for _ in 0..2 {
-        let Ok(screen) = driver.read_screen().await else {
-            return;
-        };
-        if popup(tui, &screen) == Popup::None {
-            return;
+async fn close_popup<D: PaneDriver>(driver: &D, tui: &Tui) -> Result<(), DriveError> {
+    tokio::time::timeout(STEP_TIMEOUT, async {
+        for _ in 0..2 {
+            let screen = driver.read_screen().await?;
+            if popup(tui, &screen) == Popup::None {
+                return Ok(());
+            }
+            driver.send_key("escape").await?;
+            driver.pause(POLL_INTERVAL).await;
         }
-        let _ = driver.send_key("escape").await;
-        driver.pause(POLL_INTERVAL).await;
-    }
+        let screen = driver.read_screen().await?;
+        if popup(tui, &screen) == Popup::None {
+            Ok(())
+        } else {
+            Err(DriveError::Unrecognized(last_line(&screen)))
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(DriveError::Unrecognized(
+            "메뉴를 닫지 못했습니다. 터미널에서 Esc를 누르세요.".to_string(),
+        ))
+    })
 }
 
 async fn fail_closed<D: PaneDriver, T>(
@@ -390,7 +408,7 @@ async fn fail_closed<D: PaneDriver, T>(
     result: Result<T, DriveError>,
 ) -> Result<T, DriveError> {
     if result.is_err() {
-        close_popup(driver, tui).await;
+        close_popup(driver, tui).await?;
     }
     result
 }
@@ -401,7 +419,7 @@ pub async fn list_models<D: PaneDriver>(
     driver: &D,
     tui: &Tui,
 ) -> Result<Vec<ModelOption>, DriveError> {
-    let result = async {
+    let result = tokio::time::timeout(MENU_TIMEOUT, async {
         let mut rows = open_model_popup(driver, tui).await?;
         let start = highlighted(&rows).map(|row| row.index).unwrap_or(0);
         let mut seen: Vec<PopupRow> = Vec::new();
@@ -427,11 +445,16 @@ pub async fn list_models<D: PaneDriver>(
                 current: row.current,
             })
             .collect())
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(DriveError::Unrecognized(
+            "모델 목록 조회 시간이 초과됐습니다.".to_string(),
+        ))
+    });
     let result = fail_closed(driver, tui, result).await;
     if result.is_ok() {
-        close_popup(driver, tui).await;
+        close_popup(driver, tui).await?;
     }
     result
 }
@@ -1285,6 +1308,99 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "screen_unrecognized");
+    }
+
+    struct SlowScreen {
+        delay: Duration,
+    }
+
+    impl PaneDriver for SlowScreen {
+        async fn read_screen(&self) -> Result<String, DriveError> {
+            tokio::time::sleep(self.delay).await;
+            Ok("waiting".to_string())
+        }
+        async fn send_key(&self, _key: &'static str) -> Result<(), DriveError> {
+            Ok(())
+        }
+        async fn send_text(&self, _text: &str) -> Result<(), DriveError> {
+            Ok(())
+        }
+        async fn send_turn(&self, _text: &str) -> Result<(), DriveError> {
+            Ok(())
+        }
+        async fn pause(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn screen_reads_count_toward_the_step_deadline() {
+        let driver = SlowScreen {
+            delay: Duration::from_secs(1),
+        };
+        let start = tokio::time::Instant::now();
+        let result = wait_for(&driver, |_| None::<()>).await;
+        assert!(result.is_err());
+        assert!(start.elapsed() <= STEP_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_screen_read_has_a_deadline() {
+        let driver = SlowScreen {
+            delay: Duration::from_secs(60),
+        };
+        let start = tokio::time::Instant::now();
+        let result = wait_for(&driver, |_| Some(())).await;
+        assert!(result.is_err());
+        assert!(start.elapsed() <= STEP_TIMEOUT);
+    }
+
+    struct SlowMenu {
+        inner: Fake,
+        delay: Duration,
+    }
+
+    impl PaneDriver for SlowMenu {
+        async fn read_screen(&self) -> Result<String, DriveError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.read_screen().await
+        }
+        async fn send_key(&self, key: &'static str) -> Result<(), DriveError> {
+            self.inner.send_key(key).await
+        }
+        async fn send_text(&self, text: &str) -> Result<(), DriveError> {
+            self.inner.send_text(text).await
+        }
+        async fn send_turn(&self, text: &str) -> Result<(), DriveError> {
+            self.inner.send_turn(text).await
+        }
+        async fn pause(&self, duration: Duration) {
+            self.inner.pause(duration).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_model_walk_times_out_and_closes_the_popup() {
+        let driver = SlowMenu {
+            inner: Fake::new(vec![("model", false); 60], 0),
+            delay: Duration::from_millis(500),
+        };
+        let start = tokio::time::Instant::now();
+        let result = list_models(&driver, &CODEX).await;
+        assert!(result.is_err());
+        assert!(start.elapsed() <= MENU_TIMEOUT + STEP_TIMEOUT);
+        assert!(driver.inner.mode() == Mode::Composer);
+        assert!(driver.inner.keys().contains(&"escape".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn popup_cleanup_also_has_a_deadline() {
+        let driver = SlowScreen {
+            delay: Duration::from_secs(60),
+        };
+        let start = tokio::time::Instant::now();
+        assert!(close_popup(&driver, &CODEX).await.is_err());
+        assert!(start.elapsed() <= STEP_TIMEOUT);
     }
 
     const CLAUDE_CAPTURE: &str = "   Select model

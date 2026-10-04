@@ -151,8 +151,9 @@
   }
 
   var READ_TIMEOUT_MS = 10000;
+  var MENU_READ_TIMEOUT_MS = 30000;
 
-  function api(method, path, body) {
+  function api(method, path, body, readTimeout) {
     var init = { method: method, headers: {}, credentials: 'same-origin' };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
@@ -184,7 +185,7 @@
           var error = new Error('연결이 지연됩니다. 다시 연결을 시도합니다.');
           error.code = 'read_timeout';
           reject(error);
-        }, READ_TIMEOUT_MS);
+        }, readTimeout || READ_TIMEOUT_MS);
         read.then(resolve, reject);
       });
     }
@@ -1088,7 +1089,7 @@
 
   function refreshScreen() {
     var t = state.selected;
-    if (!t) { return Promise.resolve(); }
+    if (!t || isChat(t)) { return Promise.resolve(); }
     var stickToBottom = isAtBottom(el.screen);
     return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/screen?lines=' + SCREEN_LINES + '&format=styled')
       .then(function (data) {
@@ -1406,7 +1407,7 @@
     el.modelList.textContent = '';
     el.modelCustom.hidden = true;
     setModelStatus('터미널 메뉴를 읽는 중…');
-    api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + picker.path)
+    api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + picker.path, undefined, MENU_READ_TIMEOUT_MS)
       .then(function (raw) {
         if (generation !== state.modelGeneration) { return; }
         var data = picker.rows(raw);

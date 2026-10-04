@@ -50,6 +50,7 @@ function page(initial, saved = {}, health = {}) {
   let prompt = null;
   let preview = [];
   let transcriptError = null;
+  let pendingModels = null;
   let models = { cli: 'codex', custom: false, current_model: 'Jev Auto', models: [
     { id: 'GLM 5', label: 'GLM 5', description: 'GLM', current: false },
     { id: 'Jev Auto', label: 'Jev Auto', description: 'auto', current: true },
@@ -115,7 +116,7 @@ function page(initial, saved = {}, health = {}) {
       if (init && init.method === 'POST') { prompt = null; return response({ answered: 1 }); }
       return response({ prompt, preview });
     }
-    if (url.endsWith('/models')) return response(models);
+    if (url.endsWith('/models')) return pendingModels || response(models);
     if (url.endsWith('/effort')) {
       if (init && init.method === 'POST') return response({ message: 'Set effort level to low (this session only)', session_only: true });
       return response({ levels: ['low', 'medium', 'high'], current: 'high' });
@@ -127,7 +128,12 @@ function page(initial, saved = {}, health = {}) {
   return {
     nodes, requests, storage, bodies, document, copied,
     failText() { textError = true; },
-    expireReads() { for (const timer of [...timers.values()]) { if (timer.ms === 10000) timer.callback(); } },
+    expireReads(ms = 10000) { for (const timer of [...timers.values()]) { if (timer.ms === ms) timer.callback(); } },
+    pauseModels() {
+      let resolve;
+      pendingModels = new Promise(done => { resolve = done; });
+      return () => { pendingModels = null; resolve(response(models)); };
+    },
     pauseText() {
       let resolve;
       pendingText = new Promise(done => { resolve = done; });
@@ -690,4 +696,46 @@ test('a native agent does not open the terminal model picker', async () => {
   await settle();
   assert.equal(app.nodes.get('model-picker').hidden, true);
   assert.equal(app.bodies.filter(([url]) => url.endsWith('/text')).length, 1);
+});
+
+
+test('Chat polls skip the hidden terminal grid but keep approval updates', async () => {
+  const app = page([pane(true)]);
+  app.setTranscript({entries:[], running:true, in_flight:true});
+  await settle();
+  app.tick();
+  await settle();
+  assert.equal(app.requests.some(url => url.includes('/screen?')), false);
+  assert.ok(app.requests.some(url => url.endsWith('/prompt')));
+  app.nodes.get('view-terminal').dispatch('click');
+  app.tick();
+  await settle();
+  assert.ok(app.requests.some(url => url.includes('/screen?')));
+});
+
+test('a slow menu read outlasts the ordinary read budget', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  const finish = app.pauseModels();
+  app.nodes.get('text').value = '/model';
+  app.nodes.get('send-form').dispatch('submit');
+  app.expireReads();
+  await settle();
+  assert.doesNotMatch(app.nodes.get('model-status').textContent, /지연/);
+  finish();
+  await settle();
+  assert.equal(app.nodes.get('model-list').children.length, 2);
+});
+
+test('a stalled menu read reports its own timeout', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  const finish = app.pauseModels();
+  app.nodes.get('text').value = '/model';
+  app.nodes.get('send-form').dispatch('submit');
+  app.expireReads(30000);
+  await settle();
+  assert.match(app.nodes.get('model-status').textContent, /지연/);
+  finish();
+  await settle();
 });
