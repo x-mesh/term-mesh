@@ -2083,7 +2083,12 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
         let spec = oldSession.originSpec
         let wanted = oldSession.originSurface
-        await oldSession.refreshHostTransportForReconnect()
+        // A surface refused right after a retarget proves the transport is
+        // up — it answered. Refreshing would restart a tunnel that sibling
+        // panes have just moved onto.
+        if !oldSession.relaySession.retargetedSurfaceWasRejected {
+            await oldSession.refreshHostTransportForReconnect()
+        }
         oldSession.teardown()
 
         let registry = PeerPaneHostRegistry.shared

@@ -2345,8 +2345,8 @@ final class PeerRelaySession {
     /// attach treats a refused surface as final.
     private var firstAttachAfterRetargetPending = false
     /// The relay ended because the replacement transport refused this
-    /// surface. The pane's owner reads it to rebuild rather than offer a
-    /// Reconnect that would dial the same missing surface.
+    /// surface. The pane's banner names the cause, and its Reconnect skips
+    /// the transport refresh: the refusal already proved the tunnel is up.
     private(set) var retargetedSurfaceWasRejected = false
 
     func configureOwnedTransportRecovery(
@@ -4320,6 +4320,7 @@ final class PeerRelaySession {
         relayTelemetry.resetRemote()
         session = newConnection.session
         sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
+        firstAttachAfterRetargetPending = false
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
         hostSupportsReplayRing = newConnection.hostCapabilities.has(PeerCapability.replayRingV1)
@@ -4370,7 +4371,13 @@ final class PeerRelaySession {
             dlog("peer.relay.reconnect.return elapsed=\(String(format: "%.3f", Date().timeIntervalSince(reconnectStartedAt))) swapped=\(session !== failedSession) failed=\(Self.sessionTag(failedSession))")
         }
         #endif
-        defer { reconnectInFlight = false }
+        defer {
+            reconnectInFlight = false
+            // A retarget's first attach happens inside this loop. However the
+            // loop ends — attached, refused, swapped by a heal, or stopped —
+            // a later, unrelated disconnect must retry a refusal as usual.
+            firstAttachAfterRetargetPending = false
+        }
         RemoteWorkLog.infoOffMain(
             "Peer reconnect start host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) failedSession=\(Self.sessionTag(failedSession)) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
         )
@@ -4429,8 +4436,8 @@ final class PeerRelaySession {
                 // Across a replaced transport a refusal usually means the host
                 // restarted and the surface is gone. Retrying the same id would
                 // spend the whole circuit (about two minutes) before the pane
-                // ends; ending now lets its owner rebuild against whatever the
-                // host offers instead.
+                // ends and its banner offers Reconnect; ending now offers it at
+                // once.
                 firstAttachAfterRetargetPending = false
                 retargetedSurfaceWasRejected = true
                 RemoteWorkLog.warningOffMain(

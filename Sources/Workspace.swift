@@ -3565,20 +3565,13 @@ final class Workspace: Identifiable {
                 description: reason
             )
         }
-        session.relaySession.onDisconnect = { [weak self, weak panel, weak session] in
+        session.relaySession.onDisconnect = { [weak session] in
             if recoverRemoteLeader("Remote leader relay disconnected") { return }
-            // The replacement transport refused this surface. Offering a
-            // Reconnect would dial the same missing id; the rebuild below finds
-            // the surface again by id or title. Mirror panes are left to the
-            // mirror, whose reconcile and grace deadline already handle a
-            // surface the host stopped offering.
-            if let self, let panel, let session, self.peerMirror == nil,
-               session.relaySession.retargetedSurfaceWasRejected {
-                Task { @MainActor in
-                    await PeerClientCoordinator.shared.reconnectRemotePane(
-                        oldSession: session, panelId: panel.id, workspace: self
-                    )
-                }
+            // Rebuilding on its own would pick a surface by title with nobody
+            // watching, and several panes could land on one unrelated shell.
+            // The banner's Reconnect does the same search when someone asks.
+            if session?.relaySession.retargetedSurfaceWasRejected == true {
+                showBanner("\(hostLabel) no longer offers this surface")
                 return
             }
             showBanner(hostLabel)
