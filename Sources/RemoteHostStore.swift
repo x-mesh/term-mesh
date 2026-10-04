@@ -1188,6 +1188,11 @@ final class RemoteHostStore: ObservableObject {
     /// A late completion from a cancelled attempt must not turn the row back
     /// into connected after the user has already pressed Retry.
     private var connectAttemptIDs: [String: UUID] = [:]
+    /// The replacement Reconnect Host announced for the connect it is about
+    /// to start. That connect withdraws it if it fails before reaching the
+    /// registry (a socket probe) or lands under another key, so restart
+    /// waiters stop waiting instead of running out their deadline.
+    private var announcedReplacements: [String: (hostKey: PeerPaneHostKey, token: UUID?)] = [:]
     private var profileCancellable: AnyCancellable?
 
     private init() {
@@ -1507,8 +1512,19 @@ final class RemoteHostStore: ObservableObject {
     /// socket focus policy.
     func connectSavedHost(_ host: HostEntry) {
         let key = host.id
-        guard let target = host.sshTarget, !target.isEmpty else { return }
-        guard sidebarLeases[key] == nil, connectTasks[key] == nil else { return }
+        let announced = announcedReplacements.removeValue(forKey: key)
+        let withdrawAnnounced = { (landedKey: PeerPaneHostKey?) in
+            guard let announced, announced.hostKey != landedKey else { return }
+            PeerPaneHostRegistry.shared.abandonPendingReplacement(
+                for: announced.hostKey, token: announced.token
+            )
+        }
+        guard let target = host.sshTarget, !target.isEmpty,
+              sidebarLeases[key] == nil, connectTasks[key] == nil
+        else {
+            withdrawAnnounced(nil)
+            return
+        }
         let attemptID = UUID()
         connectAttemptIDs[key] = attemptID
         hosts[key]?.connectionState = .connecting
@@ -1557,6 +1573,9 @@ final class RemoteHostStore: ObservableObject {
                 )
                 self.hosts[key]?.connectionPhase = .openingTunnel
                 self.connectingLeaseKeys[key] = spec.hostKey
+                // A re-probed socket moves the host to another key; waiters on
+                // the announced one would otherwise wait out their deadline.
+                withdrawAnnounced(spec.hostKey)
                 let lease = try await PeerPaneHostRegistry.shared.acquire(spec)
                 // Cancellation is cooperative. If the acquire completed while
                 // ssh was being reaped, balance it instead of reviving this row.
@@ -1590,7 +1609,9 @@ final class RemoteHostStore: ObservableObject {
                 #endif
             } catch is CancellationError {
                 // cancelConnectingHost already restored the row to `.saved`.
+                withdrawAnnounced(nil)
             } catch {
+                withdrawAnnounced(nil)
                 guard self.connectAttemptIDs[key] == attemptID else { return }
                 self.hosts[key]?.clearAuthenticatedHostCLIBinDirs()
                 self.hosts[key]?.connectionState = .failed(String(describing: error))
@@ -1676,6 +1697,7 @@ final class RemoteHostStore: ObservableObject {
         let hostKey = sidebarLeases[key]?.key ?? (hosts[key] ?? host).paneHostSpec.hostKey
         let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
         let retiredPath = registry.disconnectTransport(for: hostKey, replacementFollows: true)
+        let replacementToken = registry.pendingReplacementToken(for: hostKey)
         if let lease = sidebarLeases.removeValue(forKey: key) {
             registry.release(lease)
         }
@@ -1741,15 +1763,16 @@ final class RemoteHostStore: ObservableObject {
             RemoteWorkLog.info(
                 "Cannot restart \(host.displayName) — another pane is waiting on the same connection attempt; close it first"
             )
-            registry.abandonPendingReplacement(for: hostKey)
+            registry.abandonPendingReplacement(for: hostKey, token: replacementToken)
             return outcome(false)
         }
         // connectSavedHost declines a row with no SSH target; do not report a
         // start that never happened.
         guard (hosts[key] ?? host).sshTarget?.isEmpty == false else {
-            registry.abandonPendingReplacement(for: hostKey)
+            registry.abandonPendingReplacement(for: hostKey, token: replacementToken)
             return outcome(false)
         }
+        announcedReplacements[key] = (hostKey, replacementToken)
         RemoteWorkLog.info(
             retiredPath == nil
                 ? "Retrying connection to \(host.displayName)"
