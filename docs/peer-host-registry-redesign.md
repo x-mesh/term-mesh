@@ -138,7 +138,7 @@ the user's next Connect.
 | `startFinished(attempt, .lease(id) / .failure)` | the start task |
 | `restartFinished(lease, restart, cameBack)` | `PeerPaneTransportRecovery` on the lease (decision 2) |
 | `disconnect(.plain / .force / .reconnect(token))` | `RemoteHostStore` |
-| `reconnectAbandoned(token, movedTo: Key?)` | `RemoteHostStore`: its connect failed, was cancelled, or landed under another key |
+| `reconnectAbandoned(token, movedTo: Key?)` | `RemoteHostStore`: its connect failed, was cancelled, or landed under another key, **before** its token acquire. After the token acquire has started the reconnect, the machine ignores this event; a Cancel must then raise `cancel(w)` on the token holder's waiter, which is the only row that stops a reconnect start. |
 | `cancel(waiter)` | an explicit Cancel |
 | `deadline(waiter)` / `deadline(token)` | an armed deadline fires |
 | `unusedCheck(lease)` | the machine itself, through `queueUnusedCheck` |
@@ -196,7 +196,8 @@ Rule 4 applies before every row. Waiters are listed only where they change.
 | any | `disconnect(.force)` | idle, generation + 1 | as `.plain`, then `fireAbandoned`, park nil |
 | any | `disconnect(.reconnect(t))` | awaitingReconnect(t) | `cancelStart`, `stopTunnel`, `armDeadline(t)`, park update. `user` waiters are **carried**; they keep their deadlines and receive the reconnect's lease. `sweep` and `waiter` origins are resolved with `replacementUnavailable`. The generation is not bumped: the old attempt, lease, and restart ids are retired, and the token now gates who may start. |
 | awaitingReconnect(t) | `acquire(user, spec, token t)` | starting(new, spec, reconnect) + w | `startTunnel`, `armDeadline(w)` |
-| awaitingReconnect(t) | `acquire(any, no token)` | + w | `armDeadline(w)` (they wait for the reconnect) |
+| awaitingReconnect(t) | `acquire(user, no token)` | + w | `armDeadline(w)` (it waits for the reconnect) |
+| awaitingReconnect(t) | `acquire(sweep / waiter)` | — | `resume(w, .error(replacementUnavailable))`, as for the background waiters the Reconnect resolved |
 | awaitingReconnect(t) | `reconnectAbandoned(t, nil)` or `deadline(t)` | idle | `resume(each w, .error(replacementUnavailable))`; apply the park invariant |
 | awaitingReconnect(t) | `reconnectAbandoned(t, movedTo: B)` | idle | `resume(each w, .error(replacementUnavailable))`; `fireAbandoned`, park nil (any reason) |
 | any | a late `startFinished(.lease(L))` | — | `stopTunnel(L)` |
@@ -339,13 +340,14 @@ closes.
 
 | Layer | Bounds | States | Closes at depth | Release build |
 | --- | --- | --- | --- | --- |
-| 1 | 3 waiters, 1 raised acquire in flight, 2 of each disconnect kind | 870,611 | 21 | ~31 s |
-| 2 (default) | 2 waiters, 1 in flight, 2 of each disconnect kind | 370,573 | 15 | ~55 s |
-| 2 (wider, manual) | 3 waiters, 1 in flight, 1 of each disconnect kind | 1,060,036 | 16 | ~190 s |
-| 2 (widest, manual) | 3 waiters, 1 in flight, 2 of each disconnect kind | 6,846,071 | 19 | ~24 min, 7.7 GB |
+| 1 | 3 waiters, 1 raised acquire in flight, 2 of each disconnect kind | 808,475 | 21 | ~30 s |
+| 2 (default) | 2 waiters, 1 in flight, 2 of each disconnect kind | 343,825 | 15 | ~48 s |
+| 2 (wider, manual) | 3 waiters, 1 in flight, 1 of each disconnect kind | 958,228 | 16 | ~170 s |
+| 2 (widest, manual) | 3 waiters, 1 in flight, 2 of each disconnect kind | 6,205,509 | 19 | ~25–45 min, 6–8 GB |
 
 All rows passed with no violation. The wider layer 2 bounds are run by editing
-`ExplorerBounds.layer2`; they are too slow for every test run.
+`ExplorerBounds.layer2`; they are too slow for every test run. A plain debug
+`swift test` of both default layers takes about three and a half minutes.
 
 The guarantee is "no violation in any state reachable within these bounds",
 not "within N steps".
