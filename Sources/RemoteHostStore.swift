@@ -1612,8 +1612,9 @@ final class RemoteHostStore: ObservableObject {
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
         connectTasks[key] = nil
+        var stoppedStart = true
         if let hostKey = connectingLeaseKeys[key] {
-            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
+            stoppedStart = PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
         }
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
@@ -1625,9 +1626,13 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         hosts[key]?.connectionState = .saved
         #if DEBUG
-        dlog("peer.sidebar.connect cancelled key=\(key)")
+        dlog("peer.sidebar.connect cancelled key=\(key) stoppedStart=\(stoppedStart)")
         #endif
-        RemoteWorkLog.info("Cancelled connection to \(host.displayName)")
+        RemoteWorkLog.info(
+            stoppedStart
+                ? "Cancelled connection to \(host.displayName)"
+                : "Stopped waiting for \(host.displayName); other panes still share that connection attempt, so it may still come up"
+        )
     }
 
     /// Abandon whatever this row is doing and start a fresh attempt.
@@ -1736,11 +1741,13 @@ final class RemoteHostStore: ObservableObject {
             RemoteWorkLog.info(
                 "Cannot restart \(host.displayName) — another pane is waiting on the same connection attempt; close it first"
             )
+            registry.abandonPendingReplacement(for: hostKey)
             return outcome(false)
         }
         // connectSavedHost declines a row with no SSH target; do not report a
         // start that never happened.
         guard (hosts[key] ?? host).sshTarget?.isEmpty == false else {
+            registry.abandonPendingReplacement(for: hostKey)
             return outcome(false)
         }
         RemoteWorkLog.info(
