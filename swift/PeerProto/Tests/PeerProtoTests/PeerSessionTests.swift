@@ -984,6 +984,33 @@ final class PeerSessionTests: XCTestCase {
         XCTAssertTrue(didDeclareDead)
     }
 
+    func testRestartingHeartbeatDoesNotCancelAnInFlightTransportWrite() async throws {
+        let transport = MockTransport()
+        let gate = HeartbeatWriteGate()
+        let entered = AsyncFlag()
+        let cancelled = AsyncFlag()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { _ in
+                await withTaskCancellationHandler {
+                    await entered.signal()
+                    await gate.wait()
+                } onCancel: {
+                    Task { await cancelled.signal() }
+                }
+            }
+        )
+        await session.startHeartbeat(intervalSeconds: 0.1, deadAfterSeconds: 3) {}
+        let didEnter = await entered.wait(timeoutSeconds: 1)
+        await session.startHeartbeat(intervalSeconds: 5, deadAfterSeconds: 30) {}
+        let didCancel = await cancelled.wait(timeoutSeconds: 0.2)
+        await session.stopHeartbeat()
+        await gate.release()
+        await transport.closeClientRead()
+        XCTAssertTrue(didEnter)
+        XCTAssertFalse(didCancel, "cancelling a transport write closes the connection")
+    }
+
     func testStoppedHeartbeatIgnoresAStalledPingCompletion() async throws {
         let transport = MockTransport()
         let gate = HeartbeatWriteGate()

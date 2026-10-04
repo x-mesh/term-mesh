@@ -383,7 +383,7 @@ public actor PeerSession {
         heartbeatGeneration &+= 1
         heartbeatTask?.cancel()
         heartbeatTask = nil
-        heartbeatPingTask?.cancel()
+        // Cancelling an in-flight write closes the transport shared by the next heartbeat.
         heartbeatPingTask = nil
         heartbeatPingStartedAt = nil
         heartbeatPingFailed = false
