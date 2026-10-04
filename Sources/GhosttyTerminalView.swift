@@ -3083,15 +3083,43 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         }
     }
 
+    func hasSelection() -> Bool {
+        guard let surface else { return false }
+        return ghostty_surface_has_selection(surface)
+    }
+
     // MARK: - Input Handling
 
     @IBAction func copy(_ sender: Any?) {
-        guard performBindingAction("copy_to_clipboard") else { return }
-        DispatchQueue.main.async {
-            // Copy is the explicit capture gesture for Shelf. This deliberately
-            // avoids observing arbitrary clipboard changes from other apps.
-            Task { @MainActor in _ = await PasteShelfStore.shared.capture() }
+        _ = copySelectionToLocalClipboard()
+    }
+
+    @discardableResult
+    func copySelectionToLocalClipboard() -> Bool {
+        let board = NSPasteboard.general
+        let before = board.changeCount
+        let selected = hasSelection()
+        let accepted = performBindingAction("copy_to_clipboard")
+        let after = board.changeCount
+        let updated = accepted && after != before
+        #if DEBUG
+        let responder = window?.firstResponder
+        let focused = responder != nil && (responder === self
+            || responder === enclosingSurfaceScrollView?.findIMETextView())
+        dlog("terminal.copy surface=\(terminalSurface?.id.uuidString ?? "none") selection=\(selected) focused=\(focused) action=\(accepted) clipboard_before=\(before) clipboard_after=\(after) updated=\(updated)")
+        #endif
+        guard updated else {
+            RemoteWorkLog.info("Terminal copy did not update the local clipboard (selection=\(selected))")
+            return false
         }
+        DispatchQueue.main.async {
+            Task { @MainActor in
+                // Another copy must not be captured as the result of this gesture.
+                guard board.changeCount == after else { return }
+                _ = await PasteShelfStore.shared.capture(from: board)
+            }
+        }
+        return true
     }
 
     @IBAction func paste(_ sender: Any?) {
@@ -3105,8 +3133,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
         switch item.action {
         case #selector(copy(_:)):
-            guard let surface = surface else { return false }
-            return ghostty_surface_has_selection(surface)
+            return hasSelection()
         case #selector(paste(_:)), #selector(pasteAsPlainText(_:)):
             return GhosttyPasteboardHelper.hasString(for: GHOSTTY_CLIPBOARD_STANDARD)
         default:
@@ -3283,16 +3310,14 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown else { return false }
 
-        // When the IME input bar is active, allow Cmd+C to copy terminal selection
-        // even though IMETextView is the first responder. The mouse drag creates a
-        // ghostty selection, but the first-responder guard below would block copy.
-        if let imeTextView = enclosingSurfaceScrollView?.findIMETextView() {
+        // Only the pane owning the first responder can handle an IME copy gesture.
+        if let imeTextView = enclosingSurfaceScrollView?.findIMETextView(),
+           window?.firstResponder === imeTextView {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if event.keyCode == 8 && flags == .command
                 && imeTextView.selectedRange().length == 0,
-               let surface = surface, ghostty_surface_has_selection(surface) {
-                copy(nil)
-                return true
+               hasSelection() {
+                return copySelectionToLocalClipboard()
             }
         }
 
@@ -4034,7 +4059,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             flashItem.target = self
             menu.addItem(.separator())
         }
-        if ghostty_surface_has_selection(surface) {
+        if hasSelection() {
             let item = menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
             item.target = self
         }
