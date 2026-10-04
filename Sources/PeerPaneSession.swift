@@ -610,6 +610,13 @@ final class PeerPaneHostRegistry {
     func disconnectTransport(for key: PeerPaneHostKey) -> String? {
         guard let lease = leases[key] else { return nil }
         leases[key] = nil
+        // Panes preserved on this lease park until a replacement reaches
+        // them. Marking the key makes the next acquire announce itself as
+        // that replacement, whichever path makes it — a sidebar Connect, a
+        // new pane from the Peer menu, a team spawn. Without the mark only
+        // Connect resumed them, and any other path left them parked under a
+        // host the sidebar already showed as connected.
+        replacingKeys.insert(key)
         let sockPath = lease.hostSockPath
         teardown(lease)
         #if DEBUG
@@ -683,7 +690,9 @@ final class PeerPaneSession {
         case failed
     }
 
-    let lease: PeerPaneHostLease
+    /// Replaced only by `retarget(to:)`, when the host's tunnel is replaced
+    /// under a pane that keeps its relay helper.
+    private(set) var lease: PeerPaneHostLease
     let relaySession: PeerRelaySession
     let surfaceTitle: String
     let connectedAt = Date()
@@ -1006,17 +1015,7 @@ final class PeerPaneSession {
         // the session itself holds a socket path that, over SSH, is a local
         // tunnel end. Host-scoped pushes need the real identity.
         relay.hostKey = lease.key
-        relay.configureOwnedTransportRecovery(
-            generation: transportGeneration,
-            mayReconnect: { [weak lease] in lease?.canReconnectTransport == true },
-            handler: { [weak lease] generation in
-                guard let lease else { return generation }
-                return await lease.refreshTransport(
-                    after: generation,
-                    reason: "owned peer session stopped responding"
-                )
-            }
-        )
+        installOwnedTransportRecovery(on: relay, lease: lease, generation: transportGeneration)
         do {
             // Bind the local relay socket BEFORE Ghostty spawns the relay
             // binary as the pane's shell — the binary connects immediately
@@ -1157,17 +1156,7 @@ final class PeerPaneSession {
             throw error
         }
         relay.hostKey = lease.key
-        relay.configureOwnedTransportRecovery(
-            generation: transportGeneration,
-            mayReconnect: { [weak lease] in lease?.canReconnectTransport == true },
-            handler: { [weak lease] generation in
-                guard let lease else { return generation }
-                return await lease.refreshTransport(
-                    after: generation,
-                    reason: "owned peer session stopped responding"
-                )
-            }
-        )
+        installOwnedTransportRecovery(on: relay, lease: lease, generation: transportGeneration)
         do {
             try relay.prepareListener()
         } catch {
@@ -1206,6 +1195,67 @@ final class PeerPaneSession {
     /// report on top of the first. A fresh connection is required rather than
     /// convenient: this is a direct-response RPC, so it cannot share a
     /// connection that has an ensure in flight or an inbound pump running.
+    private static func installOwnedTransportRecovery(
+        on relay: PeerRelaySession,
+        lease: PeerPaneHostLease,
+        generation: UInt64
+    ) {
+        relay.configureOwnedTransportRecovery(
+            generation: generation,
+            mayReconnect: { [weak lease] in lease?.canReconnectTransport == true },
+            handler: { [weak lease] generation in
+                guard let lease else { return generation }
+                return await lease.refreshTransport(
+                    after: generation,
+                    reason: "owned peer session stopped responding"
+                )
+            }
+        )
+    }
+
+    /// Move this pane onto the lease that replaced the one it attached
+    /// through, keeping its relay helper, Ghostty surface, and scrollback.
+    /// False when the pane cannot move — torn down, a different host, or a
+    /// relay that already ended — and only a respawn brings it back.
+    @discardableResult
+    func retarget(to replacement: PeerPaneHostLease) -> Bool {
+        guard Self.mayRetarget(
+            isTorndown: isTorndown,
+            sameHost: replacement.key == lease.key,
+            sameLease: replacement === lease,
+            replacementIsActive: replacement.canReconnectTransport
+        ) else { return false }
+        let moved = relaySession.retargetOwnedTransport(
+            hostSockPath: replacement.hostSockPath,
+            hostKey: replacement.key,
+            generation: replacement.transportGeneration,
+            mayReconnect: { [weak replacement] in replacement?.canReconnectTransport == true },
+            handler: { [weak replacement] generation in
+                guard let replacement else { return generation }
+                return await replacement.refreshTransport(
+                    after: generation,
+                    reason: "owned peer session stopped responding"
+                )
+            }
+        )
+        guard moved else { return false }
+        PeerPaneHostRegistry.shared.retain(replacement)
+        let previous = lease
+        lease = replacement
+        PeerPaneHostRegistry.shared.release(previous)
+        hostTransportWasDisconnected = false
+        return true
+    }
+
+    nonisolated static func mayRetarget(
+        isTorndown: Bool,
+        sameHost: Bool,
+        sameLease: Bool,
+        replacementIsActive: Bool
+    ) -> Bool {
+        !isTorndown && sameHost && !sameLease && replacementIsActive
+    }
+
     static func terminateSurface(hostSockPath: String, surfaceID: Data) async {
         guard !hostSockPath.isEmpty, !surfaceID.isEmpty,
               let connection = try? await PeerRelaySession.connect(hostSockPath: hostSockPath)
@@ -1242,7 +1292,12 @@ final class PeerPaneSession {
     /// panes have no tunnel to stop, so their owned relay is stopped here.
     func prepareForHostTransportDisconnect(stopRelay: Bool) {
         hostTransportWasDisconnected = true
-        guard stopRelay else { return }
+        guard stopRelay else {
+            // The tunnel's EOF is about to reach this relay. Parking it keeps
+            // the helper (the pane's shell) alive for `retarget(to:)`.
+            relaySession.awaitTransportReplacement()
+            return
+        }
         Task { await relaySession.stop() }
     }
 

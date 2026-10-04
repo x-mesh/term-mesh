@@ -354,6 +354,34 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         return reattached
     }
 
+    /// Reconnect for a pane parked on a retired transport. A replacement may
+    /// already be pooled (reached by a path that did not announce it), may
+    /// need acquiring, or may be unreachable under this pane's host key. The
+    /// first two move every parked pane on the host; in the last case the
+    /// park is abandoned so the pane takes the ordinary disconnected path,
+    /// whose Reconnect rebuilds it.
+    func reconnectParkedPane(_ session: PeerPaneSession) async {
+        let registry = PeerPaneHostRegistry.shared
+        let key = session.lease.key
+        var acquired: PeerPaneHostLease?
+        if registry.activeLease(forKey: key) == nil {
+            do {
+                acquired = try await registry.acquire(session.originSpec)
+            } catch {
+                RemoteWorkLog.info(
+                    "Could not reach \(key.shortLabel) for a paused pane: \(error)"
+                )
+            }
+        }
+        resumePanesAfterHostReconnect(key)
+        // Held until the panes above took their own refs, so a lease nobody
+        // moved onto is the only one this release can stop.
+        if let acquired { registry.release(acquired) }
+        if !session.isTorndown, session.relaySession.isAwaitingTransportReplacement {
+            session.relaySession.abandonTransportReplacement()
+        }
+    }
+
     // MARK: - Live workspace mirrors (Phase 2B)
 
     private var openWorkspaceMirrors: [PeerWorkspaceMirrorController] = []
