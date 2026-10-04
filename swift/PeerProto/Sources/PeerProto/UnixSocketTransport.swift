@@ -151,19 +151,36 @@ public actor UnixSocketTransport {
     }
 
     public func write(_ data: Data) async throws {
-        if isClosed {
-            throw UnixSocketTransportError.closed
-        }
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error = error {
-                    cont.resume(throwing: UnixSocketTransportError.underlying(
-                        description: String(describing: error)
-                    ))
-                } else {
-                    cont.resume()
+        if isClosed { throw UnixSocketTransportError.closed }
+        let connection = self.connection
+        let queue = self.queue
+        let timeoutSeconds: TimeInterval = 10
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                let resumed = ResumedFlag()
+                queue.asyncAfter(deadline: .now() + timeoutSeconds) { [weak self] in
+                    if resumed.setOnce() {
+                        connection.cancel()
+                        Task { await self?.close() }
+                        cont.resume(throwing: UnixSocketTransportError.underlying(
+                            description: "write timed out after \(Int(timeoutSeconds))s"
+                        ))
+                    }
                 }
-            })
+                connection.send(content: data, completion: .contentProcessed { error in
+                    guard resumed.setOnce() else { return }
+                    if let error = error {
+                        cont.resume(throwing: UnixSocketTransportError.underlying(
+                            description: String(describing: error)
+                        ))
+                    } else {
+                        cont.resume()
+                    }
+                })
+            }
+        } onCancel: {
+            connection.cancel()
         }
     }
 

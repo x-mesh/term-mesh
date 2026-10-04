@@ -808,9 +808,8 @@ final class PeerSSHTunnel: @unchecked Sendable {
         let p = process
         process = nil
         lock.unlock()
-        if let p, p.isRunning {
-            p.terminate()
-            p.waitUntilExit()
+        if !Self.reap(p) {
+            RemoteWorkLog.warningOffMain("SSH process did not exit within the termination budget for \(sshTarget)")
         }
     }
 

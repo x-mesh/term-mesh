@@ -360,6 +360,59 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+    @MainActor
+    func testConnectTimeoutCancelsTheAttemptAndRejectsAStaleTimeout() async {
+        let store = RemoteHostStore.shared
+        let hostID = "connection-timeout-\(UUID())"
+        var host = HostEntry(
+            id: hostID, displayName: hostID, connectionState: .connecting,
+            workspaces: [], activeSockPath: "", sshTarget: nil, remoteSockPath: nil
+        )
+        host.connectionPhase = .openingTunnel
+        host.connectionStartedAt = Date()
+        defer { store.removePeerShellCleanupCacheForTesting(hostID: hostID) }
+        let attempt = Task<Void, Never> { try? await Task.sleep(nanoseconds: 60_000_000_000) }
+        let attemptID = UUID()
+        store.installConnectingHostForTesting(host, attemptID: attemptID, task: attempt)
+        store.timeoutConnectingHost(host, attemptID: attemptID)
+        XCTAssertTrue(attempt.isCancelled)
+        guard case .failed(let reason) = store.hosts[hostID]?.connectionState else {
+            XCTFail("timeout must end the connecting state")
+            return
+        }
+        XCTAssertTrue(reason.contains("Opening SSH tunnel"))
+        XCTAssertNil(store.hosts[hostID]?.connectionPhase)
+        XCTAssertNil(store.hosts[hostID]?.connectionStartedAt)
+        _ = await attempt.value
+
+        let replacement = Task<Void, Never> { try? await Task.sleep(nanoseconds: 60_000_000_000) }
+        store.installConnectingHostForTesting(host, attemptID: UUID(), task: replacement)
+        store.timeoutConnectingHost(host, attemptID: attemptID)
+        XCTAssertFalse(replacement.isCancelled)
+        XCTAssertEqual(store.hosts[hostID]?.connectionState, .connecting)
+        store.cancelConnectingHost(host)
+        _ = await replacement.value
+    }
+
+    @MainActor
+    func testConnectionProgressChangesTheHostSnapshotAndClearsWithTheRoute() {
+        let baseline = HostEntry(
+            id: "progress-test", displayName: "progress-test", connectionState: .connecting,
+            workspaces: [], activeSockPath: "", sshTarget: "test.invalid", remoteSockPath: ""
+        )
+        var host = baseline
+        host.connectionStartedAt = Date()
+        host.connectionPhase = .discoveringSocket
+        XCTAssertNotEqual(host, baseline)
+        let discovering = host
+        host.connectionPhase = .openingTunnel
+        XCTAssertNotEqual(host, discovering)
+        host.clearServingMetadata()
+        XCTAssertNil(host.connectionPhase)
+        XCTAssertNil(host.connectionStartedAt)
+    }
+
+
     func test_cleanupProjectsBecomeEligibleOnlyWhenEveryLiveSurfaceIsSelected() {
         let a = Data([1])
         let b = Data([2])
