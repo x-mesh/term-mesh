@@ -20,6 +20,12 @@ actor AsyncFlag {
     }
 }
 
+private actor HeartbeatWriteGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async { await withCheckedContinuation { continuation = $0 } }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
 /// Thread-safe counter a `Sendable` callback can increment and an async
 /// test body can read back. Used to assert exactly-once firing of
 /// `onFirstMiss` / `onMissRecovered`.
@@ -955,6 +961,51 @@ final class PeerSessionTests: XCTestCase {
         XCTAssertTrue(fired, "heartbeat should have called onDead within 2s")
 
         await session.stopHeartbeat()
+    }
+
+    func testHeartbeatDeclaresDeadWhenPingWriteStalls() async throws {
+        let transport = MockTransport()
+        let gate = HeartbeatWriteGate()
+        let entered = AsyncFlag()
+        let dead = AsyncFlag()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { _ in await entered.signal(); await gate.wait() }
+        )
+        await session.startHeartbeat(intervalSeconds: 0.1, deadAfterSeconds: 0.3) {
+            Task { await dead.signal() }
+        }
+        let didEnterWrite = await entered.wait(timeoutSeconds: 1)
+        let didDeclareDead = await dead.wait(timeoutSeconds: 1)
+        await session.stopHeartbeat()
+        await gate.release()
+        await transport.closeClientRead()
+        XCTAssertTrue(didEnterWrite)
+        XCTAssertTrue(didDeclareDead)
+    }
+
+    func testStoppedHeartbeatIgnoresAStalledPingCompletion() async throws {
+        let transport = MockTransport()
+        let gate = HeartbeatWriteGate()
+        let entered = AsyncFlag()
+        let dead = AsyncFlag()
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { _ in
+                await entered.signal()
+                await gate.wait()
+                throw CancellationError()
+            }
+        )
+        await session.startHeartbeat(intervalSeconds: 0.1, deadAfterSeconds: 0.3) {
+            Task { await dead.signal() }
+        }
+        _ = await entered.wait(timeoutSeconds: 1)
+        await session.stopHeartbeat()
+        await gate.release()
+        let fired = await dead.wait(timeoutSeconds: 0.5)
+        await transport.closeClientRead()
+        XCTAssertFalse(fired)
     }
 
     /// Heartbeat must NOT fire `onDead` while the remote is replying

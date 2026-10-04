@@ -533,12 +533,30 @@ nonisolated func acceptingTeamHostSnapshot(
     return .ready(snapshot)
 }
 
+enum HostConnectionPhase: Equatable {
+    case discoveringSocket
+    case openingTunnel
+    case authenticating
+    case loadingWorkspaces
+
+    var label: String {
+        switch self {
+        case .discoveringSocket: return "Finding peer socket"
+        case .openingTunnel: return "Opening SSH tunnel"
+        case .authenticating: return "Authenticating peer"
+        case .loadingWorkspaces: return "Reading workspaces"
+        }
+    }
+}
+
 struct HostEntry: Identifiable, Equatable {
     var guiRosterVerified = false
     var daemonRosterVerified = false
     let id: String         // stable dedup key (stableKey)
     var displayName: String
     var connectionState: HostConnectionState
+    var connectionPhase: HostConnectionPhase? = nil
+    var connectionStartedAt: Date? = nil
     var workspaces: [WorkspaceSummary]
     /// Agent teams the host reported, empty on hosts predating
     /// `team.roster.v1` or running none.
@@ -704,6 +722,8 @@ struct HostEntry: Identifiable, Equatable {
     }
 
     mutating func clearServingMetadata() {
+        connectionPhase = nil
+        connectionStartedAt = nil
         supportsWorkspaceLifecycle = nil
         servingAppVersion = nil
         sessionHostRemoteSockPath = nil
@@ -983,6 +1003,12 @@ final class RemoteHostStore: ObservableObject {
     }
 
     #if DEBUG
+    func installConnectingHostForTesting(_ host: HostEntry, attemptID: UUID, task: Task<Void, Never>) {
+        hosts[host.id] = host
+        connectAttemptIDs[host.id] = attemptID
+        connectTasks[host.id] = task
+    }
+
     func installPeerShellCleanupCacheForTesting(
         hostID: String, sockPath: String, workspaces: [WorkspaceSummary]
     ) {
@@ -1462,6 +1488,16 @@ final class RemoteHostStore: ObservableObject {
         sidebarLeases[key] != nil
     }
 
+    func timeoutConnectingHost(_ host: HostEntry, attemptID: UUID) {
+        let key = host.id
+        guard connectAttemptIDs[key] == attemptID,
+              hosts[key]?.connectionState == .connecting else { return }
+        let phase = hosts[key]?.connectionPhase?.label ?? "Connecting"
+        cancelConnectingHost(host)
+        hosts[key]?.connectionState = .failed("Timed out after \(Int(Self.connectTimeoutSeconds))s: \(phase)")
+        RemoteWorkLog.info("\(host.displayName) did not answer in \(Int(Self.connectTimeoutSeconds))s — use Retry Connection")
+    }
+
     /// Click-to-connect for a saved host: resolve the remote socket
     /// (auto-detect when the profile left it empty), lease the host —
     /// the sidebar holds one ref so the tunnel stays up while the user
@@ -1476,33 +1512,19 @@ final class RemoteHostStore: ObservableObject {
         let attemptID = UUID()
         connectAttemptIDs[key] = attemptID
         hosts[key]?.connectionState = .connecting
+        hosts[key]?.connectionStartedAt = Date()
+        hosts[key]?.connectionPhase = (host.remoteSockPath ?? "").isEmpty ? .discoveringSocket : .openingTunnel
         #if DEBUG
         dlog("peer.sidebar.connect start key=\(key)")
         #endif
         connectTasks[key] = Task { [weak self] in
             guard let self else { return }
-            // The acquire below can block indefinitely (a hung ssh spawn is
-            // not cancellation-cooperative), which would strand the row in
-            // `.connecting` where neither Connect nor Disconnect is offered.
-            // The watchdog only moves the row to `.failed` so Retry becomes
-            // reachable — it never touches the in-flight acquire, and the
-            // attemptID guard below still adopts a late success.
             let watchdog = Task { [weak self] in
                 try? await Task.sleep(
                     nanoseconds: UInt64(Self.connectTimeoutSeconds * 1_000_000_000)
                 )
                 guard !Task.isCancelled, let self else { return }
-                guard self.connectAttemptIDs[key] == attemptID,
-                      self.hosts[key]?.connectionState == .connecting
-                else { return }
-                self.hosts[key]?.connectionState =
-                    .failed("Timed out after \(Int(Self.connectTimeoutSeconds))s")
-                #if DEBUG
-                dlog("peer.sidebar.connect timeout key=\(key)")
-                #endif
-                RemoteWorkLog.info(
-                    "\(host.displayName) did not answer in \(Int(Self.connectTimeoutSeconds))s — use Retry Connection"
-                )
+                self.timeoutConnectingHost(host, attemptID: attemptID)
             }
             defer { watchdog.cancel() }
             defer {
@@ -1533,6 +1555,7 @@ final class RemoteHostStore: ObservableObject {
                     port: profile?.sshPort,
                     identityFile: profile?.identityFile
                 )
+                self.hosts[key]?.connectionPhase = .openingTunnel
                 self.connectingLeaseKeys[key] = spec.hostKey
                 let lease = try await PeerPaneHostRegistry.shared.acquire(spec)
                 // Cancellation is cooperative. If the acquire completed while
@@ -1571,6 +1594,8 @@ final class RemoteHostStore: ObservableObject {
                 guard self.connectAttemptIDs[key] == attemptID else { return }
                 self.hosts[key]?.clearAuthenticatedHostCLIBinDirs()
                 self.hosts[key]?.connectionState = .failed(String(describing: error))
+                self.hosts[key]?.connectionPhase = nil
+                self.hosts[key]?.connectionStartedAt = nil
                 #if DEBUG
                 dlog("peer.sidebar.connect fail key=\(key) error=\(error)")
                 #endif
@@ -2014,11 +2039,17 @@ final class RemoteHostStore: ObservableObject {
         // compares `HostEntry` to decide whether to redraw, so a flag held
         // only in the set above never reaches it.
         hosts[key]?.isRefreshing = true
+        hosts[key]?.connectionPhase = .authenticating
+        if hosts[key]?.connectionStartedAt == nil { hosts[key]?.connectionStartedAt = Date() }
         // Task inherits @MainActor; await suspensions yield main without blocking it.
         fetchTasks[key] = Task {
             defer {
                 self.fetchInFlight.remove(key)
                 self.hosts[key]?.isRefreshing = false
+                if !Task.isCancelled, self.hosts[key]?.activeSockPath == path {
+                    self.hosts[key]?.connectionPhase = nil
+                    self.hosts[key]?.connectionStartedAt = nil
+                }
             }
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
@@ -2085,6 +2116,9 @@ final class RemoteHostStore: ObservableObject {
                     }
                 }
                 let workspaces: [Termmesh_Peer_V1_Workspace]
+                if !Task.isCancelled, self.hosts[key]?.activeSockPath == path {
+                    self.hosts[key]?.connectionPhase = .loadingWorkspaces
+                }
                 do {
                     workspaces = try await conn.session.listWorkspaces(timeoutSeconds: 10)
                 } catch {

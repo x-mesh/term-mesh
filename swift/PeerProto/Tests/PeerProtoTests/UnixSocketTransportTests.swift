@@ -64,6 +64,60 @@ final class UnixSocketTransportTests: XCTestCase {
         await transport.close()
     }
 
+    func testWriteTimeoutClosesANonDrainingSocket() async throws {
+        let sockPath = "/tmp/tm-peer-write-timeout-\(UUID().uuidString.prefix(8)).sock"
+        let listenerFd = try Self.makeUnixListener(socketPath: sockPath)
+        defer { Darwin.close(listenerFd); unlink(sockPath) }
+        let release = AsyncFlag()
+        let acceptTask = Task.detached {
+            let fd = Darwin.accept(listenerFd, nil, nil)
+            guard fd >= 0 else { return }
+            _ = await release.wait(timeoutSeconds: 15)
+            Darwin.close(fd)
+        }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath, timeoutSeconds: 1)
+        do {
+            try await transport.write(Data(repeating: 0x41, count: 8 * 1024 * 1024))
+            XCTFail("a stalled write must time out")
+        } catch let error as UnixSocketTransportError {
+            guard case .underlying(let description) = error else {
+                XCTFail("unexpected error: \(error)")
+                await release.signal()
+                await transport.close()
+                _ = await acceptTask.value
+                return
+            }
+            XCTAssertTrue(description.contains("write timed out"))
+        }
+        await release.signal()
+        await transport.close()
+        _ = await acceptTask.value
+    }
+
+    func testCancellingAWriteClosesANonDrainingSocket() async throws {
+        let sockPath = "/tmp/tm-peer-write-cancel-\(UUID().uuidString.prefix(8)).sock"
+        let listenerFd = try Self.makeUnixListener(socketPath: sockPath)
+        defer { Darwin.close(listenerFd); unlink(sockPath) }
+        let release = AsyncFlag()
+        let acceptTask = Task.detached {
+            let fd = Darwin.accept(listenerFd, nil, nil)
+            guard fd >= 0 else { return }
+            _ = await release.wait(timeoutSeconds: 5)
+            Darwin.close(fd)
+        }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath, timeoutSeconds: 1)
+        let writer = Task { try await transport.write(Data(repeating: 0x41, count: 8 * 1024 * 1024)) }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        writer.cancel()
+        do {
+            try await writer.value
+            XCTFail("a cancelled stalled write must fail")
+        } catch {}
+        await release.signal()
+        await transport.close()
+        _ = await acceptTask.value
+    }
+
     /// Locate repo root by walking up from this test's source file.
     /// swift/PeerProto/Tests/PeerProtoTests/UnixSocketTransportTests.swift
     /// → PeerProtoTests → Tests → PeerProto → swift → repo root.

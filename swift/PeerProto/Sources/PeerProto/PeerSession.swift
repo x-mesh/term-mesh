@@ -264,6 +264,10 @@ public actor PeerSession {
     /// until the kernel TCP keepalive fires (default 2 hours on
     /// macOS).
     private var heartbeatTask: Task<Void, Never>?
+    private var heartbeatPingTask: Task<Void, Never>?
+    private var heartbeatPingStartedAt: TimeInterval?
+    private var heartbeatPingFailed = false
+    private var heartbeatGeneration: UInt64 = 0
     // Use awake-time rather than wall time. `Date` advances while macOS is
     // asleep, so the first heartbeat tick after wake used to see the whole
     // sleep interval as host silence and tear down a healthy remote pane.
@@ -342,7 +346,8 @@ public actor PeerSession {
         onMissRecovered: (@Sendable () -> Void)? = nil,
         onDead: @escaping @Sendable () -> Void
     ) {
-        heartbeatTask?.cancel()
+        stopHeartbeat()
+        let generation = heartbeatGeneration
         let nowUptime = ProcessInfo.processInfo.systemUptime
         lastPongUptime = nowUptime
         lastInboundUptime = nowUptime
@@ -354,10 +359,11 @@ public actor PeerSession {
                 try? await Task.sleep(nanoseconds: intervalNs)
                 if Task.isCancelled { return }
                 guard let self else { return }
-                let result = await self.tickHeartbeat(deadAfterSeconds: deadAfterSeconds)
+                let result = await self.tickHeartbeat(deadAfterSeconds: deadAfterSeconds, generation: generation)
+                guard !Task.isCancelled, await self.heartbeatGeneration == generation else { return }
                 switch result {
                 case .dead:
-                    onDead()
+                    await self.endHeartbeat(generation: generation, onDead: onDead)
                     return
                 case .firstMiss:
                     onFirstMiss?()
@@ -374,8 +380,19 @@ public actor PeerSession {
     /// Cancel any in-flight heartbeat task. Safe to call multiple
     /// times and from teardown paths.
     public func stopHeartbeat() {
+        heartbeatGeneration &+= 1
         heartbeatTask?.cancel()
         heartbeatTask = nil
+        heartbeatPingTask?.cancel()
+        heartbeatPingTask = nil
+        heartbeatPingStartedAt = nil
+        heartbeatPingFailed = false
+    }
+
+    private func endHeartbeat(generation: UInt64, onDead: @Sendable () -> Void) {
+        guard heartbeatGeneration == generation else { return }
+        stopHeartbeat()
+        onDead()
     }
 
     /// Outcome of a single heartbeat tick, folding the P6 first-miss/
@@ -388,8 +405,9 @@ public actor PeerSession {
         case dead
     }
 
-    private func tickHeartbeat(deadAfterSeconds: TimeInterval) async -> HeartbeatTick {
-        // Only declare the session dead when BOTH the last processed Pong AND
+    private func tickHeartbeat(deadAfterSeconds: TimeInterval, generation: UInt64) -> HeartbeatTick {
+        guard heartbeatGeneration == generation else { return .alive }
+        // Inbound silence requires BOTH the last processed Pong AND
         // the last inbound bytes are older than the deadline. A sustained
         // host→client flood blocks the pump loop from *processing* the Pong in
         // time, but bytes are still arriving, so `lastInboundUptime` stays fresh —
@@ -397,6 +415,10 @@ public actor PeerSession {
         // Goodbye and close a perfectly healthy relay pane). Awake-time also
         // prevents a local Mac sleep from counting as remote host silence.
         let nowUptime = ProcessInfo.processInfo.systemUptime
+        if heartbeatPingFailed
+            || heartbeatPingStartedAt.map({ nowUptime - $0 > deadAfterSeconds }) == true {
+            return .dead
+        }
         if nowUptime - lastPongUptime > deadAfterSeconds
             && nowUptime - lastInboundUptime > deadAfterSeconds {
             return .dead
@@ -412,18 +434,33 @@ public actor PeerSession {
             result = .firstMiss
         }
         pongSeenSinceLastTick = false
-        pingCounter &+= 1
-        let nonce = pingCounter
-        do {
-            try await sendEnvelope { env in
-                var p = Termmesh_Peer_V1_Ping()
-                p.nonce = nonce
-                env.ping = p
+        if heartbeatPingTask == nil {
+            pingCounter &+= 1
+            let nonce = pingCounter
+            let generation = heartbeatGeneration
+            heartbeatPingStartedAt = nowUptime
+            heartbeatPingTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.sendEnvelope { env in
+                        var p = Termmesh_Peer_V1_Ping()
+                        p.nonce = nonce
+                        env.ping = p
+                    }
+                    await self.finishHeartbeatPing(generation: generation, failed: false)
+                } catch {
+                    await self.finishHeartbeatPing(generation: generation, failed: true)
+                }
             }
-            return result
-        } catch {
-            return .dead
         }
+        return result
+    }
+
+    private func finishHeartbeatPing(generation: UInt64, failed: Bool) {
+        guard heartbeatGeneration == generation else { return }
+        heartbeatPingTask = nil
+        heartbeatPingStartedAt = nil
+        heartbeatPingFailed = failed
     }
 
     // MARK: - Handshake
