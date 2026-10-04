@@ -631,8 +631,16 @@ final class PeerPaneHostRegistry {
     /// Existing views keep their session objects and receive ordinary EOF,
     /// which drives their disconnected UI. A later acquire creates a fresh
     /// lease instead of reviving this stopped tunnel.
+    ///
+    /// `replacementFollows` is true for Reconnect Host, which starts the
+    /// replacement in the same call. An acquire that was waiting on this
+    /// lease's restart must then go on to that replacement; only a plain
+    /// Disconnect Host should make it give up.
     @discardableResult
-    func disconnectTransport(for key: PeerPaneHostKey) -> String? {
+    func disconnectTransport(
+        for key: PeerPaneHostKey,
+        replacementFollows: Bool = false
+    ) -> String? {
         guard let lease = leases[key] else { return nil }
         leases[key] = nil
         // Panes preserved on this lease park until a replacement reaches
@@ -642,7 +650,7 @@ final class PeerPaneHostRegistry {
         // Connect resumed them, and any other path left them parked under a
         // host the sidebar already showed as connected.
         replacingKeys.insert(key)
-        lease.wasDisconnected = true
+        lease.wasDisconnected = !replacementFollows
         let sockPath = lease.hostSockPath
         teardown(lease)
         #if DEBUG
@@ -1271,6 +1279,28 @@ final class PeerPaneSession {
         PeerPaneHostRegistry.shared.release(previous)
         hostTransportWasDisconnected = false
         return true
+    }
+
+    enum HostReconnectReattach: Equatable {
+        /// Moved onto the replacement; nothing else to do.
+        case moved
+        /// Rebuild the pane against the replacement, finding its surface again.
+        case rebuild
+        /// Leave the pane on its banner for the user's own Reconnect.
+        case leaveBanner
+    }
+
+    /// What a host reconnect does for a pane that Disconnect Host preserved.
+    /// A pane whose surface the host already refused stays on its banner: a
+    /// rebuild nobody watches would pick a surface by title, and several such
+    /// panes could land on one unrelated shell.
+    nonisolated static func hostReconnectReattach(
+        retargeted: Bool,
+        surfaceWasRejected: Bool
+    ) -> HostReconnectReattach {
+        if retargeted { return .moved }
+        if surfaceWasRejected { return .leaveBanner }
+        return .rebuild
     }
 
     nonisolated static func mayRetarget(

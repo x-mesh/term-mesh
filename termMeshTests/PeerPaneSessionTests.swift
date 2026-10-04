@@ -4414,6 +4414,44 @@ final class PeerPaneSessionTests: XCTestCase {
         registry.release(restarting)
     }
 
+    /// Reconnect Host retires the lease and starts its replacement in one
+    /// call. An acquire that was joining the old lease's restart — a pane's
+    /// banner Reconnect, a team spawn — must go on to that replacement, not
+    /// fail with "disconnected" in the middle of the user's own reconnect.
+    @MainActor
+    func test_registry_restartWaiterFollowsAReconnectHostReplacement() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-reconnect.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        var announced = 0
+        registry.hostTransportDidReplace = { _, _ in announced += 1 }
+
+        let restarting = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === restarting ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            XCTAssertEqual(
+                registry.disconnectTransport(for: key, replacementFollows: true),
+                sockPath
+            )
+            return false
+        }
+
+        let replacement = try await registry.acquire(spec)
+        XCTAssertFalse(replacement === restarting)
+        XCTAssertTrue(registry.activeLease(forKey: key) === replacement)
+        XCTAssertEqual(announced, 1, "the waiter's lease is the replacement the parked panes are owed")
+        registry.release(replacement)
+        registry.release(restarting)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
     /// A restart that does not come back is a dead lease.
     @MainActor
     func test_registry_waitForRestartReplacesTheLeaseThatDoesNot() async throws {
@@ -5030,6 +5068,23 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertFalse(PeerRelaySession.mayAwaitTransportReplacement(
             ownsSession: true, usesRelayHelper: true, isTorndown: true
         ))
+    }
+
+    func test_hostReconnectLeavesARefusedPaneOnItsBanner() {
+        XCTAssertEqual(
+            PeerPaneSession.hostReconnectReattach(retargeted: true, surfaceWasRejected: false),
+            .moved
+        )
+        XCTAssertEqual(
+            PeerPaneSession.hostReconnectReattach(retargeted: false, surfaceWasRejected: false),
+            .rebuild,
+            "a preserved pane whose relay ended (a direct host) is still rebuilt on Connect"
+        )
+        XCTAssertEqual(
+            PeerPaneSession.hostReconnectReattach(retargeted: false, surfaceWasRejected: true),
+            .leaveBanner,
+            "an unattended rebuild of a refused pane would match a surface by title"
+        )
     }
 
     func test_paneRetargetRequiresALiveReplacementForTheSameHost() {
