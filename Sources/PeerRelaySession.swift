@@ -1995,6 +1995,8 @@ final class PeerRelaySession {
         case connected
         case failed
         case refreshTransport
+        /// The host refused this surface or attached a different one.
+        case surfaceRejected
     }
 
     /// How host→viewer PtyData leaves this session.
@@ -2339,6 +2341,13 @@ final class PeerRelaySession {
     /// closed while parked must still release its helper.
     private var transportReplacementWaiter: CheckedContinuation<Void, Never>?
     var onAwaitingTransportReplacement: (@MainActor () -> Void)?
+    /// Set by a retarget until the next attach settles. Only that first
+    /// attach treats a refused surface as final.
+    private var firstAttachAfterRetargetPending = false
+    /// The relay ended because the replacement transport refused this
+    /// surface. The pane's owner reads it to rebuild rather than offer a
+    /// Reconnect that would dial the same missing surface.
+    private(set) var retargetedSurfaceWasRejected = false
 
     func configureOwnedTransportRecovery(
         generation: UInt64,
@@ -2354,9 +2363,30 @@ final class PeerRelaySession {
     /// Relay delivery only: the helper process is what is worth keeping, and
     /// callback (agent) panes rebuild through their own reattach path.
     func awaitTransportReplacement() {
-        guard ownsSession, usesRelayHelper, !isTorndown else { return }
+        guard Self.mayAwaitTransportReplacement(
+            ownsSession: ownsSession, usesRelayHelper: usesRelayHelper, isTorndown: isTorndown
+        ) else { return }
         awaitingTransportReplacement = true
     }
+
+    nonisolated static func mayAwaitTransportReplacement(
+        ownsSession: Bool,
+        usesRelayHelper: Bool,
+        isTorndown: Bool
+    ) -> Bool {
+        ownsSession && usesRelayHelper && !isTorndown
+    }
+
+    /// Stop waiting for a replacement that is not coming. The parked loop
+    /// then ends the pane the way a retired lease always did, which hands it
+    /// the ordinary disconnected banner and its Reconnect.
+    func abandonTransportReplacement() {
+        guard awaitingTransportReplacement else { return }
+        awaitingTransportReplacement = false
+        resumeTransportReplacementWaiter()
+    }
+
+    var isAwaitingTransportReplacement: Bool { awaitingTransportReplacement }
 
     /// Point this pane at the transport that replaced the one it attached
     /// through. False when nothing is left to move — the relay already ended,
@@ -2376,6 +2406,7 @@ final class PeerRelaySession {
             generation: generation, mayReconnect: mayReconnect, handler: handler
         )
         awaitingTransportReplacement = false
+        firstAttachAfterRetargetPending = true
         // Failures against the retired tunnel say nothing about the new one.
         // Left counted, a loop that burned its attempts while the host was
         // asleep would open the circuit on its first try at the replacement.
@@ -4386,12 +4417,26 @@ final class PeerRelaySession {
                 from: failedSession, generation: failedGeneration
             )
             if case .connected = result {
+                firstAttachAfterRetargetPending = false
                 onReconnected?()
                 RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
                 RemoteWorkLog.infoOffMain(
                     "Peer reconnect success host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) sessionGen=\(resumeTransitionGate.currentGeneration()) transportGen=\(ownedTransportGeneration)"
                 )
                 return true
+            }
+            if case .surfaceRejected = result, firstAttachAfterRetargetPending {
+                // Across a replaced transport a refusal usually means the host
+                // restarted and the surface is gone. Retrying the same id would
+                // spend the whole circuit (about two minutes) before the pane
+                // ends; ending now lets its owner rebuild against whatever the
+                // host offers instead.
+                firstAttachAfterRetargetPending = false
+                retargetedSurfaceWasRejected = true
+                RemoteWorkLog.warningOffMain(
+                    "Peer reconnect ended host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) — the replacement host transport no longer offers this surface"
+                )
+                break
             }
             reconnectCircuit.recordFailure()
             // An attempt that dialed the retired path and lost a retarget race
@@ -4522,13 +4567,17 @@ final class PeerRelaySession {
             #endif
             await connection.cancel()
             if case PeerSessionError.attachRejected = error {
-                return .failed
+                return .surfaceRejected
             }
             return .refreshTransport
         }
-        guard outcome.surfaceID == surfaceID, stillEligible() else {
+        guard stillEligible() else {
             await connection.cancel()
             return .failed
+        }
+        guard outcome.surfaceID == surfaceID else {
+            await connection.cancel()
+            return .surfaceRejected
         }
 
         guard let newGeneration = resumeTransitionGate.replaceSession(

@@ -4976,6 +4976,24 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(step(ownsSession: false, hostLeaseIsActive: false, awaiting: true), .stop)
     }
 
+    func test_onlyRelayHelperPanesWaitForATransportReplacement() {
+        XCTAssertTrue(PeerRelaySession.mayAwaitTransportReplacement(
+            ownsSession: true, usesRelayHelper: true, isTorndown: false
+        ))
+        XCTAssertFalse(
+            PeerRelaySession.mayAwaitTransportReplacement(
+                ownsSession: true, usesRelayHelper: false, isTorndown: false
+            ),
+            "callback (agent) panes rebuild through their own reattach and must not park"
+        )
+        XCTAssertFalse(PeerRelaySession.mayAwaitTransportReplacement(
+            ownsSession: false, usesRelayHelper: true, isTorndown: false
+        ))
+        XCTAssertFalse(PeerRelaySession.mayAwaitTransportReplacement(
+            ownsSession: true, usesRelayHelper: true, isTorndown: true
+        ))
+    }
+
     func test_paneRetargetRequiresALiveReplacementForTheSameHost() {
         XCTAssertTrue(PeerPaneSession.mayRetarget(
             isTorndown: false, sameHost: true, sameLease: false, replacementIsActive: true
@@ -9808,6 +9826,175 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             ),
             "an ended relay has nothing left to move"
         )
+        _ = hostTask
+    }
+
+    /// Disconnect Host followed by any acquire of the same host — not only a
+    /// sidebar Connect — must announce itself as the replacement, or panes
+    /// parked on the retired lease wait for a reconnect that already
+    /// happened. The pane then moves its lease ref onto the replacement, so
+    /// its teardown releases the lease it now holds and nothing else.
+    @MainActor
+    func test_paneRetargetMovesItsLeaseRefOntoTheAnnouncedReplacement() async throws {
+        let socketPath = "/tmp/peer-retarget-lease-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let key = spec.hostKey
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+        }
+        var announced: [PeerPaneHostLease] = []
+        registry.hostTransportWillRetire = { _ in }
+        registry.hostTransportDidReplace = { replaced, lease in
+            XCTAssertEqual(replaced, key)
+            announced.append(lease)
+        }
+
+        let retired = try await registry.acquire(spec)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        surface.surfaceType = SessionHostPanes.agentSurfaceType
+        let pane = try await PeerPaneSession.attach(
+            lease: retired, surface: surface, title: "retarget", spec: spec
+        )
+        registry.release(retired)
+
+        pane.prepareForHostTransportDisconnect(stopRelay: false)
+        XCTAssertEqual(registry.disconnectTransport(for: key), socketPath)
+        let replacement = try await registry.acquire(spec)
+        XCTAssertEqual(announced.count, 1, "an acquire after Disconnect Host must announce the replacement")
+        XCTAssertTrue(announced.first === replacement)
+
+        XCTAssertTrue(pane.retarget(to: replacement))
+        XCTAssertTrue(pane.lease === replacement)
+        XCTAssertFalse(pane.hostTransportWasDisconnected)
+        XCTAssertFalse(pane.retarget(to: replacement), "moving onto the lease it already holds is a no-op")
+
+        registry.release(replacement)
+        XCTAssertTrue(
+            registry.activeLease(forKey: key) === replacement,
+            "the pane's own ref must keep the replacement pooled"
+        )
+        pane.teardown()
+        let deadline = Date().addingTimeInterval(5)
+        while registry.activeLease(forKey: key) != nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(
+            registry.activeLease(forKey: key),
+            "teardown must release the replacement it moved onto, leaving no ref behind"
+        )
+        _ = hostTask
+    }
+
+    /// Across a replaced transport a refused surface usually means the host
+    /// restarted. Retrying the same id would spend the whole reconnect
+    /// circuit, about two minutes, before the pane could be rebuilt.
+    @MainActor
+    func test_retargetedReconnectEndsAtOnceWhenTheSurfaceIsRefused() async throws {
+        let suffix = "\(getpid())-\(UUID().uuidString.prefix(8))"
+        let retiredPath = "/tmp/peer-retarget-refused-old-\(suffix).sock"
+        let replacementPath = "/tmp/peer-retarget-refused-new-\(suffix).sock"
+        let retiredHost = AgentSurfaceMockHost(socketPath: retiredPath, capabilities: [])
+        let replacementHost = AgentSurfaceMockHost(socketPath: replacementPath, capabilities: [])
+        let retiredTask = try retiredHost.start()
+        let replacementTask = try replacementHost.start()
+        defer {
+            retiredHost.stop()
+            replacementHost.stop()
+        }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: retiredPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = retiredHost.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0, mayReconnect: { leaseActive }, handler: { $0 }
+        )
+        let parked = expectation(description: "parked on the retired lease")
+        parked.assertForOverFulfill = false
+        let ended = expectation(description: "relay ended after the refusal")
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        relay.onDisconnect = { ended.fulfill() }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        retiredHost.stop()
+        await fulfillment(of: [parked], timeout: 10)
+
+        replacementHost.redirectsAttach = true
+        let retargetedAt = Date()
+        XCTAssertTrue(relay.retargetOwnedTransport(
+            hostSockPath: replacementPath,
+            hostKey: PeerPaneHostSpec.direct(sockPath: replacementPath).hostKey,
+            generation: 1, mayReconnect: { true }, handler: { $0 }
+        ))
+        await fulfillment(of: [ended], timeout: 10)
+
+        XCTAssertTrue(relay.retargetedSurfaceWasRejected)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(retargetedAt), 5,
+            "the refusal must end the pane on the first attempt, not after the circuit"
+        )
+        XCTAssertEqual(relay.transportLiveness, .ended)
+        _ = retiredTask
+        _ = replacementTask
+    }
+
+    /// A Reconnect on a paused pane whose replacement cannot be reached gives
+    /// up the park. The pane must then end the way a retired lease always
+    /// ended it, so the ordinary disconnected banner and its Reconnect apply.
+    @MainActor
+    func test_abandoningAParkEndsThePaneThroughTheOrdinaryDisconnect() async throws {
+        let socketPath = "/tmp/peer-retarget-abandon-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: socketPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0, mayReconnect: { leaseActive }, handler: { $0 }
+        )
+        let parked = expectation(description: "parked on the retired lease")
+        parked.assertForOverFulfill = false
+        let ended = expectation(description: "relay ended after abandoning the park")
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        relay.onDisconnect = { ended.fulfill() }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        host.stop()
+        await fulfillment(of: [parked], timeout: 10)
+        XCTAssertTrue(relay.isAwaitingTransportReplacement)
+
+        relay.abandonTransportReplacement()
+        await fulfillment(of: [ended], timeout: 10)
+        XCTAssertFalse(relay.isAwaitingTransportReplacement)
+        XCTAssertFalse(relay.reconnectInFlightForTesting)
+        XCTAssertEqual(relay.transportLiveness, .ended)
         _ = hostTask
     }
 

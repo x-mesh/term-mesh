@@ -610,6 +610,13 @@ final class PeerPaneHostRegistry {
     func disconnectTransport(for key: PeerPaneHostKey) -> String? {
         guard let lease = leases[key] else { return nil }
         leases[key] = nil
+        // Panes preserved on this lease park until a replacement reaches
+        // them. Marking the key makes the next acquire announce itself as
+        // that replacement, whichever path makes it — a sidebar Connect, a
+        // new pane from the Peer menu, a team spawn. Without the mark only
+        // Connect resumed them, and any other path left them parked under a
+        // host the sidebar already showed as connected.
+        replacingKeys.insert(key)
         let sockPath = lease.hostSockPath
         teardown(lease)
         #if DEBUG

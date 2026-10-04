@@ -3565,10 +3565,23 @@ final class Workspace: Identifiable {
                 description: reason
             )
         }
-        session.relaySession.onDisconnect = {
-            if !recoverRemoteLeader("Remote leader relay disconnected") {
-                showBanner(hostLabel)
+        session.relaySession.onDisconnect = { [weak self, weak panel, weak session] in
+            if recoverRemoteLeader("Remote leader relay disconnected") { return }
+            // The replacement transport refused this surface. Offering a
+            // Reconnect would dial the same missing id; the rebuild below finds
+            // the surface again by id or title. Mirror panes are left to the
+            // mirror, whose reconcile and grace deadline already handle a
+            // surface the host stopped offering.
+            if let self, let panel, let session, self.peerMirror == nil,
+               session.relaySession.retargetedSurfaceWasRejected {
+                Task { @MainActor in
+                    await PeerClientCoordinator.shared.reconnectRemotePane(
+                        oldSession: session, panelId: panel.id, workspace: self
+                    )
+                }
+                return
             }
+            showBanner(hostLabel)
         }
         session.relaySession.onError = { error in
             showBanner("\(hostLabel): \(String(describing: error))")
@@ -3582,10 +3595,15 @@ final class Workspace: Identifiable {
                 }
             )
         }
-        session.relaySession.onAwaitingTransportReplacement = { [weak panel] in
+        session.relaySession.onAwaitingTransportReplacement = { [weak panel, weak session] in
             panel?.hostedView.showPeerDisconnectBanner(
                 reason: "Remote pane paused — waiting for \(hostLabel) to reconnect",
-                onReconnect: nil,
+                onReconnect: { [weak session] in
+                    guard let session else { return }
+                    Task { @MainActor in
+                        await PeerClientCoordinator.shared.reconnectParkedPane(session)
+                    }
+                },
                 onClosePane: { [weak self] in
                     _ = self?.closePanel(panelId, force: true)
                 }
