@@ -737,6 +737,12 @@ final class PeerPaneHostRegistry {
         } else {
             disconnectGenerations[key, default: 0] &+= 1
             pendingReplacementKeys.remove(key)
+            // A start in flight is now stale for everyone already awaiting
+            // it — they keep their own copy and fail its generation check
+            // when it lands, which also tears its lease down. Left in place,
+            // it would be joined by acquires made after the disconnect, such
+            // as the user's next Connect, and doom them too.
+            starting[key] = nil
         }
         guard let lease = leases[key] else { return nil }
         leases[key] = nil
