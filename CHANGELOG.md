@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.264.0] - 2026-10-05
+
+### Fixed
+
+- Remote panes keep their scrollback when host recovery replaces an SSH tunnel after sleep or a connection failure.
+- Disconnect Host stops pending connections and prevents late responses from reconnecting the host.
+- Cancel Connection stops only the current request. Other panes keep their shared connection attempt.
+- Reconnect Host restarts the discovered connection, preserves waiting panes, and ignores responses from the previous tunnel.
+- A surface that the replacement host refuses stays on its disconnected banner until the user selects Reconnect.
+- Remote connections have bounded waits and show the connection phase. SSH recovery has enough time before its caller times out.
+- IME Copy uses the focused terminal pane instead of another pane that still holds the previous selection.
+- Mobile Chat prevents duplicate submissions and preserves retry identifiers after an uncertain response. A successful send clears only its unchanged draft.
+- Mobile Chat and Terminal refresh their content immediately after a view switch, including when the page is in the background.
+- Mobile model selection reports menu navigation failures and closes failed menus.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.263.0] - 2026-10-04
 
 ### Added
