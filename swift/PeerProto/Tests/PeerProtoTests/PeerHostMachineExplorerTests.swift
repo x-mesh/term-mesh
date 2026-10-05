@@ -44,12 +44,6 @@ enum ExplorerSpec: Hashable, Sendable, CustomStringConvertible {
 typealias XM = PeerHostMachine<ExplorerSpec, Int>
 typealias XCore = PeerHostShellCore<ExplorerSpec, Int>
 
-enum LeaseHealth: Hashable {
-    case usable
-    case restarting
-    case dead
-}
-
 struct RestartKey: Hashable, Comparable, CustomStringConvertible {
     let lease: PeerHostLeaseID
     let restart: PeerHostRestartID
@@ -78,7 +72,7 @@ indirect enum ExplorerAction: Hashable, CustomStringConvertible {
     case deliverRaised
     case release
     case closeParked(PeerHostLeaseID)
-    case health(LeaseHealth)
+    case health(XM.Verdict)
     case disconnect(DisconnectChoice)
     case reconnectAbandoned(Int, moved: Bool)
     case cancel(PeerHostWaiterID)
@@ -129,7 +123,7 @@ struct ExplorerWorld: Hashable {
     var holders: [PeerHostLeaseID: Int] = [:]
     /// Panes holding a stopped lease while they wait to be reattached.
     var parked: [PeerHostLeaseID: Int] = [:]
-    var health: [PeerHostLeaseID: LeaseHealth] = [:]
+    var health: [PeerHostLeaseID: XM.Verdict] = [:]
     var mintedWaiters = 0
     var mintedLeases = 0
     var tokens = 0
@@ -146,14 +140,9 @@ struct ExplorerBounds {
     var waiters: Int
     var inFlight: Int
     var disconnectsPerKind: Int
-    var depth: Int
 
-    static let layer1 = ExplorerBounds(waiters: 3, inFlight: 1, disconnectsPerKind: 2, depth: depth("PEER_HOST_EXPLORER_L1_DEPTH", 1000))
-    static let layer2 = ExplorerBounds(waiters: 2, inFlight: 1, disconnectsPerKind: 2, depth: depth("PEER_HOST_EXPLORER_L2_DEPTH", 1000))
-
-    private static func depth(_ name: String, _ fallback: Int) -> Int {
-        ProcessInfo.processInfo.environment[name].flatMap(Int.init) ?? fallback
-    }
+    static let layer1 = ExplorerBounds(waiters: 3, inFlight: 1, disconnectsPerKind: 2)
+    static let layer2 = ExplorerBounds(waiters: 2, inFlight: 1, disconnectsPerKind: 2)
 }
 
 struct ExplorerViolation: Hashable {
@@ -307,17 +296,13 @@ final class ExplorerHarness {
     }
 
     private func verdict(for lease: PeerHostLeaseID) -> XM.Verdict {
-        switch world.health[lease] ?? .usable {
-        case .usable: return .usable
-        case .restarting: return .restarting
-        case .dead: return .dead
-        }
+        world.health[lease] ?? .usable
     }
 
     /// A retarget `retain` can land after a disconnect raised earlier in the
     /// same drain stopped the lease. That pane is then parked under the new
     /// debt, which the every-state check verifies; it is not a defect here.
-    private func shellOnly(_ lease: PeerHostLeaseID, _ delta: Int) {
+    private func shellOnly(_: PeerHostLeaseID, _ delta: Int) {
         covered.insert(delta > 0 ? "shell-only retain" : "shell-only release")
     }
 
@@ -329,6 +314,7 @@ final class ExplorerHarness {
                 execute(pending.action)
             }
         }
+        checkDeadVerdictRetires(effect, context)
         switch effect {
         case let .startTunnel(attempt, spec):
             if case let .starting(_, _, purpose) = core.state.phase {
@@ -338,11 +324,11 @@ final class ExplorerHarness {
             world.pendingStarts.insert(attempt)
         case .cancelStart:
             covered.insert("cancelStart on \(context.cause.kind)")
-            switch context.cause {
-            case .cancel, .disconnect:
+            switch (context.cause, context.before.phase) {
+            case (.disconnect, _), (.cancel, .starting(_, _, .fresh)), (.cancel, .starting(_, _, .reconnect)):
                 break
             default:
-                record("rule 7", "a start was cancelled by \(context.cause), not by a Cancel or a disconnect")
+                record("rule 7", "\(context.cause) cancelled the start in \(context.before.phase)")
             }
         case let .stopTunnel(lease):
             covered.insert("stopTunnel on \(context.cause.kind)")
@@ -379,6 +365,14 @@ final class ExplorerHarness {
             default:
                 record("rule 6", "parked panes abandoned on \(context.cause), where no replacement had failed")
             }
+            switch (context.before.park, context.cause) {
+            case (.userDisconnected?, .disconnect(.force)), (.userDisconnected?, .reconnectAbandoned(_, true)):
+                break
+            case (.userDisconnected?, _):
+                record("rule 6", "a userDisconnected debt was abandoned on \(context.cause); it waits for the user's Connect")
+            default:
+                break
+            }
             let parked = world.parked
             world.parked = [:]
             for (old, panes) in parked.sorted(by: { $0.key < $1.key }) {
@@ -403,11 +397,18 @@ final class ExplorerHarness {
             return record("rule 4", "\(waiter) was resolved twice, or was never asked")
         }
         world.armedWaiters.remove(waiter)
+        let origin = context.before.waiters.first { $0.id == waiter }?.origin
         guard case let .lease(lease) = outcome else {
             if case let .failure(failure) = outcome {
                 covered.insert("resume \(failure) on \(context.cause.kind)")
             }
+            if case .disconnect(.reconnect) = context.cause, origin == .user {
+                record("reconnect origin", "Reconnect resolved user waiter \(waiter) instead of carrying it")
+            }
             return
+        }
+        if case .startFinished = context.cause, case .starting(_, _, .reconnect) = context.before.phase, origin != .user {
+            record("reconnect origin", "\(waiter), a \(origin.map { "\($0)" } ?? "unknown") waiter, received the reconnect's \(lease)")
         }
         covered.insert("resume lease on \(context.cause.kind)")
         if core.state.pooledLease != lease {
@@ -420,6 +421,19 @@ final class ExplorerHarness {
             record("rule 3", "\(waiter) received \(lease), which was already dead when its acquire was dequeued")
         }
         world.holders[lease, default: 0] += 1
+    }
+
+    /// I8: an acquire that was admitted or served after the core sampled the
+    /// pooled lease dead must have retired it in the same transition.
+    private func checkDeadVerdictRetires(_ effect: XM.Effect, _ context: XCore.EffectContext) {
+        guard case let .acquire(request, .dead) = context.cause,
+              let dead = context.before.pooledLease, core.state.pooledLease == dead else { return }
+        switch effect {
+        case .armWaiterDeadline(request.waiter), .resume(request.waiter, .lease):
+            record("I8", "\(dead) was sampled dead for \(request.waiter) and is still pooled")
+        default:
+            break
+        }
     }
 
     private func checkStartSpec(_ spec: ExplorerSpec, _ context: XCore.EffectContext) {
@@ -439,8 +453,7 @@ final class ExplorerHarness {
         case let .acquire(request, _):
             switch before.phase {
             case .idle:
-                allowed = request.origin == .user && request.spec == spec
-                    && (request.token == nil || request.token == before.reconnectToken)
+                allowed = request.origin == .user && request.spec == spec && request.token == nil
             case let .awaitingReconnect(token):
                 allowed = request.token == token && request.spec == spec
             case .up, .restarting:
@@ -607,7 +620,6 @@ struct Explorer {
                 report.quiescentStates += 1
             }
             report.maxDepthReached = max(report.maxDepthReached, depths[node])
-            guard depths[node] < bounds.depth else { continue }
 
             for action in actions(from: world) {
                 report.transitions += 1

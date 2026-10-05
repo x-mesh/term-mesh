@@ -8,15 +8,18 @@ source inspection; every other rule gets a mutant that must be caught by the
 named layer with the named violation tag.
 
 Each mutant edits a source file, runs one explorer test, and restores the
-original. The restore is verified byte for byte, also when the run is
-interrupted.
+original. Every restore is checked against the SHA-256 taken before the first
+mutant, including after Ctrl-C or SIGTERM; a SIGKILL leaves the backup
+directory printed at the start.
 
 Usage: scripts/peer-host-machine-gate.py [--only NAME]
 """
 
 import argparse
+import hashlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,6 +32,7 @@ MACHINE = SOURCES / "PeerHostMachine.swift"
 CORE = SOURCES / "PeerHostShellCore.swift"
 TEST_CLASS = "PeerHostMachineExplorerTests"
 LOG_DIR = Path(tempfile.gettempdir()) / "peer-host-machine-gate"
+TEST_TIMEOUT_SECONDS = 1800
 LAYER1 = "test_layer1_everyStateWithinBoundsHoldsTheInvariants"
 LAYER2 = "test_layer2_reentrantCallsDuringEffectsHoldTheInvariants"
 
@@ -36,23 +40,8 @@ MUTANTS = [
     {
         "name": "rule 2: commit after the effects run",
         "file": CORE,
-        "old": "        state = after\n        let context = EffectContext(cause: event, before: before)\n"
-               "        for effect in effects {\n"
-               "            if case let .queueUnusedCheck(lease) = effect {\n"
-               "                queue.append(.event(.unusedCheck(lease)))\n"
-               "            } else {\n"
-               "                perform(effect, context)\n"
-               "            }\n"
-               "        }\n",
-        "new": "        let context = EffectContext(cause: event, before: before)\n"
-               "        for effect in effects {\n"
-               "            if case let .queueUnusedCheck(lease) = effect {\n"
-               "                queue.append(.event(.unusedCheck(lease)))\n"
-               "            } else {\n"
-               "                perform(effect, context)\n"
-               "            }\n"
-               "        }\n"
-               "        state = after\n",
+        "old": "        state = after\n        let context = EffectContext(cause: event, before: before)\n",
+        "new": "        defer { state = after }\n        let context = EffectContext(cause: event, before: before)\n",
         "test": LAYER1,
         "tag": "rule 2",
     },
@@ -135,6 +124,119 @@ MUTANTS = [
         "tag": "rule 8",
     },
     {
+        "name": "rule 7: a Cancel stops a replacement start",
+        "file": MACHINE,
+        "old": "               purpose != .replacement, state.waiters.count == 1 {\n",
+        "new": "               state.waiters.count == 1 {\n",
+        "test": LAYER1,
+        "tag": "rule 7",
+    },
+    {
+        "name": "I8: a dead verdict in restarting leaves the lease pooled",
+        "file": MACHINE,
+        "old": "                admit(waiter)\n"
+               "                if verdict == .dead {\n"
+               "                    retirePooledLease()\n"
+               "                }\n",
+        "new": "                admit(waiter)\n",
+        "test": LAYER1,
+        "tag": "I8",
+    },
+    {
+        "name": "I8: a dead verdict in up only admits the waiter",
+        "file": MACHINE,
+        "old": "                case .dead:\n"
+               "                    admit(waiter)\n"
+               "                    retirePooledLease()\n",
+        "new": "                case .dead:\n"
+               "                    admit(waiter)\n",
+        "test": LAYER1,
+        "tag": "I8",
+    },
+    {
+        "name": "park: a failed start abandons a userDisconnected debt",
+        "file": MACHINE,
+        "old": "                state.phase = .idle\n"
+               "                resolveAllWaiters(.startFailed)\n",
+        "new": "                state.phase = .idle\n"
+               "                resolveAllWaiters(.startFailed)\n"
+               "                if state.park != nil {\n"
+               "                    state.park = nil\n"
+               "                    effects.append(.fireAbandoned)\n"
+               "                }\n",
+        "test": LAYER1,
+        "tag": "rule 6",
+    },
+    {
+        "name": "park: reconnectAbandoned without a key move abandons every debt",
+        "file": MACHINE,
+        "old": "                    endReconnectWait(abandoningPark: moved)\n",
+        "new": "                    endReconnectWait(abandoningPark: true)\n",
+        "test": LAYER1,
+        "tag": "rule 6",
+    },
+    {
+        "name": "park: a Reconnect deadline abandons every debt",
+        "file": MACHINE,
+        "old": "                    endReconnectWait(abandoningPark: false)\n",
+        "new": "                    endReconnectWait(abandoningPark: true)\n",
+        "test": LAYER1,
+        "tag": "rule 6",
+    },
+    {
+        "name": "reconnect: Reconnect Host resolves user waiters too",
+        "file": MACHINE,
+        "old": "                let dropped = state.waiters.filter { $0.origin != .user }\n"
+               "                state.waiters.removeAll { $0.origin != .user }\n",
+        "new": "                let dropped = state.waiters\n"
+               "                state.waiters.removeAll()\n",
+        "test": LAYER1,
+        "tag": "reconnect origin",
+    },
+    {
+        "name": "reconnect: a background acquire waits for the reconnect",
+        "file": MACHINE,
+        "old": "                guard request.origin == .user else {\n"
+               "                    return resume(id, .failure(.replacementUnavailable))\n"
+               "                }\n"
+               "                admit(waiter)\n"
+               "                if request.token == token, let spec = request.spec {\n",
+        "new": "                admit(waiter)\n"
+               "                if request.token == token, request.origin == .user, let spec = request.spec {\n",
+        "test": LAYER1,
+        "tag": "reconnect origin",
+    },
+    {
+        "name": "reconnect: a background acquire joins a reconnect start",
+        "file": MACHINE,
+        "old": "            case .starting(_, _, .reconnect) where request.origin != .user:\n"
+               "                resume(id, .failure(.replacementUnavailable))\n",
+        "new": "",
+        "test": LAYER1,
+        "tag": "reconnect origin",
+    },
+    {
+        "name": "reconnect: a failed reconnect start keeps its token",
+        "file": MACHINE,
+        "old": "            guard case let .starting(current, spec, purpose) = state.phase, current == attempt else {\n"
+               "                if case let .lease(lease) = result {\n"
+               "                    effects.append(.stopTunnel(lease))\n"
+               "                }\n"
+               "                return\n"
+               "            }\n"
+               "            if purpose == .reconnect {\n"
+               "                state.reconnectToken = nil\n"
+               "            }\n",
+        "new": "            guard case let .starting(current, spec, _) = state.phase, current == attempt else {\n"
+               "                if case let .lease(lease) = result {\n"
+               "                    effects.append(.stopTunnel(lease))\n"
+               "                }\n"
+               "                return\n"
+               "            }\n",
+        "test": LAYER1,
+        "tag": "rule 5",
+    },
+    {
         "name": "park invariant: never abandon an unpayable debt",
         "file": MACHINE,
         "old": "        transition.enforceParkInvariant()\n",
@@ -165,8 +267,11 @@ def run_test(test, log=None):
         "swift", "test", "-c", "release", "-Xswiftc", "-enable-testing",
         "--package-path", str(PACKAGE), "--filter", f"{TEST_CLASS}/{test}",
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    output = result.stdout + result.stderr
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=TEST_TIMEOUT_SECONDS)
+        output = result.stdout + result.stderr
+    except subprocess.TimeoutExpired as expired:
+        output = f"timed out after {TEST_TIMEOUT_SECONDS}s\n{expired.stdout or ''}"
     if log is not None:
         log.write_text(output)
     executed = re.search(r"Executed 1 test, with (\d+) failures?", output)
@@ -220,21 +325,31 @@ def main():
             print(result["output"][-4000:])
             return 1
 
+    selected = [m for m in MUTANTS if not args.only or args.only in m["name"]]
+    if not selected:
+        print(f"no mutant matches {args.only!r}")
+        return 1
+
     backup_dir = Path(tempfile.mkdtemp(prefix="peer-host-gate-"))
+    print(f"backups: {backup_dir}")
     originals = {path: backup_dir / path.name for path in (MACHINE, CORE)}
+    digests = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in originals}
     for path, copy in originals.items():
         shutil.copy2(path, copy)
 
     def restore():
         for path, copy in originals.items():
             shutil.copy2(copy, path)
-            if path.read_bytes() != copy.read_bytes():
-                raise SystemExit(f"restore of {path} did not match the original")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digests[path]:
+                raise SystemExit(f"restore of {path} does not match its SHA-256 before the gate; backup in {backup_dir}")
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupted)
 
     try:
-        for mutant in MUTANTS:
-            if args.only and args.only not in mutant["name"]:
-                continue
+        for mutant in selected:
             source = mutant["file"].read_text()
             if source.count(mutant["old"]) != 1:
                 print(f"MUTANT DID NOT APPLY: {mutant['name']}")
@@ -251,6 +366,9 @@ def main():
             if mutant["tag"] is not None:
                 caught = caught and mutant["tag"] in result["tags"]
             status = "caught" if caught else "SURVIVED"
+            if not result["ran"]:
+                status = "NOT RUN"
+                caught = False
             if result["build_failed"]:
                 status = "BUILD FAILED"
                 caught = False

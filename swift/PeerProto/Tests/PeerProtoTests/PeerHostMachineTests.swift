@@ -26,7 +26,7 @@ final class PeerHostMachineTests: XCTestCase {
         let lease = PeerHostLeaseID(1)
         var events: [M.Event] = [.acquire(request(1, .user, spec: "host"), .usable)]
         events.append(.startFinished(PeerHostAttemptID(1), .lease(lease)))
-        for index in 1..<max(refs, 1) {
+        for index in 1..<refs {
             events.append(.acquire(request(UInt64(index + 1), .user, spec: "host"), .usable))
         }
         let (state, _) = run(M.State(), events)
