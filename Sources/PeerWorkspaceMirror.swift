@@ -913,6 +913,7 @@ final class PeerWorkspaceMirrorController {
     /// assert the net was needed and caught it rather than inferring from
     /// pane counts.
     private(set) var strandedPaneRespawnCount = 0
+    var unownedPaneCloseCount = 0
 
     /// How the last resync classified the panes it found.
     ///

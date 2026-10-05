@@ -2039,11 +2039,13 @@ final class Workspace: Identifiable {
     /// Close a panel.
     /// Returns true when a bonsplit tab close request was issued.
     func closePanel(_ panelId: UUID, force: Bool = false) -> Bool {
-        // Live mirror: every close — socket force-closes included —
-        // forwards to the host; the layout push performs the removal.
-        // The reconciler's own closes run under isApplyingRemoteLayout
-        // and pass through (with force, so no confirm gating).
-        if mirrorForwardsLocalActions {
+        // Live mirror: every close of a pane the mirror owns — socket
+        // force-closes included — forwards to the host; the layout push
+        // performs the removal. The reconciler's own closes run under
+        // isApplyingRemoteLayout and pass through (with force, so no confirm
+        // gating). A pane no mapping owns closes here instead: forwarding it
+        // would close the live host surface it still points at.
+        if mirrorForwardsLocalActions, peerMirror?.forwardsClose(panelId: panelId) == true {
             peerMirror?.forwardClose(panelId: panelId)
             return false
         }

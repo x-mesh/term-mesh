@@ -236,14 +236,14 @@ extension Workspace: BonsplitDelegate {
             return true
         }
 
-        // Live mirror: a user tab-close forwards to the host; the
-        // host's layout push performs the actual removal. The
-        // reconciler's own closes carry forceCloseTabIds (handled
-        // above), so they never reach this branch.
-        if mirrorForwardsLocalActions {
-            if let panelId = panelIdFromSurfaceId(tab.id) {
-                peerMirror?.forwardClose(panelId: panelId)
-            }
+        // Live mirror: a user tab-close of a pane the mirror owns forwards
+        // to the host; the host's layout push performs the actual removal.
+        // The reconciler's own closes carry forceCloseTabIds (handled
+        // above), so they never reach this branch. A pane no mapping owns
+        // closes locally, as in `closePanel`.
+        if mirrorForwardsLocalActions, let panelId = panelIdFromSurfaceId(tab.id),
+           peerMirror?.forwardsClose(panelId: panelId) == true {
+            peerMirror?.forwardClose(panelId: panelId)
             return false
         }
 

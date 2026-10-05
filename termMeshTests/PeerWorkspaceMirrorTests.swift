@@ -604,6 +604,36 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertEqual(orphaned, [Data([1])])
     }
 
+    func test_unownedPanelIDs_reportsRemotePanesNoMappingOwns() {
+        // The ghost tabs on 0.263.0: remote panes on the mirror's host that
+        // neither the map nor the stale queue held. B3c closes exactly these.
+        let mapped = UUID(), ghost = UUID(), anotherGhost = UUID()
+        let unowned = PeerWorkspaceMirrorController.unownedPanelIDs(
+            remotePanelIDs: [mapped, ghost, anotherGhost],
+            panelBySurfaceID: [Data([1]): mapped]
+        )
+        XCTAssertEqual(unowned, [ghost, anotherGhost])
+    }
+
+    func test_unownedPanelIDs_isEmptyWhenEveryRemotePaneIsMapped() {
+        let a = UUID(), b = UUID()
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.unownedPanelIDs(
+                remotePanelIDs: [a, b],
+                panelBySurfaceID: [Data([1]): a, Data([2]): b]
+            ).isEmpty
+        )
+    }
+
+    func test_forwardsClose_onlyForPanesTheMirrorOwns() {
+        // Forwarding an unowned pane's close would close the live host
+        // surface it still points at, and the ghost tab would stay.
+        let mapped = UUID(), ghost = UUID()
+        let map = [Data([1]): mapped]
+        XCTAssertTrue(PeerWorkspaceMirrorController.forwardsClose(panelId: mapped, panelBySurfaceID: map))
+        XCTAssertFalse(PeerWorkspaceMirrorController.forwardsClose(panelId: ghost, panelBySurfaceID: map))
+    }
+
     func test_orphanedSurfaceIDs_keepsEveryMappingWhenAllPanelsAreLive() {
         let a = UUID(), b = UUID()
         XCTAssertTrue(

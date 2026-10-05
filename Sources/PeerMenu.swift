@@ -1951,6 +1951,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                     "watching": mirror.lastResyncWatching,
                     "respawned": mirror.lastResyncRespawned,
                     "stranded_respawned": mirror.strandedPaneRespawnCount,
+                    "unowned_closed": mirror.unownedPaneCloseCount,
                 ]
                 entry["dropped_pane_names"] = mirror.lastDroppedPaneNames
                 entry["dropped_pane_reports"] = mirror.droppedPaneReportCount

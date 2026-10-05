@@ -110,11 +110,16 @@ extension PeerWorkspaceMirrorController {
         }
 
         // Fast paths below must only fire once every target leaf is
-        // actually mirrored — see `allTargetLeavesMapped`.
+        // actually mirrored — see `allTargetLeavesMapped` — and no unowned
+        // pane is waiting for B3c, which only the full path runs.
         let targetLeaves = Self.preorderLeaves(target)
         let allLeavesMapped = Self.allTargetLeavesMapped(targetLeaves, panelBySurfaceID: panelBySurfaceID)
+        let hasUnownedPanes = !Self.unownedPanelIDs(
+            remotePanelIDs: remotePanelIDsOnThisHost(in: workspace),
+            panelBySurfaceID: panelBySurfaceID
+        ).isEmpty
 
-        if let last = lastAppliedLayout, allLeavesMapped {
+        if let last = lastAppliedLayout, allLeavesMapped, !hasUnownedPanes {
             if Self.layoutsEquivalent(last, target) {
                 recordApplied(target)
                 return
@@ -246,6 +251,27 @@ extension PeerWorkspaceMirrorController {
                 _ = workspace2.closePanel(panelId, force: true)
             }
             pendingStalePanelIds.removeAll()
+
+            // B3c — close remote panes on this host that no mapping owns.
+            // Every path that unmaps a pane also queues it for B3b, so this
+            // finds nothing in a correct run. A pane that slipped out of both
+            // stays behind as a ghost tab whose relay keeps reattaching to
+            // the host after every tunnel drop; on 0.263.0 eleven of them
+            // piled up in one mirror's anchor pane.
+            let unowned = Self.unownedPanelIDs(
+                remotePanelIDs: remotePanelIDsOnThisHost(in: workspace2),
+                panelBySurfaceID: panelBySurfaceID
+            )
+            for panelId in unowned {
+                _ = workspace2.closePanel(panelId, force: true)
+            }
+            if !unowned.isEmpty {
+                unownedPaneCloseCount += unowned.count
+                RemoteWorkLog.infoOffMain(
+                    "Closed \(unowned.count) mirror pane(s) that no mapping owned"
+                        + " — left behind by an earlier resync"
+                )
+            }
 
             // B4 — pre-order rebuild.
             buildSplits(node: target, currentPane: anchor, workspace: workspace2)
@@ -392,6 +418,30 @@ extension PeerWorkspaceMirrorController {
     /// Pure so the sweep can be tested without a live mirror: the condition it
     /// exists for — host still reporting a surface whose local pane is gone —
     /// is not reachable from a unit test any other way.
+    nonisolated static func unownedPanelIDs(
+        remotePanelIDs: Set<UUID>,
+        panelBySurfaceID: [Data: UUID]
+    ) -> Set<UUID> {
+        remotePanelIDs.subtracting(panelBySurfaceID.values)
+    }
+
+    /// An unowned pane still points at a live host surface, so forwarding
+    /// its close would close that surface on the host and leave the ghost
+    /// tab here.
+    nonisolated static func forwardsClose(panelId: UUID, panelBySurfaceID: [Data: UUID]) -> Bool {
+        panelBySurfaceID.values.contains(panelId)
+    }
+
+    func forwardsClose(panelId: UUID) -> Bool {
+        Self.forwardsClose(panelId: panelId, panelBySurfaceID: panelBySurfaceID)
+    }
+
+    func remotePanelIDsOnThisHost(in workspace: Workspace) -> Set<UUID> {
+        Set(workspace.panels.keys.filter { panelId in
+            workspace.terminalPanel(for: panelId)?.peerPaneSession?.originSpec.hostKey == spec.hostKey
+        })
+    }
+
     nonisolated static func orphanedSurfaceIDs(
         panelBySurfaceID: [Data: UUID],
         livePanelIDs: Set<UUID>
