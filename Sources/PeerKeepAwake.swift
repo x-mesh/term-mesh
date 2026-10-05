@@ -39,6 +39,7 @@ final class PeerKeepAwakeController {
     static let shared = PeerKeepAwakeController()
 
     private var assertionID: IOPMAssertionID?
+    private var latencyActivity: NSObjectProtocol?
     private var pendingRelease: DispatchWorkItem?
     private var connectedHosts = 0
     private var attachedPeers = 0
@@ -74,7 +75,28 @@ final class PeerKeepAwakeController {
 
     func attachedPeerCountDidChange(_ count: Int) {
         attachedPeers = count
+        updateLatencyActivity()
         evaluate()
+    }
+
+    /// An unattended Mac naps background apps: timers coalesce and the process
+    /// drops to background priority. A napping host measured 120–160ms median
+    /// from a keystroke's echo to its send, most likely because the output
+    /// drain waits on a short timer. While a peer connection is accepted,
+    /// declare user-initiated work, which keeps App Nap off. Idle sleep stays
+    /// with the keep-awake mode; this activity allows it.
+    private func updateLatencyActivity() {
+        if attachedPeers > 0, latencyActivity == nil {
+            latencyActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Remote viewers are attached to this Mac's terminals"
+            )
+            RemoteWorkLog.debugOffMain("Keeping term-mesh out of App Nap while \(attachedPeers) peer connection(s) are accepted")
+        } else if attachedPeers == 0, let activity = latencyActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            latencyActivity = nil
+            RemoteWorkLog.debugOffMain("Letting term-mesh nap again: no peer connection is accepted")
+        }
     }
 
     private var decision: PeerKeepAwakePolicy.Decision {
