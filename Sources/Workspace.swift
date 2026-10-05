@@ -1110,6 +1110,9 @@ final class Workspace: Identifiable {
         #endif
         if panelDirectories[panelId] != trimmed {
             panelDirectories[panelId] = trimmed
+            // A peer viewer's sidebar shows each pane's folder from this
+            // host's workspace list, which is re-sent only on a layout change.
+            postPeerLayoutChange()
         }
         // Update current directory if this is the focused panel
         if panelId == focusedPanelId, currentDirectory != trimmed {

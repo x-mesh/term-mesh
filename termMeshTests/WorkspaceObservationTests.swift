@@ -98,6 +98,31 @@ final class WorkspaceObservationTests: XCTestCase {
     /// publisher, so the workspace calls back — and the callback has to carry
     /// both operators, or session state is written on every launch and on
     /// every no-op assignment.
+    /// A peer viewer's sidebar named a pane by the folder it was attached in,
+    /// long after the shell had moved: a directory change never reached the
+    /// host's workspace broadcast. Repeated prompts in one folder must not
+    /// rebroadcast it.
+    func testADirectoryChangeIsAnnouncedToPeerViewersOnlyWhenItChanges() {
+        let ws = workspace()
+        let panelId = ws.focusedPanelId ?? UUID()
+        var announcements = 0
+        let observer = NotificationCenter.default.addObserver(
+            forName: .peerWorkspaceLayoutDidChange, object: nil, queue: nil
+        ) { note in
+            if note.userInfo?["workspaceID"] as? UUID == ws.id { announcements += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        ws.updatePanelDirectory(panelId: panelId, directory: "/tmp/peer-cwd-a")
+        let afterFirst = announcements
+        ws.updatePanelDirectory(panelId: panelId, directory: "/tmp/peer-cwd-a")
+        XCTAssertEqual(announcements, afterFirst, "the same folder again must not rebroadcast")
+        ws.updatePanelDirectory(panelId: panelId, directory: "/tmp/peer-cwd-b")
+
+        XCTAssertGreaterThanOrEqual(afterFirst, 1)
+        XCTAssertEqual(announcements, afterFirst + 1)
+    }
+
     func testDirectoryCallbackCarriesDropFirstAndRemoveDuplicates() {
         var calls = 0
         let ws = workspace(directory: "/tmp")
