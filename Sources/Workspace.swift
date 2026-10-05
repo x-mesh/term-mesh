@@ -1110,6 +1110,12 @@ final class Workspace: Identifiable {
         #endif
         if panelDirectories[panelId] != trimmed {
             panelDirectories[panelId] = trimmed
+            // A peer viewer's sidebar shows the folder of each pane's selected
+            // tab from this host's workspace list, which is re-sent only on a
+            // layout change. Another tab's folder is not on the wire.
+            if isSelectedTabInItsPane(panelId) {
+                postPeerLayoutChange()
+            }
         }
         // Update current directory if this is the focused panel
         if panelId == focusedPanelId, currentDirectory != trimmed {
@@ -1121,6 +1127,13 @@ final class Workspace: Identifiable {
             let wt = Self.detectWorktree(in: trimmed)
             if isInsideWorktree != wt { isInsideWorktree = wt }
         }
+    }
+
+    private func isSelectedTabInItsPane(_ panelId: UUID) -> Bool {
+        guard let tabId = surfaceIdFromPanelId(panelId),
+              let pane = paneId(forPanelId: panelId)
+        else { return false }
+        return bonsplitController.selectedTab(inPane: pane)?.id == tabId
     }
 
     /// Detect if a directory is inside a git worktree.
