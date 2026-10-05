@@ -10,6 +10,22 @@ import Foundation
 import Darwin
 import PeerProto
 
+enum PeerKeepAwakeMode: String, CaseIterable, Identifiable {
+    case never
+    case onPowerAdapter
+    case always
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .never: return "Don't keep awake"
+        case .onPowerAdapter: return "On power adapter"
+        case .always: return "Even on battery"
+        }
+    }
+}
+
 enum PeerFederationSettings {
     static let autoStartKey      = "peerFederationAutoStart"
     static let socketPathKey     = "peerFederationSocketPath"

@@ -648,9 +648,11 @@ public struct PeerServerConfig: Sendable {
     public var relayTelemetryProvider: (@Sendable () async -> Termmesh_Peer_V1_RelayTelemetry?)?
     public var relayTelemetryInterval: Duration = .seconds(2)
 
-    /// Called with the number of attached sessions each time it changes,
-    /// including the drop to zero when the server stops. Runs on the server
-    /// actor, so an embedder that touches UI state hops to its own actor.
+    /// Called with the number of accepted connections each time it changes;
+    /// it is zero again once the server stops. A connection counts from
+    /// accept, before its handshake, so one-shot probes count briefly too.
+    /// Runs on the server actor, so an embedder that touches UI state hops to
+    /// its own actor.
     public var onActiveSessionCountChange: (@Sendable (Int) -> Void)?
 
     public init(
@@ -1028,10 +1030,6 @@ public actor PeerServer {
             )
         }
         throw PeerServerError.noMatchingLeaderSession
-    }
-
-    fileprivate func register(_ session: PeerServerSession) {
-        activeSessions.append(session)
     }
 
     private static func runAcceptLoop(

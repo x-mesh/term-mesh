@@ -2141,7 +2141,7 @@
         }
       }
     },
-    "Never": {
+    "Don't keep awake": {
       "localizations": {
         "ko": {
           "stringUnit": {
@@ -2156,17 +2156,17 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "전원 어댑터 연결 시"
+            "value": "전원 어댑터 사용 시"
           }
         }
       }
     },
-    "Always": {
+    "Even on battery": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "항상"
+            "value": "배터리 사용 중에도"
           }
         }
       }
@@ -2176,27 +2176,27 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "원격 세션이 연결돼 있어도 이 Mac은 평소대로 잠자기에 들어가며, 잠들 때마다 연결이 끊깁니다."
+            "value": "원격 세션이 연결돼 있어도 이 Mac은 평소대로 잠들며, 잠들 때마다 연결이 끊깁니다."
           }
         }
       }
     },
-    "While a remote host is connected or another machine is attached, this Mac does not sleep on its own while on the power adapter. On battery it sleeps as usual. The display still turns off.": {
+    "While a remote host is connected or another computer is connected to this Mac, and for a minute after the last connection ends, this Mac does not sleep on its own while on the power adapter. On battery it sleeps as usual. The display still turns off.": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "원격 호스트에 연결돼 있거나 다른 기기가 이 Mac에 붙어 있는 동안, 전원 어댑터에 연결돼 있으면 이 Mac이 스스로 잠자기에 들어가지 않습니다. 배터리 사용 중에는 평소대로 잠듭니다. 디스플레이는 그대로 꺼집니다."
+            "value": "원격 호스트에 연결돼 있거나 다른 컴퓨터가 이 Mac에 연결된 동안, 그리고 마지막 연결이 끝난 뒤 1분 동안, 전원 어댑터를 쓰고 있으면 이 Mac이 저절로 잠들지 않습니다. 배터리로 동작할 때는 평소대로 잠듭니다. 디스플레이는 그대로 꺼집니다."
           }
         }
       }
     },
-    "While a remote host is connected or another machine is attached, this Mac does not sleep on its own, even on battery. The display still turns off.": {
+    "While a remote host is connected or another computer is connected to this Mac, and for a minute after the last connection ends, this Mac does not sleep on its own, even on battery. The display still turns off.": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "원격 호스트에 연결돼 있거나 다른 기기가 이 Mac에 붙어 있는 동안, 배터리 사용 중에도 이 Mac이 스스로 잠자기에 들어가지 않습니다. 디스플레이는 그대로 꺼집니다."
+            "value": "원격 호스트에 연결돼 있거나 다른 컴퓨터가 이 Mac에 연결된 동안, 그리고 마지막 연결이 끝난 뒤 1분 동안, 배터리로 동작할 때도 이 Mac이 저절로 잠들지 않습니다. 디스플레이는 그대로 꺼집니다."
           }
         }
       }

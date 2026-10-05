@@ -7,28 +7,26 @@ import XCTest
 #endif
 
 final class PeerKeepAwakePolicyTests: XCTestCase {
-    func test_nothingConnectedNeverPreventsSleep() {
-        for mode in PeerKeepAwakeMode.allCases {
-            XCTAssertFalse(
-                PeerKeepAwakePolicy.preventsSleep(mode: mode, onACPower: true, connectedHosts: 0, attachedPeers: 0),
-                "\(mode) must let an idle Mac sleep"
-            )
-        }
+    private func decision(_ mode: PeerKeepAwakeMode, ac: Bool = true, connections: Int) -> PeerKeepAwakePolicy.Decision {
+        PeerKeepAwakePolicy.decision(mode: mode, onACPower: ac, connections: connections)
     }
 
-    func test_eitherSideOfAConnectionCounts() {
-        XCTAssertTrue(PeerKeepAwakePolicy.preventsSleep(mode: .always, onACPower: true, connectedHosts: 1, attachedPeers: 0))
-        XCTAssertTrue(PeerKeepAwakePolicy.preventsSleep(mode: .always, onACPower: true, connectedHosts: 0, attachedPeers: 1))
+    func test_aConnectionHoldsTheMacAwakeWhenTheModeAllowsIt() {
+        XCTAssertEqual(decision(.always, connections: 1), .hold)
+        XCTAssertEqual(decision(.onPowerAdapter, connections: 2), .hold)
+        XCTAssertEqual(decision(.always, ac: false, connections: 1), .hold)
     }
 
-    func test_onPowerAdapterLetsABatteryMacSleep() {
-        XCTAssertTrue(PeerKeepAwakePolicy.preventsSleep(mode: .onPowerAdapter, onACPower: true, connectedHosts: 1, attachedPeers: 0))
-        XCTAssertFalse(PeerKeepAwakePolicy.preventsSleep(mode: .onPowerAdapter, onACPower: false, connectedHosts: 1, attachedPeers: 0))
-        XCTAssertTrue(PeerKeepAwakePolicy.preventsSleep(mode: .always, onACPower: false, connectedHosts: 1, attachedPeers: 0))
+    func test_theLastConnectionEndingReleasesOnlyAfterTheGrace() {
+        // A tunnel being rebuilt reads as zero connections for a few seconds.
+        XCTAssertEqual(decision(.always, connections: 0), .releaseAfterGrace)
+        XCTAssertEqual(decision(.onPowerAdapter, connections: 0), .releaseAfterGrace)
+        XCTAssertGreaterThan(PeerKeepAwakePolicy.releaseGraceSeconds, 0)
     }
 
-    func test_neverIsOff() {
-        XCTAssertFalse(PeerKeepAwakePolicy.preventsSleep(mode: .never, onACPower: true, connectedHosts: 3, attachedPeers: 2))
+    func test_turningItOffOrGoingOnBatteryReleasesAtOnce() {
+        XCTAssertEqual(decision(.never, connections: 3), .releaseNow)
+        XCTAssertEqual(decision(.onPowerAdapter, ac: false, connections: 1), .releaseNow)
     }
 
     func test_anUnknownStoredModeFallsBackToTheDefault() {

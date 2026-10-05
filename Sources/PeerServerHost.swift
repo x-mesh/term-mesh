@@ -458,9 +458,13 @@ final class PeerHostCoordinator: NSObject {
         config.relayTelemetryProvider = {
             await provider.relayTelemetrySnapshot()
         }
+        // The main queue keeps the counts in the order the server sent them;
+        // separate Tasks could deliver a stale 1 after the final 0.
         config.onActiveSessionCountChange = { count in
-            Task { @MainActor in
-                PeerKeepAwakeController.shared.attachedPeerCountDidChange(count)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    PeerKeepAwakeController.shared.attachedPeerCountDidChange(count)
+                }
             }
         }
 

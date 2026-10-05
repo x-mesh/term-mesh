@@ -3,35 +3,27 @@ import Foundation
 import IOKit.ps
 import IOKit.pwr_mgt
 
-enum PeerKeepAwakeMode: String, CaseIterable, Identifiable {
-    case never
-    case onPowerAdapter
-    case always
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .never: return "Never"
-        case .onPowerAdapter: return "On power adapter"
-        case .always: return "Always"
-        }
-    }
-}
-
 enum PeerKeepAwakePolicy {
-    static func preventsSleep(
-        mode: PeerKeepAwakeMode,
-        onACPower: Bool,
-        connectedHosts: Int,
-        attachedPeers: Int
-    ) -> Bool {
-        guard connectedHosts > 0 || attachedPeers > 0 else { return false }
+    enum Decision: Equatable {
+        case hold
+        case releaseAfterGrace
+        case releaseNow
+    }
+
+    /// Rebuilding a host's tunnel takes it out of `.connected` for a few
+    /// seconds, and a Mac already idle past its sleep timer would sleep in that
+    /// gap — the very drop this exists to prevent.
+    static let releaseGraceSeconds: TimeInterval = 60
+
+    static func decision(mode: PeerKeepAwakeMode, onACPower: Bool, connections: Int) -> Decision {
+        let allowed: Bool
         switch mode {
-        case .never: return false
-        case .onPowerAdapter: return onACPower
-        case .always: return true
+        case .never: allowed = false
+        case .onPowerAdapter: allowed = onACPower
+        case .always: allowed = true
         }
+        guard allowed else { return .releaseNow }
+        return connections > 0 ? .hold : .releaseAfterGrace
     }
 }
 
@@ -46,6 +38,7 @@ final class PeerKeepAwakeController {
     static let shared = PeerKeepAwakeController()
 
     private var assertionID: IOPMAssertionID?
+    private var pendingRelease: DispatchWorkItem?
     private var connectedHosts = 0
     private var attachedPeers = 0
     private var onACPower = true
@@ -83,43 +76,75 @@ final class PeerKeepAwakeController {
         evaluate()
     }
 
-    private func evaluate() {
-        let wanted = PeerKeepAwakePolicy.preventsSleep(
+    private var decision: PeerKeepAwakePolicy.Decision {
+        PeerKeepAwakePolicy.decision(
             mode: PeerFederationSettings.keepAwakeMode,
             onACPower: onACPower,
-            connectedHosts: connectedHosts,
-            attachedPeers: attachedPeers
+            connections: connectedHosts + attachedPeers
         )
-        if wanted, assertionID == nil {
-            var id = IOPMAssertionID(0)
-            let result = IOPMAssertionCreateWithName(
-                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
-                IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                "term-mesh: remote sessions are connected" as CFString,
-                &id
-            )
-            guard result == kIOReturnSuccess else {
-                RemoteWorkLog.infoOffMain("Could not keep this Mac awake for remote sessions: IOKit error \(result)")
-                return
+    }
+
+    private func evaluate() {
+        switch decision {
+        case .hold:
+            cancelPendingRelease()
+            acquire()
+        case .releaseNow:
+            cancelPendingRelease()
+            release()
+        case .releaseAfterGrace:
+            guard assertionID != nil, pendingRelease == nil else { return }
+            let work = DispatchWorkItem { [weak self] in
+                MainActor.assumeIsolated { self?.graceExpired() }
             }
-            assertionID = id
-            RemoteWorkLog.infoOffMain(
-                "Keeping this Mac awake: \(connectedHosts) remote host(s) connected, \(attachedPeers) peer session(s) attached"
-            )
-        } else if !wanted, let id = assertionID {
-            IOPMAssertionRelease(id)
-            assertionID = nil
-            RemoteWorkLog.infoOffMain("Letting this Mac sleep again: no remote session needs it awake")
+            pendingRelease = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + PeerKeepAwakePolicy.releaseGraceSeconds, execute: work)
         }
+    }
+
+    private func graceExpired() {
+        pendingRelease = nil
+        if decision != .hold {
+            release()
+        }
+    }
+
+    private func cancelPendingRelease() {
+        pendingRelease?.cancel()
+        pendingRelease = nil
+    }
+
+    private func acquire() {
+        guard assertionID == nil else { return }
+        var id = IOPMAssertionID(0)
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "term-mesh: remote sessions are connected" as CFString,
+            &id
+        )
+        guard result == kIOReturnSuccess else {
+            RemoteWorkLog.infoOffMain("Could not keep this Mac awake for remote sessions: IOKit error \(result)")
+            return
+        }
+        assertionID = id
+        RemoteWorkLog.infoOffMain(
+            "Keeping this Mac awake: \(connectedHosts) remote host(s) connected, \(attachedPeers) peer connection(s) accepted"
+        )
+    }
+
+    private func release() {
+        guard let id = assertionID else { return }
+        IOPMAssertionRelease(id)
+        assertionID = nil
+        RemoteWorkLog.infoOffMain("Letting this Mac sleep again: no remote session needs it awake")
     }
 
     private func installPowerSourceObserver() {
         guard powerSourceRunLoopSource == nil,
               let source = IOPSNotificationCreateRunLoopSource({ _ in
-                  DispatchQueue.main.async {
-                      MainActor.assumeIsolated {
-                          PeerKeepAwakeController.shared.powerSourceDidChange()
-                      }
+                  MainActor.assumeIsolated {
+                      PeerKeepAwakeController.shared.powerSourceDidChange()
                   }
               }, nil)?.takeRetainedValue()
         else { return }
@@ -152,7 +177,7 @@ private final class DefaultsKeyObserver: NSObject {
         self.key = key
         self.onChange = onChange
         super.init()
-        UserDefaults.standard.addObserver(self, forKeyPath: key, options: [.new], context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: key, options: [], context: nil)
     }
 
     deinit {

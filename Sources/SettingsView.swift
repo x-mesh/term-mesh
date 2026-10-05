@@ -118,17 +118,6 @@ struct SettingsView: View {
     private let contentTopInset: CGFloat = 8
     private let pickerColumnWidth: CGFloat = 196
 
-    private var peerKeepAwakeSubtitle: LocalizedStringKey {
-        switch PeerKeepAwakeMode(rawValue: peerFederationKeepAwake) ?? PeerFederationSettings.defaultKeepAwakeMode {
-        case .never:
-            return "This Mac sleeps on its usual schedule even while remote sessions are connected, and they drop each time it sleeps."
-        case .onPowerAdapter:
-            return "While a remote host is connected or another machine is attached, this Mac does not sleep on its own while on the power adapter. On battery it sleeps as usual. The display still turns off."
-        case .always:
-            return "While a remote host is connected or another machine is attached, this Mac does not sleep on its own, even on battery. The display still turns off."
-        }
-    }
-
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
     @AppStorage(LanguageSettings.languageModeKey) private var languageMode = LanguageSettings.defaultMode.rawValue
     @AppStorage(SocketControlSettings.appStorageKey) private var socketControlMode = SocketControlSettings.defaultMode.rawValue
@@ -2527,6 +2516,17 @@ struct SettingsView: View {
     // MARK: - Section: Peer Federation
 
     @ViewBuilder
+    private var peerKeepAwakeSubtitle: LocalizedStringKey {
+        switch PeerKeepAwakeMode(rawValue: peerFederationKeepAwake) ?? PeerFederationSettings.defaultKeepAwakeMode {
+        case .never:
+            return "This Mac sleeps on its usual schedule even while remote sessions are connected, and they drop each time it sleeps."
+        case .onPowerAdapter:
+            return "While a remote host is connected or another computer is connected to this Mac, and for a minute after the last connection ends, this Mac does not sleep on its own while on the power adapter. On battery it sleeps as usual. The display still turns off."
+        case .always:
+            return "While a remote host is connected or another computer is connected to this Mac, and for a minute after the last connection ends, this Mac does not sleep on its own, even on battery. The display still turns off."
+        }
+    }
+
     private var sectionPeerFederation: some View {
         SettingsCard {
             SettingsCardRow(

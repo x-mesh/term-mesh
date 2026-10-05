@@ -575,11 +575,6 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
     }
 
-    /// End-to-end: Swift `PeerServer` accepts a Swift `PeerSession`
-    /// client over a real Unix socket, completes the handshake, and
-    /// answers ListSurfaces with the static set we seeded. Exercises
-    /// the full Swift server path that will later back term-mesh.app's
-    /// peer exposure.
     func testSessionCountCallbackReportsAttachAndDetach() async throws {
         let sockPath = "/tmp/tm-peer-swift-count-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
@@ -607,6 +602,11 @@ final class PeerServerTests: XCTestCase {
         XCTAssertEqual(counts.values, [1, 0])
     }
 
+    /// End-to-end: Swift `PeerServer` accepts a Swift `PeerSession`
+    /// client over a real Unix socket, completes the handshake, and
+    /// answers ListSurfaces with the static set we seeded. Exercises
+    /// the full Swift server path that will later back term-mesh.app's
+    /// peer exposure.
     func testHandshakeAndListViaSwiftServer() async throws {
         let sockPath = "/tmp/tm-peer-swift-srv-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }
