@@ -681,6 +681,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // before the sidebar first renders and before any relay window opens.
         _ = RemoteHostStore.shared
 
+        PeerKeepAwakeController.shared.start()
+
         // Reap leftover relay sockets from any previous crashed run
         // before a user opens a fresh relay window — otherwise stale
         // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.

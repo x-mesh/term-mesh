@@ -575,6 +575,33 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
     }
 
+    func testSessionCountCallbackReportsAttachAndDetach() async throws {
+        let sockPath = "/tmp/tm-peer-swift-count-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let counts = SessionCountRecorder()
+        var config = PeerServerConfig()
+        config.onActiveSessionCountChange = { count in counts.record(count) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: []),
+            config: config
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake(options: PeerSessionOptions())
+        try await counts.waitFor(last: 1)
+
+        await transport.close()
+        try await counts.waitFor(last: 0)
+        XCTAssertEqual(counts.values, [1, 0])
+    }
+
     /// End-to-end: Swift `PeerServer` accepts a Swift `PeerSession`
     /// client over a real Unix socket, completes the handshake, and
     /// answers ListSurfaces with the static set we seeded. Exercises
@@ -2273,5 +2300,35 @@ final class SessionHostAdvertisementTests: XCTestCase {
         XCTAssertFalse(
             PeerServer.isSocketAlive(atPath: "/tmp/tm-peer-absent-\(UUID().uuidString).sock")
         )
+    }
+}
+
+/// Collects the counts `onActiveSessionCountChange` reports, which arrive on
+/// the server actor while the test awaits on its own task.
+private final class SessionCountRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [Int] = []
+
+    var values: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    func record(_ count: Int) {
+        lock.lock()
+        recorded.append(count)
+        lock.unlock()
+    }
+
+    func waitFor(last expected: Int, timeout: TimeInterval = 5) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while values.last != expected {
+            if Date() > deadline {
+                XCTFail("session count never reached \(expected); saw \(values)")
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
     }
 }
