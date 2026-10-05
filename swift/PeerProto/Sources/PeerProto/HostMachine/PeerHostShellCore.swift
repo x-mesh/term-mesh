@@ -1,16 +1,14 @@
 import Foundation
 
-/// The synchronous half of the registry shell for one host key.
+/// The synchronous half of the registry shell for one host key (rules 2, 3
+/// and 8 of `docs/peer-host-registry-redesign.md`).
 ///
-/// It owns the event queue, commits each reduced state before running that
-/// transition's effects, samples the liveness verdict when an acquire is
-/// dequeued, and routes `retain` / `release` by whether the lease is pooled at
-/// dequeue. Effects may call back into the core; those calls are queued behind
-/// the current effect list instead of being reduced in the middle of it.
+/// Not thread-safe: the owner confines it to one actor. `perform` must not
+/// deliver a completion synchronously; completions arrive later as events.
 public final class PeerHostShellCore<Spec: Hashable & Sendable, Token: Hashable & Sendable> {
     public typealias Machine = PeerHostMachine<Spec, Token>
 
-    public struct EffectContext {
+    public struct EffectContext: Sendable {
         public let cause: Machine.Event
         public let before: Machine.State
     }
@@ -85,12 +83,14 @@ public final class PeerHostShellCore<Spec: Hashable & Sendable, Token: Hashable 
         let (after, effects) = Machine.reduce(before, event)
         state = after
         let context = EffectContext(cause: event, before: before)
+        var unusedChecks: [Input] = []
         for effect in effects {
             if case let .queueUnusedCheck(lease) = effect {
-                queue.append(.event(.unusedCheck(lease)))
+                unusedChecks.append(.event(.unusedCheck(lease)))
             } else {
                 perform(effect, context)
             }
         }
+        queue.append(contentsOf: unusedChecks)
     }
 }

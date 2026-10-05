@@ -1,6 +1,10 @@
 import Foundation
 
-public struct PeerHostID<Tag>: Hashable, Comparable, Sendable, CustomStringConvertible {
+public protocol PeerHostIDTag {
+    static var prefix: String { get }
+}
+
+public struct PeerHostID<Tag: PeerHostIDTag>: Hashable, Comparable, Sendable, CustomStringConvertible {
     public let rawValue: UInt64
 
     public init(_ rawValue: UInt64) {
@@ -12,37 +16,25 @@ public struct PeerHostID<Tag>: Hashable, Comparable, Sendable, CustomStringConve
     }
 
     public var description: String {
-        "\(PeerHostIDPrefix.prefix(for: Tag.self))\(rawValue)"
+        "\(Tag.prefix)\(rawValue)"
     }
 }
 
-public enum PeerHostLeaseTag {}
-public enum PeerHostWaiterTag {}
-public enum PeerHostAttemptTag {}
-public enum PeerHostRestartTag {}
+public enum PeerHostLeaseTag: PeerHostIDTag { public static let prefix = "L" }
+public enum PeerHostWaiterTag: PeerHostIDTag { public static let prefix = "w" }
+public enum PeerHostAttemptTag: PeerHostIDTag { public static let prefix = "a" }
+public enum PeerHostRestartTag: PeerHostIDTag { public static let prefix = "r" }
 
 public typealias PeerHostLeaseID = PeerHostID<PeerHostLeaseTag>
 public typealias PeerHostWaiterID = PeerHostID<PeerHostWaiterTag>
 public typealias PeerHostAttemptID = PeerHostID<PeerHostAttemptTag>
 public typealias PeerHostRestartID = PeerHostID<PeerHostRestartTag>
 
-private enum PeerHostIDPrefix {
-    static func prefix<Tag>(for tag: Tag.Type) -> String {
-        switch tag {
-        case is PeerHostLeaseTag.Type: return "L"
-        case is PeerHostWaiterTag.Type: return "w"
-        case is PeerHostAttemptTag.Type: return "a"
-        case is PeerHostRestartTag.Type: return "r"
-        default: return "#"
-        }
-    }
-}
-
 /// One host key's tunnel lifecycle as a pure reducer.
 ///
-/// The contract is `docs/peer-host-registry-redesign.md`. Every decision is
-/// made in `reduce`, which never waits; anything that takes time is an
-/// `Effect` the shell performs and reports back as an `Event`.
+/// Specified in `docs/peer-host-registry-redesign.md`, against the contract in
+/// `docs/peer-host-registry-invariants.md`. `reduce` never waits; anything
+/// that takes time is an `Effect` whose completion comes back as an `Event`.
 public enum PeerHostMachine<Spec: Hashable & Sendable, Token: Hashable & Sendable> {
     public enum Origin: Hashable, Sendable {
         case user
@@ -233,15 +225,15 @@ extension PeerHostMachine {
 
         private mutating func acquire(_ request: AcquireRequest, _ verdict: Verdict) {
             let id = request.waiter
+            // A waiter submitted again while it waits is the same acquire.
+            // Checked first so the resubmission cannot resolve it a second time.
+            guard !state.waiters.contains(where: { $0.id == id }) else { return }
             guard request.generation == state.generation else {
                 return resume(id, .failure(.hostDisconnected))
             }
             if let token = request.token, token != state.reconnectToken {
                 return resume(id, .failure(.reconnectSuperseded))
             }
-            // The same waiter submitted twice is one acquire; it is already
-            // waiting and will be resolved once.
-            guard !state.waiters.contains(where: { $0.id == id }) else { return }
             let waiter = Waiter(id: id, origin: request.origin)
 
             switch state.phase {
@@ -251,6 +243,8 @@ extension PeerHostMachine {
                 }
                 admit(waiter)
                 start(spec, .fresh)
+            case .starting(_, _, .reconnect) where request.origin != .user:
+                resume(id, .failure(.replacementUnavailable))
             case .starting:
                 admit(waiter)
             case let .up(lease, spec, refs):
@@ -283,9 +277,9 @@ extension PeerHostMachine {
             }
         }
 
-        /// Reaching zero only queues a check. A retarget's `retain` raised
-        /// earlier in the same drain is still in the queue, and stopping now
-        /// would strand that pane on a stopped lease.
+        /// Reaching zero only queues a check. A retarget's `retain` can already
+        /// be queued when this release is reduced, and stopping now would strand
+        /// that pane on a stopped lease.
         private mutating func adjustReferences(on lease: PeerHostLeaseID, by delta: Int) {
             switch state.phase {
             case let .up(current, spec, refs) where current == lease:
@@ -322,11 +316,14 @@ extension PeerHostMachine {
         }
 
         private mutating func startFinished(_ attempt: PeerHostAttemptID, _ result: StartResult) {
-            guard case let .starting(current, spec, _) = state.phase, current == attempt else {
+            guard case let .starting(current, spec, purpose) = state.phase, current == attempt else {
                 if case let .lease(lease) = result {
                     effects.append(.stopTunnel(lease))
                 }
                 return
+            }
+            if purpose == .reconnect {
+                state.reconnectToken = nil
             }
             switch result {
             case let .lease(lease):
@@ -419,6 +416,9 @@ extension PeerHostMachine {
                purpose != .replacement, state.waiters.count == 1 {
                 state.waiters = []
                 state.phase = .idle
+                if purpose == .reconnect {
+                    state.reconnectToken = nil
+                }
                 effects.append(.cancelStart(attempt))
             } else {
                 state.waiters.remove(at: index)
@@ -426,9 +426,9 @@ extension PeerHostMachine {
             resume(id, .failure(.cancelled))
         }
 
-        /// `dependents` is read before the references leave the pool: after
-        /// that they read zero, and a post-wake retire, whose only dependents
-        /// are panes about to park, would start no replacement.
+        /// `references` is captured from the phase before it is replaced. In a
+        /// post-wake retire those references are the only dependents: the
+        /// panes about to park, which need the replacement.
         private mutating func retirePooledLease() {
             let lease: PeerHostLeaseID
             let spec: Spec
