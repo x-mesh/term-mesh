@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.266.0] - 2026-10-05
+
+### Fixed
+
+- Typing into a Mac host's terminals from another computer no longer lags while that Mac sits unattended. macOS put the idle host's term-mesh to sleep in the background (App Nap), so each keystroke's echo took about 160ms to come back. While another computer is connected, the host now stays responsive. On a power adapter, the echo comes back in a few milliseconds; on battery, it stays under about 20ms to save power. Sleep still follows the "Keep Mac awake while connected" setting.
+- The sidebar's folder name for a remote terminal now follows the shell when it changes folders. It used to show the folder the terminal started in until a pane was split or closed. Changing folders repeatedly on the host no longer makes every connected computer reconnect to refresh its team list.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.265.0] - 2026-10-05
 
 ### Added
