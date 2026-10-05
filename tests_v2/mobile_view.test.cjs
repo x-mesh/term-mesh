@@ -184,6 +184,33 @@ for (const cli of ['claude', 'codex']) {
   });
 }
 
+test('view switches refresh content while the page is hidden', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.document.hidden = true;
+  assert.equal(app.nodes.get('screen').textContent, '');
+  app.nodes.get('view-terminal').dispatch('click');
+  await settle();
+  assert.equal(app.nodes.get('screen').textContent, 'shell screen');
+  const before = app.requests.filter(url => url.includes('/transcript')).length;
+  app.nodes.get('view-chat').dispatch('click');
+  await settle();
+  assert.ok(app.requests.filter(url => url.includes('/transcript')).length > before);
+});
+
+test('a view switch refreshes content during an outstanding target poll', async () => {
+  const app = page([pane(true)]);
+  await settle();
+  app.document.hidden = true;
+  const release = app.pauseTargets();
+  app.nodes.get('refresh').dispatch('click');
+  app.nodes.get('view-terminal').dispatch('click');
+  await settle();
+  assert.equal(app.nodes.get('screen').textContent, 'shell screen');
+  release([pane(true)]);
+  await settle();
+});
+
 test('explicit Term preference survives detection', async () => {
   const app = page([pane(false)], { 'term-mesh-view:pane-1': 'terminal' });
   await settle();

@@ -245,6 +245,8 @@
     state.mode = mode;
     window.localStorage.setItem('term-mesh-view:' + t.surface_id, state.mode);
     selectTarget(t, false);
+    refreshScreen();
+    refreshChat();
   }
 
   function targetLabel(t) {
