@@ -91,7 +91,9 @@ HostState
     up(lease, spec, refs)
     restarting(lease, spec, restart, refs)
     awaitingReconnect(token)                // with a phase deadline
-  waiters: [Waiter]           // id, origin, generation, deadline; never a spec
+  waiters: [Waiter]           // id and origin; never a spec
+  reconnectToken: Token?      // current from disconnect(.reconnect(t)) until its start
+                              // lands, fails or is cancelled, or the wait ends
   park: nil | Parked(reason)  // panes parked, owed a reattach
   reason ∈ died | reconnect | userDisconnected
 ```
@@ -115,9 +117,9 @@ How `park` is set and upgraded:
 | Event | Effect on `park` |
 | --- | --- |
 | Retire the pooled lease while it has references | `Parked(died)`, unless a `userDisconnected` debt is already there |
-| `disconnect(.reconnect)` | `Parked(reconnect)` if a lease was pooled or a debt exists, unless the debt is `userDisconnected` |
-| `disconnect(.plain)` | `Parked(userDisconnected)` if a lease was pooled or *any* debt exists. The user disconnected explicitly, so the panes now wait for the user's Connect. |
-| `disconnect(.force)` | `fireAbandoned`, then nil |
+| `disconnect(.reconnect)` | `Parked(reconnect)` if the pooled lease had references or a debt exists, unless the debt is `userDisconnected` |
+| `disconnect(.plain)` | `Parked(userDisconnected)` if the pooled lease had references or *any* debt exists. The user disconnected explicitly, so the panes now wait for the user's Connect. |
+| `disconnect(.force)` | `fireAbandoned` if a debt exists, then nil |
 | `reconnectAbandoned(t, movedTo: B)` with B set | `fireAbandoned`, then nil, **whatever the reason**. Nothing on key A can reattach panes that now belong to B. This matches what happens to them today. |
 
 **Park invariant** (checked in every state): if `park` is set, then either its
@@ -171,19 +173,35 @@ restart, or an `unusedCheck` that finds zero references while waiters remain):
 ### Transitions
 
 Rule 4 applies before every row. Waiters are listed only where they change.
+A waiter id that is already waiting is the same acquire submitted again and
+changes nothing; this is checked before rule 4, so it cannot be resolved twice.
+A reconnect start that lands, fails, or is cancelled consumes the token, so a
+later acquire carrying it is resolved `reconnectSuperseded`.
+
+The rows use short names. In the code they are:
+
+| Here | `PeerHostMachine` |
+| --- | --- |
+| `.error(e)` | `Outcome.failure(e)` |
+| `armDeadline(w)` / `armDeadline(t)` | `armWaiterDeadline` / `armReconnectDeadline` |
+| `deadline(w)` / `deadline(t)` | `waiterDeadline` / `reconnectDeadline` |
+| `reconnectAbandoned(t, movedTo: B)` | `reconnectAbandoned(t, moved: true)` |
 
 | From | Event | To | Effects |
 | --- | --- | --- | --- |
 | idle | `acquire(user, spec)` | starting(new, spec, fresh) + w | `startTunnel`, `armDeadline(w)` |
 | idle | `acquire(sweep / waiter)` | idle | `resume(w, .error(replacementUnavailable))` |
-| starting(a) | `acquire(any)` | + w | `armDeadline(w)` |
+| starting(a, fresh / replacement) | `acquire(any)` | + w | `armDeadline(w)` |
+| starting(a, reconnect) | `acquire(user)` | + w | `armDeadline(w)` |
+| starting(a, reconnect) | `acquire(sweep / waiter)` | — | `resume(w, .error(replacementUnavailable))`; only user waiters receive a reconnect's lease |
 | starting(a) | `startFinished(a, .lease(L))` | up(L, spec, refs = waiters) | `resume(each w, L)`; if `park`: `fireDidReplace(L)`, clear; then `queueUnusedCheck(L)`. **Every** pool queues the check. Retargeted panes `retain` through the queue first, so the check sees their references. With waiters it is a no-op, but one rule ("a pooled lease with zero references is stopped") is what the explorer checks. |
 | up(L) / restarting(L) | `unusedCheck(L)`, refs 0, no waiters | idle | `stopTunnel(L)` |
 | restarting(L) | `unusedCheck(L)`, refs 0, waiters remain | retire | as above |
 | up(L) / restarting(L) | `unusedCheck(L)` otherwise | — | — |
 | starting(a) | `startFinished(a, .failure)` | idle | `resume(each w, .error)`; apply the park invariant (abandon `died` / `reconnect`, keep `userDisconnected`) |
 | starting(a, fresh / reconnect) | `cancel(w)` of its last waiter | idle | `cancelStart(a)`, `resume(w, .error(cancelled))`; apply the park invariant |
-| any | `cancel(w)` / `deadline(w)` otherwise | − w | `resume(w, .error(cancelled / replacementUnavailable))` |
+| any | `cancel(w)` otherwise | − w | `resume(w, .error(cancelled))` |
+| any | `deadline(w)` | − w | `resume(w, .error(timedOut))`; the start, if any, continues |
 | up(L) / restarting(L) | `retain(L)` | refs + 1 | — |
 | up(L) / restarting(L) | `release(L)` | refs − 1 | at 0: `queueUnusedCheck(L)`. Never a stop in this transition (see the explorer findings). |
 | up(L) | `acquire(any)`, verdict usable | refs + 1 | `resume(w, L)` |
@@ -308,10 +326,14 @@ against the cause and the state before it:
 | A `resume` resolves an acquire that is asked and unresolved. | 4 |
 | A lease handed out is pooled. | I1 |
 | A lease handed out goes to a waiter raised under the current generation. | I3 |
+| A tunnel starts from `idle` only for a user acquire carrying no token. | 5 |
 | A lease handed out was not already dead when the acquire was dequeued. | 3 |
 | `stopTunnel` never reaches the lease that is pooled after the commit. | 2 |
-| `cancelStart` is caused only by a Cancel or a disconnect. | 7 |
+| `cancelStart` is caused only by a disconnect, or by a Cancel of a fresh or reconnect start. | 7 |
 | `fireAbandoned` is caused only by a failed start, a Cancel, `reconnectAbandoned`, a Reconnect deadline, or Force Disconnect. A rule-6 regression would otherwise pass by abandoning eagerly. | 6 |
+| A `userDisconnected` debt is abandoned only by Force Disconnect or a Reconnect that moved key. | 6 |
+| An acquire admitted or served after the pooled lease was sampled dead has retired that lease. | I8 |
+| A reconnect's lease goes only to `user` waiters, and Reconnect never resolves a `user` waiter. | #675 N1 |
 | `fireDidReplace` has a debt to pay. | I7 |
 
 **In every state:**
@@ -336,18 +358,21 @@ reaching a row fails the test instead of passing on a smaller search.
 ### Bounds and results
 
 Neither layer is depth-limited: each search runs until the bounded space
-closes.
+closes. "Acquires" counts every acquire in a path, including rejected and
+raised ones, not only waiters that wait.
 
 | Layer | Bounds | States | Closes at depth | Release build |
 | --- | --- | --- | --- | --- |
-| 1 | 3 waiters, 1 raised acquire in flight, 2 of each disconnect kind | 808,475 | 21 | ~30 s |
-| 2 (default) | 2 waiters, 1 in flight, 2 of each disconnect kind | 343,825 | 15 | ~48 s |
-| 2 (wider, manual) | 3 waiters, 1 in flight, 1 of each disconnect kind | 958,228 | 16 | ~170 s |
-| 2 (widest, manual) | 3 waiters, 1 in flight, 2 of each disconnect kind | 6,205,509 | 19 | ~25–45 min, 6–8 GB |
+| 1 | 3 acquires, 1 raised acquire in flight, 2 of each disconnect kind | 686,081 | 21 | ~24 s |
+| 2 (default) | 2 acquires, 1 in flight, 2 of each disconnect kind | 303,103 | 15 | ~43 s |
+| 2 (wider, manual) | 3 acquires, 1 in flight, 1 of each disconnect kind | 800,488 | 16 | ~145 s |
+| 2 (widest, manual) | 3 acquires, 1 in flight, 2 of each disconnect kind | 5,220,183 | 19 | ~18 min, 5.8 GB |
 
 All rows passed with no violation. The wider layer 2 bounds are run by editing
 `ExplorerBounds.layer2`; they are too slow for every test run. A plain debug
-`swift test` of both default layers takes about three and a half minutes.
+`swift test` of both default layers takes a few minutes, and
+`scripts/test-mesh-project-sync-integration.sh --with-peerproto` pays that
+cost, because it runs the whole PeerProto suite in debug.
 
 The guarantee is "no violation in any state reachable within these bounds",
 not "within N steps".
@@ -378,32 +403,89 @@ Two of the explorer's own judgments were too strict and were corrected:
   defect. That pane is parked under the new debt, and the parked-forever check
   verifies that.
 
+### What review found in the explorer
+
+PR A's review mutated the machine against rules the explorer had no check for.
+Eight mutants passed both layers:
+
+- a Cancel stopping a replacement start;
+- a dead verdict leaving the lease pooled, in `up` and in `restarting` (I8);
+- a `userDisconnected` debt abandoned by a failed start, by a
+  `reconnectAbandoned` without a key move, or by a Reconnect deadline;
+- Reconnect resolving user waiters;
+- a background acquire admitted during `awaitingReconnect`.
+
+The explorer was green because nothing asked those questions. The checks
+marked 6, I8, #675 N1 and 7 in the table above were added for them, and each
+mutant is now in the gate.
+
+The same review found two machine changes:
+
+- A reconnect start that failed or was cancelled kept its token, so a later
+  acquire carrying it started a fresh tunnel with the probed spec. The token is
+  now consumed.
+- A background acquire during `starting(reconnect)` received the reconnect's
+  lease. It is now resolved, as in `awaitingReconnect`.
+
 ### Gate
 
 `scripts/peer-host-machine-gate.py` runs both layers, then breaks one rule at a
-time and requires the named layer to fail with the named violation. It
-restores each source byte for byte.
+time and requires the named layer to fail with the named violation. The only
+exception is the re-entrancy mutant: it has no single expected violation and
+needs only a failure. The script checks every restore against the SHA-256
+taken before the first mutant.
 
 - **Rule 1** cannot be broken in a synchronous core, so it is checked
   structurally: no `async`, `await`, `Task`, `DispatchQueue`, or `Thread` in
   the machine or the core, and `reduce` is static.
-- **Every other rule** has a mutant. Each one, and the layer and violation
-  that caught it on the PR A run:
+- **Every other rule** has at least one mutant. Each mutant, named as in the
+  script, with the layer and the violations that caught it on the PR A run:
 
 | Mutant | Caught by | Violations |
 | --- | --- | --- |
-| Rule 2: commit after the effects run | layer 1 | I1, rule 2 |
-| Rule 2: reduce re-entrant calls in the middle of an effect list | layer 2 | I1, I3 |
-| Rule 3: sample the verdict when the acquire is raised | layer 2 | rule 3 |
-| Rule 4: ignore an acquire raised before a disconnect | layer 1 | rule 4 |
-| Rule 4: treat a stale token as a plain acquire | layer 1 | rule 5 |
-| Rule 5: let a background waiter start from `idle` with its own spec | layer 1 | rule 5 |
-| Rule 6: read dependents after the references leave the pool | layer 1 | rule 6 |
-| Rule 7: a deadline cancels the start | layer 1 | rules 6, 7 |
-| Rule 7: admit a waiter without a deadline | layer 1 | rule 7 |
-| Rule 8: resume without counting the reference | layer 1 | rule 8 |
-| Park invariant: never abandon an unpayable debt | layer 1 | parked forever |
-| Zero references stop the lease at once (finding 2) | layer 2 | parked forever |
+| rule 2: commit after the effects run | layer 1 | I1, rule 2 |
+| rule 2: reduce re-entrant calls in the middle of an effect list | layer 2 | I1, I3 |
+| rule 3: sample the verdict when the acquire is raised | layer 2 | rule 3 |
+| rule 4: ignore an acquire raised before a disconnect | layer 1 | rule 4 |
+| rule 4: treat a stale token as a plain acquire | layer 1 | rule 5 |
+| rule 5: let a background waiter start from idle with its own spec | layer 1 | rule 5 |
+| rule 6: read dependents after the references leave the pool | layer 1 | rule 6 |
+| rule 7: a deadline cancels the start | layer 1 | rule 6, rule 7 |
+| rule 7: admit a waiter without a deadline | layer 1 | rule 7 |
+| rule 8: resume with the pooled lease without counting the reference | layer 1 | rule 8 |
+| rule 7: a Cancel stops a replacement start | layer 1 | rule 7 |
+| I8: a dead verdict in restarting leaves the lease pooled | layer 1 | I8 |
+| I8: a dead verdict in up only admits the waiter | layer 1 | I8 |
+| park: a failed start abandons a userDisconnected debt | layer 1 | rule 6 |
+| park: reconnectAbandoned without a key move abandons every debt | layer 1 | rule 6 |
+| park: a Reconnect deadline abandons every debt | layer 1 | rule 6 |
+| reconnect: Reconnect Host resolves user waiters too | layer 1 | reconnect origin |
+| reconnect: a background acquire waits for the reconnect | layer 1 | reconnect origin |
+| reconnect: a background acquire joins a reconnect start | layer 1 | reconnect origin |
+| reconnect: a failed reconnect start keeps its token | layer 1 | rule 5 |
+| park invariant: never abandon an unpayable debt | layer 1 | parked forever |
+| zero references stop the lease at once instead of through the queue | layer 2 | parked forever |
+
+## PR B contract
+
+These hold for the shell that wraps `PeerHostShellCore`. The explorer assumes
+them; it cannot check the shell's own code:
+
+- `perform` never delivers a completion synchronously. `startFinished`,
+  `restartFinished` and deadlines always arrive as later events.
+- The `fireDidReplace` handler raises every retargeted pane's `retain` before
+  anything else that can call into the core.
+- On `stopTunnel` of a retired lease, the panes still holding it are the
+  references in `EffectContext.before`. They become shell-only, and their
+  releases never reach the machine.
+- The core is confined to the main actor.
+- `Failure.startFailed` carries no underlying error. The shell substitutes the
+  tunnel's error when it resumes the caller.
+- `PeerPaneHostSpec` must become `Hashable` and `Sendable` to be the machine's
+  `Spec`.
+- A Cancel in `RemoteHostStore` follows the events table:
+  - before the token acquire, it raises `reconnectAbandoned`;
+  - after it, it raises `cancel(w)` on the token holder's waiter.
 
 ## Open items
 
