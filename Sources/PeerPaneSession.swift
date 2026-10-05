@@ -32,7 +32,7 @@ import PeerProto
 /// details (an SSH tunnel's local socket path changes per reconnect)
 /// into a stable pooling identity — same convention as
 /// `RemoteHostStore.stableKey`.
-enum PeerPaneHostSpec {
+enum PeerPaneHostSpec: Hashable, Sendable {
     case direct(sockPath: String)
     /// `port`/`identityFile` are optional auth parameters from a saved
     /// host profile (nil = ssh defaults / ssh-config). They ride the
@@ -141,9 +141,7 @@ final class PeerPaneHostLease {
     /// still exist. Their later releases must not stop it a second time (or,
     /// more importantly, disturb a replacement lease for the same host).
     fileprivate var isTornDown = false
-    /// Left the pool because its last holder released it, not because a
-    /// disconnect or a dead-lease retirement took it out.
-    fileprivate var leftPoolByRelease = false
+    fileprivate var registryID: PeerHostLeaseID?
     /// Whether consumers may still recover through this lease. Exposes the
     /// lifecycle fact without allowing another file to mutate ownership.
     var canReconnectTransport: Bool { !isTornDown }
@@ -167,6 +165,10 @@ final class PeerPaneHostLease {
     }
 
     var transportGeneration: UInt64 { transportRecovery.generation }
+
+    #if DEBUG
+    var transportRecoveryForTests: PeerPaneTransportRecovery { transportRecovery }
+    #endif
 
     /// Replace a half-alive SSH forward and wait until its replacement is up.
     /// Direct Unix sockets have no owned transport to refresh.
@@ -372,87 +374,79 @@ enum PeerPaneHostAcquireError: Error, CustomStringConvertible {
 final class PeerPaneHostRegistry {
     static let shared = PeerPaneHostRegistry()
 
-    private var leases: [PeerPaneHostKey: PeerPaneHostLease] = [:]
-    /// Coalesces concurrent first-acquires of the same host so exactly
-    /// one tunnel is spawned (double-click, multi-pane open, …).
-    private struct StartingLease {
-        let id = UUID()
-        let task: Task<PeerPaneHostLease, Error>
-        /// The host's disconnect generation when this start began. A Disconnect
-        /// Host that lands while it runs makes its lease stale for every caller.
-        let disconnectGeneration: UInt64
-        /// The pending replacement this start was made under, if any.
-        let replacementToken: UUID?
-        /// Callers currently awaiting this coalesced start. Cancelling the task
-        /// aborts it for all of them, so it may only be cancelled while this is
-        /// the last waiter.
-        var waiters = 0
+    private typealias Machine = PeerHostMachine<PeerPaneHostSpec, UUID>
+    private typealias Core = PeerHostShellCore<PeerPaneHostSpec, UUID>
+
+    private final class HostShell {
+        let key: PeerPaneHostKey
+        var core: Core!
+        var leases: [PeerHostLeaseID: PeerPaneHostLease] = [:]
+        var starts: [PeerHostAttemptID: Task<Void, Never>] = [:]
+        var restarts: [PeerHostRestartID: Task<Void, Never>] = [:]
+        var deadlines: [PeerHostWaiterID: Task<Void, Never>] = [:]
+        var reconnectDeadline: Task<Void, Never>?
+        var continuations: [PeerHostWaiterID: CheckedContinuation<PeerPaneHostLease, Error>] = [:]
+        var waiterIDs: [UUID: PeerHostWaiterID] = [:]
+        var startError: Error?
+
+        init(key: PeerPaneHostKey) { self.key = key }
     }
 
-    private var starting: [PeerPaneHostKey: StartingLease] = [:]
-    /// Bumped by every plain Disconnect Host, whether or not a lease was
-    /// pooled. Kept per key because the disconnect that matters can land
-    /// while no lease exists yet — mid-start, after a Reconnect Host.
-    private var disconnectGenerations: [PeerPaneHostKey: UInt64] = [:]
-    /// Hosts whose lease Reconnect Host retired, with a replacement intended
-    /// but not yet pooled. Restart waiters may wait for it here; they never
-    /// start it themselves. The token names the Reconnect Host attempt, so a
-    /// failure belonging to another attempt cannot withdraw it.
-    private var pendingReplacements: [PeerPaneHostKey: UUID] = [:]
-    /// How long a restart waiter waits for an intended replacement to start
-    /// or pool. The same budget `PeerPaneHostLease.refreshTransport` gives a
-    /// tunnel to come back.
+    private var hosts: [PeerPaneHostKey: HostShell] = [:]
+    private var nextSerial: UInt64 = 0
     static let replacementJoinDeadlineSeconds: TimeInterval = 15
 
     #if DEBUG
-    /// Test-only: leases torn down so far. A unit test drives `.direct` specs,
-    /// whose `teardown()` stops no real process, so this counter is the only
-    /// way to tell a released lease from an orphaned one.
     private(set) var teardownCountForTests = 0
-    /// Test-only: stand in for `liveness(of:)`. A `.direct` lease is always
-    /// usable for real, so this is the only way a test can make the registry
-    /// see a dead or restarting tunnel without spawning ssh.
     var livenessOverrideForTests: ((PeerPaneHostLease) -> PeerPaneHostLeaseVerdict)?
-    /// Test-only: stand in for joining a tunnel's own restart. Returns
-    /// whether the restart brought the lease back.
     var restartWaitOverrideForTests: ((PeerPaneHostLease) async -> Bool)?
-    /// Test-only: replacements pooled so far.
+    var restartDelayForTests: ((PeerPaneHostLease) async -> Void)?
     private(set) var replacementCountForTests = 0
-    /// Test-only: runs before a coalesced start makes its lease, so a test can
-    /// hold a start open while something else (a disconnect) happens.
     var startDelayForTests: ((PeerPaneHostSpec) async -> Void)?
-    /// Test-only: replaces `replacementJoinDeadlineSeconds`.
     var replacementJoinDeadlineForTests: TimeInterval?
-    /// Test-only: sees every lease a start makes, including ones that are
-    /// torn down without ever being pooled or handed out.
     var leaseMadeForTests: ((PeerPaneHostLease) -> Void)?
-    /// Test-only: an acquire judged this pooled lease dead — `.dead`, or a
-    /// restart that did not bring it back. Invariant I8 says it must not stay
-    /// pooled after that.
     var deadLeaseObservedForTests: ((PeerPaneHostLease) -> Void)?
     #endif
 
-    /// Fires just before `acquire` tears down a pooled lease it judged dead,
-    /// and before anything else can observe the teardown. The coordinator
-    /// flags that host's panes as deliberately disconnected here so their
-    /// EOF reads as a retirement to wait out, not an accident to recover
-    /// from on their own — otherwise the reattach runs twice.
     var hostTransportWillRetire: (@MainActor (PeerPaneHostKey) -> Void)?
-    /// Fires once the replacement for a retired lease is pooled and owned.
-    /// The coordinator reattaches that host's panes and mirrors through it
-    /// and the sidebar adopts its socket path. Without this every consumer
-    /// of the old lease stays stranded and the row turns unreachable.
     var hostTransportDidReplace: (@MainActor (PeerPaneHostKey, PeerPaneHostLease) -> Void)?
-    /// Hosts whose dead lease `acquire` retired and whose replacement is not
-    /// pooled yet. A key stays here across a failed start on purpose: the
-    /// panes were flagged, so the first replacement that does land must
-    /// still reach them.
-    private var replacingKeys: Set<PeerPaneHostKey> = []
+    var hostTransportReplacementAbandoned: (@MainActor (PeerPaneHostKey) -> Void)?
 
-    /// Whether a pooled lease can still carry traffic. The tunnel state is
-    /// the answer for every state but `.up`, which also gets one local
-    /// `connect(2)`: a stopped ssh leaves its socket file behind, and that
-    /// file alone is the same broken promise as no socket at all.
+    private func serial() -> UInt64 {
+        nextSerial += 1
+        return nextSerial
+    }
+
+    private func shell(for key: PeerPaneHostKey) -> HostShell {
+        if let shell = hosts[key] { return shell }
+        let shell = HostShell(key: key)
+        shell.core = Core(
+            sampleVerdict: { [weak self, weak shell] id in
+                guard let self, let lease = shell?.leases[id] else { return .dead }
+                switch self.liveness(of: lease) {
+                case .usable: return .usable
+                case .waitForRestart: return .restarting
+                case .dead:
+                    #if DEBUG
+                    self.deadLeaseObservedForTests?(lease)
+                    #endif
+                    return .dead
+                }
+            },
+            perform: { [weak self, weak shell] effect, context in
+                guard let self, let shell else { return }
+                self.perform(effect, context: context, shell: shell)
+            },
+            shellOnlyReference: { [weak shell] id, delta in
+                guard let shell, let lease = shell.leases[id] else { return }
+                lease.refCount += delta
+                if lease.refCount == 0, lease.isTornDown { shell.leases[id] = nil }
+            }
+        )
+        hosts[key] = shell
+        return shell
+    }
+
     func liveness(of lease: PeerPaneHostLease) -> PeerPaneHostLeaseVerdict {
         #if DEBUG
         if let override = livenessOverrideForTests { return override(lease) }
@@ -465,291 +459,169 @@ final class PeerPaneHostRegistry {
         )
     }
 
-    /// Local socket of a lease that already exists for `key`, or nil.
-    ///
-    /// Read-only and refcount-free on purpose: it answers "is there already a
-    /// tunnel to this endpoint, and where is it" for callers that must not
-    /// start one. Teardown is the case — closing surfaces on an endpoint whose
-    /// tunnel is already gone has nothing left to close, and dialling a fresh
-    /// tunnel to discover that would outlive the work it was opened for.
     func existingLocalSockPath(for key: PeerPaneHostKey) -> String? {
-        guard let lease = leases[key] else { return nil }
-        let path = lease.hostSockPath
-        return path.isEmpty ? nil : path
+        guard let path = activeLease(forKey: key)?.hostSockPath, !path.isEmpty else { return nil }
+        return path
     }
 
-    /// Acquire a lease for the host (+1 ref). Starts the SSH tunnel on
-    /// first acquire; later acquires reuse the live lease.
-    ///
-    /// A pooled lease is judged before it is handed out. A long sleep can
-    /// exhaust the tunnel's own reconnect budget and leave it `.failed` in
-    /// the pool; handing that out strands the caller on a socket nothing
-    /// listens on, and no consumer ever asks for a replacement.
     func acquire(_ spec: PeerPaneHostSpec) async throws -> PeerPaneHostLease {
-        try await acquire(spec, mayStart: true)
+        try await acquire(spec, waiter: UUID())
     }
 
-    /// `mayStart` false is a restart waiter joining a replacement: it may
-    /// reuse a usable lease or join a start, but never retire or start one
-    /// with its own spec, which may predate what retired the lease.
-    private func acquire(
+    func acquire(
         _ spec: PeerPaneHostSpec,
-        mayStart: Bool
+        waiter: UUID,
+        token: UUID? = nil,
+        background: Bool = false
     ) async throws -> PeerPaneHostLease {
-        let key = spec.hostKey
-        if let lease = leases[key] {
-            switch liveness(of: lease) {
-            case .usable:
-                lease.refCount += 1
-                return lease
-            case .waitForRestart:
-                // Join the restart the tunnel is already running instead of
-                // racing it with a second ssh to the same host.
-                let observed = lease.transportGeneration
-                let generation = disconnectGeneration(for: key)
-                let cameBack = await waitForRestart(of: lease, after: observed)
-                try Task.checkCancellation()
-                guard leases[key] === lease else {
-                    return try await joinReplacement(
-                        for: spec, waitedOn: lease, waitedFrom: generation, mayStart: mayStart
-                    )
-                }
-                if cameBack || liveness(of: lease) == .usable {
-                    lease.refCount += 1
-                    return lease
-                }
-                #if DEBUG
-                deadLeaseObservedForTests?(lease)
-                #endif
-                // Retired either way (I8): left pooled, a dead lease strands
-                // every consumer until some later acquire happens by. Only the
-                // start of a replacement is withheld from a joining waiter.
-                retireDeadLease(lease, key: key)
-                guard mayStart else { throw PeerPaneHostAcquireError.replacementDied(key) }
-            case .dead:
-                #if DEBUG
-                deadLeaseObservedForTests?(lease)
-                #endif
-                retireDeadLease(lease, key: key)
-                guard mayStart else { throw PeerPaneHostAcquireError.replacementDied(key) }
-            }
-        }
-        if let startingLease = starting[key] {
-            starting[key]?.waiters += 1
-            defer {
-                if starting[key]?.id == startingLease.id {
-                    starting[key]?.waiters -= 1
-                }
-            }
-            let lease = try await awaitStart(startingLease, key: key)
-            return try await settleStart(lease, from: startingLease, spec: spec, mayStart: mayStart)
-        }
-        guard mayStart else { throw PeerPaneHostAcquireError.replacementUnavailable(key) }
-        var startingLease = StartingLease(
-            task: Task { [weak self] in
-                #if DEBUG
-                if let delay = self?.startDelayForTests { await delay(spec) }
-                #endif
-                // A start cancelled before its ssh spawns — by Cancel, or by a
-                // Disconnect Host that overtook it — has nothing to stop yet.
-                try Task.checkCancellation()
-                let made = try await Self.makeLease(spec: spec)
-                #if DEBUG
-                self?.leaseMadeForTests?(made)
-                #endif
-                return made
-            },
-            disconnectGeneration: disconnectGeneration(for: key),
-            replacementToken: pendingReplacements[key]
-        )
-        startingLease.waiters = 1
-        starting[key] = startingLease
-        defer {
-            if starting[key]?.id == startingLease.id {
-                starting[key] = nil
-            }
-        }
-        let lease: PeerPaneHostLease
-        do {
-            lease = try await awaitStart(startingLease, key: key)
-        } catch {
-            // Nothing will pool from the attempt this start was made for, so
-            // its waiters must not hold out until their deadline. A start made
-            // before a newer Reconnect Host carries no claim on that one.
-            if let token = startingLease.replacementToken, pendingReplacements[key] == token {
-                pendingReplacements[key] = nil
-            }
-            throw error
-        }
-        return try await settleStart(lease, from: startingLease, spec: spec, mayStart: true)
-    }
-
-    /// Hand out the lease a start produced, once this caller resumes.
-    ///
-    /// Every caller of one start resumes separately. Between the first, which
-    /// pools the lease, and a later one, the lease can be retired (Reconnect
-    /// Host, a dead retire, a last release). Pooling it again would hand out a
-    /// torn-down tunnel and announce it as a replacement a second time (I1,
-    /// I7), so that caller joins whatever replaced it instead.
-    private func settleStart(
-        _ lease: PeerPaneHostLease,
-        from startingLease: StartingLease,
-        spec: PeerPaneHostSpec,
-        mayStart: Bool
-    ) async throws -> PeerPaneHostLease {
-        let key = spec.hostKey
-        let generation = startingLease.disconnectGeneration
-        if generation == disconnectGeneration(for: key), lease.isTornDown {
-            // The finished start stays in `starting` until its creator resumes.
-            // Left there, the join below would rejoin it, get this same
-            // torn-down lease back without suspending, and recurse until the
-            // stack ran out.
-            if starting[key]?.id == startingLease.id {
-                starting[key] = nil
-            }
-            return try await joinReplacement(
-                for: spec, waitedOn: lease, waitedFrom: generation, mayStart: mayStart
-            )
-        }
-        return try adoptUnlessDisconnected(lease, startedAt: generation, key: key)
-    }
-
-    /// A start cancelled because Disconnect Host overtook it reports that
-    /// disconnect, not the cancellation, to everyone who was waiting on it.
-    private func awaitStart(
-        _ startingLease: StartingLease,
-        key: PeerPaneHostKey
-    ) async throws -> PeerPaneHostLease {
-        do {
-            return try await startingLease.task.value
-        } catch {
-            if startingLease.disconnectGeneration != disconnectGeneration(for: key) {
-                throw PeerPaneHostAcquireError.hostDisconnected(key)
-            }
-            throw error
-        }
-    }
-
-    private func disconnectGeneration(for key: PeerPaneHostKey) -> UInt64 {
-        disconnectGenerations[key, default: 0]
-    }
-
-    /// A start that a Disconnect Host overtook is not pooled for anyone: the
-    /// user ended this host while it was coming up, and pooling it would
-    /// announce it as the replacement and reattach the panes they disconnected.
-    private func adoptUnlessDisconnected(
-        _ lease: PeerPaneHostLease,
-        startedAt generation: UInt64,
-        key: PeerPaneHostKey
-    ) throws -> PeerPaneHostLease {
-        guard generation == disconnectGeneration(for: key) else {
-            if leases[key] !== lease { teardown(lease) }
-            throw PeerPaneHostAcquireError.hostDisconnected(key)
-        }
-        return try adopt(lease, key: key)
-    }
-
-    /// The lease this caller waited on is gone. It never starts a replacement
-    /// itself: its spec may predate what retired the lease (a repaired
-    /// identity, an invalidated socket), and a user's Disconnect Host must
-    /// stay final. It takes what is pooled, joins what is starting, or waits
-    /// for the replacement Reconnect Host intends — and otherwise gives up.
-    private func joinReplacement(
-        for spec: PeerPaneHostSpec,
-        waitedOn waitedLease: PeerPaneHostLease,
-        waitedFrom generation: UInt64,
-        mayStart: Bool
-    ) async throws -> PeerPaneHostLease {
-        let key = spec.hostKey
-        var budget = Self.replacementJoinDeadlineSeconds
-        #if DEBUG
-        if let override = replacementJoinDeadlineForTests { budget = override }
-        #endif
-        let deadline = Date().addingTimeInterval(budget)
-        let token = pendingReplacements[key]
+        let shell = shell(for: spec.hostKey)
+        precondition(shell.waiterIDs[waiter] == nil, "each acquire must use its own waiter ID")
+        let generation = shell.core.state.generation
+        var origin: Machine.Origin = background ? .sweep : .user
+        var requestToken = token
         while true {
-            try Task.checkCancellation()
-            if disconnectGeneration(for: key) != generation {
-                throw PeerPaneHostAcquireError.hostDisconnected(key)
-            }
-            if leases[key] != nil || starting[key] != nil {
-                return try await acquire(spec, mayStart: false)
-            }
-            if pendingReplacements[key] == nil {
-                // Its last holder released the lease; nothing retired it, so
-                // nothing replaced its spec either, and starting with it is
-                // what this caller asked for in the first place.
-                if waitedLease.leftPoolByRelease, mayStart {
-                    return try await acquire(spec, mayStart: true)
+            let id = PeerHostWaiterID(serial())
+            let request = Machine.AcquireRequest(
+                waiter: id, origin: origin, generation: generation, spec: spec, token: requestToken
+            )
+            let lease = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    shell.continuations[id] = continuation
+                    shell.waiterIDs[waiter] = id
+                    shell.core.acquire(request)
                 }
-                throw PeerPaneHostAcquireError.replacementUnavailable(key)
+            } onCancel: {
+                Task { @MainActor in shell.core.deliver(.cancel(id)) }
             }
-            guard Date() < deadline else {
-                // The intended replacement never came, or came under another
-                // key (a re-probed socket). Later waiters need not wait for it.
-                if let token, pendingReplacements[key] == token {
-                    pendingReplacements[key] = nil
+            if Task.isCancelled {
+                release(lease)
+                throw CancellationError()
+            }
+            guard shell.core.state.generation == generation else {
+                release(lease)
+                throw PeerPaneHostAcquireError.hostDisconnected(spec.hostKey)
+            }
+            if !lease.isTornDown { return lease }
+            release(lease)
+            origin = .waiter
+            requestToken = nil
+        }
+    }
+
+    private func perform(_ effect: Machine.Effect, context: Core.EffectContext, shell: HostShell) {
+        switch effect {
+        case let .startTunnel(attempt, spec):
+            shell.starts[attempt] = Task { [self] in
+                do {
+                    #if DEBUG
+                    if let delay = startDelayForTests { await delay(spec) }
+                    #endif
+                    try Task.checkCancellation()
+                    let lease = try await Self.makeLease(spec: spec)
+                    let id = PeerHostLeaseID(serial())
+                    lease.registryID = id
+                    shell.leases[id] = lease
+                    #if DEBUG
+                    leaseMadeForTests?(lease)
+                    #endif
+                    shell.starts[attempt] = nil
+                    shell.core.deliver(.startFinished(attempt, .lease(id)))
+                } catch {
+                    shell.starts[attempt] = nil
+                    shell.startError = error
+                    shell.core.deliver(.startFinished(attempt, .failure))
+                    shell.startError = nil
                 }
-                throw PeerPaneHostAcquireError.replacementUnavailable(key)
             }
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-    }
-
-    /// The replacement Reconnect Host announced for `key`, if one is pending.
-    func pendingReplacementToken(for key: PeerPaneHostKey) -> UUID? {
-        pendingReplacements[key]
-    }
-
-    /// The announced replacement will not come. With a token, only that
-    /// announcement is withdrawn, so a newer Reconnect Host's survives.
-    func abandonPendingReplacement(for key: PeerPaneHostKey, token: UUID? = nil) {
-        guard token == nil || pendingReplacements[key] == token else { return }
-        pendingReplacements[key] = nil
-    }
-
-    /// Pool the lease a coalesced start task produced and take one ref.
-    ///
-    /// Cancellation is honoured only *after* the lease is owned. Checking it
-    /// before pooling orphans an already-spawned tunnel: the lease never
-    /// reaches `leases`, so nothing ever releases it and the helper process
-    /// outlives the pane that asked for it.
-    private func adopt(_ lease: PeerPaneHostLease, key: PeerPaneHostKey) throws -> PeerPaneHostLease {
-        // A racing acquire may have landed a lease already (both awaited the
-        // same task); pool exactly one instance. A *different* pooled instance
-        // makes ours an orphan whose tunnel nobody would ever stop.
-        let pooled: PeerPaneHostLease
-        var isReplacement = false
-        if let existing = leases[key] {
-            if existing !== lease { teardown(lease) }
-            pooled = existing
-        } else {
-            leases[key] = lease
-            pooled = lease
-            pendingReplacements[key] = nil
-            isReplacement = replacingKeys.remove(key) != nil
-            #if DEBUG
-            dlog("peer.pane.lease.up key=\(key) replacement=\(isReplacement)")
-            #endif
-        }
-        pooled.refCount += 1
-        if Task.isCancelled {
-            release(pooled)
-            // The replacement never reached its consumers; the next one
-            // that lands must still fire for them.
-            if isReplacement { replacingKeys.insert(key) }
-            throw CancellationError()
-        }
-        if isReplacement {
+        case let .cancelStart(attempt):
+            shell.starts.removeValue(forKey: attempt)?.cancel()
+        case let .stopTunnel(id):
+            guard let lease = shell.leases[id] else { return }
+            switch context.before.phase {
+            case let .up(current, _, refs) where current == id,
+                 let .restarting(current, _, _, refs) where current == id:
+                lease.refCount = refs
+            default: break
+            }
+            teardown(lease)
+            if lease.refCount == 0 { shell.leases[id] = nil }
+        case let .resume(id, outcome):
+            shell.deadlines.removeValue(forKey: id)?.cancel()
+            shell.waiterIDs = shell.waiterIDs.filter { $0.value != id }
+            guard let continuation = shell.continuations.removeValue(forKey: id) else { return }
+            switch outcome {
+            case let .lease(leaseID):
+                guard let lease = shell.leases[leaseID] else {
+                    preconditionFailure("machine resumed a lease that the shell does not own")
+                }
+                continuation.resume(returning: lease)
+            case let .failure(failure):
+                let error: Error
+                switch failure {
+                case .cancelled: error = CancellationError()
+                case .hostDisconnected: error = PeerPaneHostAcquireError.hostDisconnected(shell.key)
+                case .replacementUnavailable, .timedOut:
+                    error = PeerPaneHostAcquireError.replacementUnavailable(shell.key)
+                case .startFailed:
+                    guard let underlying = shell.startError else {
+                        preconditionFailure("startFinished failure must carry the tunnel error")
+                    }
+                    error = underlying
+                case .reconnectSuperseded: error = failure
+                }
+                continuation.resume(throwing: error)
+            }
+        case let .fireWillRetire(id):
+            if let lease = shell.leases[id] {
+                #if DEBUG
+                deadLeaseObservedForTests?(lease)
+                #endif
+            }
+            hostTransportWillRetire?(shell.key)
+        case let .fireDidReplace(id):
+            guard let lease = shell.leases[id] else { return }
             #if DEBUG
             replacementCountForTests += 1
             #endif
-            hostTransportDidReplace?(key, pooled)
+            hostTransportDidReplace?(shell.key, lease)
+        case .fireAbandoned:
+            hostTransportReplacementAbandoned?(shell.key)
+        case let .armWaiterDeadline(id):
+            let budget = deadlineSeconds
+            shell.deadlines[id] = Task {
+                do { try await Task.sleep(for: .seconds(budget)) } catch { return }
+                shell.core.deliver(.waiterDeadline(id))
+            }
+        case let .armReconnectDeadline(token):
+            shell.reconnectDeadline?.cancel()
+            let budget = deadlineSeconds
+            shell.reconnectDeadline = Task {
+                do { try await Task.sleep(for: .seconds(budget)) } catch { return }
+                shell.core.deliver(.reconnectDeadline(token))
+            }
+        case let .waitRestart(id, restart):
+            guard let lease = shell.leases[id] else { return }
+            let observed = lease.transportGeneration
+            shell.restarts[restart] = Task { [self] in
+                #if DEBUG
+                if let delay = restartDelayForTests { await delay(lease) }
+                #endif
+                let cameBack = await waitForRestart(of: lease, after: observed)
+                shell.restarts[restart] = nil
+                shell.core.deliver(.restartFinished(id, restart, cameBack: cameBack))
+            }
+        case .queueUnusedCheck:
+            preconditionFailure("unusedCheck is owned by PeerHostShellCore")
         }
-        return pooled
     }
 
-    /// Join a tunnel's own restart; true when a new generation came up.
+    private var deadlineSeconds: TimeInterval {
+        #if DEBUG
+        if let override = replacementJoinDeadlineForTests { return override }
+        #endif
+        return Self.replacementJoinDeadlineSeconds
+    }
+
     private func waitForRestart(of lease: PeerPaneHostLease, after observed: UInt64) async -> Bool {
         #if DEBUG
         if let override = restartWaitOverrideForTests { return await override(lease) }
@@ -760,136 +632,59 @@ final class PeerPaneHostRegistry {
         return after > observed
     }
 
-    /// Take a dead lease out of the pool ahead of its replacement. Order
-    /// matters: the panes are flagged before teardown so the EOF they are
-    /// about to see reads as this retirement.
-    private func retireDeadLease(_ lease: PeerPaneHostLease, key: PeerPaneHostKey) {
-        hostTransportWillRetire?(key)
-        leases[key] = nil
-        replacingKeys.insert(key)
-        teardown(lease)
-        #if DEBUG
-        dlog("peer.pane.lease.retire key=\(key)")
-        #endif
+    func pendingReplacementToken(for key: PeerPaneHostKey) -> UUID? {
+        hosts[key]?.core.state.reconnectToken
     }
 
-    /// Stop this caller's in-flight first acquire.
-    ///
-    /// The start task is shared by every pane that coalesced onto the same
-    /// host, so it is only cancelled when this is the last waiter. With others
-    /// still waiting the caller just stops waiting: its own task cancellation
-    /// makes `adopt` pool the lease and release it again, which leaves the
-    /// remaining panes' connect untouched.
-    ///
-    /// An already-live lease is never affected — it may be owned by another
-    /// pane or workspace mirror.
-    /// Returns false when a pending start exists but could not be cancelled
-    /// because other panes are waiting on it. Callers that promise the user a
-    /// fresh attempt (sidebar Retry, `peer.host.retry`) must not claim to have
-    /// restarted anything in that case — `connectSavedHost` would simply
-    /// rejoin the same hung task and add one more waiter.
+    func abandonPendingReplacement(for key: PeerPaneHostKey, token: UUID? = nil, moved: Bool = false) {
+        guard let shell = hosts[key], let current = shell.core.state.reconnectToken,
+              token == nil || token == current else { return }
+        shell.core.deliver(.reconnectAbandoned(current, moved: moved))
+    }
+
     @discardableResult
-    func cancelPendingAcquire(for key: PeerPaneHostKey) -> Bool {
-        guard let startingLease = starting[key] else { return true }
-        guard startingLease.waiters <= 1 else {
-            #if DEBUG
-            dlog("peer.pane.acquire.cancel.shared key=\(key) waiters=\(startingLease.waiters)")
-            #endif
-            return false
+    func cancelPendingAcquire(for key: PeerPaneHostKey, waiter: UUID? = nil) -> Bool {
+        guard let shell = hosts[key] else { return true }
+        let id: PeerHostWaiterID
+        if let waiter {
+            guard let current = shell.waiterIDs[waiter] else { return true }
+            id = current
+        } else {
+            guard shell.core.state.waiters.count <= 1 else { return false }
+            guard let current = shell.core.state.waiters.first else { return true }
+            id = current.id
         }
-        starting[key] = nil
-        startingLease.task.cancel()
+        shell.core.deliver(.cancel(id))
         return true
     }
 
-    /// What Force Disconnect does to the registry before its connections are
-    /// closed and their references released. It ends the host exactly as
-    /// Disconnect Host does (I3-F): without the disconnect recorded, the last
-    /// release reads as an ordinary one and a restart waiter — the wake sweep,
-    /// a team spawn — reopens ssh to the host the user just ended.
     func endTransportForForceDisconnect(for key: PeerPaneHostKey) {
-        disconnectTransport(for: key)
+        shell(for: key).core.deliver(.disconnect(.force))
     }
 
     #if DEBUG
-    /// Test-only: callers currently awaiting a coalesced start for this host.
     func pendingWaiterCountForTests(for key: PeerPaneHostKey) -> Int {
-        starting[key]?.waiters ?? 0
+        hosts[key]?.core.state.waiters.count ?? 0
     }
     #endif
 
-    /// Additional ref on an already-acquired lease (a new pane joining
-    /// the host).
     func retain(_ lease: PeerPaneHostLease) {
-        lease.refCount += 1
+        guard let id = lease.registryID else { return }
+        shell(for: lease.key).core.retain(id)
     }
 
-    /// Balance one acquire/retain. The last release tears the lease
-    /// down (stops the shared tunnel) and removes it from the pool.
     func release(_ lease: PeerPaneHostLease) {
-        lease.refCount -= 1
-        guard lease.refCount <= 0 else { return }
-        // A host disconnect removes a still-referenced lease from the pool so
-        // Reconnect can create a fresh tunnel. Releasing that retired lease
-        // later must not evict the replacement.
-        if leases[lease.key] === lease {
-            leases[lease.key] = nil
-            lease.leftPoolByRelease = true
-        }
-        teardown(lease)
-        #if DEBUG
-        dlog("peer.pane.lease.down key=\(lease.key)")
-        #endif
+        guard let id = lease.registryID else { return }
+        shell(for: lease.key).core.release(id)
     }
 
-    /// End this host's pooled transport without releasing pane/mirror refs.
-    /// Existing views keep their session objects and receive ordinary EOF,
-    /// which drives their disconnected UI. A later acquire creates a fresh
-    /// lease instead of reviving this stopped tunnel.
-    ///
-    /// `replacementFollows` is true for Reconnect Host, which intends to start
-    /// the replacement right after. An acquire that was waiting on this
-    /// lease's restart waits up to `replacementJoinDeadlineSeconds` to join
-    /// it; Reconnect Host calls `abandonPendingReplacement` if it starts
-    /// nothing. A plain Disconnect Host is recorded even when no lease is
-    /// pooled, so a start already in flight is not pooled when it lands.
     @discardableResult
-    func disconnectTransport(
-        for key: PeerPaneHostKey,
-        replacementFollows: Bool = false
-    ) -> String? {
-        if replacementFollows {
-            pendingReplacements[key] = UUID()
-        } else {
-            disconnectGenerations[key, default: 0] &+= 1
-            pendingReplacements[key] = nil
-            // A start in flight is now stale for everyone already awaiting
-            // it — they fail its generation check and report the disconnect.
-            // Left in place, it would be joined by acquires made after the
-            // disconnect, such as the user's next Connect, and doom them too.
-            // Cancelling it as well stops its ssh now rather than when it
-            // lands, so it does not overlap the next Connect's tunnel and
-            // race it for the dashboard port.
-            starting.removeValue(forKey: key)?.task.cancel()
-        }
-        guard let lease = leases[key] else { return nil }
-        leases[key] = nil
-        // Panes preserved on this lease park until a replacement reaches
-        // them. Marking the key makes the next acquire announce itself as
-        // that replacement, whichever path makes it — a sidebar Connect, a
-        // new pane from the Peer menu, a team spawn. Without the mark only
-        // Connect resumed them, and any other path left them parked under a
-        // host the sidebar already showed as connected.
-        replacingKeys.insert(key)
-        let sockPath = lease.hostSockPath
-        teardown(lease)
-        #if DEBUG
-        dlog("peer.pane.lease.disconnect key=\(key) refs=\(lease.refCount)")
-        #endif
-        return sockPath
+    func disconnectTransport(for key: PeerPaneHostKey, replacementFollows: Bool = false) -> String? {
+        let path = activeLease(forKey: key)?.hostSockPath
+        shell(for: key).core.deliver(.disconnect(replacementFollows ? .reconnect(UUID()) : .plain))
+        return path
     }
 
-    /// Single teardown funnel so every path that stops a tunnel is counted.
     private func teardown(_ lease: PeerPaneHostLease) {
         let wasTornDown = lease.isTornDown
         lease.teardown()
@@ -898,14 +693,17 @@ final class PeerPaneHostRegistry {
         #endif
     }
 
-    /// Every pooled lease, for a sweep that judges each one after a wake.
     func pooledLeases() -> [(key: PeerPaneHostKey, lease: PeerPaneHostLease)] {
-        leases.map { (key: $0.key, lease: $0.value) }
+        hosts.compactMap { key, _ in
+            activeLease(forKey: key).map { (key: key, lease: $0) }
+        }
     }
 
-    /// Diagnostics/tests.
-    func activeLease(forKey key: PeerPaneHostKey) -> PeerPaneHostLease? { leases[key] }
-    var activeLeaseCount: Int { leases.count }
+    func activeLease(forKey key: PeerPaneHostKey) -> PeerPaneHostLease? {
+        guard let shell = hosts[key], let id = shell.core.state.pooledLease else { return nil }
+        return shell.leases[id]
+    }
+    var activeLeaseCount: Int { pooledLeases().count }
 
     private static func makeLease(spec: PeerPaneHostSpec) async throws -> PeerPaneHostLease {
         switch spec {

@@ -1185,6 +1185,8 @@ final class RemoteHostStore: ObservableObject {
     /// Available only after an auto socket probe. It lets Cancel stop exactly
     /// the matching pending SSH acquire, never another host's live lease.
     private var connectingLeaseKeys: [String: PeerPaneHostKey] = [:]
+    private var connectingAcquireIDs: [String: UUID] = [:]
+    private var connectingAnnouncements: [String: (hostKey: PeerPaneHostKey, token: UUID?)] = [:]
     /// A late completion from a cancelled attempt must not turn the row back
     /// into connected after the user has already pressed Retry.
     private var connectAttemptIDs: [String: UUID] = [:]
@@ -1516,7 +1518,7 @@ final class RemoteHostStore: ObservableObject {
         let withdrawAnnounced = { (landedKey: PeerPaneHostKey?) in
             guard let announced, announced.hostKey != landedKey else { return }
             PeerPaneHostRegistry.shared.abandonPendingReplacement(
-                for: announced.hostKey, token: announced.token
+                for: announced.hostKey, token: announced.token, moved: landedKey != nil
             )
         }
         guard let target = host.sshTarget, !target.isEmpty,
@@ -1527,6 +1529,8 @@ final class RemoteHostStore: ObservableObject {
         }
         let attemptID = UUID()
         connectAttemptIDs[key] = attemptID
+        connectingAcquireIDs[key] = attemptID
+        connectingAnnouncements[key] = announced
         hosts[key]?.connectionState = .connecting
         hosts[key]?.connectionStartedAt = Date()
         hosts[key]?.connectionPhase = (host.remoteSockPath ?? "").isEmpty ? .discoveringSocket : .openingTunnel
@@ -1547,6 +1551,8 @@ final class RemoteHostStore: ObservableObject {
                 if self.connectAttemptIDs[key] == attemptID {
                     self.connectTasks[key] = nil
                     self.connectingLeaseKeys[key] = nil
+                    self.connectingAcquireIDs[key] = nil
+                    self.connectingAnnouncements[key] = nil
                     self.connectAttemptIDs[key] = nil
                 }
             }
@@ -1576,7 +1582,11 @@ final class RemoteHostStore: ObservableObject {
                 // A re-probed socket moves the host to another key; waiters on
                 // the announced one would otherwise wait out their deadline.
                 withdrawAnnounced(spec.hostKey)
-                let lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+                try Task.checkCancellation()
+                let token = announced?.hostKey == spec.hostKey ? announced?.token : nil
+                let lease = try await PeerPaneHostRegistry.shared.acquire(
+                    spec, waiter: attemptID, token: token
+                )
                 // Cancellation is cooperative. If the acquire completed while
                 // ssh was being reaped, balance it instead of reviving this row.
                 guard !Task.isCancelled,
@@ -1624,6 +1634,20 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
+    @discardableResult
+    private func cancelConnectingAcquire(for key: String) -> Bool {
+        let registry = PeerPaneHostRegistry.shared
+        let waiter = connectingAcquireIDs.removeValue(forKey: key)
+        let announced = connectingAnnouncements.removeValue(forKey: key)
+        if let hostKey = connectingLeaseKeys[key], let waiter {
+            return registry.cancelPendingAcquire(for: hostKey, waiter: waiter)
+        }
+        if let announced {
+            registry.abandonPendingReplacement(for: announced.hostKey, token: announced.token)
+        }
+        return true
+    }
+
     /// Cancel an in-progress sidebar connection and return immediately to a
     /// retryable state. Existing panes/mirrors retain their independent
     /// leases; only this host-row attempt is stopped.
@@ -1633,10 +1657,7 @@ final class RemoteHostStore: ObservableObject {
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
         connectTasks[key] = nil
-        var stoppedStart = true
-        if let hostKey = connectingLeaseKeys[key] {
-            stoppedStart = PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
-        }
+        let stoppedStart = cancelConnectingAcquire(for: key)
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
@@ -1669,8 +1690,7 @@ final class RemoteHostStore: ObservableObject {
 
     /// What `reconnectHost` did, for callers that must not overstate it.
     struct HostReconnectOutcome: Equatable {
-        /// A fresh connect was scheduled. False when another pane waits on
-        /// the same coalesced start, or the host has no SSH route.
+        /// A fresh connect was scheduled. False when the host has no SSH route.
         let started: Bool
         /// A pooled tunnel existed and was retired; the next acquire builds
         /// a new one.
@@ -1709,10 +1729,7 @@ final class RemoteHostStore: ObservableObject {
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
         connectTasks[key] = nil
-        var cancelledPending = true
-        if let hostKey = connectingLeaseKeys[key] {
-            cancelledPending = PeerPaneHostRegistry.shared.cancelPendingAcquire(for: hostKey)
-        }
+        cancelConnectingAcquire(for: key)
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
@@ -1745,7 +1762,7 @@ final class RemoteHostStore: ObservableObject {
             hosts[key]?.remoteSockPath = nil
         }
         #if DEBUG
-        dlog("peer.sidebar.connect retry key=\(key) cancelledPending=\(cancelledPending)")
+        dlog("peer.sidebar.connect retry key=\(key)")
         #endif
         let outcome = { (started: Bool) in
             HostReconnectOutcome(
@@ -1754,17 +1771,6 @@ final class RemoteHostStore: ObservableObject {
                 previousSockPath: retiredPath,
                 panesPreserved: panesPreserved
             )
-        }
-        if !cancelledPending {
-            // A pane or mirror is waiting on the same coalesced start, so it
-            // cannot be cancelled from here. connectSavedHost would rejoin that
-            // very task, leaving the row stuck and the waiter count higher —
-            // say so rather than pretending a fresh attempt began.
-            RemoteWorkLog.info(
-                "Cannot restart \(host.displayName) — another pane is waiting on the same connection attempt; close it first"
-            )
-            registry.abandonPendingReplacement(for: hostKey, token: replacementToken)
-            return outcome(false)
         }
         // connectSavedHost declines a row with no SSH target; do not report a
         // start that never happened.
@@ -1896,9 +1902,7 @@ final class RemoteHostStore: ObservableObject {
         // inherit the cancel above, so an in-flight — or hung — ssh spawn
         // would outlive the force disconnect and leak its helper process.
         // Cancel it before dropping the key that identifies it.
-        if let connectingKey = connectingLeaseKeys[key], connectingKey != hostKey {
-            PeerPaneHostRegistry.shared.cancelPendingAcquire(for: connectingKey)
-        }
+        cancelConnectingAcquire(for: key)
         connectingLeaseKeys[key] = nil
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
@@ -2029,9 +2033,7 @@ final class RemoteHostStore: ObservableObject {
         // Cancel the row's own start before the disconnect detaches it from
         // the registry; afterwards there is nothing left to cancel and its ssh
         // would run to completion before being torn down.
-        if let connectingKey = connectingLeaseKeys[key] {
-            registry.cancelPendingAcquire(for: connectingKey)
-        }
+        cancelConnectingAcquire(for: key)
         let retiredPath = registry.disconnectTransport(for: hostKey)
 
         if let lease = sidebarLeases.removeValue(forKey: key) {
