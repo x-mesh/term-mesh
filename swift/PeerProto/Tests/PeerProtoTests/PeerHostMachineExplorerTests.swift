@@ -325,7 +325,10 @@ final class ExplorerHarness {
         case .cancelStart:
             covered.insert("cancelStart on \(context.cause.kind)")
             switch (context.cause, context.before.phase) {
-            case (.disconnect, _), (.cancel, .starting(_, _, .fresh)), (.cancel, .starting(_, _, .reconnect)):
+            case (.disconnect, _):
+                break
+            case (.cancel, .starting(_, _, .fresh)) where context.before.waiters.count == 1,
+                 (.cancel, .starting(_, _, .reconnect)) where context.before.waiters.count == 1:
                 break
             default:
                 record("rule 7", "\(context.cause) cancelled the start in \(context.before.phase)")
@@ -423,14 +426,18 @@ final class ExplorerHarness {
         world.holders[lease, default: 0] += 1
     }
 
-    /// I8: an acquire that was admitted or served after the core sampled the
-    /// pooled lease dead must have retired it in the same transition.
+    /// I8: an acquire that passed rule 4's checks after the core sampled the
+    /// pooled lease dead must have retired it in the same transition, whether
+    /// the acquire was admitted, served, or refused.
     private func checkDeadVerdictRetires(_ effect: XM.Effect, _ context: XCore.EffectContext) {
         guard case let .acquire(request, .dead) = context.cause,
               let dead = context.before.pooledLease, core.state.pooledLease == dead else { return }
         switch effect {
         case .armWaiterDeadline(request.waiter), .resume(request.waiter, .lease):
             record("I8", "\(dead) was sampled dead for \(request.waiter) and is still pooled")
+        case let .resume(waiter, .failure(failure))
+            where waiter == request.waiter && failure != .hostDisconnected && failure != .reconnectSuperseded:
+            record("I8", "\(dead) was sampled dead for \(request.waiter), which was refused, and is still pooled")
         default:
             break
         }

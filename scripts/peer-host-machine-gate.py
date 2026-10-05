@@ -216,7 +216,7 @@ MUTANTS = [
         "tag": "reconnect origin",
     },
     {
-        "name": "reconnect: a failed reconnect start keeps its token",
+        "name": "reconnect: a reconnect start that lands or fails keeps its token",
         "file": MACHINE,
         "old": "            guard case let .starting(current, spec, purpose) = state.phase, current == attempt else {\n"
                "                if case let .lease(lease) = result {\n"
@@ -235,6 +235,38 @@ MUTANTS = [
                "            }\n",
         "test": LAYER1,
         "tag": "rule 5",
+    },
+    {
+        "name": "reconnect: a cancelled reconnect start keeps its token",
+        "file": MACHINE,
+        "old": "                state.phase = .idle\n"
+               "                if purpose == .reconnect {\n"
+               "                    state.reconnectToken = nil\n"
+               "                }\n"
+               "                effects.append(.cancelStart(attempt))\n",
+        "new": "                state.phase = .idle\n"
+               "                effects.append(.cancelStart(attempt))\n",
+        "test": LAYER1,
+        "tag": "rule 5",
+    },
+    {
+        "name": "rule 7: a Cancel of one of several waiters stops a fresh start",
+        "file": MACHINE,
+        "old": "               purpose != .replacement, state.waiters.count == 1 {\n",
+        "new": "               purpose != .replacement {\n",
+        "test": LAYER1,
+        "tag": "rule 7",
+    },
+    {
+        "name": "I8: a dead verdict in up refuses the waiter and leaves the lease pooled",
+        "file": MACHINE,
+        "old": "                case .dead:\n"
+               "                    admit(waiter)\n"
+               "                    retirePooledLease()\n",
+        "new": "                case .dead:\n"
+               "                    resume(id, .failure(.replacementUnavailable))\n",
+        "test": LAYER1,
+        "tag": "I8",
     },
     {
         "name": "park invariant: never abandon an unpayable debt",

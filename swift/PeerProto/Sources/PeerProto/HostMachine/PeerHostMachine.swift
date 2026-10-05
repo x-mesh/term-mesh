@@ -426,9 +426,9 @@ extension PeerHostMachine {
             resume(id, .failure(.cancelled))
         }
 
-        /// `references` is captured from the phase before it is replaced. In a
-        /// post-wake retire those references are the only dependents: the
-        /// panes about to park, which need the replacement.
+        /// `references` is captured from the phase before it is replaced, and
+        /// counts as a dependent: the panes about to park need the replacement
+        /// even when no waiter is left, as after a failed restart.
         private mutating func retirePooledLease() {
             let lease: PeerHostLeaseID
             let spec: Spec

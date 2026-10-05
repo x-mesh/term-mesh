@@ -119,7 +119,7 @@ How `park` is set and upgraded:
 | Retire the pooled lease while it has references | `Parked(died)`, unless a `userDisconnected` debt is already there |
 | `disconnect(.reconnect)` | `Parked(reconnect)` if the pooled lease had references or a debt exists, unless the debt is `userDisconnected` |
 | `disconnect(.plain)` | `Parked(userDisconnected)` if the pooled lease had references or *any* debt exists. The user disconnected explicitly, so the panes now wait for the user's Connect. |
-| `disconnect(.force)` | `fireAbandoned` if a debt exists, then nil |
+| `disconnect(.force)` | `fireAbandoned` if a debt exists once the `.plain` update has run, then nil |
 | `reconnectAbandoned(t, movedTo: B)` with B set | `fireAbandoned`, then nil, **whatever the reason**. Nothing on key A can reattach panes that now belong to B. This matches what happens to them today. |
 
 **Park invariant** (checked in every state): if `park` is set, then either its
@@ -329,10 +329,10 @@ against the cause and the state before it:
 | A tunnel starts from `idle` only for a user acquire carrying no token. | 5 |
 | A lease handed out was not already dead when the acquire was dequeued. | 3 |
 | `stopTunnel` never reaches the lease that is pooled after the commit. | 2 |
-| `cancelStart` is caused only by a disconnect, or by a Cancel of a fresh or reconnect start. | 7 |
+| `cancelStart` is caused only by a disconnect, or by a Cancel of the last waiter of a fresh or reconnect start. | 7 |
 | `fireAbandoned` is caused only by a failed start, a Cancel, `reconnectAbandoned`, a Reconnect deadline, or Force Disconnect. A rule-6 regression would otherwise pass by abandoning eagerly. | 6 |
 | A `userDisconnected` debt is abandoned only by Force Disconnect or a Reconnect that moved key. | 6 |
-| An acquire admitted or served after the pooled lease was sampled dead has retired that lease. | I8 |
+| An acquire that passed rule 4's checks after the pooled lease was sampled dead has retired that lease, whether it was admitted, served, or refused. | I8 |
 | A reconnect's lease goes only to `user` waiters, and Reconnect never resolves a `user` waiter. | #675 N1 |
 | `fireDidReplace` has a debt to pay. | I7 |
 
@@ -419,7 +419,13 @@ The explorer was green because nothing asked those questions. The checks
 marked 6, I8, #675 N1 and 7 in the table above were added for them, and each
 mutant is now in the gate.
 
-The same review found two machine changes:
+A second review of that fix round found two of the new checks still too
+weak: the Cancel check ignored "only the last waiter", and the I8 check missed
+an acquire that is refused while the dead lease stays pooled. Both were
+tightened and each has a mutant. A unit test now covers a waiting waiter
+submitted again with a stale token.
+
+The first review also found two machine changes:
 
 - A reconnect start that failed or was cancelled kept its token, so a later
   acquire carrying it started a fresh tunnel with the probed spec. The token is
@@ -462,7 +468,10 @@ taken before the first mutant.
 | reconnect: Reconnect Host resolves user waiters too | layer 1 | reconnect origin |
 | reconnect: a background acquire waits for the reconnect | layer 1 | reconnect origin |
 | reconnect: a background acquire joins a reconnect start | layer 1 | reconnect origin |
-| reconnect: a failed reconnect start keeps its token | layer 1 | rule 5 |
+| reconnect: a reconnect start that lands or fails keeps its token | layer 1 | rule 5 |
+| reconnect: a cancelled reconnect start keeps its token | layer 1 | rule 5 |
+| rule 7: a Cancel of one of several waiters stops a fresh start | layer 1 | rule 4, rule 7 |
+| I8: a dead verdict in up refuses the waiter and leaves the lease pooled | layer 1 | I8 |
 | park invariant: never abandon an unpayable debt | layer 1 | parked forever |
 | zero references stop the lease at once instead of through the queue | layer 2 | parked forever |
 

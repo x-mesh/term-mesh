@@ -123,6 +123,19 @@ final class PeerHostMachineTests: XCTestCase {
         XCTAssertNil(core.state.park)
     }
 
+    func test_aWaiterSubmittedAgainWhileItWaitsIsNotResolvedTwice() {
+        var (state, _) = pooled(refs: 1)
+        (state, _) = M.reduce(state, .acquire(request(5, .user, spec: "host"), .restarting))
+        (state, _) = M.reduce(state, .disconnect(.reconnect(1)))
+        (state, _) = M.reduce(state, .disconnect(.reconnect(2)))
+        XCTAssertEqual(state.waiters.map(\.id), [PeerHostWaiterID(5)])
+
+        let (after, effects) = M.reduce(state, .acquire(request(5, .user, spec: "probed-1", token: 1), .usable))
+
+        XCTAssertEqual(effects, [], "a stale token on a waiting waiter must not resolve it a second time")
+        XCTAssertEqual(after, state)
+    }
+
     func test_aDeadlineResolvesItsWaiterButNeverCancelsTheStart() {
         let (state, effects) = M.reduce(M.State(), .acquire(request(1, .user, spec: "host"), .usable))
         guard case let .starting(attempt, _, .fresh) = state.phase else {
