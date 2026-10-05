@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.265.0] - 2026-10-05
+
+### Added
+
+- Settings › Peer Federation › "Keep Mac awake while connected" keeps the Mac from sleeping on its own while a remote host is connected or another computer is connected to it, and for a minute after the last connection ends. The display still turns off, and closing the lid or choosing Sleep still sleeps the Mac. Choose Don't keep awake, On power adapter (the default), or Even on battery. A sleeping Mac drops its SSH tunnels, so remote panes used to reconnect every few minutes while it was idle.
+
+### Fixed
+
+- A live workspace mirror no longer piles up duplicate tabs for the same remote terminal after repeated reconnects. Tabs left over from earlier reconnects close on the next sync, and closing one by hand no longer closes the remote terminal it pointed at.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.264.0] - 2026-10-05
 
 ### Fixed
