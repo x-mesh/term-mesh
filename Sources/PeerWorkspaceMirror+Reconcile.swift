@@ -164,6 +164,7 @@ extension PeerWorkspaceMirrorController {
         }
         let missing = targetLeaves.filter { panelBySurfaceID[$0.surfaceID] == nil }
         var newSessions: [Data: PeerPaneSession] = [:]
+        var spawnedCount = 0
         for leaf in missing {
             do {
                 let session = try await PeerPaneSession.attach(
@@ -230,6 +231,7 @@ extension PeerWorkspaceMirrorController {
                 }
                 workspace2.bindRemotePane(session: session, to: panel)
                 panelBySurfaceID[leaf.surfaceID] = panel.id
+                spawnedCount += 1
             }
 
             // B3 — close stale panels (their sessions tear down via
@@ -263,14 +265,13 @@ extension PeerWorkspaceMirrorController {
             // finds none. One that escapes both keeps its relay, which
             // reattaches to the host after every tunnel drop.
             let ghosts = ghostPanelIDs(in: workspace2)
-            for panelId in ghosts {
-                _ = workspace2.closePanel(panelId, force: true)
-            }
+            let closedGhosts = ghosts.filter { workspace2.closePanel($0, force: true) }
             everMappedPanelIDs.formIntersection(workspace2.panels.keys)
             if !ghosts.isEmpty {
-                ghostPaneCloseCount += ghosts.count
+                ghostPaneCloseCount += closedGhosts.count
                 RemoteWorkLog.infoOffMain(
-                    "Closed \(ghosts.count) mirror pane(s) that were neither mapped nor queued to close"
+                    "Closed \(closedGhosts.count) of \(ghosts.count) mirror pane(s)"
+                        + " that were neither mapped nor queued to close"
                 )
             }
 
@@ -305,13 +306,13 @@ extension PeerWorkspaceMirrorController {
 
         recordApplied(target)
         #if DEBUG
-        dlog("peer.mirror.reconcile leaves=\(targetLeaves.count) spawned=\(newSessions.count) shape=\(Self.shapeHash(target))")
+        dlog("peer.mirror.reconcile leaves=\(targetLeaves.count) spawned=\(spawnedCount) shape=\(Self.shapeHash(target))")
         #endif
         // The shape hash is what makes this readable as a sequence: two
         // reconciles with the same hash mean the layout settled, and a hash
         // that keeps changing with nothing spawned means it is flapping.
         RemoteWorkLog.debugOffMain(
-            "Layout synced — \(targetLeaves.count) pane(s), \(newSessions.count) spawned, shape \(Self.shapeHash(target))"
+            "Layout synced — \(targetLeaves.count) pane(s), \(spawnedCount) spawned, shape \(Self.shapeHash(target))"
         )
     }
 
@@ -426,8 +427,8 @@ extension PeerWorkspaceMirrorController {
             .subtracting(pendingStale)
     }
 
-    /// A ghost still points at a live host surface that a mapped pane also
-    /// shows, so forwarding its close would close that surface on the host.
+    /// A ghost still points at a host surface, which a mapped pane may also
+    /// show, so forwarding its close could close that surface on the host.
     /// A panel queued for B3b is a mirror pane mid-replacement, and closing it
     /// means closing its terminal, as it always did.
     nonisolated static func forwardsClose(

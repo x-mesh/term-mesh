@@ -1426,7 +1426,7 @@ class termmesh:
         cannot witness: `resync` ({kept, watching, respawned,
         stranded_respawned}) says how the last reconnect classified the panes
         it found — keeping four live panes and respawning four dead ones both
-        settle at four leaves — `ghost_pane_closes` counts panels B3c reaped
+        settle at four leaves — `ghost_pane_closes` counts panels B3c closed
         because nothing mapped or queued them, and `panes[]` carries each pane's
         `relay_startup_state` beside its real `relay_liveness`, which is where
         the two visibly disagree.

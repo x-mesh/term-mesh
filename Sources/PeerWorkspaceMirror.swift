@@ -127,7 +127,8 @@ final class PeerWorkspaceMirrorController {
     }
     /// Every panel this mirror has mapped and that may still exist. B3c only
     /// reaps ghosts among these, so a remote pane that reached the workspace
-    /// some other way (a socket `surface.move`) is never closed by the mirror.
+    /// some other way (a socket `surface.move`) is not the mirror's to close
+    /// unless this mirror once mapped it.
     var everMappedPanelIDs: Set<UUID> = []
     /// Host split id bytes → local bonsplit split UUID. Rebuilt on every
     /// structural reconcile; consumed by divider fast path + outbound diff.
