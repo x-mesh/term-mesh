@@ -80,22 +80,22 @@ final class PeerKeepAwakeController {
     }
 
     /// An unattended Mac naps background apps: timers coalesce and the process
-    /// drops to background priority. The host's output drain waits on a short
-    /// timer, so a napping host sent each keystroke's echo 120–160ms late at
-    /// the median. While another machine is attached, declare latency-critical
-    /// work so the host answers promptly. Idle sleep stays with the keep-awake
-    /// mode; this activity allows it.
+    /// drops to background priority. A napping host measured 120–160ms median
+    /// from a keystroke's echo to its send, most likely because the output
+    /// drain waits on a short timer. While a peer connection is accepted,
+    /// declare user-initiated work, which keeps App Nap off. Idle sleep stays
+    /// with the keep-awake mode; this activity allows it.
     private func updateLatencyActivity() {
         if attachedPeers > 0, latencyActivity == nil {
             latencyActivity = ProcessInfo.processInfo.beginActivity(
-                options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+                options: .userInitiatedAllowingIdleSystemSleep,
                 reason: "Remote viewers are attached to this Mac's terminals"
             )
-            RemoteWorkLog.infoOffMain("Keeping term-mesh responsive while \(attachedPeers) peer connection(s) are accepted")
+            RemoteWorkLog.debugOffMain("Keeping term-mesh out of App Nap while \(attachedPeers) peer connection(s) are accepted")
         } else if attachedPeers == 0, let activity = latencyActivity {
             ProcessInfo.processInfo.endActivity(activity)
             latencyActivity = nil
-            RemoteWorkLog.infoOffMain("Letting term-mesh nap again: no peer connection is accepted")
+            RemoteWorkLog.debugOffMain("Letting term-mesh nap again: no peer connection is accepted")
         }
     }
 
