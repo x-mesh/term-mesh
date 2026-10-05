@@ -2323,6 +2323,8 @@ final class PeerRelaySession {
     /// carries the generation it originally attached through so sibling panes
     /// coalesce one half-alive tunnel reset instead of restarting each other.
     private var ownedTransportGeneration: UInt64 = 0
+    // Different leases can have the same recovery generation and socket path.
+    private var ownedTransportRevision: UInt64 = 0
     private var ownedTransportRecovery: ((UInt64) async -> UInt64)?
     /// False once Disconnect Host retires the lease behind this pane. The old
     /// local socket path remains on the session for diagnostics, but nothing
@@ -2400,6 +2402,7 @@ final class PeerRelaySession {
         handler: @escaping (UInt64) async -> UInt64
     ) -> Bool {
         guard ownsSession, !isTorndown else { return false }
+        ownedTransportRevision &+= 1
         self.hostSockPath = hostSockPath
         self.hostKey = hostKey
         configureOwnedTransportRecovery(
@@ -2416,7 +2419,7 @@ final class PeerRelaySession {
         )
         if transportReplacementWaiter != nil {
             resumeTransportReplacementWaiter()
-        } else if !reconnectInFlight, let transport {
+        } else if let transport {
             // The retired tunnel's EOF has not reached the pump yet. Closing
             // the transport now sends it into the reconnect loop, which dials
             // the replacement, instead of leaving it on a dead socket until
@@ -4181,12 +4184,15 @@ final class PeerRelaySession {
             return
         }
         guard let oldTransport = transport else { return }
+        let transportRevision = ownedTransportRevision
+        let dialedPath = hostSockPath
 
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+        guard transportRevision == ownedTransportRevision else { return }
 
         let newConnection: PeerRelayConnection
         do {
-            newConnection = try await Self.connect(hostSockPath: hostSockPath)
+            newConnection = try await Self.connect(hostSockPath: dialedPath)
         } catch {
             #if DEBUG
             dlog("peer.relay.gap.heal.resume.connectFailed error=\(error)")
@@ -4203,7 +4209,7 @@ final class PeerRelaySession {
             }
             return
         }
-        guard !isTorndown else {
+        guard !isTorndown, transportRevision == ownedTransportRevision else {
             await newConnection.cancel()
             return
         }
@@ -4265,7 +4271,8 @@ final class PeerRelaySession {
             await abortResumeTransition(transition)
             return
         }
-        guard outcome.surfaceID == surfaceID, !isTorndown else {
+        guard outcome.surfaceID == surfaceID, !isTorndown,
+              transportRevision == ownedTransportRevision else {
             await newConnection.cancel()
             await abortResumeTransition(transition)
             return
@@ -4290,6 +4297,7 @@ final class PeerRelaySession {
         // this the mutations below would revive session/transport state right
         // after teardown nilled them.
         guard !isTorndown, session === oldSession,
+              transportRevision == ownedTransportRevision,
               let newGeneration = resumeTransitionGate.replaceSession(
                   expectedGeneration: transition.generation
               )
@@ -4419,10 +4427,12 @@ final class PeerRelaySession {
                 "Peer reconnect attempt host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) delay=\(delay) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
             )
             onReconnecting?(attempt)
-            let dialedPath = hostSockPath
+            let transportRevision = ownedTransportRevision
             let result = await attemptOwnedSessionReconnect(
-                from: failedSession, generation: failedGeneration
+                from: failedSession, generation: failedGeneration,
+                transportRevision: transportRevision
             )
+            guard transportRevision == ownedTransportRevision else { continue }
             if case .connected = result {
                 firstAttachAfterRetargetPending = false
                 onReconnected?()
@@ -4446,11 +4456,7 @@ final class PeerRelaySession {
                 break
             }
             reconnectCircuit.recordFailure()
-            // An attempt that dialed the retired path and lost a retarget race
-            // failed against the old tunnel. Refreshing now would restart the
-            // replacement — and every sibling pane on it — for no reason.
-            if case .refreshTransport = result, !didRefreshTransport,
-               dialedPath == hostSockPath {
+            if case .refreshTransport = result, !didRefreshTransport {
                 didRefreshTransport = true
                 await refreshOwnedTransportForReconnect(reason: "owned peer reconnect failed")
             }
@@ -4520,7 +4526,8 @@ final class PeerRelaySession {
     /// Unlike gap healing, no old-session bytes can race this attach boundary.
     private func attemptOwnedSessionReconnect(
         from failedSession: PeerSession,
-        generation failedGeneration: UInt64
+        generation failedGeneration: UInt64,
+        transportRevision: UInt64
     ) async -> OwnedReconnectAttemptResult {
         // The outer loop's predicate, re-checked at every await boundary
         // INSIDE the attempt. `connect` and `attachSurface` are exactly
@@ -4536,12 +4543,15 @@ final class PeerRelaySession {
                 isCurrentSession: session === failedSession,
                 hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
             ) && resumeTransitionGate.currentGeneration() == failedGeneration
+                && ownedTransportRevision == transportRevision
         }
         guard stillEligible() else { return .failed }
+        let dialedPath = hostSockPath
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+        guard stillEligible() else { return .failed }
         let connection: PeerRelayConnection
         do {
-            connection = try await Self.connect(hostSockPath: hostSockPath)
+            connection = try await Self.connect(hostSockPath: dialedPath)
         } catch {
             #if DEBUG
             dlog("peer.relay.reconnect.connectFailed error=\(error)")

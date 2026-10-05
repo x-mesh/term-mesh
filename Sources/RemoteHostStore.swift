@@ -1003,10 +1003,15 @@ final class RemoteHostStore: ObservableObject {
     }
 
     #if DEBUG
-    func installConnectingHostForTesting(_ host: HostEntry, attemptID: UUID, task: Task<Void, Never>) {
+    func installConnectingHostForTesting(
+        _ host: HostEntry, attemptID: UUID, task: Task<Void, Never>,
+        leaseKey: PeerPaneHostKey? = nil
+    ) {
         hosts[host.id] = host
         connectAttemptIDs[host.id] = attemptID
         connectTasks[host.id] = task
+        connectingAcquireIDs[host.id] = attemptID
+        connectingLeaseKeys[host.id] = leaseKey
     }
 
     func installPeerShellCleanupCacheForTesting(
@@ -1714,7 +1719,7 @@ final class RemoteHostStore: ObservableObject {
         let registry = PeerPaneHostRegistry.shared
         // Resolve the pooled key before `invalidateAutoDetectedSocket` below
         // clears `remoteSockPath` — it is part of the key.
-        let hostKey = sidebarLeases[key]?.key ?? (hosts[key] ?? host).paneHostSpec.hostKey
+        let hostKey = sidebarLeases[key]?.key ?? connectingLeaseKeys[key] ?? (hosts[key] ?? host).paneHostSpec.hostKey
         let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
         let retiredPath = registry.disconnectTransport(for: hostKey, replacementFollows: true)
         let replacementToken = registry.pendingReplacementToken(for: hostKey)

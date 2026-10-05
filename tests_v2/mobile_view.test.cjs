@@ -602,6 +602,39 @@ test('a delayed send preserves the next draft and rejects concurrent submissions
   assert.equal(app.nodes.get('send').disabled, false);
 });
 
+test('a successful send clears its unchanged draft after switching panes', async () => {
+  const app = page([pane(true), pane(true, 'pane-2')]);
+  await settle();
+  const finish = app.pauseText();
+  app.nodes.get('text').value = 'first';
+  app.nodes.get('send-form').dispatch('submit');
+  app.nodes.get('target').value = 'pane-2';
+  app.nodes.get('target').dispatch('change');
+  finish();
+  await settle();
+  assert.equal(app.nodes.get('text').value, '');
+  assert.notEqual(app.nodes.get('send-status').textContent, 'sending…');
+  app.nodes.get('target').value = 'pane-1';
+  app.nodes.get('target').dispatch('change');
+  app.nodes.get('send-form').dispatch('submit');
+  assert.equal(app.bodies.filter(([url]) => url.endsWith('/text')).length, 1);
+});
+
+test('a successful send preserves a new draft on another pane', async () => {
+  const app = page([pane(true), pane(true, 'pane-2')]);
+  await settle();
+  const finish = app.pauseText();
+  app.nodes.get('text').value = 'first';
+  app.nodes.get('send-form').dispatch('submit');
+  app.nodes.get('target').value = 'pane-2';
+  app.nodes.get('target').dispatch('change');
+  app.nodes.get('text').value = 'another pane draft';
+  finish();
+  await settle();
+  assert.equal(app.nodes.get('text').value, 'another pane draft');
+  assert.notEqual(app.nodes.get('send-status').textContent, 'sending…');
+});
+
 test('retrying the same message reuses its request ID', async () => {
   const app = page([pane(true)]);
   await settle();

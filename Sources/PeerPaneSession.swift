@@ -394,7 +394,8 @@ final class PeerPaneHostRegistry {
 
     private var hosts: [PeerPaneHostKey: HostShell] = [:]
     private var nextSerial: UInt64 = 0
-    static let replacementJoinDeadlineSeconds: TimeInterval = 15
+    // Recovery can spend 3s reaping SSH and then 15s observing its restart.
+    static let replacementJoinDeadlineSeconds: TimeInterval = 20
 
     #if DEBUG
     private(set) var teardownCountForTests = 0

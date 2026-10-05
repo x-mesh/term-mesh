@@ -1538,7 +1538,15 @@
     api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', body, SEND_TIMEOUT_MS)
       .then(function (data) {
         state.pendingSend = null;
-        if (!isCurrentTarget(t)) { return; }
+        state.terminalAfterSend = null;
+        if (el.text.value === text) {
+          el.text.value = '';
+          fitTextarea();
+        }
+        if (!isCurrentTarget(t)) {
+          setSendStatus('');
+          return;
+        }
         if (chatInput) {
           setSendStatus(data.deduplicated ? 'already sent' : 'turn sent');
         } else if (t.kind === 'leader') {
@@ -1550,11 +1558,6 @@
           setSendStatus(data.deduplicated ? 'already delivered' : 'submitted');
         }
         var opensTerminal = terminalCommand && chatInput && text.indexOf(terminalCommand) === 0;
-        state.terminalAfterSend = null;
-        if (el.text.value === text) {
-          el.text.value = '';
-          fitTextarea();
-        }
         if (opensTerminal) {
           setMode('terminal');
           setSendStatus('터미널에서 열었어요 · 채팅으로 돌아가려면 Chat 탭');
