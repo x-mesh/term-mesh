@@ -26,10 +26,10 @@ enum PeerKeepAwakePolicy {
         return connections > 0 ? .hold : .releaseAfterGrace
     }
 
-    /// On an unattended Mac with its display off, user-initiated work alone
-    /// lifted the host from priority 4 to 20 and its echo-to-send step from
-    /// 159ms to 16ms at the median; adding latency-critical reached priority 54
-    /// and 3.5ms. Latency-critical keeps every timer in the process precise, so
+    /// On an unattended Mac, a napping host sat at priority 4 and took 159ms at
+    /// the median from a keystroke's echo to its send. With its display off and
+    /// a viewer attached, user-initiated work alone reached priority 20 and
+    /// 16ms; adding latency-critical reached priority 54 and 3.5ms. Latency-critical keeps every timer in the process precise, so
     /// a host on battery settles for the 16ms.
     static func latencyActivityOptions(onACPower: Bool) -> ProcessInfo.ActivityOptions {
         onACPower
@@ -101,16 +101,18 @@ final class PeerKeepAwakeController {
             ? PeerKeepAwakePolicy.latencyActivityOptions(onACPower: onACPower)
             : nil
         guard wanted != latencyActivityOptions else { return }
-        if let activity = latencyActivity {
-            ProcessInfo.processInfo.endActivity(activity)
-            latencyActivity = nil
-        }
-        latencyActivityOptions = wanted
-        if let wanted {
-            latencyActivity = ProcessInfo.processInfo.beginActivity(
-                options: wanted,
+        let previous = latencyActivity
+        latencyActivity = wanted.map {
+            ProcessInfo.processInfo.beginActivity(
+                options: $0,
                 reason: "Remote viewers are attached to this Mac's terminals"
             )
+        }
+        latencyActivityOptions = wanted
+        if let previous {
+            ProcessInfo.processInfo.endActivity(previous)
+        }
+        if let wanted {
             RemoteWorkLog.debugOffMain(
                 "Keeping term-mesh out of App Nap (latency-critical: \(wanted.contains(.latencyCritical))) while \(attachedPeers) peer connection(s) are accepted"
             )
