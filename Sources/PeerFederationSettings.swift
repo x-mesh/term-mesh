@@ -19,6 +19,8 @@ enum PeerFederationSettings {
     static let inputPathTelemetryKey = "peerFederationInputPathTelemetry"
     static let forwardDashboardKey = "peerFederationForwardDashboard"
     static let remoteDashboardPortKey = "peerFederationRemoteDashboardPort"
+    static let keepAwakeKey = "peerFederationKeepAwakeWhileConnected"
+    static let defaultKeepAwakeMode = PeerKeepAwakeMode.onPowerAdapter
 
     /// The bundle whose peer socket keeps the unsuffixed path.
     ///
@@ -132,6 +134,11 @@ enum PeerFederationSettings {
     static var displayName: String {
         let v = UserDefaults.standard.string(forKey: displayNameKey) ?? ""
         return v.isEmpty ? defaultDisplayName : v
+    }
+
+    static var keepAwakeMode: PeerKeepAwakeMode {
+        UserDefaults.standard.string(forKey: keepAwakeKey)
+            .flatMap(PeerKeepAwakeMode.init(rawValue:)) ?? defaultKeepAwakeMode
     }
 
     /// Phase E-6: when on, the host injects Ctrl-L into the PTY at

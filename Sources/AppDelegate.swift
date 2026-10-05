@@ -680,6 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Eager init so the NotificationCenter subscription is wired up
         // before the sidebar first renders and before any relay window opens.
         _ = RemoteHostStore.shared
+        PeerKeepAwakeController.shared.start()
 
         // Reap leftover relay sockets from any previous crashed run
         // before a user opens a fresh relay window — otherwise stale

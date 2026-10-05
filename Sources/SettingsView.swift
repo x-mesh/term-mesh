@@ -98,7 +98,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .browser: return ["browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion"]
         case .imeInputBar: return ["ime", "input", "bar", "font", "height", "cjk"]
         case .keyboardShortcuts: return ["keyboard", "shortcut", "keybinding", "hotkey"]
-        case .peerFederation: return ["peer", "federation", "remote", "ssh", "relay", "share", "bonjour", "lan"]
+        case .peerFederation: return ["peer", "federation", "remote", "ssh", "relay", "share", "bonjour", "lan", "sleep", "awake"]
         case .projectSync: return ["project", "sync", "manifest", "device", "conflict", "recovery", "gc"]
         case .reset: return ["reset", "clear", "defaults"]
         }
@@ -117,6 +117,17 @@ enum SettingsSectionCategory: String {
 struct SettingsView: View {
     private let contentTopInset: CGFloat = 8
     private let pickerColumnWidth: CGFloat = 196
+
+    private var peerKeepAwakeSubtitle: LocalizedStringKey {
+        switch PeerKeepAwakeMode(rawValue: peerFederationKeepAwake) ?? PeerFederationSettings.defaultKeepAwakeMode {
+        case .never:
+            return "This Mac sleeps on its usual schedule even while remote sessions are connected, and they drop each time it sleeps."
+        case .onPowerAdapter:
+            return "While a remote host is connected or another machine is attached, this Mac does not sleep on its own while on the power adapter. On battery it sleeps as usual. The display still turns off."
+        case .always:
+            return "While a remote host is connected or another machine is attached, this Mac does not sleep on its own, even on battery. The display still turns off."
+        }
+    }
 
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
     @AppStorage(LanguageSettings.languageModeKey) private var languageMode = LanguageSettings.defaultMode.rawValue
@@ -210,6 +221,7 @@ struct SettingsView: View {
     @AppStorage(PeerFederationSettings.socketPathKey) private var peerFederationSocketPath = PeerFederationSettings.defaultSocketPath
     @AppStorage(PeerFederationSettings.displayNameKey) private var peerFederationDisplayName = ""
     @AppStorage(PeerFederationSettings.forceRedrawKey) private var peerFederationForceRedraw = false
+    @AppStorage(PeerFederationSettings.keepAwakeKey) private var peerFederationKeepAwake = PeerFederationSettings.defaultKeepAwakeMode.rawValue
     @AppStorage(PeerFederationSettings.inputPathTelemetryKey) private var peerFederationInputPathTelemetry = false
     /// Mirrors `PeerHostCoordinator.shared.isRunning`. Refreshed on
     /// section appear and after every toggle change since the
@@ -2616,6 +2628,22 @@ struct SettingsView: View {
                 Toggle("", isOn: $peerFederationForceRedraw)
                     .labelsHidden()
                     .controlSize(.small)
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
+                "Keep Mac awake while connected",
+                subtitle: peerKeepAwakeSubtitle,
+                controlWidth: pickerColumnWidth
+            ) {
+                Picker("", selection: $peerFederationKeepAwake) {
+                    ForEach(PeerKeepAwakeMode.allCases) { mode in
+                        Text(LocalizedStringKey(mode.displayName)).tag(mode.rawValue)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
             }
 
             SettingsCardDivider()

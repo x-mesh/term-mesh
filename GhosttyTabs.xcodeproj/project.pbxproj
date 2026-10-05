@@ -103,6 +103,7 @@
 			CVB0009A /* PeerWorkspaceMirror+Reconcile.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS0009A /* PeerWorkspaceMirror+Reconcile.swift */; };
 			CVB00088 /* PeerBonjour.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00088 /* PeerBonjour.swift */; };
 			CVB00089 /* PeerFederationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00089 /* PeerFederationSettings.swift */; };
+			CVB00950 /* PeerKeepAwake.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00950 /* PeerKeepAwake.swift */; };
 			CVB00090 /* PeerRelayBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00090 /* PeerRelayBanner.swift */; };
 			CVB00091 /* PeerConnectionsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsWindowController.swift */; };
 			CVB00092 /* PeerRelayBannerPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00092 /* PeerRelayBannerPresenter.swift */; };
@@ -322,6 +323,7 @@
 			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
+				CVB00951 /* PeerKeepAwakePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00951 /* PeerKeepAwakePolicyTests.swift */; };
 		FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */; };
 		FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */; };
 		A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */; };
@@ -484,6 +486,7 @@
 			CVS0009A /* PeerWorkspaceMirror+Reconcile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PeerWorkspaceMirror+Reconcile.swift"; sourceTree = "<group>"; };
 			CVS00088 /* PeerBonjour.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerBonjour.swift; sourceTree = "<group>"; };
 			CVS00089 /* PeerFederationSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerFederationSettings.swift; sourceTree = "<group>"; };
+			CVS00950 /* PeerKeepAwake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerKeepAwake.swift; sourceTree = "<group>"; };
 			CVS00090 /* PeerRelayBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBanner.swift; sourceTree = "<group>"; };
 			CVS00091 /* PeerConnectionsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsWindowController.swift; sourceTree = "<group>"; };
 			CVS00092 /* PeerRelayBannerPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBannerPresenter.swift; sourceTree = "<group>"; };
@@ -704,6 +707,7 @@
 			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
+			CVS00951 /* PeerKeepAwakePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerKeepAwakePolicyTests.swift; sourceTree = "<group>"; };
 		FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerServerHostLayoutTests.swift; sourceTree = "<group>"; };
 		FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnelBudgetTests.swift; sourceTree = "<group>"; };
 			A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteWorkLogRetentionTests.swift; sourceTree = "<group>"; };
@@ -903,6 +907,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				CVS0009A /* PeerWorkspaceMirror+Reconcile.swift */,
 				CVS00088 /* PeerBonjour.swift */,
 				CVS00089 /* PeerFederationSettings.swift */,
+				CVS00950 /* PeerKeepAwake.swift */,
 				CVS00090 /* PeerRelayBanner.swift */,
 				CVS00091 /* PeerConnectionsWindowController.swift */,
 				CVS00092 /* PeerRelayBannerPresenter.swift */,
@@ -1153,6 +1158,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
+				CVS00951 /* PeerKeepAwakePolicyTests.swift */,
 				FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */,
 				FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */,
 				A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */,
@@ -1397,6 +1403,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				CVB0009A /* PeerWorkspaceMirror+Reconcile.swift in Sources */,
 				CVB00088 /* PeerBonjour.swift in Sources */,
 				CVB00089 /* PeerFederationSettings.swift in Sources */,
+				CVB00950 /* PeerKeepAwake.swift in Sources */,
 				CVB00090 /* PeerRelayBanner.swift in Sources */,
 				CVB00091 /* PeerConnectionsWindowController.swift in Sources */,
 				CVB00092 /* PeerRelayBannerPresenter.swift in Sources */,
@@ -1619,6 +1626,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
+				CVB00951 /* PeerKeepAwakePolicyTests.swift in Sources */,
 				FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */,
 				FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */,
 				A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */,

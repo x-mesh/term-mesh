@@ -458,6 +458,11 @@ final class PeerHostCoordinator: NSObject {
         config.relayTelemetryProvider = {
             await provider.relayTelemetrySnapshot()
         }
+        config.onActiveSessionCountChange = { count in
+            Task { @MainActor in
+                PeerKeepAwakeController.shared.attachedPeerCountDidChange(count)
+            }
+        }
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {
