@@ -360,6 +360,27 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+
+    private func rosterWorkspace(cwd: String?, busy: Bool = false, title: String = "work") -> WorkspaceSummary {
+        WorkspaceSummary(
+            id: Data([1]), title: title, hostSockPath: "/tmp/peer.sock", windowID: Data([9]),
+            windowTitle: "w", isDefault: true, paneCount: 1, surfaceCount: 1, busyCount: busy ? 1 : 0,
+            panes: [RemotePaneSummary(
+                id: Data([2]), surfaceIDs: [Data([2])], title: "shell",
+                workingDirectoryPath: cwd, workingDirectoryName: cwd.map { ($0 as NSString).lastPathComponent },
+                projectRootPath: nil, tabCount: 1, columns: 80, rows: 24, isBusy: busy
+            )]
+        )
+    }
+
+    func test_rosterChangeIsDirectoryOnly_onlyWhenNothingButFoldersMoved() {
+        let before = [rosterWorkspace(cwd: "/work/x-kit")]
+        XCTAssertTrue(workspaceRosterChangeIsDirectoryOnly(previous: before, next: [rosterWorkspace(cwd: "/work/agentic")]))
+        XCTAssertFalse(workspaceRosterChangeIsDirectoryOnly(previous: before, next: [rosterWorkspace(cwd: "/work/agentic", busy: true)]))
+        XCTAssertFalse(workspaceRosterChangeIsDirectoryOnly(previous: before, next: [rosterWorkspace(cwd: "/work/x-kit", title: "renamed")]))
+        XCTAssertFalse(workspaceRosterChangeIsDirectoryOnly(previous: nil, next: before), "the first roster must refresh teams")
+    }
+
     @MainActor
     func testConnectTimeoutCancelsTheAttemptAndRejectsAStaleTimeout() async {
         let store = RemoteHostStore.shared

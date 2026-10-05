@@ -137,6 +137,42 @@ struct RemotePaneSummary: Identifiable, Equatable {
 
 /// Flatten a peer layout into the compact pane details shown by the sidebar.
 /// Pre-order traversal matches the visual left-to-right/top-to-bottom layout.
+/// Whether `next` differs from `previous` at most in its panes' folders.
+func workspaceRosterChangeIsDirectoryOnly(
+    previous: [WorkspaceSummary]?,
+    next: [WorkspaceSummary]
+) -> Bool {
+    guard let previous else { return false }
+    func withoutFolders(_ workspace: WorkspaceSummary) -> WorkspaceSummary {
+        WorkspaceSummary(
+            id: workspace.id,
+            title: workspace.title,
+            hostSockPath: workspace.hostSockPath,
+            windowID: workspace.windowID,
+            windowTitle: workspace.windowTitle,
+            isDefault: workspace.isDefault,
+            paneCount: workspace.paneCount,
+            surfaceCount: workspace.surfaceCount,
+            busyCount: workspace.busyCount,
+            panes: workspace.panes.map { pane in
+                RemotePaneSummary(
+                    id: pane.id,
+                    surfaceIDs: pane.surfaceIDs,
+                    title: pane.title,
+                    workingDirectoryPath: nil,
+                    workingDirectoryName: nil,
+                    projectRootPath: nil,
+                    tabCount: pane.tabCount,
+                    columns: pane.columns,
+                    rows: pane.rows,
+                    isBusy: pane.isBusy
+                )
+            }
+        )
+    }
+    return previous.map(withoutFolders) == next.map(withoutFolders)
+}
+
 func peerPaneSummaries(
     _ layout: Termmesh_Peer_V1_WorkspaceLayout?
 ) -> [RemotePaneSummary] {
@@ -2506,7 +2542,12 @@ final class RemoteHostStore: ObservableObject {
                 panes: peerPaneSummaries(layout)
             )
         }
+        let previous = hosts[key]?.workspaces
         replaceWorkspaceRoster(summaries, for: key)
+        // A host rebroadcasts its list each time a pane's folder changes, and
+        // a team refresh opens a fresh connection; a `cd` loop on the host
+        // would reconnect every viewer once per iteration.
+        guard !workspaceRosterChangeIsDirectoryOnly(previous: previous, next: summaries) else { return }
         scheduleTeamRosterRefresh(for: hostSockPath, key: key)
     }
 

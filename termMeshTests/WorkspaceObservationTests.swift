@@ -91,20 +91,15 @@ final class WorkspaceObservationTests: XCTestCase {
         wait(for: [redrew], timeout: 1)
     }
 
-    // MARK: - The callback that replaced a Combine publisher
+    // MARK: - Peer viewers
 
-    /// `TabManager` used to reach this through
-    /// `$currentDirectory.dropFirst().removeDuplicates()`. `@Observable` has no
-    /// publisher, so the workspace calls back — and the callback has to carry
-    /// both operators, or session state is written on every launch and on
-    /// every no-op assignment.
     /// A peer viewer's sidebar named a pane by the folder it was attached in,
     /// long after the shell had moved: a directory change never reached the
     /// host's workspace broadcast. Repeated prompts in one folder must not
     /// rebroadcast it.
-    func testADirectoryChangeIsAnnouncedToPeerViewersOnlyWhenItChanges() {
+    func testADirectoryChangeIsAnnouncedToPeerViewersOnlyWhenItChanges() throws {
         let ws = workspace()
-        let panelId = ws.focusedPanelId ?? UUID()
+        let panelId = try XCTUnwrap(ws.focusedPanelId)
         var announcements = 0
         let observer = NotificationCenter.default.addObserver(
             forName: .peerWorkspaceLayoutDidChange, object: nil, queue: nil
@@ -123,6 +118,34 @@ final class WorkspaceObservationTests: XCTestCase {
         XCTAssertEqual(announcements, afterFirst + 1)
     }
 
+    /// Only a pane's selected tab has its folder on the wire, so a background
+    /// tab moving must not make the host rebroadcast.
+    func testABackgroundTabsDirectoryChangeIsNotAnnounced() throws {
+        let ws = workspace()
+        let firstPanel = try XCTUnwrap(ws.focusedPanelId)
+        let pane = try XCTUnwrap(ws.paneId(forPanelId: firstPanel))
+        let second = try XCTUnwrap(ws.newTerminalSurface(inPane: pane, focus: true))
+        var announcements = 0
+        let observer = NotificationCenter.default.addObserver(
+            forName: .peerWorkspaceLayoutDidChange, object: nil, queue: nil
+        ) { note in
+            if note.userInfo?["workspaceID"] as? UUID == ws.id { announcements += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        ws.updatePanelDirectory(panelId: firstPanel, directory: "/tmp/peer-cwd-background")
+        XCTAssertEqual(announcements, 0, "the first tab is in the background")
+        ws.updatePanelDirectory(panelId: second.id, directory: "/tmp/peer-cwd-selected")
+        XCTAssertEqual(announcements, 1)
+    }
+
+    // MARK: - The callback that replaced a Combine publisher
+
+    /// `TabManager` used to reach this through
+    /// `$currentDirectory.dropFirst().removeDuplicates()`. `@Observable` has no
+    /// publisher, so the workspace calls back — and the callback has to carry
+    /// both operators, or session state is written on every launch and on
+    /// every no-op assignment.
     func testDirectoryCallbackCarriesDropFirstAndRemoveDuplicates() {
         var calls = 0
         let ws = workspace(directory: "/tmp")
