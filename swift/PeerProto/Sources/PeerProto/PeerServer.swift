@@ -648,9 +648,10 @@ public struct PeerServerConfig: Sendable {
     public var relayTelemetryProvider: (@Sendable () async -> Termmesh_Peer_V1_RelayTelemetry?)?
     public var relayTelemetryInterval: Duration = .seconds(2)
 
-    /// Called with the number of accepted connections each time it changes;
-    /// it is zero again once the server stops. A connection counts from
-    /// accept, before its handshake, so one-shot probes count briefly too.
+    /// Called with the number of accepted connections each time it changes.
+    /// It returns to zero after the server stops and its last session ends. A
+    /// connection counts from accept, before its handshake, so a one-shot
+    /// probe counts too, for as long as it stays open.
     /// Runs on the server actor, so an embedder that touches UI state hops to
     /// its own actor.
     public var onActiveSessionCountChange: (@Sendable (Int) -> Void)?

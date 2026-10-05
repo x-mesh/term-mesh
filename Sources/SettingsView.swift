@@ -2515,7 +2515,6 @@ struct SettingsView: View {
 
     // MARK: - Section: Peer Federation
 
-    @ViewBuilder
     private var peerKeepAwakeSubtitle: LocalizedStringKey {
         switch PeerKeepAwakeMode(rawValue: peerFederationKeepAwake) ?? PeerFederationSettings.defaultKeepAwakeMode {
         case .never:
@@ -2527,6 +2526,7 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
     private var sectionPeerFederation: some View {
         SettingsCard {
             SettingsCardRow(

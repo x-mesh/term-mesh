@@ -27,7 +27,8 @@ enum PeerKeepAwakePolicy {
     }
 }
 
-/// Holds an idle-sleep assertion while remote sessions are connected.
+/// Holds an idle-sleep assertion while remote sessions are connected, and for
+/// `PeerKeepAwakePolicy.releaseGraceSeconds` after the last one ends.
 ///
 /// A sleeping Mac stops answering its SSH tunnels; each dark wake then finds
 /// them reset, and every viewer and mirror reconnects. The assertion is the
