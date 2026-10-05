@@ -1995,6 +1995,8 @@ final class PeerRelaySession {
         case connected
         case failed
         case refreshTransport
+        /// The host refused this surface or attached a different one.
+        case surfaceRejected
     }
 
     /// How host→viewer PtyData leaves this session.
@@ -2151,7 +2153,10 @@ final class PeerRelaySession {
         return env
     }
 
-    let hostSockPath: String
+    /// Mutable only through `retargetOwnedTransport`: a replaced SSH tunnel
+    /// listens on a new local path, and a pane that keeps its helper across
+    /// the replacement has to dial that path from then on.
+    private(set) var hostSockPath: String
     let hostDisplayName: String
     /// Which machine this session reaches, for state that belongs to the
     /// host rather than to one pane (its load, memory, and I/O rates).
@@ -2318,11 +2323,33 @@ final class PeerRelaySession {
     /// carries the generation it originally attached through so sibling panes
     /// coalesce one half-alive tunnel reset instead of restarting each other.
     private var ownedTransportGeneration: UInt64 = 0
+    // Different leases can have the same recovery generation and socket path.
+    private var ownedTransportRevision: UInt64 = 0
     private var ownedTransportRecovery: ((UInt64) async -> UInt64)?
     /// False once Disconnect Host retires the lease behind this pane. The old
     /// local socket path remains on the session for diagnostics, but nothing
     /// will ever listen there again.
     private var ownedTransportMayReconnect: (() -> Bool)?
+    /// Set when the host transport behind this pane is being retired on
+    /// purpose (Reconnect Host, or a dead tunnel replaced after wake) and a
+    /// replacement is expected. Ending the pump there sends the relay helper
+    /// a Goodbye, and the helper is the Ghostty pane's shell — so the pane,
+    /// and the scrollback it holds, died with the tunnel and had to be
+    /// respawned. With this set the owned reconnect loop parks instead and
+    /// resumes once `retargetOwnedTransport` names the replacement.
+    private var awaitingTransportReplacement = false
+    /// The parked reconnect loop. Resumed exactly once, by
+    /// `resumeTransportReplacementWaiter`, from retarget or teardown — a pane
+    /// closed while parked must still release its helper.
+    private var transportReplacementWaiter: CheckedContinuation<Void, Never>?
+    var onAwaitingTransportReplacement: (@MainActor () -> Void)?
+    /// Set by a retarget until the next attach settles. Only that first
+    /// attach treats a refused surface as final.
+    private var firstAttachAfterRetargetPending = false
+    /// The relay ended because the replacement transport refused this
+    /// surface. The pane's banner names the cause, and its Reconnect skips
+    /// the transport refresh: the refusal already proved the tunnel is up.
+    private(set) var retargetedSurfaceWasRejected = false
 
     func configureOwnedTransportRecovery(
         generation: UInt64,
@@ -2332,6 +2359,148 @@ final class PeerRelaySession {
         ownedTransportGeneration = generation
         ownedTransportMayReconnect = mayReconnect
         ownedTransportRecovery = handler
+    }
+
+    /// Keep this pane alive across a deliberate host-transport replacement.
+    /// Relay delivery only: the helper process is what is worth keeping, and
+    /// callback (agent) panes rebuild through their own reattach path.
+    func awaitTransportReplacement() {
+        guard Self.mayAwaitTransportReplacement(
+            ownsSession: ownsSession, usesRelayHelper: usesRelayHelper, isTorndown: isTorndown
+        ) else { return }
+        awaitingTransportReplacement = true
+    }
+
+    nonisolated static func mayAwaitTransportReplacement(
+        ownsSession: Bool,
+        usesRelayHelper: Bool,
+        isTorndown: Bool
+    ) -> Bool {
+        ownsSession && usesRelayHelper && !isTorndown
+    }
+
+    /// Stop waiting for a replacement that is not coming. The parked loop
+    /// then ends the pane the way a retired lease always did, which hands it
+    /// the ordinary disconnected banner and its Reconnect.
+    func abandonTransportReplacement() {
+        guard awaitingTransportReplacement else { return }
+        awaitingTransportReplacement = false
+        resumeTransportReplacementWaiter()
+    }
+
+    var isAwaitingTransportReplacement: Bool { awaitingTransportReplacement }
+
+    /// Point this pane at the transport that replaced the one it attached
+    /// through. False when nothing is left to move — the relay already ended,
+    /// so only a respawn brings the pane back.
+    @discardableResult
+    func retargetOwnedTransport(
+        hostSockPath: String,
+        hostKey: PeerPaneHostKey,
+        generation: UInt64,
+        mayReconnect: @escaping () -> Bool,
+        handler: @escaping (UInt64) async -> UInt64
+    ) -> Bool {
+        guard ownsSession, !isTorndown else { return false }
+        ownedTransportRevision &+= 1
+        self.hostSockPath = hostSockPath
+        self.hostKey = hostKey
+        configureOwnedTransportRecovery(
+            generation: generation, mayReconnect: mayReconnect, handler: handler
+        )
+        awaitingTransportReplacement = false
+        firstAttachAfterRetargetPending = true
+        // Failures against the retired tunnel say nothing about the new one.
+        // Left counted, a loop that burned its attempts while the host was
+        // asleep would open the circuit on its first try at the replacement.
+        reconnectCircuit.recordRecovery()
+        RemoteWorkLog.infoOffMain(
+            "Peer transport retarget host=\(hostKey) surface=\(surfaceID.base64EncodedString().prefix(12)) parked=\(transportReplacementWaiter != nil) transportGen=\(generation)"
+        )
+        if transportReplacementWaiter != nil {
+            resumeTransportReplacementWaiter()
+        } else if let transport {
+            // The retired tunnel's EOF has not reached the pump yet. Closing
+            // the transport now sends it into the reconnect loop, which dials
+            // the replacement, instead of leaving it on a dead socket until
+            // the heartbeat gives up.
+            Task { await transport.close() }
+        }
+        return true
+    }
+
+    enum OwnedReconnectStep: Equatable {
+        case proceed
+        case park
+        case stop
+    }
+
+    /// `shouldReconnectOwnedSession`, plus the one case that must neither
+    /// proceed nor stop: the lease is retired but a replacement is expected.
+    nonisolated static func ownedReconnectStep(
+        ownsSession: Bool,
+        isTorndown: Bool,
+        isCurrentSession: Bool,
+        hostLeaseIsActive: Bool,
+        awaitingTransportReplacement: Bool
+    ) -> OwnedReconnectStep {
+        if shouldReconnectOwnedSession(
+            ownsSession: ownsSession,
+            isTorndown: isTorndown,
+            isCurrentSession: isCurrentSession,
+            hostLeaseIsActive: hostLeaseIsActive
+        ) {
+            return .proceed
+        }
+        if ownsSession, !isTorndown, isCurrentSession, !hostLeaseIsActive,
+           awaitingTransportReplacement {
+            return .park
+        }
+        return .stop
+    }
+
+    /// The reconnect loop's eligibility check at each suspension boundary.
+    /// Parks for as long as a replacement is awaited, then re-judges: a
+    /// retarget makes the lease active again, a teardown ends it.
+    private func ownedReconnectMayProceed(afterLosing failedSession: PeerSession) async -> Bool {
+        while true {
+            switch Self.ownedReconnectStep(
+                ownsSession: ownsSession,
+                isTorndown: isTorndown,
+                isCurrentSession: session === failedSession,
+                hostLeaseIsActive: ownedTransportMayReconnect?() ?? true,
+                awaitingTransportReplacement: awaitingTransportReplacement
+            ) {
+            case .proceed: return true
+            case .stop: return false
+            case .park: await parkUntilTransportReplaced()
+            }
+        }
+    }
+
+    private func parkUntilTransportReplaced() async {
+        RemoteWorkLog.infoOffMain(
+            "Peer reconnect parked host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) — waiting for the replacement host transport"
+        )
+        onAwaitingTransportReplacement?()
+        await withCheckedContinuation { continuation in
+            guard awaitingTransportReplacement, !isTorndown else {
+                continuation.resume()
+                return
+            }
+            // Only the pump's reconnect loop parks, and a pane has one pump,
+            // so there is never a waiter here already. Overwriting one would
+            // leak its continuation, so it is resumed first; two loops would
+            // still not be supported — each would wake the other.
+            transportReplacementWaiter?.resume()
+            transportReplacementWaiter = continuation
+        }
+    }
+
+    private func resumeTransportReplacementWaiter() {
+        let waiter = transportReplacementWaiter
+        transportReplacementWaiter = nil
+        waiter?.resume()
     }
 
     func refreshOwnedTransportForReconnect(reason: String) async {
@@ -4015,12 +4184,15 @@ final class PeerRelaySession {
             return
         }
         guard let oldTransport = transport else { return }
+        let transportRevision = ownedTransportRevision
+        let dialedPath = hostSockPath
 
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+        guard transportRevision == ownedTransportRevision else { return }
 
         let newConnection: PeerRelayConnection
         do {
-            newConnection = try await Self.connect(hostSockPath: hostSockPath)
+            newConnection = try await Self.connect(hostSockPath: dialedPath)
         } catch {
             #if DEBUG
             dlog("peer.relay.gap.heal.resume.connectFailed error=\(error)")
@@ -4037,7 +4209,7 @@ final class PeerRelaySession {
             }
             return
         }
-        guard !isTorndown else {
+        guard !isTorndown, transportRevision == ownedTransportRevision else {
             await newConnection.cancel()
             return
         }
@@ -4099,7 +4271,8 @@ final class PeerRelaySession {
             await abortResumeTransition(transition)
             return
         }
-        guard outcome.surfaceID == surfaceID, !isTorndown else {
+        guard outcome.surfaceID == surfaceID, !isTorndown,
+              transportRevision == ownedTransportRevision else {
             await newConnection.cancel()
             await abortResumeTransition(transition)
             return
@@ -4124,6 +4297,7 @@ final class PeerRelaySession {
         // this the mutations below would revive session/transport state right
         // after teardown nilled them.
         guard !isTorndown, session === oldSession,
+              transportRevision == ownedTransportRevision,
               let newGeneration = resumeTransitionGate.replaceSession(
                   expectedGeneration: transition.generation
               )
@@ -4154,6 +4328,7 @@ final class PeerRelaySession {
         relayTelemetry.resetRemote()
         session = newConnection.session
         sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
+        firstAttachAfterRetargetPending = false
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
         hostSupportsReplayRing = newConnection.hostCapabilities.has(PeerCapability.replayRingV1)
@@ -4187,12 +4362,7 @@ final class PeerRelaySession {
         afterLosing failedSession: PeerSession,
         generation failedGeneration: UInt64
     ) async -> Bool {
-        guard Self.shouldReconnectOwnedSession(
-            ownsSession: ownsSession,
-            isTorndown: isTorndown,
-            isCurrentSession: session === failedSession,
-            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
-        ) else {
+        guard ownsSession, !isTorndown, session === failedSession else {
             return session !== failedSession
         }
         guard resumeTransitionGate.currentGeneration() == failedGeneration else {
@@ -4200,7 +4370,8 @@ final class PeerRelaySession {
         }
         // From here to the return, this pane is RECONNECTING rather than
         // live — the distinction the workspace mirror reads before it keeps
-        // a pane instead of respawning it.
+        // a pane instead of respawning it. That includes time parked on a
+        // retired lease: the mirror must watch such a pane, not respawn it.
         reconnectInFlight = true
         #if DEBUG
         let reconnectStartedAt = Date()
@@ -4208,7 +4379,13 @@ final class PeerRelaySession {
             dlog("peer.relay.reconnect.return elapsed=\(String(format: "%.3f", Date().timeIntervalSince(reconnectStartedAt))) swapped=\(session !== failedSession) failed=\(Self.sessionTag(failedSession))")
         }
         #endif
-        defer { reconnectInFlight = false }
+        defer {
+            reconnectInFlight = false
+            // A retarget's first attach happens inside this loop. However the
+            // loop ends — attached, refused, swapped by a heal, or stopped —
+            // a later, unrelated disconnect must retry a refusal as usual.
+            firstAttachAfterRetargetPending = false
+        }
         RemoteWorkLog.infoOffMain(
             "Peer reconnect start host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) failedSession=\(Self.sessionTag(failedSession)) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
         )
@@ -4222,24 +4399,14 @@ final class PeerRelaySession {
         ) {
             reconnectCircuit.recordRecovery()
         }
-        guard Self.shouldReconnectOwnedSession(
-            ownsSession: ownsSession,
-            isTorndown: isTorndown,
-            isCurrentSession: session === failedSession,
-            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
-        ) else {
+        guard await ownedReconnectMayProceed(afterLosing: failedSession) else {
             return session !== failedSession
         }
         guard resumeTransitionGate.currentGeneration() == failedGeneration else {
             return session !== failedSession
         }
         var didRefreshTransport = false
-        while Self.shouldReconnectOwnedSession(
-            ownsSession: ownsSession,
-            isTorndown: isTorndown,
-            isCurrentSession: session === failedSession,
-            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
-        ) {
+        while await ownedReconnectMayProceed(afterLosing: failedSession) {
             guard let next = reconnectCircuit.nextAttempt() else {
                 RemoteWorkLog.warningOffMain(
                     "Peer reconnect circuit open host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) attempts=\(reconnectCircuit.attempts)"
@@ -4255,26 +4422,38 @@ final class PeerRelaySession {
                 // next backoff is longer. Wake as soon as the session moves.
                 await sleepUnlessSessionReplaced(failedSession, seconds: delay)
             }
-            guard Self.shouldReconnectOwnedSession(
-                ownsSession: ownsSession,
-                isTorndown: isTorndown,
-                isCurrentSession: session === failedSession,
-                hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
-            ) else { break }
+            guard await ownedReconnectMayProceed(afterLosing: failedSession) else { break }
             RemoteWorkLog.infoOffMain(
                 "Peer reconnect attempt host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) delay=\(delay) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
             )
             onReconnecting?(attempt)
+            let transportRevision = ownedTransportRevision
             let result = await attemptOwnedSessionReconnect(
-                from: failedSession, generation: failedGeneration
+                from: failedSession, generation: failedGeneration,
+                transportRevision: transportRevision
             )
+            guard transportRevision == ownedTransportRevision else { continue }
             if case .connected = result {
+                firstAttachAfterRetargetPending = false
                 onReconnected?()
                 RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
                 RemoteWorkLog.infoOffMain(
                     "Peer reconnect success host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) sessionGen=\(resumeTransitionGate.currentGeneration()) transportGen=\(ownedTransportGeneration)"
                 )
                 return true
+            }
+            if case .surfaceRejected = result, firstAttachAfterRetargetPending {
+                // Across a replaced transport a refusal usually means the host
+                // restarted and the surface is gone. Retrying the same id would
+                // spend the whole circuit (about two minutes) before the pane
+                // ends and its banner offers Reconnect; ending now offers it at
+                // once.
+                firstAttachAfterRetargetPending = false
+                retargetedSurfaceWasRejected = true
+                RemoteWorkLog.warningOffMain(
+                    "Peer reconnect ended host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) — the replacement host transport no longer offers this surface"
+                )
+                break
             }
             reconnectCircuit.recordFailure()
             if case .refreshTransport = result, !didRefreshTransport {
@@ -4347,7 +4526,8 @@ final class PeerRelaySession {
     /// Unlike gap healing, no old-session bytes can race this attach boundary.
     private func attemptOwnedSessionReconnect(
         from failedSession: PeerSession,
-        generation failedGeneration: UInt64
+        generation failedGeneration: UInt64,
+        transportRevision: UInt64
     ) async -> OwnedReconnectAttemptResult {
         // The outer loop's predicate, re-checked at every await boundary
         // INSIDE the attempt. `connect` and `attachSurface` are exactly
@@ -4363,12 +4543,15 @@ final class PeerRelaySession {
                 isCurrentSession: session === failedSession,
                 hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
             ) && resumeTransitionGate.currentGeneration() == failedGeneration
+                && ownedTransportRevision == transportRevision
         }
         guard stillEligible() else { return .failed }
+        let dialedPath = hostSockPath
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
+        guard stillEligible() else { return .failed }
         let connection: PeerRelayConnection
         do {
-            connection = try await Self.connect(hostSockPath: hostSockPath)
+            connection = try await Self.connect(hostSockPath: dialedPath)
         } catch {
             #if DEBUG
             dlog("peer.relay.reconnect.connectFailed error=\(error)")
@@ -4401,13 +4584,17 @@ final class PeerRelaySession {
             #endif
             await connection.cancel()
             if case PeerSessionError.attachRejected = error {
-                return .failed
+                return .surfaceRejected
             }
             return .refreshTransport
         }
-        guard outcome.surfaceID == surfaceID, stillEligible() else {
+        guard stillEligible() else {
             await connection.cancel()
             return .failed
+        }
+        guard outcome.surfaceID == surfaceID else {
+            await connection.cancel()
+            return .surfaceRejected
         }
 
         guard let newGeneration = resumeTransitionGate.replaceSession(
@@ -4544,6 +4731,17 @@ final class PeerRelaySession {
     /// -1 unless a relay listener was actually bound — the callback-mode
     /// "no listener socket" assertion reads this.
     var listenerFileDescriptorForTesting: Int32 { listenerFd }
+
+    /// `awaitTransportReplacement` without its relay-helper gate. The mock
+    /// host harness only drives callback delivery, and the park/retarget loop
+    /// under test is the same for both deliveries.
+    func awaitTransportReplacementForTesting() {
+        awaitingTransportReplacement = true
+    }
+
+    /// Whether the owned reconnect loop is still running. A loop parked on a
+    /// retired lease and never resumed would hold this true forever.
+    var reconnectInFlightForTesting: Bool { reconnectInFlight }
     #endif
 
     private func disconnect(reason: String, notifyDisconnect: Bool = true) {
@@ -4552,6 +4750,8 @@ final class PeerRelaySession {
         // fires 2-3 times per session.
         guard !isTorndown else { return }
         isTorndown = true
+        awaitingTransportReplacement = false
+        resumeTransportReplacementWaiter()
         #if DEBUG
         // Which teardown path fired first is the key signal for the
         // "heavy input → truncate → pane closes" investigation: e.g. a

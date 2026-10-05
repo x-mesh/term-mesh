@@ -92,6 +92,8 @@
     fastPollTimer: null,
     inFlight: false,
     targetsRequest: null,
+    sendInFlight: false,
+    pendingSend: null,
     lastText: null,
     lastError: null,
     rowKeys: [],         // per-row render keys for incremental redraws
@@ -148,13 +150,20 @@
     return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
   }
 
-  function api(method, path, body) {
+  var READ_TIMEOUT_MS = 10000;
+  var SEND_TIMEOUT_MS = 10000;
+  var MENU_READ_TIMEOUT_MS = 30000;
+
+  function api(method, path, body, timeoutMs) {
     var init = { method: method, headers: {}, credentials: 'same-origin' };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    return fetch(path, init).then(function (res) {
+    var timer = null;
+    var controller = (method === 'GET' || timeoutMs !== undefined) ? new window.AbortController() : null;
+    if (controller) { init.signal = controller.signal; }
+    var request = fetch(path, init).then(function (res) {
       return res.text().then(function (raw) {
         var data = null;
         try { data = raw ? JSON.parse(raw) : null; } catch (e) { data = null; }
@@ -169,11 +178,33 @@
         return data;
       });
     });
+    if (controller) {
+      var read = request;
+      request = new Promise(function (resolve, reject) {
+        timer = window.setTimeout(function () {
+          controller.abort();
+          var error = new Error(method === 'GET'
+            ? '연결이 지연됩니다. 다시 연결을 시도합니다.'
+            : '전송 결과를 확인하지 못했습니다. 같은 메시지를 다시 보내 재시도하세요.');
+          error.code = method === 'GET' ? 'read_timeout' : 'send_timeout';
+          reject(error);
+        }, timeoutMs || READ_TIMEOUT_MS);
+        read.then(resolve, reject);
+      });
+    }
+    return request.then(function (data) {
+      window.clearTimeout(timer);
+      return data;
+    }, function (error) {
+      window.clearTimeout(timer);
+      throw error;
+    });
   }
 
   function describeError(err) {
     if (!err) { return 'error'; }
     switch (err.code) {
+      case 'send_timeout': return err.message;
       case 'login_required': return '인증 없음: Tailscale Serve를 통해 접속하세요';
       case 'login_not_allowed': return '이 tailnet 계정은 허용 목록에 없습니다';
       case 'not_exposed': return '이 pane은 더 이상 노출되지 않습니다 (/rc on)';
@@ -214,6 +245,8 @@
     state.mode = mode;
     window.localStorage.setItem('term-mesh-view:' + t.surface_id, state.mode);
     selectTarget(t, false);
+    refreshScreen();
+    refreshChat();
   }
 
   function targetLabel(t) {
@@ -1062,7 +1095,7 @@
 
   function refreshScreen() {
     var t = state.selected;
-    if (!t) { return Promise.resolve(); }
+    if (!t || isChat(t)) { return Promise.resolve(); }
     var stickToBottom = isAtBottom(el.screen);
     return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/screen?lines=' + SCREEN_LINES + '&format=styled')
       .then(function (data) {
@@ -1380,7 +1413,7 @@
     el.modelList.textContent = '';
     el.modelCustom.hidden = true;
     setModelStatus('터미널 메뉴를 읽는 중…');
-    api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + picker.path)
+    api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + picker.path, undefined, MENU_READ_TIMEOUT_MS)
       .then(function (raw) {
         if (generation !== state.modelGeneration) { return; }
         var data = picker.rows(raw);
@@ -1478,17 +1511,44 @@
 
   function sendText(text) {
     var t = state.selected;
-    if (!t || isPaneReadOnly(t)) { return; }
-    var id = requestId();
+    if (!t || isPaneReadOnly(t) || state.sendInFlight) { return; }
+    var command = text.trim();
+    if (t.kind === 'pane' && isChat(t) && (t.agent_cli === 'claude' || t.agent_cli === 'codex')) {
+      if (command === '/model' || (command === '/effort' && t.agent_cli === 'claude')) {
+        openModelPicker(command === '/effort' ? 'effort' : 'model');
+        return;
+      }
+      state.commandItems.forEach(function (item) {
+        if (item.action === 'terminal' && item.invocation === command) { state.terminalAfterSend = command; }
+      });
+    }
+    var chatInput = isAgent(t) || isChat(t);
+    var pending = state.pendingSend;
+    if (!pending || pending.target !== t.surface_id || pending.text !== text || pending.chat !== chatInput) {
+      pending = { target: t.surface_id, text: text, chat: chatInput, id: requestId() };
+      state.pendingSend = pending;
+    }
+    var id = pending.id;
+    var terminalCommand = state.terminalAfterSend;
+    state.sendInFlight = true;
     el.send.disabled = true;
     setSendStatus('sending…');
-    var chatInput = isAgent(t) || isChat(t);
     var body = { text: text, request_id: id, mode: chatInput ? 'chat' : 'terminal' };
     // Send means Enter in a terminal: the daemon delivers text and Return as
     // one turn so a separate Enter cannot race the paste.
     if (!chatInput && t.kind === 'pane') { body.submit = true; }
-    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', body)
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', body, SEND_TIMEOUT_MS)
       .then(function (data) {
+        state.pendingSend = null;
+        state.terminalAfterSend = null;
+        if (el.text.value === text) {
+          el.text.value = '';
+          fitTextarea();
+        }
+        if (!isCurrentTarget(t)) {
+          setSendStatus('');
+          return;
+        }
         if (chatInput) {
           setSendStatus(data.deduplicated ? 'already sent' : 'turn sent');
         } else if (t.kind === 'leader') {
@@ -1499,10 +1559,7 @@
         } else {
           setSendStatus(data.deduplicated ? 'already delivered' : 'submitted');
         }
-        var opensTerminal = state.terminalAfterSend && chatInput && text.indexOf(state.terminalAfterSend) === 0;
-        state.terminalAfterSend = null;
-        el.text.value = '';
-        fitTextarea();
+        var opensTerminal = terminalCommand && chatInput && text.indexOf(terminalCommand) === 0;
         if (opensTerminal) {
           setMode('terminal');
           setSendStatus('터미널에서 열었어요 · 채팅으로 돌아가려면 Chat 탭');
@@ -1512,7 +1569,7 @@
       .catch(function (err) {
         setSendStatus(describeError(err), true);
       })
-      .then(function () { el.send.disabled = false; });
+      .then(function () { state.sendInFlight = false; el.send.disabled = false; });
   }
 
   function sendKey(key) {
@@ -1622,6 +1679,7 @@
 
   el.form.addEventListener('submit', function (ev) {
     ev.preventDefault();
+    if (state.sendInFlight) { return; }
     closeCommandPicker(false);
     var text = el.text.value;
     if (text.trim()) {

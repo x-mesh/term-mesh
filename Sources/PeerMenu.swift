@@ -227,6 +227,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// close.
     private var openPaneSessions: [PeerPaneSession] = []
 
+    #if DEBUG
+    var replacementConsumersForTests: [PeerPaneHostKey: [@MainActor (PeerPaneHostLease) -> Void]] = [:]
+    #endif
+
     func registerPaneSession(_ session: PeerPaneSession) {
         guard !openPaneSessions.contains(where: { $0 === session }) else { return }
         openPaneSessions.append(session)
@@ -251,8 +255,30 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             self?.preparePanesForHostDisconnect(key)
         }
         registry.hostTransportDidReplace = { [weak self] key, lease in
-            self?.resumePanesAfterHostReconnect(key)
+            guard let self else { return }
+            let registry = PeerPaneHostRegistry.shared
+            let reservations = self.openPaneSessions.filter { $0.lease.key == key && !$0.isTorndown }.count
+                + self.openWorkspaceMirrors.filter { $0.lease.key == key && !$0.isTornDown }.count
+            #if DEBUG
+            let testConsumers = self.replacementConsumersForTests[key] ?? []
+            let reservationCount = reservations + testConsumers.count
+            #else
+            let reservationCount = reservations
+            #endif
+            // Queue every consumer's retain before callbacks can release or disconnect.
+            for _ in 0..<reservationCount { registry.retain(lease) }
+            defer { for _ in 0..<reservationCount { registry.release(lease) } }
+            #if DEBUG
+            for consume in testConsumers { consume(lease) }
+            #endif
+            self.resumePanesAfterHostReconnect(key)
             RemoteHostStore.shared.adoptReplacementTransport(hostKey: key, lease: lease)
+        }
+        registry.hostTransportReplacementAbandoned = { [weak self] key in
+            guard let self else { return }
+            for session in self.openPaneSessions where session.lease.key == key && !session.isTorndown {
+                session.relaySession.abandonTransportReplacement()
+            }
         }
     }
 
@@ -277,7 +303,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                   registry.activeLease(forKey: key) === lease
             else { continue }
             do {
-                let current = try await registry.acquire(lease.spec)
+                let current = try await registry.acquire(lease.spec, waiter: UUID(), background: true)
                 registry.release(current)
                 if current !== lease { replaced += 1 }
             } catch {
@@ -303,7 +329,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         for session in sessions {
             session.prepareForHostTransportDisconnect(stopRelay: stopRelay)
         }
-        return sessions.count
+        // A pane whose surface the host refused stays on its banner and will
+        // not reattach (`PeerPaneSession.hostReconnectReattach`); counting it
+        // would promise a reattach that never happens.
+        return sessions.filter { !$0.relaySession.retargetedSurfaceWasRejected }.count
     }
 
     /// A pane preserved by a deliberate disconnect is reattached when its host
@@ -352,6 +381,34 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
         #endif
         return reattached
+    }
+
+    /// Reconnect for a pane parked on a retired transport. A replacement may
+    /// already be pooled (reached by a path that did not announce it), may
+    /// need acquiring, or may be unreachable under this pane's host key. The
+    /// first two move every parked pane on the host; in the last case the
+    /// park is abandoned so the pane takes the ordinary disconnected path,
+    /// whose Reconnect rebuilds it.
+    func reconnectParkedPane(_ session: PeerPaneSession) async {
+        let registry = PeerPaneHostRegistry.shared
+        let key = session.lease.key
+        var acquired: PeerPaneHostLease?
+        if registry.activeLease(forKey: key) == nil {
+            do {
+                acquired = try await registry.acquire(session.originSpec)
+            } catch {
+                RemoteWorkLog.info(
+                    "Could not reach \(key.shortLabel) for a paused pane: \(error)"
+                )
+            }
+        }
+        resumePanesAfterHostReconnect(key)
+        // Held until the panes above took their own refs, so a lease nobody
+        // moved onto is the only one this release can stop.
+        if let acquired { registry.release(acquired) }
+        if !session.isTorndown, session.relaySession.isAwaitingTransportReplacement {
+            session.relaySession.abandonTransportReplacement()
+        }
     }
 
     // MARK: - Live workspace mirrors (Phase 2B)
@@ -2055,7 +2112,12 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
         let spec = oldSession.originSpec
         let wanted = oldSession.originSurface
-        await oldSession.refreshHostTransportForReconnect()
+        // A surface refused right after a retarget proves the transport is
+        // up — it answered. Refreshing would restart a tunnel that sibling
+        // panes have just moved onto.
+        if !oldSession.relaySession.retargetedSurfaceWasRejected {
+            await oldSession.refreshHostTransportForReconnect()
+        }
         oldSession.teardown()
 
         let registry = PeerPaneHostRegistry.shared

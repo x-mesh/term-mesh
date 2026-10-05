@@ -3376,9 +3376,11 @@ struct RemoteHostGroupView: View, Equatable {
         if host.workspaces.isEmpty {
             if offeredProjects.isEmpty {
                 HStack(spacing: 8) {
-                    Text(emptyBodyText)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
+                    if host.connectionPhase == nil {
+                        Text(emptyBodyText)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
                     if case .connecting = host.connectionState {
                         Spacer(minLength: 4)
                         Button("Cancel") { store.cancelConnectingHost(host) }
@@ -3449,6 +3451,18 @@ struct RemoteHostGroupView: View, Equatable {
     var body: some View {
         VStack(spacing: 0) {
             hostHeader
+            if let phase = host.connectionPhase, let startedAt = host.connectionStartedAt {
+                HStack(spacing: 4) {
+                    Text(phase.label).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(startedAt, style: .timer).monospacedDigit()
+                }
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .padding(.leading, 20)
+                .padding(.trailing, 8)
+                .padding(.top, 2)
+            }
             if isExpanded {
                 hostContent
                     .padding(.top, 4)

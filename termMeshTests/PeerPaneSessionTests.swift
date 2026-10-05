@@ -360,6 +360,102 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+    @MainActor
+    func testConnectTimeoutCancelsTheAttemptAndRejectsAStaleTimeout() async {
+        let store = RemoteHostStore.shared
+        let hostID = "connection-timeout-\(UUID())"
+        var host = HostEntry(
+            id: hostID, displayName: hostID, connectionState: .connecting,
+            workspaces: [], activeSockPath: "", sshTarget: nil, remoteSockPath: nil
+        )
+        host.connectionPhase = .openingTunnel
+        host.connectionStartedAt = Date()
+        defer { store.removePeerShellCleanupCacheForTesting(hostID: hostID) }
+        let attempt = Task<Void, Never> { try? await Task.sleep(nanoseconds: 60_000_000_000) }
+        let attemptID = UUID()
+        store.installConnectingHostForTesting(host, attemptID: attemptID, task: attempt)
+        store.timeoutConnectingHost(host, attemptID: attemptID)
+        XCTAssertTrue(attempt.isCancelled)
+        guard case .failed(let reason) = store.hosts[hostID]?.connectionState else {
+            XCTFail("timeout must end the connecting state")
+            return
+        }
+        XCTAssertTrue(reason.contains("Opening SSH tunnel"))
+        XCTAssertNil(store.hosts[hostID]?.connectionPhase)
+        XCTAssertNil(store.hosts[hostID]?.connectionStartedAt)
+        _ = await attempt.value
+
+        let replacement = Task<Void, Never> { try? await Task.sleep(nanoseconds: 60_000_000_000) }
+        store.installConnectingHostForTesting(host, attemptID: UUID(), task: replacement)
+        store.timeoutConnectingHost(host, attemptID: attemptID)
+        XCTAssertFalse(replacement.isCancelled)
+        XCTAssertEqual(store.hosts[hostID]?.connectionState, .connecting)
+        store.cancelConnectingHost(host)
+        _ = await replacement.value
+    }
+
+    @MainActor
+    func testConnectionProgressChangesTheHostSnapshotAndClearsWithTheRoute() {
+        let baseline = HostEntry(
+            id: "progress-test", displayName: "progress-test", connectionState: .connecting,
+            workspaces: [], activeSockPath: "", sshTarget: "test.invalid", remoteSockPath: ""
+        )
+        var host = baseline
+        host.connectionStartedAt = Date()
+        host.connectionPhase = .discoveringSocket
+        XCTAssertNotEqual(host, baseline)
+        let discovering = host
+        host.connectionPhase = .openingTunnel
+        XCTAssertNotEqual(host, discovering)
+        host.clearServingMetadata()
+        XCTAssertNil(host.connectionPhase)
+        XCTAssertNil(host.connectionStartedAt)
+    }
+
+    @MainActor
+    func testReconnectRetiresTheDiscoveredKeyWithSharedWaiters() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let store = RemoteHostStore.shared
+        let hostID = "retry-discovered-\(UUID())"
+        let spec = PeerPaneHostSpec.ssh(target: "test.invalid", remoteSockPath: "/tmp/retry.sock", port: nil, identityFile: nil)
+        let waiter = UUID()
+        var startEntered = false
+        var startCancelled = false
+        registry.startDelayForTests = { _ in
+            startEntered = true
+            do { try await Task.sleep(for: .seconds(30)) } catch { startCancelled = Task.isCancelled }
+        }
+        let row = Task<Void, Never> {
+            if let lease = try? await registry.acquire(spec, waiter: waiter) { registry.release(lease) }
+        }
+        let sibling = Task<Void, Never> {
+            if let lease = try? await registry.acquire(spec) { registry.release(lease) }
+        }
+        defer {
+            row.cancel()
+            sibling.cancel()
+            registry.disconnectTransport(for: spec.hostKey)
+            registry.startDelayForTests = nil
+            store.removePeerShellCleanupCacheForTesting(hostID: hostID)
+        }
+        let ready = await waitFor { startEntered && registry.pendingWaiterCountForTests(for: spec.hostKey) == 2 }
+        XCTAssertTrue(ready)
+        let host = HostEntry(
+            id: hostID, displayName: hostID, connectionState: .connecting,
+            workspaces: [], activeSockPath: "", sshTarget: nil, remoteSockPath: nil
+        )
+        store.installConnectingHostForTesting(host, attemptID: waiter, task: row, leaseKey: spec.hostKey)
+        XCTAssertFalse(store.reconnectHost(host).started)
+        let cancelled = await waitFor { startCancelled }
+        XCTAssertTrue(cancelled, "Retry must retire the discovered transport even when another waiter still uses it")
+        XCTAssertEqual(registry.pendingWaiterCountForTests(for: spec.hostKey), 0)
+        row.cancel()
+        sibling.cancel()
+        await row.value
+        await sibling.value
+    }
+
+
     func test_cleanupProjectsBecomeEligibleOnlyWhenEveryLiveSurfaceIsSelected() {
         let a = Data([1])
         let b = Data([2])
@@ -4323,6 +4419,653 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: key))
     }
 
+    @MainActor
+    func test_registry_restartCompletedBeforeTaskKeepsTheRecoveredLease() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-restart-hop.sock")
+        let lease = try await registry.acquire(spec)
+        let teardownsBefore = registry.teardownCountForTests
+        registry.livenessOverrideForTests = { $0 === lease ? .waitForRestart : .usable }
+        registry.restartDelayForTests = { recovering in
+            let generation = await recovering.transportRecoveryForTests.refresh(
+                after: recovering.transportGeneration
+            ) { true }
+            XCTAssertEqual(generation, 1)
+        }
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartDelayForTests = nil
+        }
+
+        let joined = try await registry.acquire(spec)
+        XCTAssertTrue(joined === lease, "a recovery completed during the Task hop must keep its lease")
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore)
+        XCTAssertEqual(lease.transportGeneration, 1)
+        registry.release(lease)
+        registry.release(joined)
+        XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
+    }
+
+    @MainActor
+    func test_registry_restartObservationCanFinishBeforeTheAcquireDeadline() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-restart-budget.sock")
+        let lease = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === lease ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            try? await Task.sleep(for: .seconds(18.1))
+            return true
+        }
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.release(lease)
+        }
+        let joined = try await registry.acquire(spec)
+        XCTAssertTrue(joined === lease)
+        registry.release(joined)
+    }
+
+    @MainActor
+    func test_registry_reentrantRetainsKeepAllReplacementConsumersAlive() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let coordinator = PeerClientCoordinator.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-retarget-refs.sock")
+        let consumers = 3
+        let dead = try await registry.acquire(spec)
+        for _ in 1..<consumers { registry.retain(dead) }
+        var holders = Array(repeating: dead, count: consumers)
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        let savedAbandon = registry.hostTransportReplacementAbandoned
+        let teardownsBefore = registry.teardownCountForTests
+        var startEntered = false
+        var openStart = false
+        var replacements = 0
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+        registry.startDelayForTests = { _ in
+            startEntered = true
+            let deadline = Date().addingTimeInterval(2)
+            while !openStart, !Task.isCancelled, Date() < deadline { await Task.yield() }
+            XCTAssertTrue(openStart)
+            XCTAssertFalse(Task.isCancelled, "a replacement survives cancellation of its last waiter")
+        }
+        coordinator.replacementConsumersForTests[spec.hostKey] = (0..<consumers).map { index in
+            { replacement in
+                if index == 0 {
+                    replacements += 1
+                    if replacements == 1 {
+                        XCTAssertEqual(registry.pendingWaiterCountForTests(for: spec.hostKey), 0)
+                        registry.disconnectTransport(for: spec.hostKey, replacementFollows: true)
+                    }
+                }
+                registry.retain(replacement)
+                registry.release(holders[index])
+                holders[index] = replacement
+            }
+        }
+        coordinator.installHostTransportReplacementHooks()
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+            registry.hostTransportReplacementAbandoned = savedAbandon
+            coordinator.replacementConsumersForTests[spec.hostKey] = nil
+            for held in holders { registry.release(held) }
+        }
+
+        let caller = Task { @MainActor in try await registry.acquire(spec) }
+        let enteredBy = Date().addingTimeInterval(2)
+        while !startEntered, Date() < enteredBy { await Task.yield() }
+        XCTAssertTrue(startEntered)
+        caller.cancel()
+        do {
+            _ = try await caller.value
+            XCTFail("the triggering waiter must be cancelled")
+        } catch is CancellationError {}
+        openStart = true
+        let replacedBy = Date().addingTimeInterval(2)
+        while replacements == 0, Date() < replacedBy { await Task.yield() }
+        XCTAssertEqual(replacements, 1)
+        let interrupted = holders[0]
+        XCTAssertTrue(holders.allSatisfy { $0 === interrupted })
+        XCTAssertFalse(interrupted.canReconnectTransport)
+        XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
+        let token = try XCTUnwrap(registry.pendingReplacementToken(for: spec.hostKey))
+        let replacement = try await registry.acquire(spec, waiter: UUID(), token: token)
+        XCTAssertEqual(replacements, 2, "reservations must carry every consumer into a reentrant reconnect")
+        XCTAssertTrue(holders.allSatisfy { $0 === replacement })
+        registry.release(replacement)
+        XCTAssertTrue(registry.activeLease(forKey: spec.hostKey) === replacement)
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
+        while !holders.isEmpty {
+            registry.release(holders.removeLast())
+            if !holders.isEmpty {
+                XCTAssertTrue(registry.activeLease(forKey: spec.hostKey) === replacement)
+            }
+        }
+        XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 3)
+    }
+
+    /// The wake sweep waits on a restarting tunnel with nobody asking. If the
+    /// user disconnects the host during that wait, the sweep must give up
+    /// rather than build a lease that announces itself as the replacement —
+    /// that would reattach the panes the user just disconnected.
+    @MainActor
+    func test_registry_restartWaiterDoesNotUndoADisconnectDuringTheWait() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-disconnect.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        var announced = 0
+        registry.hostTransportDidReplace = { _, _ in announced += 1 }
+
+        let restarting = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === restarting ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            XCTAssertEqual(registry.disconnectTransport(for: key), sockPath)
+            return false
+        }
+
+        do {
+            let lease = try await registry.acquire(spec)
+            registry.release(lease)
+            XCTFail("an acquire waiting through a Disconnect Host must not build a new lease")
+        } catch PeerPaneHostAcquireError.hostDisconnected(let disconnected) {
+            XCTAssertEqual(disconnected, key)
+        }
+        XCTAssertEqual(announced, 0, "no replacement may be announced against the disconnect")
+        XCTAssertNil(registry.activeLease(forKey: key))
+        registry.release(restarting)
+    }
+
+    /// Reconnect Host retires the lease and then starts the replacement. An
+    /// acquire that was joining the old lease's restart — a pane's banner
+    /// Reconnect, a team spawn — must end up on that replacement, and must not
+    /// start one itself: its spec may predate the change that retired the
+    /// lease (a repaired identity, an invalidated socket).
+    @MainActor
+    func test_registry_restartWaiterJoinsTheReconnectHostReplacementWithoutStartingOne() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-reconnect.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        var announced = 0
+        registry.hostTransportDidReplace = { _, _ in announced += 1 }
+
+        let restarting = try await registry.acquire(spec)
+        var starts = 0
+        registry.startDelayForTests = { _ in starts += 1 }
+        var retired = false
+        registry.livenessOverrideForTests = { $0 === restarting ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            XCTAssertEqual(
+                registry.disconnectTransport(for: key, replacementFollows: true),
+                sockPath
+            )
+            retired = true
+            return false
+        }
+
+        let waiter = Task { @MainActor in try await registry.acquire(spec) }
+        while !retired { await Task.yield() }
+        // Long enough for a waiter that wrongly starts its own lease to have
+        // done so; the follower below must be the first and only start.
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(starts, 0, "the waiter must not start the replacement")
+        XCTAssertNil(registry.activeLease(forKey: key))
+
+        let follower = try await registry.acquire(spec, waiter: UUID(), token: registry.pendingReplacementToken(for: key))
+        let joined = try await waiter.value
+        XCTAssertTrue(joined === follower, "the waiter must end up on the follower's lease")
+        XCTAssertEqual(starts, 1, "only the follower may start a lease")
+        XCTAssertEqual(announced, 1)
+
+        registry.release(joined)
+        registry.release(follower)
+        registry.release(restarting)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// Disconnect Host while the Reconnect Host replacement is still coming
+    /// up. Nothing is pooled yet, so the disconnect used to go unrecorded and
+    /// the start, kept alive by a joined waiter, pooled itself and reattached
+    /// the panes. Every caller of that start must now fail and nothing pool.
+    @MainActor
+    func test_registry_disconnectDuringAReplacementStartPoolsNothing() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-disconnect-midstart.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        let teardownsBefore = registry.teardownCountForTests
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        var announced = 0
+        registry.hostTransportDidReplace = { _, _ in announced += 1 }
+
+        let restarting = try await registry.acquire(spec)
+        var retired = false
+        registry.livenessOverrideForTests = { $0 === restarting ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            registry.disconnectTransport(for: key, replacementFollows: true)
+            retired = true
+            return false
+        }
+        var startHeld = false
+        var releaseStart = false
+        registry.startDelayForTests = { _ in
+            startHeld = true
+            while !releaseStart { await Task.yield() }
+        }
+
+        let waiter = Task { @MainActor in try await registry.acquire(spec) }
+        while !retired { await Task.yield() }
+        let follower = Task { @MainActor in
+            try await registry.acquire(spec, waiter: UUID(), token: registry.pendingReplacementToken(for: key))
+        }
+        while !startHeld { await Task.yield() }
+
+        XCTAssertNil(
+            registry.disconnectTransport(for: key),
+            "nothing is pooled mid-start, but the disconnect must still count"
+        )
+        releaseStart = true
+
+        for task in [waiter, follower] {
+            do {
+                let lease = try await task.value
+                registry.release(lease)
+                XCTFail("a start overtaken by Disconnect Host must not be handed out")
+            } catch PeerPaneHostAcquireError.hostDisconnected(let disconnected) {
+                XCTAssertEqual(disconnected, key)
+            }
+        }
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(announced, 0, "no replacement may be announced against the disconnect")
+        XCTAssertEqual(
+            registry.teardownCountForTests, teardownsBefore + 1,
+            "the retired lease is stopped; the cancelled start never made one"
+        )
+        registry.release(restarting)
+    }
+
+    /// A Connect made after Disconnect Host must not join the start the
+    /// disconnect overtook: that start is doomed, and joining it failed the
+    /// user's fresh Connect with "disconnected" for as long as the old ssh
+    /// took to come up. The callers already awaiting it still fail.
+    @MainActor
+    func test_registry_acquireAfterADisconnectDoesNotJoinTheOvertakenStart() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-disconnect-fresh.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        defer { registry.startDelayForTests = nil }
+        var startsSeen = 0
+        var releaseFirstStart = false
+        registry.startDelayForTests = { _ in
+            startsSeen += 1
+            if startsSeen == 1 {
+                while !releaseFirstStart { await Task.yield() }
+            }
+        }
+
+        let first = Task { @MainActor in try await registry.acquire(spec) }
+        while startsSeen == 0 { await Task.yield() }
+        let joined = Task { @MainActor in try await registry.acquire(spec) }
+        while registry.pendingWaiterCountForTests(for: key) < 2 { await Task.yield() }
+
+        XCTAssertNil(registry.disconnectTransport(for: key))
+        let freshTask = Task { @MainActor in try await registry.acquire(spec) }
+        // A Connect that wrongly joins the overtaken start would wait on it
+        // forever here, so look for its own start with a deadline instead.
+        let deadline = Date().addingTimeInterval(2)
+        while startsSeen < 2, Date() < deadline { await Task.yield() }
+        XCTAssertEqual(startsSeen, 2, "the Connect after the disconnect must start its own lease")
+        releaseFirstStart = startsSeen < 2
+        let fresh: PeerPaneHostLease
+        do {
+            fresh = try await freshTask.value
+        } catch {
+            releaseFirstStart = true
+            for task in [first, joined] { _ = try? await task.value }
+            return XCTFail("the Connect after the disconnect failed: \(error)")
+        }
+        XCTAssertTrue(registry.activeLease(forKey: key) === fresh)
+
+        releaseFirstStart = true
+        for task in [first, joined] {
+            do {
+                let lease = try await task.value
+                registry.release(lease)
+                XCTFail("callers of the overtaken start must still fail")
+            } catch PeerPaneHostAcquireError.hostDisconnected {}
+        }
+        XCTAssertTrue(
+            registry.activeLease(forKey: key) === fresh,
+            "the overtaken start landing late must not evict the fresh lease"
+        )
+        XCTAssertEqual(
+            registry.teardownCountForTests, teardownsBefore,
+            "the cancelled overtaken start never made a lease, and the fresh one is not stopped"
+        )
+        registry.release(fresh)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// Nothing retired the lease a restart waiter was waiting on — its last
+    /// holder released it. Its spec is therefore not stale, so the waiter
+    /// starts a lease as an ordinary acquire would, instead of failing.
+    @MainActor
+    func test_registry_restartWaiterStartsFreshWhenTheLeaseWasOnlyReleased() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-released.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+        }
+
+        let released = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === released ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { lease in
+            registry.release(lease)
+            return false
+        }
+        let fresh = try await registry.acquire(spec)
+        XCTAssertFalse(fresh === released)
+        XCTAssertTrue(registry.activeLease(forKey: key) === fresh)
+        registry.release(fresh)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// A pending replacement belongs to one Reconnect Host attempt. A start
+    /// from before it failing — here cancelled — must not withdraw it, and
+    /// only the announcing attempt's token may.
+    @MainActor
+    func test_registry_pendingReplacementIsWithdrawnOnlyByItsOwnAttempt() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-pending-token.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        defer { registry.startDelayForTests = nil }
+        var held = false
+        registry.startDelayForTests = { _ in
+            held = true
+            let until = Date().addingTimeInterval(2)
+            while !Task.isCancelled, Date() < until { await Task.yield() }
+        }
+
+        let older = Task { @MainActor in try await registry.acquire(spec) }
+        while !held { await Task.yield() }
+        registry.disconnectTransport(for: key, replacementFollows: true)
+        let token = try XCTUnwrap(registry.pendingReplacementToken(for: key))
+
+        XCTAssertTrue(registry.cancelPendingAcquire(for: key))
+        let olderLease = try? await older.value
+        if let olderLease { registry.release(olderLease) }
+        XCTAssertEqual(
+            registry.pendingReplacementToken(for: key), token,
+            "a start made before the Reconnect Host must not withdraw its announcement"
+        )
+
+        registry.abandonPendingReplacement(for: key, token: UUID())
+        XCTAssertEqual(registry.pendingReplacementToken(for: key), token)
+        registry.abandonPendingReplacement(for: key, token: token)
+        XCTAssertNil(registry.pendingReplacementToken(for: key))
+    }
+
+    @MainActor
+    func test_registry_backgroundWaiterEndsWhenReconnectReplacesTheHost() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-background-reconnect.sock")
+        let key = spec.hostKey
+        let lease = try await registry.acquire(spec)
+        var restartEntered = false
+        var finishRestart = false
+        var starts = 0
+        registry.livenessOverrideForTests = { $0 === lease ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            restartEntered = true
+            let deadline = Date().addingTimeInterval(2)
+            while !finishRestart, Date() < deadline { await Task.yield() }
+            XCTAssertTrue(finishRestart)
+            return false
+        }
+        registry.startDelayForTests = { _ in starts += 1 }
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+        }
+        let background = Task { @MainActor in
+            try await registry.acquire(spec, waiter: UUID(), background: true)
+        }
+        let enteredBy = Date().addingTimeInterval(2)
+        while !restartEntered, Date() < enteredBy { await Task.yield() }
+        XCTAssertTrue(restartEntered)
+        registry.disconnectTransport(for: key, replacementFollows: true)
+        do {
+            _ = try await background.value
+            XCTFail("background waiters must not join a user reconnect")
+        } catch PeerPaneHostAcquireError.replacementUnavailable {}
+        XCTAssertEqual(starts, 0)
+        let token = try XCTUnwrap(registry.pendingReplacementToken(for: key))
+        let replacement = try await registry.acquire(spec, waiter: UUID(), token: token)
+        XCTAssertEqual(starts, 1)
+        finishRestart = true
+        registry.release(lease)
+        registry.release(replacement)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    @MainActor
+    func test_registry_rejectsAStaleReconnectTokenWithoutStarting() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-stale-token.sock")
+        registry.disconnectTransport(for: spec.hostKey, replacementFollows: true)
+        let stale = try XCTUnwrap(registry.pendingReplacementToken(for: spec.hostKey))
+        registry.disconnectTransport(for: spec.hostKey, replacementFollows: true)
+        let current = try XCTUnwrap(registry.pendingReplacementToken(for: spec.hostKey))
+        var starts = 0
+        registry.startDelayForTests = { _ in starts += 1 }
+        defer { registry.startDelayForTests = nil }
+        do {
+            _ = try await registry.acquire(spec, waiter: UUID(), token: stale)
+            XCTFail("a stale reconnect must not acquire a lease")
+        } catch PeerHostMachine<PeerPaneHostSpec, UUID>.Failure.reconnectSuperseded {}
+        XCTAssertEqual(starts, 0)
+        XCTAssertEqual(registry.pendingReplacementToken(for: spec.hostKey), current)
+        let lease = try await registry.acquire(spec, waiter: UUID(), token: current)
+        XCTAssertEqual(starts, 1)
+        registry.release(lease)
+    }
+
+    @MainActor
+    func test_registry_deadlineDoesNotCancelTheReplacementStart() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-deadline-start.sock")
+        let lease = try await registry.acquire(spec)
+        var started = false
+        var open = false
+        let savedReplace = registry.hostTransportDidReplace
+        registry.replacementJoinDeadlineForTests = 0.03
+        registry.livenessOverrideForTests = { $0 === lease ? .dead : .usable }
+        registry.startDelayForTests = { _ in
+            started = true
+            let deadline = Date().addingTimeInterval(2)
+            while !open, Date() < deadline { await Task.yield() }
+            XCTAssertTrue(open)
+            XCTAssertFalse(Task.isCancelled)
+        }
+        var adopted: PeerPaneHostLease?
+        registry.hostTransportDidReplace = { _, replacement in
+            registry.retain(replacement)
+            adopted = replacement
+        }
+        defer {
+            registry.startDelayForTests = nil
+            registry.livenessOverrideForTests = nil
+            registry.replacementJoinDeadlineForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        do {
+            _ = try await registry.acquire(spec)
+            XCTFail("the waiter must have a deadline")
+        } catch PeerPaneHostAcquireError.replacementUnavailable {}
+        XCTAssertTrue(started)
+        open = true
+        let deadline = Date().addingTimeInterval(2)
+        while adopted == nil, Date() < deadline { await Task.yield() }
+        XCTAssertNotNil(adopted)
+        registry.release(lease)
+        if let adopted { registry.release(adopted) }
+        XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
+    }
+
+    @MainActor
+    func test_registry_abandonsParkAfterTheReconnectDeadline() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-abandon-deadline.sock")
+        let lease = try await registry.acquire(spec)
+        let saved = registry.hostTransportReplacementAbandoned
+        var abandoned = 0
+        registry.hostTransportReplacementAbandoned = { key in
+            if key == spec.hostKey { abandoned += 1 }
+        }
+        registry.replacementJoinDeadlineForTests = 0.03
+        defer {
+            registry.hostTransportReplacementAbandoned = saved
+            registry.replacementJoinDeadlineForTests = nil
+        }
+        registry.disconnectTransport(for: spec.hostKey, replacementFollows: true)
+        let deadline = Date().addingTimeInterval(2)
+        while abandoned == 0, Date() < deadline { await Task.yield() }
+        XCTAssertEqual(abandoned, 1)
+        XCTAssertNil(registry.pendingReplacementToken(for: spec.hostKey))
+        registry.release(lease)
+    }
+
+    /// The start a Disconnect Host overtakes is cancelled at once, not left
+    /// to finish: its ssh would otherwise overlap the next Connect's tunnel
+    /// and race it for the dashboard port.
+    @MainActor
+    func test_registry_disconnectCancelsTheStartItOvertakes() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-disconnect-cancel.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        defer { registry.startDelayForTests = nil }
+        var held = false
+        var sawCancel = false
+        registry.startDelayForTests = { _ in
+            held = true
+            // Bounded so a start that is never cancelled fails this test
+            // instead of holding it open forever.
+            let until = Date().addingTimeInterval(2)
+            while !Task.isCancelled, Date() < until { await Task.yield() }
+            sawCancel = Task.isCancelled
+        }
+
+        let first = Task { @MainActor in try await registry.acquire(spec) }
+        let joined = Task { @MainActor in
+            while !held { await Task.yield() }
+            return try await registry.acquire(spec)
+        }
+        while registry.pendingWaiterCountForTests(for: key) < 2 { await Task.yield() }
+
+        registry.disconnectTransport(for: key)
+        for task in [first, joined] {
+            do {
+                let lease = try await task.value
+                registry.release(lease)
+                XCTFail("an overtaken start must not be handed out")
+            } catch PeerPaneHostAcquireError.hostDisconnected {}
+        }
+        XCTAssertTrue(sawCancel, "the overtaken start must be cancelled, not left to finish")
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// Reconnect Host that starts nothing (it declined, or the replacement
+    /// came up under another key) must not leave a waiter to build one.
+    @MainActor
+    func test_registry_restartWaiterGivesUpWhenNoReplacementStarts() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-nofollower.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.replacementJoinDeadlineForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+        registry.hostTransportDidReplace = { _, _ in }
+        registry.replacementJoinDeadlineForTests = 0.3
+
+        let first = try await registry.acquire(spec)
+        var starts = 0
+        registry.startDelayForTests = { _ in starts += 1 }
+        registry.livenessOverrideForTests = { $0 === first ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in
+            registry.disconnectTransport(for: key, replacementFollows: true)
+            return false
+        }
+        do {
+            let lease = try await registry.acquire(spec)
+            registry.release(lease)
+            XCTFail("a waiter with no replacement to join must give up")
+        } catch PeerPaneHostAcquireError.replacementUnavailable(let unavailable) {
+            XCTAssertEqual(unavailable, key)
+        }
+
+        registry.restartWaitOverrideForTests = { _ in
+            registry.disconnectTransport(for: key, replacementFollows: true)
+            registry.abandonPendingReplacement(for: key)
+            return false
+        }
+        let second = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === second ? .waitForRestart : .usable }
+        let abandonedAt = Date()
+        do {
+            let lease = try await registry.acquire(spec)
+            registry.release(lease)
+            XCTFail("an abandoned replacement must not be built by the waiter")
+        } catch PeerPaneHostAcquireError.replacementUnavailable {
+            XCTAssertLessThan(
+                Date().timeIntervalSince(abandonedAt), 0.25,
+                "an abandoned replacement ends the wait at once, not at the deadline"
+            )
+        }
+        XCTAssertEqual(starts, 1, "only the test's own acquire of `second` may start a lease")
+        XCTAssertNil(registry.activeLease(forKey: key))
+        registry.release(first)
+        registry.release(second)
+    }
+
     /// A restart that does not come back is a dead lease.
     @MainActor
     func test_registry_waitForRestartReplacesTheLeaseThatDoesNot() async throws {
@@ -4895,6 +5638,87 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    func test_ownedReconnectParksOnRetiredLeaseOnlyWhileAReplacementIsAwaited() {
+        func step(
+            ownsSession: Bool = true, isTorndown: Bool = false,
+            isCurrentSession: Bool = true, hostLeaseIsActive: Bool,
+            awaiting: Bool
+        ) -> PeerRelaySession.OwnedReconnectStep {
+            PeerRelaySession.ownedReconnectStep(
+                ownsSession: ownsSession, isTorndown: isTorndown,
+                isCurrentSession: isCurrentSession,
+                hostLeaseIsActive: hostLeaseIsActive,
+                awaitingTransportReplacement: awaiting
+            )
+        }
+        XCTAssertEqual(step(hostLeaseIsActive: true, awaiting: false), .proceed)
+        XCTAssertEqual(step(hostLeaseIsActive: true, awaiting: true), .proceed)
+        XCTAssertEqual(
+            step(hostLeaseIsActive: false, awaiting: true), .park,
+            "a deliberately retired lease with a replacement expected must keep the helper alive"
+        )
+        XCTAssertEqual(
+            step(hostLeaseIsActive: false, awaiting: false), .stop,
+            "a retired lease nobody is replacing still ends the pane"
+        )
+        XCTAssertEqual(step(isTorndown: true, hostLeaseIsActive: false, awaiting: true), .stop)
+        XCTAssertEqual(step(isCurrentSession: false, hostLeaseIsActive: false, awaiting: true), .stop)
+        XCTAssertEqual(step(ownsSession: false, hostLeaseIsActive: false, awaiting: true), .stop)
+    }
+
+    func test_onlyRelayHelperPanesWaitForATransportReplacement() {
+        XCTAssertTrue(PeerRelaySession.mayAwaitTransportReplacement(
+            ownsSession: true, usesRelayHelper: true, isTorndown: false
+        ))
+        XCTAssertFalse(
+            PeerRelaySession.mayAwaitTransportReplacement(
+                ownsSession: true, usesRelayHelper: false, isTorndown: false
+            ),
+            "callback (agent) panes rebuild through their own reattach and must not park"
+        )
+        XCTAssertFalse(PeerRelaySession.mayAwaitTransportReplacement(
+            ownsSession: false, usesRelayHelper: true, isTorndown: false
+        ))
+        XCTAssertFalse(PeerRelaySession.mayAwaitTransportReplacement(
+            ownsSession: true, usesRelayHelper: true, isTorndown: true
+        ))
+    }
+
+    func test_hostReconnectLeavesARefusedPaneOnItsBanner() {
+        XCTAssertEqual(
+            PeerPaneSession.hostReconnectReattach(retargeted: true, surfaceWasRejected: false),
+            .moved
+        )
+        XCTAssertEqual(
+            PeerPaneSession.hostReconnectReattach(retargeted: false, surfaceWasRejected: false),
+            .rebuild,
+            "a preserved pane whose relay ended (a direct host) is still rebuilt on Connect"
+        )
+        XCTAssertEqual(
+            PeerPaneSession.hostReconnectReattach(retargeted: false, surfaceWasRejected: true),
+            .leaveBanner,
+            "an unattended rebuild of a refused pane would match a surface by title"
+        )
+    }
+
+    func test_paneRetargetRequiresALiveReplacementForTheSameHost() {
+        XCTAssertTrue(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: true, sameLease: false, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: true, sameHost: true, sameLease: false, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: false, sameLease: false, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: true, sameLease: true, replacementIsActive: true
+        ))
+        XCTAssertFalse(PeerPaneSession.mayRetarget(
+            isTorndown: false, sameHost: true, sameLease: false, replacementIsActive: false
+        ))
+    }
+
     @MainActor
     func test_registry_concurrentFirstAcquireYieldsOneLease() async throws {
         let registry = PeerPaneHostRegistry.shared
@@ -4911,43 +5735,37 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
     }
 
-    /// The coalesced start task is shared by every pane waiting on the host, so
-    /// one pane's sidebar Cancel must not abort it — that would kill the other
-    /// panes' connect too. It may only be cancelled by the last waiter.
     @MainActor
-    func test_cancelPendingAcquire_refusesWhileAnotherPaneIsWaiting() async throws {
+    func test_cancelPendingAcquire_cancelsOnlyTheSelectedWaiter() async throws {
         let registry = PeerPaneHostRegistry.shared
-        let sockPath = "/tmp/psp-unit-\(getpid())-shared-cancel.sock"
-        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-shared-cancel.sock")
         let key = spec.hostKey
-        XCTAssertNil(registry.activeLease(forKey: key))
-
-        var waitersAtCancel = 0
-        var pendingSurvivedCancel = false
-
-        // Queued in order on the main actor: both acquires park on the same
-        // start task before the cancel runs.
-        let paneA = Task { @MainActor in try await registry.acquire(spec) }
-        let paneB = Task { @MainActor in try await registry.acquire(spec) }
-        let sidebarCancel = Task { @MainActor in
-            waitersAtCancel = registry.pendingWaiterCountForTests(for: key)
-            registry.cancelPendingAcquire(for: key)
-            pendingSurvivedCancel = registry.pendingWaiterCountForTests(for: key) > 0
+        let waiterA = UUID()
+        let waiterB = UUID()
+        var open = false
+        registry.startDelayForTests = { _ in
+            let deadline = Date().addingTimeInterval(2)
+            while !open, !Task.isCancelled, Date() < deadline { await Task.yield() }
+            XCTAssertTrue(open || Task.isCancelled)
         }
-
-        _ = await sidebarCancel.value
-        let leaseA = try await paneA.value
-        let leaseB = try await paneB.value
-
-        XCTAssertEqual(waitersAtCancel, 2, "both panes must be parked on one start task")
-        XCTAssertTrue(pendingSurvivedCancel, "a shared start must survive one pane's cancel")
-        XCTAssertTrue(leaseA === leaseB)
-        XCTAssertNotNil(registry.activeLease(forKey: key), "the other pane must keep its lease")
-
-        registry.release(leaseA)
-        registry.release(leaseB)
+        defer { registry.startDelayForTests = nil }
+        let paneA = Task { @MainActor in try await registry.acquire(spec, waiter: waiterA) }
+        let paneB = Task { @MainActor in try await registry.acquire(spec, waiter: waiterB) }
+        let deadline = Date().addingTimeInterval(2)
+        while registry.pendingWaiterCountForTests(for: key) < 2, Date() < deadline { await Task.yield() }
+        XCTAssertEqual(registry.pendingWaiterCountForTests(for: key), 2)
+        XCTAssertTrue(registry.cancelPendingAcquire(for: key, waiter: waiterA))
+        XCTAssertEqual(registry.pendingWaiterCountForTests(for: key), 1)
+        do {
+            _ = try await paneA.value
+            XCTFail("the selected waiter must be cancelled")
+        } catch is CancellationError {}
+        open = true
+        let lease = try await paneB.value
+        XCTAssertTrue(registry.activeLease(forKey: key) === lease)
+        registry.release(lease)
         XCTAssertNil(registry.activeLease(forKey: key))
-        XCTAssertEqual(registry.pendingWaiterCountForTests(for: key), 0, "waiter accounting must not leak")
+        XCTAssertEqual(registry.pendingWaiterCountForTests(for: key), 0)
     }
 
     /// A caller cancelled *after* the start task already produced a lease must
@@ -4962,13 +5780,14 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: key))
         let teardownsBefore = registry.teardownCountForTests
 
-        // The test holds the main actor until it awaits, so the cancel always
-        // lands before `acquire` starts running.
-        let acquisition = Task { @MainActor in try await registry.acquire(spec) }
-        acquisition.cancel()
+        var acquisition: Task<PeerPaneHostLease, Error>?
+        registry.leaseMadeForTests = { _ in acquisition?.cancel() }
+        defer { registry.leaseMadeForTests = nil }
+        let task = Task { @MainActor in try await registry.acquire(spec) }
+        acquisition = task
 
         do {
-            _ = try await acquisition.value
+            _ = try await task.value
             XCTFail("a cancelled acquire must not return a lease")
         } catch is CancellationError {
             // expected
@@ -9579,6 +10398,433 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         _ = hostTask
     }
 
+    /// Reconnect Host and post-wake tunnel replacement used to end every pane
+    /// on the retired tunnel: the loop saw an inactive lease, sent the helper
+    /// a Goodbye, and the mirror respawned each pane with empty scrollback.
+    /// Here the first host goes away under a retired lease, the loop must
+    /// park rather than end, and a retarget must bring the SAME relay back
+    /// through the replacement host's socket.
+    @MainActor
+    func test_parkedOwnedReconnectResumesThroughRetargetedTransport() async throws {
+        let suffix = "\(getpid())-\(UUID().uuidString.prefix(8))"
+        let retiredPath = "/tmp/peer-retarget-old-\(suffix).sock"
+        let replacementPath = "/tmp/peer-retarget-new-\(suffix).sock"
+        let retiredHost = AgentSurfaceMockHost(socketPath: retiredPath, capabilities: [])
+        let replacementHost = AgentSurfaceMockHost(socketPath: replacementPath, capabilities: [])
+        let retiredTask = try retiredHost.start()
+        let replacementTask = try replacementHost.start()
+        defer {
+            retiredHost.stop()
+            replacementHost.stop()
+        }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: retiredPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = retiredHost.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0,
+            mayReconnect: { leaseActive },
+            handler: { $0 }
+        )
+
+        let parked = expectation(description: "reconnect loop parked on the retired lease")
+        parked.assertForOverFulfill = false
+        let reconnected = expectation(description: "relay reattached through the replacement")
+        var reconnectedCount = 0
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        relay.onReconnected = {
+            reconnectedCount += 1
+            reconnected.fulfill()
+        }
+        var disconnectCount = 0
+        relay.onDisconnect = { disconnectCount += 1 }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        retiredHost.stop()
+        await fulfillment(of: [parked], timeout: 10)
+
+        XCTAssertEqual(relay.transportLiveness, .reconnecting)
+        XCTAssertEqual(reconnectedCount, 0)
+        XCTAssertEqual(disconnectCount, 0, "a parked pane must not end before its replacement arrives")
+
+        XCTAssertTrue(relay.retargetOwnedTransport(
+            hostSockPath: replacementPath,
+            hostKey: PeerPaneHostSpec.direct(sockPath: replacementPath).hostKey,
+            generation: 1,
+            mayReconnect: { true },
+            handler: { $0 }
+        ))
+        await fulfillment(of: [reconnected], timeout: 10)
+
+        XCTAssertEqual(relay.hostSockPath, replacementPath)
+        XCTAssertEqual(relay.transportLiveness, .live)
+        XCTAssertEqual(disconnectCount, 0)
+        await relay.stop()
+        _ = retiredTask
+        _ = replacementTask
+    }
+
+    @MainActor
+    func test_retargetDiscardsARefusalFromThePreviousTransport() async throws {
+        try await assertRetargetDiscardsHeldAttach(refused: true)
+    }
+
+    @MainActor
+    func test_retargetDiscardsASuccessFromThePreviousTransport() async throws {
+        try await assertRetargetDiscardsHeldAttach(refused: false)
+    }
+
+    @MainActor
+    private func assertRetargetDiscardsHeldAttach(refused: Bool) async throws {
+        let suffix = "\(getpid())-\(UUID().uuidString.prefix(8))"
+        let oldPath = "/tmp/peer-inflight-old-\(suffix).sock"
+        let newPath = "/tmp/peer-inflight-new-\(suffix).sock"
+        let oldHost = AgentSurfaceMockHost(socketPath: oldPath, capabilities: [])
+        let newHost = AgentSurfaceMockHost(socketPath: newPath, capabilities: [])
+        let oldTask = try oldHost.start()
+        let newTask = try newHost.start()
+        defer { oldHost.stop(); newHost.stop() }
+        let connection = try await PeerRelaySession.connect(hostSockPath: oldPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = oldHost.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(connection, surface: surface, ptyDelivery: .callback)
+        relay.configureOwnedTransportRecovery(generation: 0, mayReconnect: { true }, handler: { $0 })
+        let oldAttachHeld = expectation(description: "old attach is pending")
+        oldHost.holdNextAttach { oldAttachHeld.fulfill() }
+        let newAttachHeld = expectation(description: "replacement receives its own attach")
+        newHost.holdNextAttach { newAttachHeld.fulfill() }
+        var disconnects = 0
+        let reconnected = expectation(description: "new transport connected")
+        reconnected.assertForOverFulfill = false
+        relay.onDisconnect = { disconnects += 1 }
+        relay.onReconnected = { reconnected.fulfill() }
+        try await relay.start()
+        XCTAssertTrue(relay.debugDropOwnedTransport())
+        await fulfillment(of: [oldAttachHeld], timeout: 10)
+        oldHost.rejectsAttach = refused
+        XCTAssertTrue(relay.retargetOwnedTransport(
+            hostSockPath: newPath, hostKey: PeerPaneHostSpec.direct(sockPath: newPath).hostKey,
+            generation: 0, mayReconnect: { true }, handler: { $0 }
+        ))
+        oldHost.releaseHeldAttach()
+        await fulfillment(of: [newAttachHeld], timeout: 5)
+        newHost.releaseHeldAttach()
+        await fulfillment(of: [reconnected], timeout: 5)
+        XCTAssertFalse(relay.retargetedSurfaceWasRejected)
+        XCTAssertEqual(disconnects, 0)
+        XCTAssertEqual(relay.transportLiveness, .live)
+        await relay.stop()
+        _ = oldTask
+        _ = newTask
+    }
+
+    /// The other exit from a park. A pane closed while waiting for a
+    /// replacement must still end its reconnect loop; a continuation nobody
+    /// resumes would hold the pump (and, for relay delivery, the helper
+    /// process) for the life of the app.
+    @MainActor
+    func test_parkedOwnedReconnectEndsWhenThePaneIsTornDown() async throws {
+        let socketPath = "/tmp/peer-retarget-teardown-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: socketPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0,
+            mayReconnect: { leaseActive },
+            handler: { $0 }
+        )
+        let parked = expectation(description: "reconnect loop parked on the retired lease")
+        parked.assertForOverFulfill = false
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        host.stop()
+        await fulfillment(of: [parked], timeout: 10)
+        XCTAssertTrue(relay.reconnectInFlightForTesting)
+
+        await relay.stop()
+        let deadline = Date().addingTimeInterval(5)
+        while relay.reconnectInFlightForTesting, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertFalse(
+            relay.reconnectInFlightForTesting,
+            "the parked reconnect loop never resumed after teardown"
+        )
+        XCTAssertEqual(relay.transportLiveness, .ended)
+        XCTAssertFalse(
+            relay.retargetOwnedTransport(
+                hostSockPath: socketPath,
+                hostKey: PeerPaneHostSpec.direct(sockPath: socketPath).hostKey,
+                generation: 1,
+                mayReconnect: { true },
+                handler: { $0 }
+            ),
+            "an ended relay has nothing left to move"
+        )
+        _ = hostTask
+    }
+
+    /// Disconnect Host followed by any acquire of the same host — not only a
+    /// sidebar Connect — must announce itself as the replacement, or panes
+    /// parked on the retired lease wait for a reconnect that already
+    /// happened. The pane then moves its lease ref onto the replacement, so
+    /// its teardown releases the lease it now holds and nothing else.
+    @MainActor
+    func test_paneRetargetMovesItsLeaseRefOntoTheAnnouncedReplacement() async throws {
+        let socketPath = "/tmp/peer-retarget-lease-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+        let registry = PeerPaneHostRegistry.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let key = spec.hostKey
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+        }
+        var announced: [PeerPaneHostLease] = []
+        registry.hostTransportWillRetire = { _ in }
+        registry.hostTransportDidReplace = { replaced, lease in
+            XCTAssertEqual(replaced, key)
+            announced.append(lease)
+        }
+
+        let retired = try await registry.acquire(spec)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        surface.surfaceType = SessionHostPanes.agentSurfaceType
+        let pane = try await PeerPaneSession.attach(
+            lease: retired, surface: surface, title: "retarget", spec: spec
+        )
+        registry.release(retired)
+
+        pane.prepareForHostTransportDisconnect(stopRelay: false)
+        XCTAssertEqual(registry.disconnectTransport(for: key), socketPath)
+        let replacement = try await registry.acquire(spec)
+        XCTAssertEqual(announced.count, 1, "an acquire after Disconnect Host must announce the replacement")
+        XCTAssertTrue(announced.first === replacement)
+
+        XCTAssertTrue(pane.retarget(to: replacement))
+        XCTAssertTrue(pane.lease === replacement)
+        XCTAssertFalse(pane.hostTransportWasDisconnected)
+        XCTAssertFalse(pane.retarget(to: replacement), "moving onto the lease it already holds is a no-op")
+
+        registry.release(replacement)
+        XCTAssertTrue(
+            registry.activeLease(forKey: key) === replacement,
+            "the pane's own ref must keep the replacement pooled"
+        )
+        pane.teardown()
+        let deadline = Date().addingTimeInterval(5)
+        while registry.activeLease(forKey: key) != nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(
+            registry.activeLease(forKey: key),
+            "teardown must release the replacement it moved onto, leaving no ref behind"
+        )
+        _ = hostTask
+    }
+
+    /// Across a replaced transport a refused surface usually means the host
+    /// restarted. Retrying the same id would spend the whole reconnect
+    /// circuit, about two minutes, before the pane could be rebuilt.
+    @MainActor
+    func test_retargetedReconnectEndsAtOnceWhenTheSurfaceIsRefused() async throws {
+        let suffix = "\(getpid())-\(UUID().uuidString.prefix(8))"
+        let retiredPath = "/tmp/peer-retarget-refused-old-\(suffix).sock"
+        let replacementPath = "/tmp/peer-retarget-refused-new-\(suffix).sock"
+        let retiredHost = AgentSurfaceMockHost(socketPath: retiredPath, capabilities: [])
+        let replacementHost = AgentSurfaceMockHost(socketPath: replacementPath, capabilities: [])
+        let retiredTask = try retiredHost.start()
+        let replacementTask = try replacementHost.start()
+        defer {
+            retiredHost.stop()
+            replacementHost.stop()
+        }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: retiredPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = retiredHost.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0, mayReconnect: { leaseActive }, handler: { $0 }
+        )
+        let parked = expectation(description: "parked on the retired lease")
+        parked.assertForOverFulfill = false
+        let ended = expectation(description: "relay ended after the refusal")
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        relay.onDisconnect = { ended.fulfill() }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        retiredHost.stop()
+        await fulfillment(of: [parked], timeout: 10)
+
+        replacementHost.redirectsAttach = true
+        let retargetedAt = Date()
+        XCTAssertTrue(relay.retargetOwnedTransport(
+            hostSockPath: replacementPath,
+            hostKey: PeerPaneHostSpec.direct(sockPath: replacementPath).hostKey,
+            generation: 1, mayReconnect: { true }, handler: { $0 }
+        ))
+        await fulfillment(of: [ended], timeout: 10)
+
+        XCTAssertTrue(relay.retargetedSurfaceWasRejected)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(retargetedAt), 5,
+            "the refusal must end the pane on the first attempt, not after the circuit"
+        )
+        XCTAssertEqual(relay.transportLiveness, .ended)
+        _ = retiredTask
+        _ = replacementTask
+    }
+
+    /// Only the first attach after a retarget may treat a refusal as final.
+    /// Once the retargeted pane is live, a later drop whose reconnect is
+    /// refused must go through the ordinary retry circuit again.
+    @MainActor
+    func test_refusalAfterARetargetHasSettledIsRetriedAsUsual() async throws {
+        let suffix = "\(getpid())-\(UUID().uuidString.prefix(8))"
+        let retiredPath = "/tmp/peer-retarget-settled-old-\(suffix).sock"
+        let replacementPath = "/tmp/peer-retarget-settled-new-\(suffix).sock"
+        let retiredHost = AgentSurfaceMockHost(socketPath: retiredPath, capabilities: [])
+        let replacementHost = AgentSurfaceMockHost(socketPath: replacementPath, capabilities: [])
+        let retiredTask = try retiredHost.start()
+        let replacementTask = try replacementHost.start()
+        defer {
+            retiredHost.stop()
+            replacementHost.stop()
+        }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: retiredPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = retiredHost.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0, mayReconnect: { leaseActive }, handler: { $0 }
+        )
+        let parked = expectation(description: "parked on the retired lease")
+        parked.assertForOverFulfill = false
+        let reconnected = expectation(description: "retargeted attach succeeded")
+        reconnected.assertForOverFulfill = false
+        let retrying = expectation(description: "later refusal enters the retry circuit")
+        retrying.assertForOverFulfill = false
+        var reconnectingAttempts: [Int] = []
+        var disconnects = 0
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        relay.onReconnected = { reconnected.fulfill() }
+        relay.onDisconnect = { disconnects += 1 }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        retiredHost.stop()
+        await fulfillment(of: [parked], timeout: 10)
+        XCTAssertTrue(relay.retargetOwnedTransport(
+            hostSockPath: replacementPath,
+            hostKey: PeerPaneHostSpec.direct(sockPath: replacementPath).hostKey,
+            generation: 1, mayReconnect: { true }, handler: { $0 }
+        ))
+        await fulfillment(of: [reconnected], timeout: 10)
+
+        replacementHost.redirectsAttach = true
+        relay.onReconnecting = { attempt in
+            reconnectingAttempts.append(attempt)
+            if attempt >= 2 { retrying.fulfill() }
+        }
+        replacementHost.closeActiveConnections()
+        await fulfillment(of: [retrying], timeout: 15)
+
+        XCTAssertFalse(relay.retargetedSurfaceWasRejected)
+        XCTAssertEqual(disconnects, 0, "a settled pane must not end on its first refused reconnect")
+        XCTAssertNotEqual(relay.transportLiveness, .ended)
+        await relay.stop()
+        _ = retiredTask
+        _ = replacementTask
+    }
+
+    /// A Reconnect on a paused pane whose replacement cannot be reached gives
+    /// up the park. The pane must then end the way a retired lease always
+    /// ended it, so the ordinary disconnected banner and its Reconnect apply.
+    @MainActor
+    func test_abandoningAParkEndsThePaneThroughTheOrdinaryDisconnect() async throws {
+        let socketPath = "/tmp/peer-retarget-abandon-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: socketPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var leaseActive = true
+        relay.configureOwnedTransportRecovery(
+            generation: 0, mayReconnect: { leaseActive }, handler: { $0 }
+        )
+        let parked = expectation(description: "parked on the retired lease")
+        parked.assertForOverFulfill = false
+        let ended = expectation(description: "relay ended after abandoning the park")
+        relay.onAwaitingTransportReplacement = { parked.fulfill() }
+        relay.onDisconnect = { ended.fulfill() }
+        try await relay.start()
+
+        relay.awaitTransportReplacementForTesting()
+        leaseActive = false
+        host.stop()
+        await fulfillment(of: [parked], timeout: 10)
+        XCTAssertTrue(relay.isAwaitingTransportReplacement)
+
+        relay.abandonTransportReplacement()
+        await fulfillment(of: [ended], timeout: 10)
+        XCTAssertFalse(relay.isAwaitingTransportReplacement)
+        XCTAssertFalse(relay.reconnectInFlightForTesting)
+        XCTAssertEqual(relay.transportLiveness, .ended)
+        _ = hostTask
+    }
+
     @MainActor
     func test_ownedReconnectRefreshesTransportAfterReconnectHandshakeFails() async throws {
         let socketPath = "/tmp/peer-reconnect-refresh-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
@@ -11012,6 +12258,7 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
     /// matters: the ensure has committed a child on the host and the attach
     /// then fails.
     var redirectsAttach = false
+    var rejectsAttach = false
     /// Hold the reply to the next `attachSurface` until `releaseHeldAttach()`,
     /// so a caller can tear down while an attach is genuinely in flight. Off
     /// unless armed, so every other test here is unaffected.
@@ -11233,7 +12480,7 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
                     _ = attachReleased.wait(timeout: .now() + 10)
                 }
                 var attached = Termmesh_Peer_V1_AttachResult()
-                attached.accepted = true
+                attached.accepted = !rejectsAttach
                 attached.surfaceID = redirectsAttach
                     ? Data(repeating: 0x11, count: 16)
                     : attach.surfaceID
@@ -11322,5 +12569,332 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
             guard count > 0 else { throw Failure.syscall("write", errno) }
             offset += count
         }
+    }
+}
+
+/// Random interleavings of the registry's events, checked against the rules in
+/// `docs/peer-host-registry-invariants.md`. Each trial drives one host key
+/// through acquires, releases, Disconnect / Reconnect / Force Disconnect,
+/// cancels, and tunnel restarts and deaths, while holding starts and restart
+/// waits open and letting them go in random order. A failure names the
+/// invariant and the seed that broke it.
+@MainActor
+final class PeerHostRegistrySimulationTests: XCTestCase {
+    private struct SplitMix64: RandomNumberGenerator {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    private enum Outcome {
+        case lease
+        case disconnected
+        case unavailable
+        case other
+    }
+
+    private final class Call {
+        let startStep: Int
+        var endStep: Int?
+        var outcome: Outcome?
+        init(startStep: Int) { self.startStep = startStep }
+    }
+
+    private final class Gate {
+        var open = false
+        var cameBack = true
+    }
+
+    /// Everything one trial observes. A class so the registry's test hooks
+    /// and the spawned acquires share it by reference.
+    private final class Trial {
+        var step = 0
+        var calls: [Call] = []
+        var held: [PeerPaneHostLease] = []
+        var made: [PeerPaneHostLease] = []
+        var disconnects: [(step: Int, kind: String)] = []
+        var announced: Set<ObjectIdentifier> = []
+        var observedDead: Set<ObjectIdentifier> = []
+        var restarting: Set<ObjectIdentifier> = []
+        var dead: Set<ObjectIdentifier> = []
+        var startGates: [Gate] = []
+        var restartGates: [(gate: Gate, lease: PeerPaneHostLease)] = []
+        var violations: [String] = []
+    }
+
+    /// Relative weights of the events a trial picks from.
+    private struct Mix {
+        var acquire = 25, release = 13, disconnect = 7, reconnect = 8, force = 5
+        var cancel = 4, restart = 7, die = 5, openStart = 13, openRestart = 13
+
+        /// Many replacements that restart or die while restart waiters are
+        /// still joining them — the interleavings behind I5 and I8, which a
+        /// uniform mix reaches about once in thousands of trials.
+        static let replacementChurn = Mix(
+            acquire: 22, release: 8, disconnect: 2, reconnect: 16, force: 1,
+            cancel: 2, restart: 12, die: 14, openStart: 11, openRestart: 12
+        )
+    }
+
+    private static let trials: UInt64 = 1000
+    private static let stepsPerTrial = 30
+    /// Every wait in a trial is bounded, so a broken invariant fails the test
+    /// rather than hanging it.
+    private static let trialDeadlineSeconds: TimeInterval = 3
+    /// Stop once this many trials have broken something: enough to show every
+    /// invariant involved, without a broken registry stalling every remaining
+    /// trial until its deadline.
+    private static let failingTrialsToReport = 20
+
+    func test_registryKeepsItsInvariantsUnderRandomInterleavings() async throws {
+        await assertInvariantsHold(mix: Mix())
+    }
+
+    func test_registryKeepsItsInvariantsUnderReplacementChurn() async throws {
+        await assertInvariantsHold(mix: .replacementChurn)
+    }
+
+    private func assertInvariantsHold(mix: Mix) async {
+        // Every seed runs, and each invariant reports its first few
+        // breaks, so one noisy invariant cannot hide another.
+        var byInvariant: [String: [String]] = [:]
+        var failingTrials = 0
+        for seed in 1...Self.trials {
+            let violations = await runTrial(seed: seed, mix: mix)
+            if !violations.isEmpty { failingTrials += 1 }
+            if failingTrials > Self.failingTrialsToReport { break }
+            for violation in violations {
+                var invariant = String(violation.prefix(while: { $0 != " " }))
+                if violation.contains("Force Disconnect") { invariant += "-F" }
+                byInvariant[invariant, default: []].append(violation)
+            }
+        }
+        let report = byInvariant.keys.sorted().flatMap { invariant -> [String] in
+            let all = byInvariant[invariant] ?? []
+            return ["\(invariant): \(all.count) break(s)"] + all.prefix(3).map { "  " + $0 }
+        }
+        XCTAssertTrue(
+            byInvariant.isEmpty,
+            "registry invariants broken:\n" + report.joined(separator: "\n")
+        )
+    }
+
+    private func runTrial(seed: UInt64, mix: Mix) async -> [String] {
+        let registry = PeerPaneHostRegistry.shared
+        var rng = SplitMix64(state: seed)
+        let sockPath = "/tmp/psp-sim-\(getpid())-\(seed).sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let trial = Trial()
+        let hardStop = Date().addingTimeInterval(Self.trialDeadlineSeconds)
+
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+            registry.startDelayForTests = nil
+            registry.replacementJoinDeadlineForTests = nil
+            registry.leaseMadeForTests = nil
+            registry.deadLeaseObservedForTests = nil
+        }
+
+        registry.hostTransportWillRetire = { _ in }
+        registry.hostTransportDidReplace = { _, lease in
+            let id = ObjectIdentifier(lease)
+            if trial.announced.contains(id) {
+                trial.violations.append("I7 seed \(seed): one lease was announced as a replacement twice")
+            }
+            if registry.activeLease(forKey: key) !== lease {
+                trial.violations.append("I7 seed \(seed): the announced replacement is not the pooled lease")
+            }
+            trial.announced.insert(id)
+        }
+        registry.leaseMadeForTests = { trial.made.append($0) }
+        registry.deadLeaseObservedForTests = { trial.observedDead.insert(ObjectIdentifier($0)) }
+        registry.replacementJoinDeadlineForTests = 0.15
+        registry.livenessOverrideForTests = { lease in
+            let id = ObjectIdentifier(lease)
+            if trial.dead.contains(id) { return .dead }
+            if trial.restarting.contains(id) { return .waitForRestart }
+            return .usable
+        }
+        registry.startDelayForTests = { _ in
+            // Half the starts land at once, so replacements get pooled and
+            // can die while restart waiters are still on their way to them.
+            guard Bool.random(using: &rng) else { return }
+            let gate = Gate()
+            trial.startGates.append(gate)
+            while !gate.open, !Task.isCancelled, Date() < hardStop {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+        registry.restartWaitOverrideForTests = { lease in
+            let gate = Gate()
+            trial.restartGates.append((gate, lease))
+            while !gate.open, Date() < hardStop {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+            if gate.cameBack { trial.restarting.remove(ObjectIdentifier(lease)) }
+            return gate.cameBack
+        }
+
+        func spawnAcquire() {
+            let call = Call(startStep: trial.step)
+            trial.calls.append(call)
+            Task { @MainActor in
+                do {
+                    let lease = try await registry.acquire(spec)
+                    trial.held.append(lease)
+                    call.outcome = .lease
+                } catch PeerPaneHostAcquireError.hostDisconnected {
+                    call.outcome = .disconnected
+                } catch PeerPaneHostAcquireError.replacementUnavailable {
+                    call.outcome = .unavailable
+                } catch PeerPaneHostAcquireError.replacementDied {
+                    call.outcome = .unavailable
+                } catch {
+                    call.outcome = .other
+                }
+                call.endStep = trial.step
+                // I8 checked as each acquire finishes: a later acquire may
+                // retire the dead lease and hide that this one left it pooled.
+                if let pooled = registry.activeLease(forKey: key),
+                   trial.observedDead.contains(ObjectIdentifier(pooled)) {
+                    trial.violations.append(
+                        "I8 seed \(seed): an acquire from step \(call.startStep) judged the pooled lease dead and left it pooled"
+                    )
+                }
+            }
+        }
+
+        func releaseHeld(at index: Int) {
+            registry.release(trial.held.remove(at: index))
+        }
+
+        for _ in 0..<Self.stepsPerTrial {
+            trial.step += 1
+            let weights = [
+                mix.acquire, mix.release, mix.disconnect, mix.reconnect, mix.force,
+                mix.cancel, mix.restart, mix.die, mix.openStart, mix.openRestart,
+            ]
+            var roll = Int.random(in: 0..<weights.reduce(0, +), using: &rng)
+            var event = 0
+            while roll >= weights[event] {
+                roll -= weights[event]
+                event += 1
+            }
+            switch event {
+            case 0:
+                spawnAcquire()
+            case 1:
+                if !trial.held.isEmpty {
+                    releaseHeld(at: Int.random(in: 0..<trial.held.count, using: &rng))
+                }
+            case 2:
+                registry.disconnectTransport(for: key)
+                trial.disconnects.append((trial.step, "Disconnect Host"))
+            case 3:
+                registry.disconnectTransport(for: key, replacementFollows: true)
+                let token = registry.pendingReplacementToken(for: key)
+                if Bool.random(using: &rng) {
+                    spawnAcquire()
+                } else {
+                    registry.abandonPendingReplacement(for: key, token: token)
+                }
+            case 4:
+                // Force Disconnect as RemoteHostStore performs it on the
+                // registry: end the transport, then every connection closes
+                // and releases its reference.
+                registry.endTransportForForceDisconnect(for: key)
+                while !trial.held.isEmpty { releaseHeld(at: 0) }
+                trial.disconnects.append((trial.step, "Force Disconnect"))
+            case 5:
+                registry.cancelPendingAcquire(for: key)
+            case 6:
+                if let pooled = registry.activeLease(forKey: key) {
+                    trial.restarting.insert(ObjectIdentifier(pooled))
+                }
+            case 7:
+                if let pooled = registry.activeLease(forKey: key) {
+                    trial.dead.insert(ObjectIdentifier(pooled))
+                }
+            case 8:
+                let closed = trial.startGates.filter { !$0.open }
+                if !closed.isEmpty {
+                    closed[Int.random(in: 0..<closed.count, using: &rng)].open = true
+                }
+            default:
+                let closed = trial.restartGates.filter { !$0.gate.open }
+                if !closed.isEmpty {
+                    let pick = closed[Int.random(in: 0..<closed.count, using: &rng)]
+                    pick.gate.cameBack = Bool.random(using: &rng)
+                    pick.gate.open = true
+                }
+            }
+            for _ in 0..<3 { await Task.yield() }
+        }
+
+        // Let everything settle: open every gate until no acquire is left.
+        trial.step += 1
+        while trial.calls.contains(where: { $0.outcome == nil }), Date() < hardStop {
+            for gate in trial.startGates where !gate.open { gate.open = true }
+            for entry in trial.restartGates where !entry.gate.open {
+                entry.gate.cameBack = Bool.random(using: &rng)
+                entry.gate.open = true
+            }
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let unfinished = trial.calls.filter { $0.outcome == nil }.count
+        if unfinished > 0 {
+            trial.violations.append("I6 seed \(seed): \(unfinished) acquire(s) never finished")
+        }
+
+        // I3: no caller that was waiting before a disconnect ends up with a lease.
+        for call in trial.calls {
+            guard case .lease = call.outcome, let end = call.endStep else { continue }
+            if let disconnect = trial.disconnects.first(where: { call.startStep < $0.step && $0.step <= end }) {
+                trial.violations.append(
+                    "I3 seed \(seed): an acquire from step \(call.startStep) got a lease at step \(end), after the \(disconnect.kind) at step \(disconnect.step)"
+                )
+            }
+        }
+        // I4: an acquire is reported disconnected only if a disconnect landed while it ran.
+        for call in trial.calls {
+            guard case .disconnected = call.outcome, let end = call.endStep else { continue }
+            if !trial.disconnects.contains(where: { call.startStep < $0.step && $0.step <= end }) {
+                trial.violations.append(
+                    "I4 seed \(seed): an acquire from step \(call.startStep) failed as disconnected with no disconnect while it ran"
+                )
+            }
+        }
+        // I8: a lease judged dead is not left pooled.
+        if let pooled = registry.activeLease(forKey: key),
+           trial.observedDead.contains(ObjectIdentifier(pooled)) {
+            trial.violations.append("I8 seed \(seed): a lease judged dead was left in the pool")
+        }
+
+        // I1 / I2: once every holder releases, nothing stays pooled and every
+        // lease any start made has been torn down.
+        while !trial.held.isEmpty { releaseHeld(at: 0) }
+        if registry.activeLease(forKey: key) != nil {
+            trial.violations.append("I2 seed \(seed): a lease stayed pooled after every holder released it")
+        }
+        let leaked = trial.made.filter { $0.canReconnectTransport }.count
+        if leaked > 0 {
+            trial.violations.append("I1 seed \(seed): \(leaked) lease(s) were never torn down")
+        }
+        // Leave nothing for the next trial: a key left mid-replacement would
+        // otherwise carry its state into a later test using the same path.
+        registry.disconnectTransport(for: key)
+        return trial.violations
     }
 }

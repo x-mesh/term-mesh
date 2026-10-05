@@ -774,10 +774,10 @@ final class PeerWorkspaceMirrorController {
     ///                   the user something that does nothing and no event
     ///                   to explain it.
     ///
-    /// RECONNECT ONLY. `forceResync` (the user pressing Retry) and
-    /// `resumeAfterHostReconnect` (a new lease, so every pane's transport is
-    /// gone anyway) still wipe everything — there, distrusting what is on
-    /// screen is the entire point.
+    /// RECONNECT ONLY. `forceResync` (the user pressing Retry) still wipes
+    /// everything — there, distrusting what is on screen is the entire point.
+    /// `resumeAfterHostReconnect` moves panes onto the new lease instead
+    /// (`retargetPanes(onto:)`).
     func markPanesStaleKeepingRecovered() {
         guard let workspace else {
             markAllPanesStale()
@@ -793,6 +793,35 @@ final class PeerWorkspaceMirrorController {
                 return .respawn
             }
         )
+        applyReconnectPartition(split, context: "resync")
+    }
+
+    /// Reconnect-Host twin of `markPanesStaleKeepingRecovered`. The panes'
+    /// relays are parked on the retired lease, so each one is moved onto the
+    /// replacement and keeps its panel, helper process, and scrollback; it is
+    /// then watched like any pane still reconnecting. A pane that cannot move
+    /// — its relay already ended — is respawned.
+    private func retargetPanes(onto replacement: PeerPaneHostLease) {
+        guard let workspace else {
+            markAllPanesStale()
+            return
+        }
+        let split = Self.partitionForReconnect(
+            panelBySurfaceID: panelBySurfaceID,
+            classify: { panelId in
+                guard let session = workspace.terminalPanel(for: panelId)?.peerPaneSession,
+                      session.retarget(to: replacement)
+                else { return .respawn }
+                return .watch
+            }
+        )
+        applyReconnectPartition(split, context: "host reconnect")
+    }
+
+    private func applyReconnectPartition(
+        _ split: (keep: [Data: UUID], watch: [Data: UUID], respawn: [Data: UUID]),
+        context: String
+    ) {
         let kept = split.keep.merging(split.watch) { first, _ in first }
         guard !kept.isEmpty else {
             markAllPanesStale()
@@ -821,7 +850,7 @@ final class PeerWorkspaceMirrorController {
         dropDiagnosticsBaseline = lastAppliedLayout
         lastAppliedLayout = nil
         RemoteWorkLog.infoOffMain(
-            "Mirror resync kept \(split.keep.count) live pane(s)"
+            "Mirror \(context) kept \(split.keep.count) live pane(s)"
                 + ", watching \(split.watch.count) still reconnecting"
                 + ", respawning \(split.respawn.count)"
         )
@@ -1267,8 +1296,10 @@ final class PeerWorkspaceMirrorController {
     }
 
     /// Move a mirror preserved by Disconnect Host onto the replacement lease
-    /// created by Connect. Starting a fresh subscription also rebuilds every
-    /// mirrored pane from the host's current layout.
+    /// created by Connect (or by Reconnect Host, or a tunnel replaced after
+    /// wake). Panes whose relay parked on the retired lease move with it and
+    /// keep their scrollback; the fresh subscription reconciles the rest
+    /// against the host's current layout.
     @discardableResult
     func resumeAfterHostReconnect(using replacement: PeerPaneHostLease) -> Bool {
         guard !isTornDown, lease.key == replacement.key, lease !== replacement else {
@@ -1289,7 +1320,7 @@ final class PeerWorkspaceMirrorController {
         PeerPaneHostRegistry.shared.retain(replacement)
         lease = replacement
         PeerPaneHostRegistry.shared.release(previousLease)
-        markAllPanesStale()
+        retargetPanes(onto: replacement)
         markWorkspaceTitle(suffix: "reconnecting…")
 
         reconnectTask = Task { [weak self] in

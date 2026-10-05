@@ -3499,12 +3499,20 @@ final class Workspace: Identifiable {
         session.requestPaneClose = { [weak self] in
             _ = self?.closePanel(panelId, force: true)
         }
-        // Disconnect Host preserves this pane. Once the sidebar establishes a
-        // replacement lease, rebuild the terminal against that lease exactly
-        // as the banner's explicit Reconnect action does. Mirror panes stay
-        // under their controller's one-subscription reconnect path.
+        // Disconnect Host preserves this pane. Once a replacement lease is up,
+        // move the parked relay onto it so the pane keeps its scrollback;
+        // a relay that already ended is rebuilt the way the banner's explicit
+        // Reconnect does, unless the host refused its surface — that pane
+        // keeps its banner (`PeerPaneSession.hostReconnectReattach`). Mirror
+        // panes stay under their controller's one-subscription reconnect path.
         session.requestHostReconnectReattach = { [weak self, weak panel, weak session] in
             guard let self, let panel, let session, self.peerMirror == nil else { return }
+            let retargeted = PeerPaneHostRegistry.shared.activeLease(forKey: session.lease.key)
+                .map { session.retarget(to: $0) } ?? false
+            guard PeerPaneSession.hostReconnectReattach(
+                retargeted: retargeted,
+                surfaceWasRejected: session.relaySession.retargetedSurfaceWasRejected
+            ) == .rebuild else { return }
             Task { @MainActor in
                 await PeerClientCoordinator.shared.reconnectRemotePane(
                     oldSession: session, panelId: panel.id, workspace: self
@@ -3560,10 +3568,16 @@ final class Workspace: Identifiable {
                 description: reason
             )
         }
-        session.relaySession.onDisconnect = {
-            if !recoverRemoteLeader("Remote leader relay disconnected") {
-                showBanner(hostLabel)
+        session.relaySession.onDisconnect = { [weak session] in
+            if recoverRemoteLeader("Remote leader relay disconnected") { return }
+            // Rebuilding on its own would pick a surface by title with nobody
+            // watching, and several panes could land on one unrelated shell.
+            // The banner's Reconnect does the same search when someone asks.
+            if session?.relaySession.retargetedSurfaceWasRejected == true {
+                showBanner("\(hostLabel) no longer offers this surface")
+                return
             }
+            showBanner(hostLabel)
         }
         session.relaySession.onError = { error in
             showBanner("\(hostLabel): \(String(describing: error))")
@@ -3572,6 +3586,20 @@ final class Workspace: Identifiable {
             panel?.hostedView.showPeerDisconnectBanner(
                 reason: "Remote pane disconnected — reconnecting to \(hostLabel) (try \(attempt))…",
                 onReconnect: nil,
+                onClosePane: { [weak self] in
+                    _ = self?.closePanel(panelId, force: true)
+                }
+            )
+        }
+        session.relaySession.onAwaitingTransportReplacement = { [weak panel, weak session] in
+            panel?.hostedView.showPeerDisconnectBanner(
+                reason: "Remote pane paused — waiting for \(hostLabel) to reconnect",
+                onReconnect: { [weak session] in
+                    guard let session else { return }
+                    Task { @MainActor in
+                        await PeerClientCoordinator.shared.reconnectParkedPane(session)
+                    }
+                },
                 onClosePane: { [weak self] in
                     _ = self?.closePanel(panelId, force: true)
                 }

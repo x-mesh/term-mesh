@@ -19,6 +19,19 @@ private enum TestVK {
 /// Test target has no bridging header, so we use the raw value directly.
 private let ghosttyModsAlt: UInt32 = 4
 
+private final class CopyRoutingTerminalView: GhosttyNSView {
+    var selectionPresent = false
+    var copied = false
+    override func hasSelection() -> Bool { selectionPresent }
+    var copyAccepted = true
+    override func copySelectionToLocalClipboard() -> Bool { copied = true; return copyAccepted }
+}
+
+private final class UnpublishedCopyTerminalView: GhosttyNSView {
+    override func hasSelection() -> Bool { true }
+    override func performBindingAction(_ action: String) -> Bool { true }
+}
+
 /// Tests that IMETextView correctly routes arrow key events:
 /// - Option+↑↓ → plain arrows to terminal (Claude Code selection)
 /// - Option+←→ → Alt-modified arrows to terminal (word movement)
@@ -68,11 +81,112 @@ final class IMEArrowKeyTests: XCTestCase {
             timestamp: ProcessInfo.processInfo.systemUptime,
             windowNumber: 0,
             context: nil,
-            characters: "",
-            charactersIgnoringModifiers: "",
+            characters: keyCode == 8 ? "c" : "",
+            charactersIgnoringModifiers: keyCode == 8 ? "c" : "",
             isARepeat: false,
             keyCode: keyCode
         )
+    }
+
+    @MainActor
+    func testCopyUsesTheIMEPaneInsteadOfAnotherPaneSelection() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let other = CopyRoutingTerminalView(frame: .zero)
+        other.selectionPresent = true
+        let current = CopyRoutingTerminalView(frame: .zero)
+        current.selectionPresent = true
+        let otherPane = GhosttySurfaceScrollView(surfaceView: other)
+        let currentPane = GhosttySurfaceScrollView(surfaceView: current)
+        window.contentView?.addSubview(otherPane)
+        window.contentView?.addSubview(currentPane)
+        currentPane.addSubview(sut)
+        window.makeFirstResponder(sut)
+        guard let event = makeKeyDownEvent(keyCode: 8, modifiers: .command) else {
+            XCTFail("Expected copy event")
+            return
+        }
+        _ = sut.performKeyEquivalent(with: event)
+        XCTAssertTrue(current.copied)
+        XCTAssertFalse(other.copied)
+        window.orderOut(nil)
+    }
+
+    @MainActor
+    func testCopyDoesNotBorrowAnotherPaneSelectionWhenItsOwnIsEmpty() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let other = CopyRoutingTerminalView(frame: .zero)
+        other.selectionPresent = true
+        let current = CopyRoutingTerminalView(frame: .zero)
+        let otherPane = GhosttySurfaceScrollView(surfaceView: other)
+        let currentPane = GhosttySurfaceScrollView(surfaceView: current)
+        window.contentView?.addSubview(otherPane)
+        window.contentView?.addSubview(currentPane)
+        currentPane.addSubview(sut)
+        window.makeFirstResponder(sut)
+        guard let event = makeKeyDownEvent(keyCode: 8, modifiers: .command) else {
+            XCTFail("Expected copy event")
+            return
+        }
+        _ = sut.performKeyEquivalent(with: event)
+        XCTAssertFalse(current.copied)
+        XCTAssertFalse(other.copied)
+        window.orderOut(nil)
+    }
+
+    @MainActor
+    func testInactivePaneDoesNotInterceptTheFocusedIMECopyGesture() throws {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let other = CopyRoutingTerminalView(frame: .zero)
+        other.selectionPresent = true
+        let otherPane = GhosttySurfaceScrollView(surfaceView: other)
+        otherPane.frame = NSRect(x: 0, y: 0, width: 300, height: 300)
+        let currentPane = GhosttySurfaceScrollView(surfaceView: CopyRoutingTerminalView(frame: .zero))
+        currentPane.frame = NSRect(x: 300, y: 0, width: 300, height: 300)
+        currentPane.addSubview(sut)
+        window.contentView?.addSubview(otherPane)
+        window.contentView?.addSubview(currentPane)
+        otherPane.toggleIMEInputBar()
+        otherPane.layoutSubtreeIfNeeded()
+        window.contentView?.layoutSubtreeIfNeeded()
+        let inactiveIME = try XCTUnwrap(otherPane.findIMETextView())
+        window.makeFirstResponder(sut)
+        guard let event = makeKeyDownEvent(keyCode: 8, modifiers: .command) else {
+            XCTFail("Expected copy event")
+            return
+        }
+        XCTAssertFalse(inactiveIME.performKeyEquivalent(with: event))
+        XCTAssertFalse(other.performKeyEquivalent(with: event))
+        XCTAssertFalse(other.copied)
+        window.orderOut(nil)
+    }
+
+    @MainActor
+    func testCopyFailureDoesNotReportTheGestureAsHandled() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let terminal = CopyRoutingTerminalView(frame: .zero)
+        terminal.selectionPresent = true
+        terminal.copyAccepted = false
+        let pane = GhosttySurfaceScrollView(surfaceView: terminal)
+        pane.addSubview(sut)
+        window.contentView?.addSubview(pane)
+        window.makeFirstResponder(sut)
+        guard let event = makeKeyDownEvent(keyCode: 8, modifiers: .command) else {
+            XCTFail("Expected copy event")
+            return
+        }
+        XCTAssertFalse(sut.performKeyEquivalent(with: event))
+        XCTAssertTrue(terminal.copied)
+        window.orderOut(nil)
+    }
+
+    @MainActor
+    func testCopyWithoutAClipboardUpdateIsNotReportedAsSuccess() {
+        let terminal = UnpublishedCopyTerminalView(frame: .zero)
+        XCTAssertFalse(terminal.copySelectionToLocalClipboard())
     }
 
     // MARK: - Option+Arrow tests (Claude Code selection)
