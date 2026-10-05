@@ -29,6 +29,18 @@ final class PeerKeepAwakePolicyTests: XCTestCase {
         XCTAssertEqual(decision(.onPowerAdapter, ac: false, connections: 1), .releaseNow)
     }
 
+    func test_aHostOnBatteryStaysOutOfAppNapWithoutPreciseTimers() {
+        let onAC = PeerKeepAwakePolicy.latencyActivityOptions(onACPower: true)
+        let onBattery = PeerKeepAwakePolicy.latencyActivityOptions(onACPower: false)
+        XCTAssertTrue(onAC.contains(.latencyCritical))
+        XCTAssertFalse(onBattery.contains(.latencyCritical))
+        for options in [onAC, onBattery] {
+            XCTAssertTrue(options.contains(.userInitiatedAllowingIdleSystemSleep))
+            XCTAssertFalse(options.contains(.idleSystemSleepDisabled), "idle sleep belongs to the keep-awake mode")
+            XCTAssertFalse(options.contains(.idleDisplaySleepDisabled))
+        }
+    }
+
     func test_anUnknownStoredModeFallsBackToTheDefault() {
         let key = PeerFederationSettings.keepAwakeKey
         let saved = UserDefaults.standard.object(forKey: key)
