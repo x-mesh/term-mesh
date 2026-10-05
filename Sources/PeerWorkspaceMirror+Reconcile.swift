@@ -110,11 +110,13 @@ extension PeerWorkspaceMirrorController {
         }
 
         // Fast paths below must only fire once every target leaf is
-        // actually mirrored — see `allTargetLeavesMapped`.
+        // actually mirrored — see `allTargetLeavesMapped` — and no ghost is
+        // waiting for B3c, which only the full path runs.
         let targetLeaves = Self.preorderLeaves(target)
         let allLeavesMapped = Self.allTargetLeavesMapped(targetLeaves, panelBySurfaceID: panelBySurfaceID)
+        let hasGhosts = !ghostPanelIDs(in: workspace).isEmpty
 
-        if let last = lastAppliedLayout, allLeavesMapped {
+        if let last = lastAppliedLayout, allLeavesMapped, !hasGhosts {
             if Self.layoutsEquivalent(last, target) {
                 recordApplied(target)
                 return
@@ -162,6 +164,7 @@ extension PeerWorkspaceMirrorController {
         }
         let missing = targetLeaves.filter { panelBySurfaceID[$0.surfaceID] == nil }
         var newSessions: [Data: PeerPaneSession] = [:]
+        var spawnedCount = 0
         for leaf in missing {
             do {
                 let session = try await PeerPaneSession.attach(
@@ -210,6 +213,14 @@ extension PeerWorkspaceMirrorController {
             // B2 — spawn missing leaves as remote-pane tabs in the anchor.
             for leaf in missing {
                 guard let session = newSessions[leaf.surfaceID] else { continue }
+                // `start()`, `forceResync` and `reconnectLoop` call reconcile
+                // directly, outside `scheduleApply`'s chain, so another pass
+                // can map this leaf while ours awaited its attach. Overwriting
+                // that mapping would leave its panel owned by nothing.
+                guard panelBySurfaceID[leaf.surfaceID] == nil else {
+                    session.teardown()
+                    continue
+                }
                 guard let panel = workspace2.newRemoteTerminalTab(
                     inPane: anchor,
                     command: session.relayLaunchCommand,
@@ -220,6 +231,7 @@ extension PeerWorkspaceMirrorController {
                 }
                 workspace2.bindRemotePane(session: session, to: panel)
                 panelBySurfaceID[leaf.surfaceID] = panel.id
+                spawnedCount += 1
             }
 
             // B3 — close stale panels (their sessions tear down via
@@ -246,6 +258,22 @@ extension PeerWorkspaceMirrorController {
                 _ = workspace2.closePanel(panelId, force: true)
             }
             pendingStalePanelIds.removeAll()
+
+            // B3c — close ghosts: panels this mirror mapped that are now
+            // neither mapped nor queued for B3b. Unmapping a still-open panel
+            // is meant to close it (B3) or queue it (B3b), so a correct pass
+            // finds none. One that escapes both keeps its relay, which
+            // reattaches to the host after every tunnel drop.
+            let ghosts = ghostPanelIDs(in: workspace2)
+            let closedGhosts = ghosts.filter { workspace2.closePanel($0, force: true) }
+            everMappedPanelIDs.formIntersection(workspace2.panels.keys)
+            if !ghosts.isEmpty {
+                ghostPaneCloseCount += closedGhosts.count
+                RemoteWorkLog.infoOffMain(
+                    "Closed \(closedGhosts.count) of \(ghosts.count) mirror pane(s)"
+                        + " that were neither mapped nor queued to close"
+                )
+            }
 
             // B4 — pre-order rebuild.
             buildSplits(node: target, currentPane: anchor, workspace: workspace2)
@@ -278,13 +306,13 @@ extension PeerWorkspaceMirrorController {
 
         recordApplied(target)
         #if DEBUG
-        dlog("peer.mirror.reconcile leaves=\(targetLeaves.count) spawned=\(newSessions.count) shape=\(Self.shapeHash(target))")
+        dlog("peer.mirror.reconcile leaves=\(targetLeaves.count) spawned=\(spawnedCount) shape=\(Self.shapeHash(target))")
         #endif
         // The shape hash is what makes this readable as a sequence: two
         // reconciles with the same hash mean the layout settled, and a hash
         // that keeps changing with nothing spawned means it is flapping.
         RemoteWorkLog.debugOffMain(
-            "Layout synced — \(targetLeaves.count) pane(s), \(newSessions.count) spawned, shape \(Self.shapeHash(target))"
+            "Layout synced — \(targetLeaves.count) pane(s), \(spawnedCount) spawned, shape \(Self.shapeHash(target))"
         )
     }
 
@@ -385,6 +413,48 @@ extension PeerWorkspaceMirrorController {
         panelBySurfaceID: [Data: UUID]
     ) -> Bool {
         leaves.allSatisfy { panelBySurfaceID[$0.surfaceID] != nil }
+    }
+
+    nonisolated static func ghostPanelIDs(
+        everMapped: Set<UUID>,
+        existing: Set<UUID>,
+        panelBySurfaceID: [Data: UUID],
+        pendingStale: [UUID]
+    ) -> Set<UUID> {
+        everMapped
+            .intersection(existing)
+            .subtracting(panelBySurfaceID.values)
+            .subtracting(pendingStale)
+    }
+
+    /// A ghost still points at a host surface, which a mapped pane may also
+    /// show, so forwarding its close could close that surface on the host.
+    /// A panel queued for B3b is a mirror pane mid-replacement, and closing it
+    /// means closing its terminal, as it always did.
+    nonisolated static func forwardsClose(
+        panelId: UUID,
+        panelBySurfaceID: [Data: UUID],
+        pendingStale: [UUID]
+    ) -> Bool {
+        panelBySurfaceID.values.contains(panelId) || pendingStale.contains(panelId)
+    }
+
+    func forwardsClose(panelId: UUID) -> Bool {
+        Self.forwardsClose(panelId: panelId, panelBySurfaceID: panelBySurfaceID, pendingStale: pendingStalePanelIds)
+    }
+
+    func isGhost(panelId: UUID) -> Bool {
+        guard let workspace else { return false }
+        return ghostPanelIDs(in: workspace).contains(panelId)
+    }
+
+    func ghostPanelIDs(in workspace: Workspace) -> Set<UUID> {
+        Self.ghostPanelIDs(
+            everMapped: everMappedPanelIDs,
+            existing: Set(workspace.panels.keys),
+            panelBySurfaceID: panelBySurfaceID,
+            pendingStale: pendingStalePanelIds
+        )
     }
 
     /// Surface ids whose mapped panel no longer exists in the workspace.
