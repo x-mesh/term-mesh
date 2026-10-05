@@ -648,6 +648,14 @@ public struct PeerServerConfig: Sendable {
     public var relayTelemetryProvider: (@Sendable () async -> Termmesh_Peer_V1_RelayTelemetry?)?
     public var relayTelemetryInterval: Duration = .seconds(2)
 
+    /// Called with the number of accepted connections each time it changes.
+    /// It returns to zero after the server stops and its last session ends. A
+    /// connection counts from accept, before its handshake, so a one-shot
+    /// probe counts too, for as long as it stays open.
+    /// Runs on the server actor, so an embedder that touches UI state hops to
+    /// its own actor.
+    public var onActiveSessionCountChange: (@Sendable (Int) -> Void)?
+
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
@@ -891,11 +899,19 @@ public actor PeerServer {
         for session in activeSessions {
             await session.close()
         }
+        let hadSessions = !activeSessions.isEmpty
         activeSessions.removeAll()
+        if hadSessions {
+            config.onActiveSessionCountChange?(0)
+        }
     }
 
     fileprivate func sessionFinished(_ session: PeerServerSession) {
+        let before = activeSessions.count
         activeSessions.removeAll { $0 === session }
+        if activeSessions.count != before {
+            config.onActiveSessionCountChange?(activeSessions.count)
+        }
     }
 
     /// Atomic capacity-check + insert. The previous "canAcceptSession()
@@ -906,6 +922,7 @@ public actor PeerServer {
     fileprivate func tryRegister(_ session: PeerServerSession) -> Bool {
         guard activeSessions.count < maxPeerServerSessions else { return false }
         activeSessions.append(session)
+        config.onActiveSessionCountChange?(activeSessions.count)
         return true
     }
 
@@ -1014,10 +1031,6 @@ public actor PeerServer {
             )
         }
         throw PeerServerError.noMatchingLeaderSession
-    }
-
-    fileprivate func register(_ session: PeerServerSession) {
-        activeSessions.append(session)
     }
 
     private static func runAcceptLoop(

@@ -10,6 +10,22 @@ import Foundation
 import Darwin
 import PeerProto
 
+enum PeerKeepAwakeMode: String, CaseIterable, Identifiable {
+    case never
+    case onPowerAdapter
+    case always
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .never: return "Don't keep awake"
+        case .onPowerAdapter: return "On power adapter"
+        case .always: return "Even on battery"
+        }
+    }
+}
+
 enum PeerFederationSettings {
     static let autoStartKey      = "peerFederationAutoStart"
     static let socketPathKey     = "peerFederationSocketPath"
@@ -19,6 +35,8 @@ enum PeerFederationSettings {
     static let inputPathTelemetryKey = "peerFederationInputPathTelemetry"
     static let forwardDashboardKey = "peerFederationForwardDashboard"
     static let remoteDashboardPortKey = "peerFederationRemoteDashboardPort"
+    static let keepAwakeKey = "peerFederationKeepAwakeWhileConnected"
+    static let defaultKeepAwakeMode = PeerKeepAwakeMode.onPowerAdapter
 
     /// The bundle whose peer socket keeps the unsuffixed path.
     ///
@@ -132,6 +150,11 @@ enum PeerFederationSettings {
     static var displayName: String {
         let v = UserDefaults.standard.string(forKey: displayNameKey) ?? ""
         return v.isEmpty ? defaultDisplayName : v
+    }
+
+    static var keepAwakeMode: PeerKeepAwakeMode {
+        UserDefaults.standard.string(forKey: keepAwakeKey)
+            .flatMap(PeerKeepAwakeMode.init(rawValue:)) ?? defaultKeepAwakeMode
     }
 
     /// Phase E-6: when on, the host injects Ctrl-L into the PTY at
