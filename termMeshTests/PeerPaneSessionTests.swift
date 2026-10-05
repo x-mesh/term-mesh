@@ -361,24 +361,35 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
 
 final class PeerPaneSessionTests: XCTestCase {
 
-    private func rosterWorkspace(cwd: String?, busy: Bool = false, title: String = "work") -> WorkspaceSummary {
+    private func rosterWorkspace(
+        cwd: String?, busy: Bool = false, title: String = "work", surfaces: Set<Data> = [Data([2])]
+    ) -> WorkspaceSummary {
         WorkspaceSummary(
             id: Data([1]), title: title, hostSockPath: "/tmp/peer.sock", windowID: Data([9]),
-            windowTitle: "w", isDefault: true, paneCount: 1, surfaceCount: 1, busyCount: busy ? 1 : 0,
+            windowTitle: "w", isDefault: true, paneCount: 1, surfaceCount: surfaces.count, busyCount: busy ? 1 : 0,
             panes: [RemotePaneSummary(
-                id: Data([2]), surfaceIDs: [Data([2])], title: "shell",
+                id: Data([2]), surfaceIDs: surfaces, title: title,
                 workingDirectoryPath: cwd, workingDirectoryName: cwd.map { ($0 as NSString).lastPathComponent },
-                projectRootPath: nil, tabCount: 1, columns: 80, rows: 24, isBusy: busy
+                projectRootPath: nil, tabCount: surfaces.count, columns: 80, rows: 24, isBusy: busy
             )]
         )
     }
 
-    func test_rosterChangeIsDirectoryOnly_onlyWhenNothingButFoldersMoved() {
-        let before = [rosterWorkspace(cwd: "/work/x-kit")]
-        XCTAssertTrue(workspaceRosterChangeIsDirectoryOnly(previous: before, next: [rosterWorkspace(cwd: "/work/agentic")]))
-        XCTAssertFalse(workspaceRosterChangeIsDirectoryOnly(previous: before, next: [rosterWorkspace(cwd: "/work/agentic", busy: true)]))
-        XCTAssertFalse(workspaceRosterChangeIsDirectoryOnly(previous: before, next: [rosterWorkspace(cwd: "/work/x-kit", title: "renamed")]))
-        XCTAssertFalse(workspaceRosterChangeIsDirectoryOnly(previous: nil, next: before), "the first roster must refresh teams")
+    /// A `cd` rewrites a pane's folder and, through the prompt, its title in
+    /// one push; neither may cost every viewer a team-roster reconnect.
+    func test_rosterKeepsStructure_ignoresFoldersTitlesAndBusyButNotTabs() {
+        let before = [rosterWorkspace(cwd: "/work/x-kit", title: "~/work/x-kit")]
+        XCTAssertTrue(workspaceRosterKeepsStructure(
+            previous: before, next: [rosterWorkspace(cwd: "/work/agentic", busy: true, title: "~/work/agentic")]
+        ))
+        XCTAssertFalse(workspaceRosterKeepsStructure(
+            previous: before, next: [rosterWorkspace(cwd: "/work/x-kit", surfaces: [Data([2]), Data([3])])]
+        ), "a new tab may be a team member")
+        XCTAssertFalse(workspaceRosterKeepsStructure(
+            previous: before, next: [rosterWorkspace(cwd: "/work/x-kit", surfaces: [Data([3])])]
+        ), "one tab closed and another opened in the same push")
+        XCTAssertFalse(workspaceRosterKeepsStructure(previous: before, next: []), "a closed workspace")
+        XCTAssertFalse(workspaceRosterKeepsStructure(previous: nil, next: before), "the first roster must refresh teams")
     }
 
     @MainActor

@@ -137,40 +137,22 @@ struct RemotePaneSummary: Identifiable, Equatable {
 
 /// Flatten a peer layout into the compact pane details shown by the sidebar.
 /// Pre-order traversal matches the visual left-to-right/top-to-bottom layout.
-/// Whether `next` differs from `previous` at most in its panes' folders.
-func workspaceRosterChangeIsDirectoryOnly(
+/// Whether `next` has the same workspaces, panes and tabs as `previous`.
+/// Titles, folders, sizes and busy state may differ: a shell's prompt rewrites
+/// its title together with its folder on every `cd`.
+func workspaceRosterKeepsStructure(
     previous: [WorkspaceSummary]?,
     next: [WorkspaceSummary]
 ) -> Bool {
-    guard let previous else { return false }
-    func withoutFolders(_ workspace: WorkspaceSummary) -> WorkspaceSummary {
-        WorkspaceSummary(
-            id: workspace.id,
-            title: workspace.title,
-            hostSockPath: workspace.hostSockPath,
-            windowID: workspace.windowID,
-            windowTitle: workspace.windowTitle,
-            isDefault: workspace.isDefault,
-            paneCount: workspace.paneCount,
-            surfaceCount: workspace.surfaceCount,
-            busyCount: workspace.busyCount,
-            panes: workspace.panes.map { pane in
-                RemotePaneSummary(
-                    id: pane.id,
-                    surfaceIDs: pane.surfaceIDs,
-                    title: pane.title,
-                    workingDirectoryPath: nil,
-                    workingDirectoryName: nil,
-                    projectRootPath: nil,
-                    tabCount: pane.tabCount,
-                    columns: pane.columns,
-                    rows: pane.rows,
-                    isBusy: pane.isBusy
-                )
-            }
-        )
+    guard let previous, previous.count == next.count else { return false }
+    return zip(previous, next).allSatisfy { old, new in
+        old.id == new.id
+            && old.windowID == new.windowID
+            && old.isDefault == new.isDefault
+            && old.paneCount == new.paneCount
+            && old.surfaceCount == new.surfaceCount
+            && old.panes.map(\.surfaceIDs) == new.panes.map(\.surfaceIDs)
     }
-    return previous.map(withoutFolders) == next.map(withoutFolders)
 }
 
 func peerPaneSummaries(
@@ -2546,8 +2528,9 @@ final class RemoteHostStore: ObservableObject {
         replaceWorkspaceRoster(summaries, for: key)
         // A host rebroadcasts its list each time a pane's folder changes, and
         // a team refresh opens a fresh connection; a `cd` loop on the host
-        // would reconnect every viewer once per iteration.
-        guard !workspaceRosterChangeIsDirectoryOnly(previous: previous, next: summaries) else { return }
+        // would reconnect every viewer once per iteration. Teams come and go
+        // with panes, so only a structural change needs a refresh.
+        guard !workspaceRosterKeepsStructure(previous: previous, next: summaries) else { return }
         scheduleTeamRosterRefresh(for: hostSockPath, key: key)
     }
 
