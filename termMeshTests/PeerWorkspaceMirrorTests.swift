@@ -604,34 +604,28 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertEqual(orphaned, [Data([1])])
     }
 
-    func test_unownedPanelIDs_reportsRemotePanesNoMappingOwns() {
-        // The ghost tabs on 0.263.0: remote panes on the mirror's host that
-        // neither the map nor the stale queue held. B3c closes exactly these.
-        let mapped = UUID(), ghost = UUID(), anotherGhost = UUID()
-        let unowned = PeerWorkspaceMirrorController.unownedPanelIDs(
-            remotePanelIDs: [mapped, ghost, anotherGhost],
-            panelBySurfaceID: [Data([1]): mapped]
+    func test_ghostPanelIDs_areMirrorPanelsNeitherMappedNorQueued() {
+        let mapped = UUID(), queued = UUID(), ghost = UUID(), gone = UUID(), movedIn = UUID()
+        let ghosts = PeerWorkspaceMirrorController.ghostPanelIDs(
+            everMapped: [mapped, queued, ghost, gone],
+            existing: [mapped, queued, ghost, movedIn],
+            panelBySurfaceID: [Data([1]): mapped],
+            pendingStale: [queued]
         )
-        XCTAssertEqual(unowned, [ghost, anotherGhost])
+        XCTAssertEqual(ghosts, [ghost], "a queued panel is B3b's, a panel the mirror never mapped is not its to close")
     }
 
-    func test_unownedPanelIDs_isEmptyWhenEveryRemotePaneIsMapped() {
-        let a = UUID(), b = UUID()
-        XCTAssertTrue(
-            PeerWorkspaceMirrorController.unownedPanelIDs(
-                remotePanelIDs: [a, b],
-                panelBySurfaceID: [Data([1]): a, Data([2]): b]
-            ).isEmpty
-        )
-    }
-
-    func test_forwardsClose_onlyForPanesTheMirrorOwns() {
-        // Forwarding an unowned pane's close would close the live host
-        // surface it still points at, and the ghost tab would stay.
-        let mapped = UUID(), ghost = UUID()
+    func test_forwardsClose_forMappedAndQueuedPanelsButNotGhosts() {
+        // A ghost still points at a live host surface that a mapped pane
+        // shows too, so forwarding its close would close that surface.
+        let mapped = UUID(), queued = UUID(), ghost = UUID()
         let map = [Data([1]): mapped]
-        XCTAssertTrue(PeerWorkspaceMirrorController.forwardsClose(panelId: mapped, panelBySurfaceID: map))
-        XCTAssertFalse(PeerWorkspaceMirrorController.forwardsClose(panelId: ghost, panelBySurfaceID: map))
+        func forwards(_ id: UUID) -> Bool {
+            PeerWorkspaceMirrorController.forwardsClose(panelId: id, panelBySurfaceID: map, pendingStale: [queued])
+        }
+        XCTAssertTrue(forwards(mapped))
+        XCTAssertTrue(forwards(queued))
+        XCTAssertFalse(forwards(ghost))
     }
 
     func test_orphanedSurfaceIDs_keepsEveryMappingWhenAllPanelsAreLive() {

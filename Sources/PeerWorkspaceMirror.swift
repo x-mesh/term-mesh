@@ -122,7 +122,13 @@ final class PeerWorkspaceMirrorController {
     /// reconnect is the very path that has to clear the real one.
     var dropDiagnosticsBaseline: Termmesh_Peer_V1_WorkspaceLayout?
     /// Wire surfaceID → local TerminalPanel.id for every mirrored leaf.
-    var panelBySurfaceID: [Data: UUID] = [:]
+    var panelBySurfaceID: [Data: UUID] = [:] {
+        didSet { everMappedPanelIDs.formUnion(panelBySurfaceID.values) }
+    }
+    /// Every panel this mirror has mapped and that may still exist. B3c only
+    /// reaps ghosts among these, so a remote pane that reached the workspace
+    /// some other way (a socket `surface.move`) is never closed by the mirror.
+    var everMappedPanelIDs: Set<UUID> = []
     /// Host split id bytes → local bonsplit split UUID. Rebuilt on every
     /// structural reconcile; consumed by divider fast path + outbound diff.
     var hostSplitToLocal: [Data: UUID] = [:]
@@ -913,7 +919,8 @@ final class PeerWorkspaceMirrorController {
     /// assert the net was needed and caught it rather than inferring from
     /// pane counts.
     private(set) var strandedPaneRespawnCount = 0
-    var unownedPaneCloseCount = 0
+    /// Ghost panels B3c has closed over this mirror's lifetime.
+    var ghostPaneCloseCount = 0
 
     /// How the last resync classified the panes it found.
     ///

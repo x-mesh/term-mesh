@@ -110,16 +110,13 @@ extension PeerWorkspaceMirrorController {
         }
 
         // Fast paths below must only fire once every target leaf is
-        // actually mirrored — see `allTargetLeavesMapped` — and no unowned
-        // pane is waiting for B3c, which only the full path runs.
+        // actually mirrored — see `allTargetLeavesMapped` — and no ghost is
+        // waiting for B3c, which only the full path runs.
         let targetLeaves = Self.preorderLeaves(target)
         let allLeavesMapped = Self.allTargetLeavesMapped(targetLeaves, panelBySurfaceID: panelBySurfaceID)
-        let hasUnownedPanes = !Self.unownedPanelIDs(
-            remotePanelIDs: remotePanelIDsOnThisHost(in: workspace),
-            panelBySurfaceID: panelBySurfaceID
-        ).isEmpty
+        let hasGhosts = !ghostPanelIDs(in: workspace).isEmpty
 
-        if let last = lastAppliedLayout, allLeavesMapped, !hasUnownedPanes {
+        if let last = lastAppliedLayout, allLeavesMapped, !hasGhosts {
             if Self.layoutsEquivalent(last, target) {
                 recordApplied(target)
                 return
@@ -215,6 +212,14 @@ extension PeerWorkspaceMirrorController {
             // B2 — spawn missing leaves as remote-pane tabs in the anchor.
             for leaf in missing {
                 guard let session = newSessions[leaf.surfaceID] else { continue }
+                // `start()`, `forceResync` and `reconnectLoop` call reconcile
+                // directly, outside `scheduleApply`'s chain, so another pass
+                // can map this leaf while ours awaited its attach. Overwriting
+                // that mapping would leave its panel owned by nothing.
+                guard panelBySurfaceID[leaf.surfaceID] == nil else {
+                    session.teardown()
+                    continue
+                }
                 guard let panel = workspace2.newRemoteTerminalTab(
                     inPane: anchor,
                     command: session.relayLaunchCommand,
@@ -252,24 +257,20 @@ extension PeerWorkspaceMirrorController {
             }
             pendingStalePanelIds.removeAll()
 
-            // B3c — close remote panes on this host that no mapping owns.
-            // Every path that unmaps a pane also queues it for B3b, so this
-            // finds nothing in a correct run. A pane that slipped out of both
-            // stays behind as a ghost tab whose relay keeps reattaching to
-            // the host after every tunnel drop; on 0.263.0 eleven of them
-            // piled up in one mirror's anchor pane.
-            let unowned = Self.unownedPanelIDs(
-                remotePanelIDs: remotePanelIDsOnThisHost(in: workspace2),
-                panelBySurfaceID: panelBySurfaceID
-            )
-            for panelId in unowned {
+            // B3c — close ghosts: panels this mirror mapped that are now
+            // neither mapped nor queued for B3b. Unmapping a still-open panel
+            // is meant to close it (B3) or queue it (B3b), so a correct pass
+            // finds none. One that escapes both keeps its relay, which
+            // reattaches to the host after every tunnel drop.
+            let ghosts = ghostPanelIDs(in: workspace2)
+            for panelId in ghosts {
                 _ = workspace2.closePanel(panelId, force: true)
             }
-            if !unowned.isEmpty {
-                unownedPaneCloseCount += unowned.count
+            everMappedPanelIDs.formIntersection(workspace2.panels.keys)
+            if !ghosts.isEmpty {
+                ghostPaneCloseCount += ghosts.count
                 RemoteWorkLog.infoOffMain(
-                    "Closed \(unowned.count) mirror pane(s) that no mapping owned"
-                        + " — left behind by an earlier resync"
+                    "Closed \(ghosts.count) mirror pane(s) that were neither mapped nor queued to close"
                 )
             }
 
@@ -413,35 +414,53 @@ extension PeerWorkspaceMirrorController {
         leaves.allSatisfy { panelBySurfaceID[$0.surfaceID] != nil }
     }
 
+    nonisolated static func ghostPanelIDs(
+        everMapped: Set<UUID>,
+        existing: Set<UUID>,
+        panelBySurfaceID: [Data: UUID],
+        pendingStale: [UUID]
+    ) -> Set<UUID> {
+        everMapped
+            .intersection(existing)
+            .subtracting(panelBySurfaceID.values)
+            .subtracting(pendingStale)
+    }
+
+    /// A ghost still points at a live host surface that a mapped pane also
+    /// shows, so forwarding its close would close that surface on the host.
+    /// A panel queued for B3b is a mirror pane mid-replacement, and closing it
+    /// means closing its terminal, as it always did.
+    nonisolated static func forwardsClose(
+        panelId: UUID,
+        panelBySurfaceID: [Data: UUID],
+        pendingStale: [UUID]
+    ) -> Bool {
+        panelBySurfaceID.values.contains(panelId) || pendingStale.contains(panelId)
+    }
+
+    func forwardsClose(panelId: UUID) -> Bool {
+        Self.forwardsClose(panelId: panelId, panelBySurfaceID: panelBySurfaceID, pendingStale: pendingStalePanelIds)
+    }
+
+    func isGhost(panelId: UUID) -> Bool {
+        guard let workspace else { return false }
+        return ghostPanelIDs(in: workspace).contains(panelId)
+    }
+
+    func ghostPanelIDs(in workspace: Workspace) -> Set<UUID> {
+        Self.ghostPanelIDs(
+            everMapped: everMappedPanelIDs,
+            existing: Set(workspace.panels.keys),
+            panelBySurfaceID: panelBySurfaceID,
+            pendingStale: pendingStalePanelIds
+        )
+    }
+
     /// Surface ids whose mapped panel no longer exists in the workspace.
     ///
     /// Pure so the sweep can be tested without a live mirror: the condition it
     /// exists for — host still reporting a surface whose local pane is gone —
     /// is not reachable from a unit test any other way.
-    nonisolated static func unownedPanelIDs(
-        remotePanelIDs: Set<UUID>,
-        panelBySurfaceID: [Data: UUID]
-    ) -> Set<UUID> {
-        remotePanelIDs.subtracting(panelBySurfaceID.values)
-    }
-
-    /// An unowned pane still points at a live host surface, so forwarding
-    /// its close would close that surface on the host and leave the ghost
-    /// tab here.
-    nonisolated static func forwardsClose(panelId: UUID, panelBySurfaceID: [Data: UUID]) -> Bool {
-        panelBySurfaceID.values.contains(panelId)
-    }
-
-    func forwardsClose(panelId: UUID) -> Bool {
-        Self.forwardsClose(panelId: panelId, panelBySurfaceID: panelBySurfaceID)
-    }
-
-    func remotePanelIDsOnThisHost(in workspace: Workspace) -> Set<UUID> {
-        Set(workspace.panels.keys.filter { panelId in
-            workspace.terminalPanel(for: panelId)?.peerPaneSession?.originSpec.hostKey == spec.hostKey
-        })
-    }
-
     nonisolated static func orphanedSurfaceIDs(
         panelBySurfaceID: [Data: UUID],
         livePanelIDs: Set<UUID>
