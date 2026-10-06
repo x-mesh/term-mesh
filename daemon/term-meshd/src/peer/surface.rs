@@ -2473,7 +2473,13 @@ fn identity_environment(surface_id: &[u8]) -> Vec<(String, String)> {
     // surface it belongs to. Both spellings, matching what a local pane gets.
     let id = hex_id(surface_id);
     env.push(("TERMMESH_SURFACE_ID".to_string(), id.clone()));
-    env.push(("CMUX_SURFACE_ID".to_string(), id));
+    env.push(("CMUX_SURFACE_ID".to_string(), id.clone()));
+    // `pane_tracker` keys on this name alone, so without it this host cannot
+    // tell which pane a Claude or Codex process belongs to, and the mobile
+    // page offers no Chat for a CLI someone started by hand in this pane. A
+    // local pane gets both names with the same value; a remote one used to
+    // get only the surface spelling.
+    env.push(("TERMMESH_PANEL_ID".to_string(), id));
     // This is the daemon socket on THIS host, never the viewer app's socket.
     // A remote leader with a scoped grant uses it as the first hop of the
     // reverse team.leader.v1 route.
@@ -4149,6 +4155,22 @@ mod tests {
         assert!(!stdout
             .lines()
             .any(|line| line.starts_with("TERMMESH_LAUNCH_")));
+    }
+
+    #[test]
+    fn identity_environment_names_the_pane_for_the_session_resolver() {
+        let env = identity_environment(&[0xab, 0xcd]);
+        let get = |key: &str| {
+            env.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let surface = get("TERMMESH_SURFACE_ID").expect("surface id");
+        // `pane_tracker` reads TERMMESH_PANEL_ID and nothing else. Without it
+        // this host cannot map a Claude or Codex process to the pane that runs
+        // it, so the mobile page offers no Chat for a hand-started CLI.
+        assert_eq!(get("TERMMESH_PANEL_ID"), Some(surface.clone()));
+        assert_eq!(get("CMUX_SURFACE_ID"), Some(surface));
     }
 
     #[test]
