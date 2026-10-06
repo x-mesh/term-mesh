@@ -104,6 +104,10 @@ public enum PeerCapability {
     /// Advertised by the HOST. Unlike the roster, this CHANGES things, so
     /// the allow-list — not the capability — is what bounds it.
     public static let teamCallV1 = "team.call.v1"
+    /// The host answers `surface.transcript` over `team.call.v1`'s envelope.
+    /// Separate because that capability is withheld from a host with no teams,
+    /// and reading a pane's transcript has nothing to do with teams.
+    public static let surfaceTranscriptV1 = "surface.transcript.v1"
     /// Project-bound remote leader bootstrap with scoped, expiring grants.
     /// This is separate from `team.call.v1` so its lifecycle exception cannot
     /// widen that generic allow-list.
@@ -121,7 +125,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, overflowResyncV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, overflowResyncV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1, surfaceTranscriptV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input

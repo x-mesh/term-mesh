@@ -886,35 +886,52 @@ async fn reader_loop(
                 // PeerTeamCall). It is checked HERE, before anything touches
                 // the manager: a refusal must not depend on the translation
                 // below being reached.
-                let response = if !team_call_allowed(&request.method) {
-                    TeamCallResponse {
+                let response = if surface_call_allowed(&request.method) {
+                    match plan_surface_transcript_call(&attached, &request.params_json) {
+                        Err(refusal) => Some(refusal),
+                        Ok(read) => {
+                            spawn_surface_transcript_read(
+                                read,
+                                env.seq,
+                                outgoing_tx.clone(),
+                                seq_counter.clone(),
+                            );
+                            None
+                        }
+                    }
+                } else if !team_call_allowed(&request.method) {
+                    Some(TeamCallResponse {
                         ok: false,
                         result_json: String::new(),
                         error_code: "method_not_allowed".to_string(),
                         error_message: format!("{} is not callable by a peer", request.method),
-                    }
+                    })
                 } else if let Some(manager) = host.team_manager() {
-                    run_headless_team_call(
-                        &manager,
-                        host.agent_store().as_ref(),
-                        &request.method,
-                        &request.params_json,
+                    Some(
+                        run_headless_team_call(
+                            &manager,
+                            host.agent_store().as_ref(),
+                            &request.method,
+                            &request.params_json,
+                        )
+                        .await,
                     )
-                    .await
                 } else {
-                    TeamCallResponse {
+                    Some(TeamCallResponse {
                         ok: false,
                         result_json: String::new(),
                         error_code: "host_error".to_string(),
                         error_message: "host has no team subsystem".to_string(),
-                    }
+                    })
                 };
-                let reply = Envelope {
-                    seq: next_seq(&seq_counter),
-                    correlation_id: env.seq,
-                    payload: Some(Payload::TeamCallResponse(response)),
-                };
-                send(&outgoing_tx, reply).await?;
+                if let Some(response) = response {
+                    let reply = Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::TeamCallResponse(response)),
+                    };
+                    send(&outgoing_tx, reply).await?;
+                }
             }
 
             (HandshakeState::Ready, Payload::TeamLeaderCommandResponse(response)) => {
@@ -2015,6 +2032,120 @@ const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
     // read. See the Swift mirror for the full reasoning.
     "team.task.diff",
 ];
+
+/// What a validated `surface.transcript` request asks for.
+#[derive(Debug)]
+struct SurfaceTranscriptRead {
+    surface_id: Vec<u8>,
+    limit: usize,
+}
+
+/// Validate `surface.transcript` against this connection's attachments.
+///
+/// Attachment is the authorization: a peer that is already streaming a
+/// surface's bytes and typing into it is the one asking to read that same
+/// pane's conversation. A surface it never attached to is refused, so naming
+/// an id is not enough. Pure and synchronous, so the reader task can decide
+/// without touching the filesystem.
+fn plan_surface_transcript_call(
+    attached: &HashMap<Vec<u8>, AttachEntry>,
+    params_json: &str,
+) -> Result<SurfaceTranscriptRead, TeamCallResponse> {
+    let refuse = |code: &str, message: String| TeamCallResponse {
+        ok: false,
+        result_json: String::new(),
+        error_code: code.to_string(),
+        error_message: message,
+    };
+    let params: serde_json::Value = match serde_json::from_str(params_json) {
+        Ok(v) => v,
+        Err(e) => return Err(refuse("invalid_params", format!("params are not JSON: {e}"))),
+    };
+    let Some(hex) = params.get("surface_id").and_then(serde_json::Value::as_str) else {
+        return Err(refuse("invalid_params", "surface_id is required".to_string()));
+    };
+    let Some(surface_id) = decode_hex(hex) else {
+        return Err(refuse("invalid_params", "surface_id is not hex".to_string()));
+    };
+    if !attached.contains_key(&surface_id) {
+        return Err(refuse(
+            "not_attached",
+            "this connection is not attached to that surface".to_string(),
+        ));
+    }
+    let limit = params
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(200)
+        .clamp(1, 2000) as usize;
+    Ok(SurfaceTranscriptRead { surface_id, limit })
+}
+
+/// Read the transcript and answer, off the reader task.
+///
+/// The read touches the filesystem, and the reader task also pumps this
+/// connection's PTY frames: awaiting it there stalls the pane for as long as
+/// the session log takes to parse. `correlation_id` is what lets the answer
+/// arrive after later frames.
+fn spawn_surface_transcript_read(
+    read: SurfaceTranscriptRead,
+    correlation_id: u64,
+    outgoing_tx: mpsc::Sender<Envelope>,
+    seq_counter: Arc<AtomicU64>,
+) {
+    tokio::spawn(async move {
+        let refuse = |code: &str, message: String| TeamCallResponse {
+            ok: false,
+            result_json: String::new(),
+            error_code: code.to_string(),
+            error_message: message,
+        };
+        let response = match super::layout::transcript_off_thread(read.surface_id, read.limit).await
+        {
+            Some(Ok(value)) => TeamCallResponse {
+                ok: true,
+                result_json: value.to_string(),
+                error_code: String::new(),
+                error_message: String::new(),
+            },
+            Some(Err(message)) => refuse("session_unavailable", message),
+            None => refuse(
+                "unsupported",
+                "this host cannot read transcripts".to_string(),
+            ),
+        };
+        let reply = Envelope {
+            seq: next_seq(&seq_counter),
+            correlation_id,
+            payload: Some(Payload::TeamCallResponse(response)),
+        };
+        let _ = send(&outgoing_tx, reply).await;
+    });
+}
+
+/// Hex back to bytes, for ids that cross the wire as text.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Calls that act on one surface rather than on a team.
+///
+/// Kept apart from `TEAM_CALL_ALLOWED_METHODS` on purpose: that list is
+/// mirrored in Swift and in the CLI and also decides what a scoped leader
+/// grant may reach, and a surface read belongs to none of those. The rule
+/// here is attachment, checked in the handler — a peer may read only what it
+/// is already streaming.
+const SURFACE_CALL_ALLOWED_METHODS: &[&str] = &["surface.transcript"];
+
+pub(crate) fn surface_call_allowed(method: &str) -> bool {
+    SURFACE_CALL_ALLOWED_METHODS.contains(&method)
+}
 
 pub(crate) fn team_call_allowed(method: &str) -> bool {
     TEAM_CALL_ALLOWED_METHODS.contains(&method)
@@ -4226,6 +4357,42 @@ mod team_leader_capability_tests {
             .cli_bin_dirs
             .iter()
             .all(|path| !path.is_empty() && Path::new(path).is_absolute()));
+    }
+}
+
+#[cfg(test)]
+mod surface_call_tests {
+    use super::{plan_surface_transcript_call, surface_call_allowed};
+    use std::collections::HashMap;
+
+    /// Attachment is the authorization. Naming a surface is not enough, or a
+    /// peer that never attached could read a pane's whole conversation.
+    #[test]
+    fn a_transcript_is_refused_for_a_surface_this_connection_never_attached() {
+        let attached = HashMap::new();
+        let response =
+            plan_surface_transcript_call(&attached, r#"{"surface_id":"aabb","limit":5}"#)
+                .expect_err("a surface this connection never attached must be refused");
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "not_attached");
+    }
+
+    #[test]
+    fn a_surface_id_that_is_not_hex_is_invalid_params() {
+        let attached = HashMap::new();
+        let response = plan_surface_transcript_call(&attached, r#"{"surface_id":"zz"}"#)
+            .expect_err("a non-hex surface id must be refused");
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "invalid_params");
+    }
+
+    /// The surface boundary stays its own list: the team one is mirrored in
+    /// Swift and in the CLI and also gates scoped leader grants.
+    #[test]
+    fn the_surface_list_holds_only_the_transcript_read() {
+        assert!(surface_call_allowed("surface.transcript"));
+        assert!(!surface_call_allowed("surface.send_text"));
+        assert!(!surface_call_allowed("team.read"));
     }
 }
 

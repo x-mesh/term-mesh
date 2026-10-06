@@ -1985,6 +1985,14 @@ actor RelayLeaderSessionGate {
     #endif
 }
 
+/// The host refused or could not produce a surface transcript. Carries the
+/// host's own wording: only it knows whether the session was unreadable, the
+/// connection was never attached, or the build cannot read transcripts.
+struct PeerSurfaceTranscriptFailure: Error {
+    let code: String
+    let message: String
+}
+
 /// Manages the full relay lifetime for one remote-pane window.
 /// 1. Creates a listener socket that the relay binary will connect to.
 /// 2. Holds a PeerSession to the remote host.
@@ -2587,6 +2595,83 @@ final class PeerRelaySession {
         guard let session else { return false }
         try await session.sendInput(surfaceID: surfaceID, keys: keys)
         return true
+    }
+
+    /// The `surface.transcript` call waiting for its answer.
+    ///
+    /// `TeamCallResponse` carries no correlation id, which is fine here: this
+    /// session allows one such call at a time, and the pump is the only reader
+    /// of the inbound stream.
+    private var pendingSurfaceTranscript:
+        CheckedContinuation<Termmesh_Peer_V1_TeamCallResponse, Error>?
+
+    /// Hand the pump's answer to the waiting caller.
+    fileprivate func deliverSurfaceTranscript(_ response: Termmesh_Peer_V1_TeamCallResponse) {
+        guard let pending = pendingSurfaceTranscript else { return }
+        pendingSurfaceTranscript = nil
+        pending.resume(returning: response)
+    }
+
+    /// Fail the waiting caller. A no-op once the answer arrived, so the
+    /// watchdog can fire late without consequence.
+    fileprivate func failSurfaceTranscript(_ error: Error) {
+        guard let pending = pendingSurfaceTranscript else { return }
+        pendingSurfaceTranscript = nil
+        pending.resume(throwing: error)
+    }
+
+    /// Ask the host for this pane's agent transcript.
+    ///
+    /// It has to go over this session: the host authorizes the read by the
+    /// surfaces this connection attached, so a fresh connection would be
+    /// refused even with the same credentials. `nil` when the transport is
+    /// down.
+    func requestSurfaceTranscript(limit: Int) async throws -> String? {
+        guard let session else { return nil }
+        guard pendingSurfaceTranscript == nil else {
+            throw PeerSurfaceTranscriptFailure(
+                code: "busy", message: "A transcript call is already in flight"
+            )
+        }
+        let hex = surfaceID.map { String(format: "%02x", $0) }.joined()
+        guard
+            let data = try? JSONSerialization.data(
+                withJSONObject: ["surface_id": hex, "limit": limit]
+            ),
+            let paramsJSON = String(data: data, encoding: .utf8)
+        else { return nil }
+
+        let response: Termmesh_Peer_V1_TeamCallResponse = try await withCheckedThrowingContinuation {
+            continuation in
+            pendingSurfaceTranscript = continuation
+            Task { [weak self] in
+                do {
+                    try await session.sendTeamCallRequest(
+                        method: "surface.transcript",
+                        paramsJSON: paramsJSON,
+                        requiring: PeerCapability.surfaceTranscriptV1
+                    )
+                } catch {
+                    await self?.failSurfaceTranscript(error)
+                    return
+                }
+                // A host that never answers must not hold the caller: the
+                // pump has no deadline of its own for this frame.
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                await self?.failSurfaceTranscript(
+                    PeerSurfaceTranscriptFailure(
+                        code: "timeout", message: "The host did not answer in time"
+                    )
+                )
+            }
+        }
+        guard response.ok else {
+            throw PeerSurfaceTranscriptFailure(
+                code: response.errorCode,
+                message: response.errorMessage
+            )
+        }
+        return response.resultJson
     }
 
     // ── Stale-socket sweep ──────────────────────────────────────────
@@ -3907,6 +3992,10 @@ final class PeerRelaySession {
                         }
                     case .relayTelemetry(let sample):
                         telemetryStore.record(sample, surfaceID: mySurfaceID)
+                    case .teamCallResponse(let response):
+                        // This pane asked for its own transcript; the pump is
+                        // the only reader, so the answer lands here.
+                        await self.deliverSurfaceTranscript(response)
                     case .goodbye:
                         if let writer {
                             try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))

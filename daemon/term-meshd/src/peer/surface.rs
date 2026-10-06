@@ -1968,6 +1968,32 @@ impl PtySurface {
         Some((out, screen.fed_through))
     }
 
+    /// Plain-text render of the visible screen.
+    ///
+    /// The attach path sends the ANSI stream; a reader that wants text has no
+    /// way to get it from that. The mobile listener needs text for a surface
+    /// this daemon owns itself, where there is no app to ask
+    /// (`surface.read_text`).
+    ///
+    /// Only the live view: scrollback stays out of it, so the offset this
+    /// reads at is always absolute 0 and cannot drift the way
+    /// [`PtySurface::scrollback_render`] documents. `None` on an agent
+    /// surface (no screen model) or a poisoned lock, matching the other
+    /// snapshot readers.
+    pub fn screen_text(&self) -> Option<String> {
+        let screen = self.pty_io()?.screen.lock().ok()?;
+        Some(screen.parser.screen().contents())
+    }
+
+    /// Whether the program on this surface asked for application cursor keys
+    /// (DECCKM). An arrow key is `ESC O A` while it is set and `ESC [ A` while
+    /// it is not, so a writer that ignores it moves the cursor in some TUIs
+    /// and types a letter in others.
+    pub fn application_cursor(&self) -> Option<bool> {
+        let screen = self.pty_io()?.screen.lock().ok()?;
+        Some(screen.parser.screen().application_cursor())
+    }
+
     /// Render the scrollback window whose bottom sits `offset_rows` above
     /// the live view's bottom, as a full-screen replacement (clear+home
     /// first) — what a `ScrollbackRequest` gets back.
@@ -2473,7 +2499,13 @@ fn identity_environment(surface_id: &[u8]) -> Vec<(String, String)> {
     // surface it belongs to. Both spellings, matching what a local pane gets.
     let id = hex_id(surface_id);
     env.push(("TERMMESH_SURFACE_ID".to_string(), id.clone()));
-    env.push(("CMUX_SURFACE_ID".to_string(), id));
+    env.push(("CMUX_SURFACE_ID".to_string(), id.clone()));
+    // `pane_tracker` keys on this name alone, so without it this host cannot
+    // tell which pane a Claude or Codex process belongs to, and the mobile
+    // page offers no Chat for a CLI someone started by hand in this pane. A
+    // local pane gets both names with the same value; a remote one used to
+    // get only the surface spelling.
+    env.push(("TERMMESH_PANEL_ID".to_string(), id));
     // This is the daemon socket on THIS host, never the viewer app's socket.
     // A remote leader with a scoped grant uses it as the first hop of the
     // reverse team.leader.v1 route.
@@ -2544,7 +2576,7 @@ fn terminfo_entry_exists(name: &str) -> bool {
     })
 }
 
-fn hex_id(bytes: &[u8]) -> String {
+pub(crate) fn hex_id(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -4149,6 +4181,22 @@ mod tests {
         assert!(!stdout
             .lines()
             .any(|line| line.starts_with("TERMMESH_LAUNCH_")));
+    }
+
+    #[test]
+    fn identity_environment_names_the_pane_for_the_session_resolver() {
+        let env = identity_environment(&[0xab, 0xcd]);
+        let get = |key: &str| {
+            env.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let surface = get("TERMMESH_SURFACE_ID").expect("surface id");
+        // `pane_tracker` reads TERMMESH_PANEL_ID and nothing else. Without it
+        // this host cannot map a Claude or Codex process to the pane that runs
+        // it, so the mobile page offers no Chat for a hand-started CLI.
+        assert_eq!(get("TERMMESH_PANEL_ID"), Some(surface.clone()));
+        assert_eq!(get("CMUX_SURFACE_ID"), Some(surface));
     }
 
     #[test]

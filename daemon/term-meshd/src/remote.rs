@@ -72,6 +72,13 @@ pub struct Entry {
     pub kind: TargetKind,
     #[serde(default)]
     pub chat_capable: bool,
+    /// This pane mirrors a surface on a peer host. Its session log lives
+    /// there, so the transcript comes from that host over the pane's own peer
+    /// session. Absence of a local session id does not imply this: a local
+    /// CLI that has not written its session file yet also has none, and that
+    /// case must keep answering `session_unavailable` so the page retries.
+    #[serde(default)]
+    pub remote_pane: bool,
     /// Required for `kind = leader`: the team whose durable request board
     /// receives the text. Required for `kind = agent` together with
     /// `agent_name`.
@@ -121,6 +128,13 @@ pub struct EnableSpec {
     pub kind: TargetKind,
     #[serde(default)]
     pub chat_capable: bool,
+    /// This pane mirrors a surface on a peer host. Its session log lives
+    /// there, so the transcript comes from that host over the pane's own peer
+    /// session. Absence of a local session id does not imply this: a local
+    /// CLI that has not written its session file yet also has none, and that
+    /// case must keep answering `session_unavailable` so the page retries.
+    #[serde(default)]
+    pub remote_pane: bool,
     #[serde(default)]
     pub team_name: Option<String>,
     #[serde(default)]
@@ -246,6 +260,7 @@ impl Registry {
             surface_id: surface_id.clone(),
             kind: spec.kind,
             chat_capable: spec.chat_capable || spec.kind == TargetKind::Agent,
+            remote_pane: spec.remote_pane,
             team_name: spec
                 .team_name
                 .map(|t| t.trim().to_string())

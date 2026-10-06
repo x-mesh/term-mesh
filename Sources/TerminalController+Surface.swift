@@ -892,6 +892,90 @@ extension TerminalController {
         return result
     }
 
+    /// `peer.surface.transcript`: ask the host that owns this relay pane for
+    /// the pane's agent transcript.
+    ///
+    /// A relay pane mirrors a surface on another host, so its session log
+    /// lives there and this machine's daemon has no route to that host. The
+    /// pane's own relay session does. It must be that session: the host
+    /// authorizes the read by the surfaces the asking connection attached, so
+    /// a fresh connection would be refused with the same credentials.
+    func dispatchPeerSurfaceTranscript(params: [String: Any], id: Any?) -> String {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return v2Error(id: id, code: "unavailable", message: "TabManager not available")
+        }
+        guard let surfaceId = v2UUID(params, "surface_id") else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing surface_id")
+        }
+        let limit = max(1, min(v2Int(params, "limit") ?? 200, 2000))
+
+        var panelExists = false
+        var relay: PeerRelaySession?
+        let resolved = v2MainExec {
+            guard let panel = self.v2ResolveWorkspace(params: params, tabManager: tabManager)?
+                .terminalPanel(for: surfaceId)
+            else { return }
+            panelExists = true
+            relay = panel.peerPaneSession?.relaySession
+        }
+        guard resolved else {
+            return v2Error(id: id, code: "timeout", message: "Main thread busy")
+        }
+        // `not_found` is reserved for a surface that is gone: the listener
+        // drops the mobile exposure when it sees that code (`app_call`). A
+        // pane that exists but mirrors nothing — a torn-down relay, a stale
+        // record — must not cost the user their exposure.
+        guard panelExists else {
+            return v2Error(id: id, code: "not_found", message: "No such surface")
+        }
+        guard let relay else {
+            return v2Error(
+                id: id, code: "unavailable", message: "This surface is not a remote pane"
+            )
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var outcome: Result<String?, Error> = .success(nil)
+        let task = Task {
+            defer { semaphore.signal() }
+            do {
+                outcome = .success(try await relay.requestSurfaceTranscript(limit: limit))
+            } catch {
+                outcome = .failure(error)
+            }
+        }
+        if semaphore.wait(timeout: .now() + 12) == .timedOut {
+            task.cancel()
+            return v2Error(id: id, code: "timeout", message: "The host did not answer in time")
+        }
+
+        switch outcome {
+        case .failure(let error as PeerSurfaceTranscriptFailure):
+            // The host's own wording: only it knows whether the session was
+            // unreadable or this connection never attached that surface.
+            return v2Error(
+                id: id,
+                code: error.code.isEmpty ? "host_error" : error.code,
+                message: error.message
+            )
+        case .failure(let error):
+            return v2Error(id: id, code: "host_error", message: String(describing: error))
+        case .success(nil):
+            return v2Error(
+                id: id, code: "unavailable", message: "This pane has no live relay session"
+            )
+        case .success(.some(let json)):
+            guard let data = json.data(using: .utf8),
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else {
+                return v2Error(
+                    id: id, code: "host_error", message: "The host answered with unreadable JSON"
+                )
+            }
+            return v2Ok(id: id, result: object)
+        }
+    }
+
     func v2SurfaceReadText(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)

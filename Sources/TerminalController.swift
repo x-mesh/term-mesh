@@ -907,6 +907,13 @@ class TerminalController {
             return dispatchPeerLeaderCall(params: params, id: id)
         }
 
+        // A relay pane's transcript lives on the host that owns the surface,
+        // reachable only over that pane's own peer session. Routed here for
+        // the same reason as the call above: it is not a local team command.
+        if method == "peer.surface.transcript" {
+            return dispatchPeerSurfaceTranscript(params: params, id: id)
+        }
+
         // ── Approach D: Async Team Dispatch ─────────────────────────────
         // ALL team commands are handled via async path. Data-only commands
         // use TeamDataStore directly (no main thread). UI commands use

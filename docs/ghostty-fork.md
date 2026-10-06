@@ -143,6 +143,82 @@ over this summary.
 - Upstreamable: yes, subject to agreement on the grace/force deadlines and the
   intentional residual-process tradeoff.
 
+### 5) Surface teardown must not wait on the consumers it stops
+
+- Commits:
+  - `e9c86d177` (fix(termio): bound mailbox pushes so surface teardown cannot
+    deadlock) — first attempt, insufficient. See below.
+  - `d4a838026` (fix(termio): drop surface messages once teardown starts, do
+    not wait)
+- Files:
+  - `src/Surface.zig`
+  - `src/datastruct/blocking_queue.zig`
+  - `src/termio/Options.zig`
+  - `src/termio/Termio.zig`
+  - `src/termio/mailbox.zig`
+  - `src/termio/stream_handler.zig`
+- The defect:
+  - `Surface.deinit` joins the IO thread from the app thread. The app thread is
+    also the only drainer of the app mailbox. The IO thread's parse stage pushes
+    surface messages into that mailbox, and a `.forever` push waits for space.
+    Each side then waits for the other.
+  - A production app froze for 69 hours in this cycle. The main thread sat in
+    `freeGhosttySurface` and `pthread_join`. The blocked producer was
+    `StreamHandler.windowTitle` -> `apprt.surface.Mailbox.push`.
+  - A peer-relay pane triggers it reliably. Its producer is a socket, so bytes
+    keep arriving through the whole teardown. A local shell pane did not
+    reproduce it in 95 rounds.
+- Why the first attempt failed:
+  - `e9c86d177` replaced `.forever` with a 2 second timeout and dropped the
+    message after it. The budget applies per message, and a torn-down surface
+    can hold thousands of queued title changes, so teardown still takes hours.
+    A 2 second build stayed stalled for over 70 minutes with no recovery, the
+    same as the unbounded build.
+- The fix:
+  - `Surface.deinit` raises a per-surface `tearing_down` flag before it stops
+    any consumer, then calls `wakeWaiters` on the app mailbox, the renderer
+    mailbox and the termio mailbox.
+  - `BlockingQueue.wakeWaiters` broadcasts `cond_not_full`. A `.forever` push
+    rechecks `full` once after a wakeup and returns 0, so one broadcast
+    releases every parked producer. The shared app mailbox keeps no sticky
+    state, so other surfaces are unaffected.
+  - While the flag is set, `surfaceMessageWriter` and `messageWriter` push
+    `.instant` and discard on failure. A discard frees the memory the message
+    owns: `clipboard_write.req`, `pwd_change.pwd`, `tmux_control.data`,
+    `change_config` and `write_alloc`.
+  - Outside teardown the unbounded wait stays. For a live surface that wait is
+    correct backpressure, and dropping a keystroke or a VT reply there is worse
+    than a slow pane close.
+- Measured on mac-sub, Debug app, DEBUG loopback relay pane plus an OSC title
+  flood on the mirrored source:
+  - pre-fix: 8 of 8 rounds deadlock.
+  - with the fix: 0 of 8 rounds, pane close 2.76 s to 2.95 s.
+- Still true after this change: `Surface.deinit` keeps joining the renderer and
+  IO threads on the app thread. This change removes the wait that can make
+  those joins permanent. It does not move them off the app thread.
+- Upstreamable: yes. Upstream `ghostty-org` and `manaflow-ai` both keep the
+  `.forever` push, so the defect exists there too.
+
+### 6) Clear mouse tracking when the shell draws a prompt
+
+- Commit: `ac5c1c33d` (fix(termio): clear mouse tracking when the shell draws a prompt)
+- File: `src/termio/stream_handler.zig`
+- A full-screen program that dies without sending its DECRST leaves mouse
+  tracking enabled. The common way to reach that state is a dropped
+  connection: ssh to a host, run a TUI, lose the network. The remote program
+  never turns the modes off, so from then on every scroll or mouse move
+  writes an SGR mouse report onto the prompt line and the shell echoes it as
+  text.
+- `prompt_start` and `fresh_line_new_prompt` (OSC 133) now clear
+  `mouse_event_x10/normal/button/any`, reset `flags.mouse_event`, and put the
+  pointer shape back to `.text`. The guard runs only when tracking is on, so
+  an ordinary prompt costs one comparison.
+- The encodings (1005/1006/1015/1016) are deliberately left alone: they
+  select a report format and emit nothing on their own.
+- A program that both drives a prompt marker and wants the mouse would lose
+  tracking at its prompt. Shell integration is what emits these markers, so
+  that combination is not expected.
+
 ## Merge conflict notes
 
 These files change frequently upstream; be careful when rebasing the fork:
