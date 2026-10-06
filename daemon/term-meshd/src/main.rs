@@ -935,6 +935,12 @@ mod shutdown_budget_tests {
 fn mobile_surface_access() -> http_mobile::SurfaceAccess {
     std::sync::Arc::new(|method: &str, params: &serde_json::Value| {
         let host = peer::layout::PeerHost::active_host()?;
+        let find = |host: &std::sync::Arc<peer::layout::PeerHost>, id: &str| {
+            host.pty
+                .list()
+                .into_iter()
+                .find(|s| peer::surface::hex_id(&s.info().surface_id) == id)
+        };
         let want = |key: &str| {
             params
                 .get(key)
@@ -959,12 +965,7 @@ fn mobile_surface_access() -> http_mobile::SurfaceAccess {
             }
             "surface.read_text" => {
                 let id = want("surface_id");
-                let found = host
-                    .pty
-                    .list()
-                    .into_iter()
-                    .find(|s| peer::surface::hex_id(&s.info().surface_id) == id);
-                let Some(surface) = found else {
+                let Some(surface) = find(&host, &id) else {
                     return Some(Err(format!("no surface {id} on this host")));
                 };
                 match surface.screen_text() {
@@ -972,8 +973,60 @@ fn mobile_surface_access() -> http_mobile::SurfaceAccess {
                     None => Some(Err("surface has no screen to read".to_string())),
                 }
             }
+            "surface.send_text" => {
+                let id = want("surface_id");
+                let Some(surface) = find(&host, &id) else {
+                    return Some(Err(format!("no surface {id} on this host")));
+                };
+                match surface.write_all(want("text").as_bytes()) {
+                    Ok(()) => Some(Ok(serde_json::json!({ "ok": true }))),
+                    Err(e) => Some(Err(format!("write failed: {e}"))),
+                }
+            }
+            "surface.send_key" => {
+                let id = want("surface_id");
+                let Some(surface) = find(&host, &id) else {
+                    return Some(Err(format!("no surface {id} on this host")));
+                };
+                // DECCKM decides the arrow encoding and the program on the
+                // surface owns that mode, so read it instead of guessing.
+                let application_cursor = surface.application_cursor().unwrap_or(false);
+                let Some(bytes) = named_key_bytes(&want("key"), application_cursor) else {
+                    return Some(Err(format!("unsupported key {:?}", want("key"))));
+                };
+                match surface.write_all(bytes) {
+                    Ok(()) => Some(Ok(serde_json::json!({ "ok": true }))),
+                    Err(e) => Some(Err(format!("write failed: {e}"))),
+                }
+            }
             _ => None,
         }
+    })
+}
+
+/// Bytes for the key names the mobile page is allowed to send
+/// (`http_mobile::gui_key`). Only the legacy encodings: this daemon cannot see
+/// whether the program negotiated the kitty keyboard protocol — the terminal
+/// model it keeps (`vt100`) tracks DECCKM and the keypad but no kitty flags —
+/// and every one of these keys keeps its legacy form in that protocol unless
+/// the program asks for the report-all-keys mode.
+fn named_key_bytes(key: &str, application_cursor: bool) -> Option<&'static [u8]> {
+    Some(match key {
+        "enter" => b"\r".as_slice(),
+        "escape" => b"\x1b".as_slice(),
+        "tab" => b"\t".as_slice(),
+        // DEL, not BS: what a terminal sends for Backspace by default.
+        "backspace" => b"\x7f".as_slice(),
+        "ctrl-c" => b"\x03".as_slice(),
+        "up" if application_cursor => b"\x1bOA".as_slice(),
+        "down" if application_cursor => b"\x1bOB".as_slice(),
+        "right" if application_cursor => b"\x1bOC".as_slice(),
+        "left" if application_cursor => b"\x1bOD".as_slice(),
+        "up" => b"\x1b[A".as_slice(),
+        "down" => b"\x1b[B".as_slice(),
+        "right" => b"\x1b[C".as_slice(),
+        "left" => b"\x1b[D".as_slice(),
+        _ => return None,
     })
 }
 
@@ -1059,6 +1112,24 @@ fn mobile_session_resolver(
 #[cfg(test)]
 mod owner_tests {
     use super::*;
+
+    /// The page sends key names; the pane reads bytes. DECCKM is the program's
+    /// choice, so the arrows have to follow it — the wrong form moves the
+    /// cursor in some TUIs and types a letter in others.
+    #[test]
+    fn named_keys_follow_the_cursor_mode_the_program_set() {
+        assert_eq!(named_key_bytes("enter", false), Some(b"\r".as_slice()));
+        assert_eq!(named_key_bytes("escape", false), Some(b"\x1b".as_slice()));
+        assert_eq!(named_key_bytes("tab", false), Some(b"\t".as_slice()));
+        // DEL, which is what a terminal sends for Backspace by default.
+        assert_eq!(named_key_bytes("backspace", false), Some(b"\x7f".as_slice()));
+        assert_eq!(named_key_bytes("ctrl-c", true), Some(b"\x03".as_slice()));
+        assert_eq!(named_key_bytes("up", false), Some(b"\x1b[A".as_slice()));
+        assert_eq!(named_key_bytes("up", true), Some(b"\x1bOA".as_slice()));
+        assert_eq!(named_key_bytes("left", true), Some(b"\x1bOD".as_slice()));
+        // Outside the page's allowlist nothing is sent at all.
+        assert_eq!(named_key_bytes("f1", false), None);
+    }
 
     #[test]
     fn owner_pid_parser_rejects_invalid_and_self_values() {

@@ -1985,6 +1985,15 @@ impl PtySurface {
         Some(screen.parser.screen().contents())
     }
 
+    /// Whether the program on this surface asked for application cursor keys
+    /// (DECCKM). An arrow key is `ESC O A` while it is set and `ESC [ A` while
+    /// it is not, so a writer that ignores it moves the cursor in some TUIs
+    /// and types a letter in others.
+    pub fn application_cursor(&self) -> Option<bool> {
+        let screen = self.pty_io()?.screen.lock().ok()?;
+        Some(screen.parser.screen().application_cursor())
+    }
+
     /// Render the scrollback window whose bottom sits `offset_rows` above
     /// the live view's bottom, as a full-screen replacement (clear+home
     /// first) — what a `ScrollbackRequest` gets back.
