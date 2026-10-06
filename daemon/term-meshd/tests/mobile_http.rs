@@ -402,6 +402,48 @@ async fn targets_lists_live_entries_and_prunes_dead_sockets() {
 }
 
 #[tokio::test]
+async fn a_transcript_with_no_local_session_is_asked_of_the_pane_owner() {
+    // A relay pane mirrors another host: the session log is there, not here,
+    // so the listener asks the app, which can reach that host over the pane's
+    // own peer session.
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.list", json!({ "surfaces": [{ "id": "pane-1" }] }));
+    app.reply(
+        "peer.surface.transcript",
+        json!({
+            "running": true,
+            "in_flight": false,
+            "summary": "claude · terminal",
+            "total": 1,
+            "entries": [{ "id": "e1", "kind": "answered", "text": "pong" }],
+        }),
+    );
+    let h = start_tailscale().await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "pane-1".to_string(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                keys: KeysPolicy::Safe,
+                chat_capable: true,
+                remote_pane: true,
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let r = get(&h, "/api/targets/pane-1/transcript").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["entries"][0]["text"], "pong");
+    assert_eq!(r.json()["terminal_backed"], true);
+}
+
+#[tokio::test]
 async fn screen_reads_a_daemon_owned_surface_without_an_app() {
     // A peer host owns its surfaces itself: there is no app socket to ask, so
     // the listener has to read them from this daemon.

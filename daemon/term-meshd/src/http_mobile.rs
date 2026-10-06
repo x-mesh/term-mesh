@@ -3038,18 +3038,30 @@ async fn transcript_handler(
         .await?;
         let running = surface_roster_contains(&surfaces, &entry.surface_id);
         let session_entry = entry.clone();
-        let mut value = tokio::task::spawn_blocking(move || {
-            session_transcript(
-                &session_entry.agent_cli,
-                session_entry.session_id.as_deref(),
-                &session_entry.cwd,
-                limit as usize,
+        let mut value = if !session_entry.remote_pane {
+            tokio::task::spawn_blocking(move || {
+                session_transcript(
+                    &session_entry.agent_cli,
+                    session_entry.session_id.as_deref(),
+                    &session_entry.cwd,
+                    limit as usize,
+                )
+            })
+            .await
+            .map_err(|e| {
+                ApiError::conflict("session_unavailable", format!("session reader failed: {e}"))
+            })??
+        } else {
+            // A relay pane: the log lives on the host that owns the surface,
+            // and the app can ask it over the pane's own peer session.
+            app_call(
+                &state,
+                &entry,
+                "peer.surface.transcript",
+                json!({ "surface_id": entry.surface_id, "limit": limit }),
             )
-        })
-                .await
-                .map_err(|e| {
-                    ApiError::conflict("session_unavailable", format!("session reader failed: {e}"))
-                })??;
+            .await?
+        };
         // The log reads idle between a finished tool and the next step; the
         // CLI's own working line on screen is the ground truth. A failed read
         // leaves the log's answer standing.

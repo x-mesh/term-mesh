@@ -131,6 +131,10 @@ public enum PeerIncomingMessage: Sendable {
         Termmesh_Peer_V1_TeamLeaderCommandRequest,
         correlationID: UInt64
     )
+    /// Answer to a `TeamCallRequest`. A session whose inbound stream is
+    /// owned by a pump (an attached relay pane) cannot read its own reply, so
+    /// the response surfaces here and the pump hands it to the caller.
+    case teamCallResponse(Termmesh_Peer_V1_TeamCallResponse)
     case error(code: UInt32, message: String)
     case goodbye(reason: String)
     case other
@@ -670,12 +674,36 @@ public actor PeerSession {
     /// A refusal comes back as a normal response with `ok == false` and
     /// `error_code == method_not_allowed`, not as a transport error: the
     /// host declining is information, not a broken connection.
+    /// Send a team-call request without reading the reply.
+    ///
+    /// `callTeam` reads the next frame itself, which a session whose inbound
+    /// stream is already pumped cannot do (`concurrentReceiveOperation`). An
+    /// attached relay pane is exactly that case: it sends from here and takes
+    /// the `.teamCallResponse` its pump delivers.
+    public func sendTeamCallRequest(
+        method: String,
+        paramsJSON: String,
+        requiring capability: String
+    ) async throws {
+        try requireHostCapability(capability)
+        try await sendEnvelope { env in
+            var request = Termmesh_Peer_V1_TeamCallRequest()
+            request.method = method
+            request.paramsJson = paramsJSON
+            env.teamCallRequest = request
+        }
+    }
+
     public func callTeam(
         method: String,
         paramsJSON: String,
+        requiring capability: String = PeerCapability.teamCallV1,
         timeoutSeconds: TimeInterval = 10
     ) async throws -> Termmesh_Peer_V1_TeamCallResponse {
-        try requireHostCapability(PeerCapability.teamCallV1)
+        // The envelope is shared; what the host must advertise is not. A
+        // surface read rides here but is not a team call, and a host with no
+        // teams withholds `team.call.v1`.
+        try requireHostCapability(capability)
         try beginDirectResponseRPC()
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
@@ -1468,6 +1496,8 @@ public actor PeerSession {
 
     private func classifyIncoming(_ env: Termmesh_Peer_V1_Envelope) -> PeerIncomingMessage {
         switch env.payload {
+        case .teamCallResponse(let response):
+            return .teamCallResponse(response)
         case .pong:
             // Liveness reply to a heartbeat Ping — refresh the timestamp
             // the heartbeat task checks, and mark a Pong as seen for the
