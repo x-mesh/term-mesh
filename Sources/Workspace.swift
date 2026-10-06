@@ -697,6 +697,7 @@ final class Workspace: Identifiable {
                 workspaceDirectory: currentDirectory
             )
         )
+        identity.isRemotePane = terminalPanel(for: panelId)?.peerPaneSession != nil
         if let teamName = TeamOrchestrator.shared.teamName(containingPanelId: panelId),
            let team = TeamOrchestrator.shared.teams[teamName] {
             if team.leaderPanelId == panelId {

@@ -647,6 +647,7 @@ async fn main() -> anyhow::Result<()> {
                         pane_tracker.clone(),
                         usage_tracker.clone(),
                     )),
+                    Some(mobile_surface_access()),
                     shutdown_rx.clone(),
                 ))),
                 Err(e) => {
@@ -661,6 +662,13 @@ async fn main() -> anyhow::Result<()> {
 
     // 5a. Peer federation server (opt-in via TERMMESH_PEER_SOCKET).
     let (peer_started_tx, peer_started_rx) = tokio::sync::watch::channel(false);
+    // A peer that attaches a surface can also ask for that pane's transcript;
+    // the reader lives here because the session logs and the pane tracker do.
+    peer::layout::set_transcript_provider(peer_transcript_provider(
+        pane_tracker.clone(),
+        usage_tracker.clone(),
+    ));
+
     let mut peer_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
         std::env::var("TERMMESH_PEER_SOCKET")
             .ok()
@@ -923,6 +931,144 @@ mod shutdown_budget_tests {
 /// file only with its first reply — comes back with `session_id: None`, so
 /// the phone offers Chat before the first turn. Resolved per request, so
 /// starting or restarting a CLI is picked up without re-exposing the pane.
+/// Serves the listener's `surface.*` calls from this daemon's own surfaces.
+///
+/// Only the calls a surface can answer by itself. Input is deliberately absent:
+/// `surface.send_key` names a key so the app can encode it for the keyboard
+/// protocol the pane negotiated, and this daemon has no such encoder — raw CSI
+/// bytes reach a plain shell but not a kitty-protocol TUI. Returning `None`
+/// leaves the caller to report `method_not_found` rather than type something
+/// the pane would misread.
+/// Reads a surface's agent transcript for a peer that asks over
+/// `team.call.v1` (`PeerHost::transcript`).
+///
+/// The host answers from its own state: the surface names the directory, the
+/// session resolver names the CLI and the session. Nothing about the path or
+/// the log comes from the caller.
+fn peer_transcript_provider(
+    pane_tracker: pane_tracker::PaneTracker,
+    usage_tracker: tokens::UsageTracker,
+) -> peer::layout::TranscriptProvider {
+    let resolver = mobile_session_resolver(pane_tracker, usage_tracker);
+    std::sync::Arc::new(move |surface_id: &[u8], limit: usize| {
+        let host =
+            peer::layout::PeerHost::active_host().ok_or_else(|| "no peer host".to_string())?;
+        let hex = peer::surface::hex_id(surface_id);
+        let surface = host
+            .pty
+            .list()
+            .into_iter()
+            .find(|s| peer::surface::hex_id(&s.info().surface_id) == hex)
+            .ok_or_else(|| format!("no surface {hex} on this host"))?;
+        let session = resolver(&hex)
+            .ok_or_else(|| "no claude or codex session for this surface".to_string())?;
+        http_mobile::transcript_for_peer(
+            &session.cli,
+            session.session_id.as_deref(),
+            &surface.info().cwd,
+            limit,
+        )
+    })
+}
+
+fn mobile_surface_access() -> http_mobile::SurfaceAccess {
+    std::sync::Arc::new(|method: &str, params: &serde_json::Value| {
+        let host = peer::layout::PeerHost::active_host()?;
+        let find = |host: &std::sync::Arc<peer::layout::PeerHost>, id: &str| {
+            host.pty
+                .list()
+                .into_iter()
+                .find(|s| peer::surface::hex_id(&s.info().surface_id) == id)
+        };
+        let want = |key: &str| {
+            params
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        match method {
+            // The roster the listener reads liveness from.
+            "surface.list" => {
+                let surfaces: Vec<serde_json::Value> = host
+                    .pty
+                    .list()
+                    .into_iter()
+                    .map(|surface| {
+                        serde_json::json!({
+                            "id": peer::surface::hex_id(&surface.info().surface_id),
+                        })
+                    })
+                    .collect();
+                Some(Ok(serde_json::json!({ "surfaces": surfaces })))
+            }
+            "surface.read_text" => {
+                let id = want("surface_id");
+                let Some(surface) = find(&host, &id) else {
+                    return Some(Err(format!("no surface {id} on this host")));
+                };
+                match surface.screen_text() {
+                    Some(text) => Some(Ok(serde_json::json!({ "text": text }))),
+                    None => Some(Err("surface has no screen to read".to_string())),
+                }
+            }
+            "surface.send_text" => {
+                let id = want("surface_id");
+                let Some(surface) = find(&host, &id) else {
+                    return Some(Err(format!("no surface {id} on this host")));
+                };
+                match surface.write_all(want("text").as_bytes()) {
+                    Ok(()) => Some(Ok(serde_json::json!({ "ok": true }))),
+                    Err(e) => Some(Err(format!("write failed: {e}"))),
+                }
+            }
+            "surface.send_key" => {
+                let id = want("surface_id");
+                let Some(surface) = find(&host, &id) else {
+                    return Some(Err(format!("no surface {id} on this host")));
+                };
+                // DECCKM decides the arrow encoding and the program on the
+                // surface owns that mode, so read it instead of guessing.
+                let application_cursor = surface.application_cursor().unwrap_or(false);
+                let Some(bytes) = named_key_bytes(&want("key"), application_cursor) else {
+                    return Some(Err(format!("unsupported key {:?}", want("key"))));
+                };
+                match surface.write_all(bytes) {
+                    Ok(()) => Some(Ok(serde_json::json!({ "ok": true }))),
+                    Err(e) => Some(Err(format!("write failed: {e}"))),
+                }
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Bytes for the key names the mobile page is allowed to send
+/// (`http_mobile::gui_key`). Only the legacy encodings: this daemon cannot see
+/// whether the program negotiated the kitty keyboard protocol — the terminal
+/// model it keeps (`vt100`) tracks DECCKM and the keypad but no kitty flags —
+/// and every one of these keys keeps its legacy form in that protocol unless
+/// the program asks for the report-all-keys mode.
+fn named_key_bytes(key: &str, application_cursor: bool) -> Option<&'static [u8]> {
+    Some(match key {
+        "enter" => b"\r".as_slice(),
+        "escape" => b"\x1b".as_slice(),
+        "tab" => b"\t".as_slice(),
+        // DEL, not BS: what a terminal sends for Backspace by default.
+        "backspace" => b"\x7f".as_slice(),
+        "ctrl-c" => b"\x03".as_slice(),
+        "up" if application_cursor => b"\x1bOA".as_slice(),
+        "down" if application_cursor => b"\x1bOB".as_slice(),
+        "right" if application_cursor => b"\x1bOC".as_slice(),
+        "left" if application_cursor => b"\x1bOD".as_slice(),
+        "up" => b"\x1b[A".as_slice(),
+        "down" => b"\x1b[B".as_slice(),
+        "right" => b"\x1b[C".as_slice(),
+        "left" => b"\x1b[D".as_slice(),
+        _ => return None,
+    })
+}
+
 fn mobile_session_resolver(
     pane_tracker: pane_tracker::PaneTracker,
     usage_tracker: tokens::UsageTracker,
@@ -1005,6 +1151,24 @@ fn mobile_session_resolver(
 #[cfg(test)]
 mod owner_tests {
     use super::*;
+
+    /// The page sends key names; the pane reads bytes. DECCKM is the program's
+    /// choice, so the arrows have to follow it — the wrong form moves the
+    /// cursor in some TUIs and types a letter in others.
+    #[test]
+    fn named_keys_follow_the_cursor_mode_the_program_set() {
+        assert_eq!(named_key_bytes("enter", false), Some(b"\r".as_slice()));
+        assert_eq!(named_key_bytes("escape", false), Some(b"\x1b".as_slice()));
+        assert_eq!(named_key_bytes("tab", false), Some(b"\t".as_slice()));
+        // DEL, which is what a terminal sends for Backspace by default.
+        assert_eq!(named_key_bytes("backspace", false), Some(b"\x7f".as_slice()));
+        assert_eq!(named_key_bytes("ctrl-c", true), Some(b"\x03".as_slice()));
+        assert_eq!(named_key_bytes("up", false), Some(b"\x1b[A".as_slice()));
+        assert_eq!(named_key_bytes("up", true), Some(b"\x1bOA".as_slice()));
+        assert_eq!(named_key_bytes("left", true), Some(b"\x1bOD".as_slice()));
+        // Outside the page's allowlist nothing is sent at all.
+        assert_eq!(named_key_bytes("f1", false), None);
+    }
 
     #[test]
     fn owner_pid_parser_rejects_invalid_and_self_values() {

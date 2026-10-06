@@ -135,6 +135,11 @@ pub mod capability {
     /// Daemon-owned workers read a transferable scoped team route from an
     /// owner-only file on every tm-agent invocation. Required before a viewer
     /// may promise that an adopted worker keeps team RPCs after handoff.
+    /// The host answers `surface.transcript` over `team.call.v1`'s envelope.
+    /// Separate from `team.call.v1` because that one is withheld from a host
+    /// with no teams, and reading a pane's transcript has nothing to do with
+    /// teams.
+    pub const SURFACE_TRANSCRIPT_V1: &str = "surface.transcript.v1";
     pub const TEAM_ROUTE_FILE_V1: &str = "team.route-file.v1";
 
     /// Every capability this build supports. Single source of truth for
@@ -161,6 +166,7 @@ pub mod capability {
         PROJECT_PRESENTATION_V1,
         PROJECT_PRESENTATION_REPAIR_V1,
         TEAM_ROUTE_FILE_V1,
+        SURFACE_TRANSCRIPT_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.

@@ -362,6 +362,10 @@ extension RemoteExposureStore {
         var agentTeamName: String?
         var agentName: String?
         var agentCLI: String = ""
+        /// Set when this pane mirrors a surface on a peer host. Its session
+        /// log lives there, so the transcript is fetched over the pane's own
+        /// peer session rather than read locally.
+        var isRemotePane: Bool = false
     }
 
     /// How much the phone may send back to a terminal-backed pane.
@@ -402,12 +406,20 @@ extension RemoteExposureStore {
 
         let kind: String
         let chatCapable: Bool
+        var remotePane = false
         if pane.leaderTeamName != nil {
             kind = "leader"
             chatCapable = true
         } else if pane.panelType == .agent, pane.agentName != nil {
             kind = "agent"
             chatCapable = true
+        } else if pane.isRemotePane {
+            // The host that owns the surface answers for its transcript, and
+            // the daemon's local session resolver cannot see a process on
+            // another machine. Claim chat here or the page never offers it.
+            kind = "pane"
+            chatCapable = true
+            remotePane = true
         } else {
             kind = "pane"
             chatCapable = false
@@ -417,6 +429,7 @@ extension RemoteExposureStore {
             "surface_id": pane.surfaceID,
             "kind": kind,
             "chat_capable": chatCapable,
+            "remote_pane": remotePane,
             "agent_cli": pane.agentCLI,
             "title": pane.title,
             "cwd": pane.cwd,

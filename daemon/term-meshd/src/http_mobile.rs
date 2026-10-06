@@ -171,12 +171,28 @@ pub struct PaneSession {
 /// together, and the trackers behind this reach the rest of the daemon.
 pub type SessionResolver = Arc<dyn Fn(&str) -> Option<PaneSession> + Send + Sync>;
 
+/// Answers the `surface.*` calls for a surface this daemon owns itself.
+///
+/// A pane the app owns is read and typed into through `entry.app_socket`. A
+/// peer host's own surface has no app behind it, so those calls have to be
+/// served from this daemon's PTY registry instead. Injected rather than
+/// imported for the same reason [`SessionResolver`] is: this module stays on
+/// `crate::remote` and `crate::app_socket` alone.
+///
+/// `None` means the method is not one this accessor serves, which the caller
+/// turns into `method_not_found` so an optional call (`surface.read_screen_grid`)
+/// keeps its documented fallback.
+pub type SurfaceAccess =
+    Arc<dyn Fn(&str, &Value) -> Option<Result<Value, String>> + Send + Sync>;
+
 pub struct MobileState {
     pub config: MobileConfig,
     pub registry: SharedRegistry,
     /// None in tests and wherever the daemon cannot correlate panes, which
     /// leaves the record's own answer standing.
     session_resolver: Option<SessionResolver>,
+    /// None in tests and wherever this daemon owns no surfaces of its own.
+    surface_access: Option<SurfaceAccess>,
     /// Request ids are reserved while delivery is in flight and become
     /// deduplicable only after the app acknowledges the write.
     dedupe: Mutex<HashMap<String, (Instant, DedupeState)>>,
@@ -257,11 +273,13 @@ pub fn new_state(
     config: MobileConfig,
     registry: SharedRegistry,
     session_resolver: Option<SessionResolver>,
+    surface_access: Option<SurfaceAccess>,
 ) -> SharedState {
     Arc::new(MobileState {
         config,
         registry,
         session_resolver,
+        surface_access,
         dedupe: Mutex::new(HashMap::new()),
         model_busy: Mutex::new(BTreeSet::new()),
     })
@@ -273,13 +291,14 @@ pub async fn serve(
     config: MobileConfig,
     registry: SharedRegistry,
     session_resolver: Option<SessionResolver>,
+    surface_access: Option<SurfaceAccess>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.addr).await?;
     let _serving = crate::remote::ListenerServing::begin();
     serve_listener(
         listener,
-        new_state(config, registry, session_resolver),
+        new_state(config, registry, session_resolver, surface_access),
         shutdown_rx,
     )
     .await
@@ -437,6 +456,12 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// `code: message`, for an error that leaves this listener's HTTP surface
+    /// — a peer link carries no status code of ours.
+    pub(crate) fn message_for_peer(&self) -> String {
+        format!("{}: {}", self.code, self.message)
+    }
+
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -1799,8 +1824,8 @@ fn home_dir() -> Result<PathBuf, ApiError> {
         .ok_or_else(|| ApiError::conflict("session_unavailable", "HOME is not set"))
 }
 
-fn claude_session_path(entry: &Entry, session_id: &str) -> Result<PathBuf, ApiError> {
-    let encoded = entry.cwd.replace('/', "-");
+fn claude_session_path_in(cwd: &str, session_id: &str) -> Result<PathBuf, ApiError> {
+    let encoded = cwd.replace('/', "-");
     Ok(home_dir()?
         .join(".claude/projects")
         .join(encoded)
@@ -2185,15 +2210,35 @@ fn log_is_fresh(path: &FsPath, within: Duration) -> bool {
         .is_some_and(|age| age <= within)
 }
 
-fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
-    let session_id = entry.session_id.as_deref().ok_or_else(|| {
+/// Read one agent session's transcript without an exposure record.
+///
+/// The peer-facing path has a surface, not an `Entry`: a host answering
+/// `surface.transcript` resolves the CLI, the session and the directory from
+/// its own state. Errors come back as text because they cross a peer link,
+/// where this listener's HTTP error shape means nothing.
+pub(crate) fn transcript_for_peer(
+    agent_cli: &str,
+    session_id: Option<&str>,
+    cwd: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    session_transcript(agent_cli, session_id, cwd, limit).map_err(|e| e.message_for_peer())
+}
+
+fn session_transcript(
+    agent_cli: &str,
+    session_id: Option<&str>,
+    cwd: &str,
+    limit: usize,
+) -> Result<Value, ApiError> {
+    let session_id = session_id.ok_or_else(|| {
         ApiError::conflict(
             "session_unavailable",
             "the CLI session id is not available yet",
         )
     })?;
-    let path = match entry.agent_cli.as_str() {
-        "claude" => claude_session_path(entry, session_id)?,
+    let path = match agent_cli {
+        "claude" => claude_session_path_in(cwd, session_id)?,
         "codex" => codex_session_path(session_id)?,
         _ => {
             return Err(ApiError::conflict(
@@ -2203,7 +2248,7 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
         }
     };
     let lines = tail_json_lines(&path)?;
-    let mut entries = match entry.agent_cli.as_str() {
+    let mut entries = match agent_cli {
         "claude" => claude_entries(&lines),
         "codex" => codex_entries(&lines),
         _ => Vec::new(),
@@ -2211,7 +2256,7 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
     if entries.len() > limit {
         entries = entries.split_off(entries.len() - limit);
     }
-    let in_flight = if entry.agent_cli == "codex" {
+    let in_flight = if agent_cli == "codex" {
         codex_turn_in_flight(&lines)
     } else {
         claude_turn_in_flight(&lines).map(|open| open && log_is_fresh(&path, CLAUDE_OPEN_TURN_STALE))
@@ -2221,7 +2266,7 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
         "running": true,
         "thinking": false,
         "in_flight": in_flight,
-        "summary": format!("{} · terminal", entry.agent_cli),
+        "summary": format!("{agent_cli} · terminal"),
         "total": entries.len(),
         "entries": entries,
     }))
@@ -2269,6 +2314,33 @@ fn app_socket_of(entry: &Entry) -> Result<&str, ApiError> {
     })
 }
 
+/// Serve one `surface.*` call from this daemon's own surfaces.
+///
+/// Without an accessor the listener keeps the answer it gave before this
+/// path existed, so a build that cannot reach a surface registry still says
+/// so plainly instead of pretending the call failed.
+fn native_surface_call(
+    state: &MobileState,
+    method: &str,
+    params: &Value,
+) -> Result<Value, ApiError> {
+    let Some(access) = state.surface_access.as_ref() else {
+        return Err(ApiError::conflict(
+            "not_readable",
+            "daemon-owned surfaces are not served by this listener yet",
+        ));
+    };
+    match access(method, params) {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(message)) => Err(ApiError::conflict("surface_unavailable", message)),
+        // Keeps `surface.read_screen_grid`'s documented fallback to plain text.
+        None => Err(ApiError::conflict(
+            "method_not_found",
+            format!("{method} is not served for daemon-owned surfaces"),
+        )),
+    }
+}
+
 /// Run one app RPC for an entry. A `not_found` from the app means the surface
 /// (or its team) is gone: drop the exposure so it stops being listed.
 async fn app_call(
@@ -2277,6 +2349,11 @@ async fn app_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ApiError> {
+    // A surface this daemon owns has no app to ask. Serving it from the PTY
+    // registry is what lets a peer host's own listener show its panes.
+    if entry.app_socket.is_none() {
+        return native_surface_call(state, method, &params);
+    }
     let socket = app_socket_of(entry)?;
     match app_socket::call(socket, method, params).await {
         Ok(v) => Ok(v),
@@ -2961,12 +3038,30 @@ async fn transcript_handler(
         .await?;
         let running = surface_roster_contains(&surfaces, &entry.surface_id);
         let session_entry = entry.clone();
-        let mut value =
-            tokio::task::spawn_blocking(move || session_transcript(&session_entry, limit as usize))
-                .await
-                .map_err(|e| {
-                    ApiError::conflict("session_unavailable", format!("session reader failed: {e}"))
-                })??;
+        let mut value = if !session_entry.remote_pane {
+            tokio::task::spawn_blocking(move || {
+                session_transcript(
+                    &session_entry.agent_cli,
+                    session_entry.session_id.as_deref(),
+                    &session_entry.cwd,
+                    limit as usize,
+                )
+            })
+            .await
+            .map_err(|e| {
+                ApiError::conflict("session_unavailable", format!("session reader failed: {e}"))
+            })??
+        } else {
+            // A relay pane: the log lives on the host that owns the surface,
+            // and the app can ask it over the pane's own peer session.
+            app_call(
+                &state,
+                &entry,
+                "peer.surface.transcript",
+                json!({ "surface_id": entry.surface_id, "limit": limit }),
+            )
+            .await?
+        };
         // The log reads idle between a finished tool and the next step; the
         // CLI's own working line on screen is the ground truth. A failed read
         // leaves the log's answer standing.

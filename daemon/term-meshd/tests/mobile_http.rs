@@ -115,10 +115,27 @@ async fn start(auth: AuthMode, allowed: &[&str]) -> Harness {
     start_with_resolver(auth, allowed, None).await
 }
 
+async fn start_with_surface_access(
+    auth: AuthMode,
+    allowed: &[&str],
+    surface_access: http_mobile::SurfaceAccess,
+) -> Harness {
+    start_inner(auth, allowed, None, Some(surface_access)).await
+}
+
 async fn start_with_resolver(
     auth: AuthMode,
     allowed: &[&str],
     session_resolver: Option<http_mobile::SessionResolver>,
+) -> Harness {
+    start_inner(auth, allowed, session_resolver, None).await
+}
+
+async fn start_inner(
+    auth: AuthMode,
+    allowed: &[&str],
+    session_resolver: Option<http_mobile::SessionResolver>,
+    surface_access: Option<http_mobile::SurfaceAccess>,
 ) -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -128,7 +145,7 @@ async fn start_with_resolver(
         allowed_logins: allowed.iter().map(|s| s.to_string()).collect(),
     };
     let registry = remote::new_registry();
-    let state = http_mobile::new_state(config, registry.clone(), session_resolver);
+    let state = http_mobile::new_state(config, registry.clone(), session_resolver, surface_access);
     let (tx, rx) = watch::channel(false);
     tokio::spawn(http_mobile::serve_listener(listener, state, rx));
     Harness {
@@ -382,6 +399,106 @@ async fn targets_lists_live_entries_and_prunes_dead_sockets() {
     assert_eq!(targets[1]["team_name"], "live-team");
     assert_eq!(targets[1]["keys"], "none");
     assert_eq!(h.registry.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_transcript_with_no_local_session_is_asked_of_the_pane_owner() {
+    // A relay pane mirrors another host: the session log is there, not here,
+    // so the listener asks the app, which can reach that host over the pane's
+    // own peer session.
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.list", json!({ "surfaces": [{ "id": "pane-1" }] }));
+    app.reply(
+        "peer.surface.transcript",
+        json!({
+            "running": true,
+            "in_flight": false,
+            "summary": "claude · terminal",
+            "total": 1,
+            "entries": [{ "id": "e1", "kind": "answered", "text": "pong" }],
+        }),
+    );
+    let h = start_tailscale().await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "pane-1".to_string(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                keys: KeysPolicy::Safe,
+                chat_capable: true,
+                remote_pane: true,
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let r = get(&h, "/api/targets/pane-1/transcript").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["entries"][0]["text"], "pong");
+    assert_eq!(r.json()["terminal_backed"], true);
+}
+
+#[tokio::test]
+async fn screen_reads_a_daemon_owned_surface_without_an_app() {
+    // A peer host owns its surfaces itself: there is no app socket to ask, so
+    // the listener has to read them from this daemon.
+    let access: http_mobile::SurfaceAccess =
+        std::sync::Arc::new(|method: &str, params: &serde_json::Value| match method {
+            "surface.read_text" => {
+                assert_eq!(params["surface_id"], "host-pane");
+                Some(Ok(json!({ "text": "host screen" })))
+            }
+            _ => None,
+        });
+    let h = start_with_surface_access(AuthMode::Tailscale, &[LOGIN], access).await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "host-pane".to_string(),
+                kind: TargetKind::Pane,
+                app_socket: None,
+                keys: KeysPolicy::Safe,
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let r = get(&h, "/api/targets/host-pane/screen").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["text"], "host screen");
+}
+
+#[tokio::test]
+async fn a_daemon_owned_surface_says_so_when_this_build_cannot_read_it() {
+    // Without an accessor the listener keeps its old answer rather than
+    // reporting a call failure it never made.
+    let h = start_tailscale().await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "host-pane".to_string(),
+                kind: TargetKind::Pane,
+                app_socket: None,
+                keys: KeysPolicy::Safe,
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let r = get(&h, "/api/targets/host-pane/screen").await;
+    assert_eq!(r.status, 409, "{}", r.body);
+    assert_eq!(r.json()["error"]["code"], "not_readable");
 }
 
 #[tokio::test]
@@ -1757,7 +1874,7 @@ async fn listener_serving_reports_whether_the_bind_held() {
         allowed_logins: BTreeSet::new(),
     };
     let (_tx, rx) = watch::channel(false);
-    assert!(http_mobile::serve(config, remote::new_registry(), None, rx)
+    assert!(http_mobile::serve(config, remote::new_registry(), None, None, rx)
         .await
         .is_err());
     assert!(!remote::listener_serving());
@@ -1768,7 +1885,7 @@ async fn listener_serving_reports_whether_the_bind_held() {
         allowed_logins: BTreeSet::new(),
     };
     let (tx, rx) = watch::channel(false);
-    let task = tokio::spawn(http_mobile::serve(config, remote::new_registry(), None, rx));
+    let task = tokio::spawn(http_mobile::serve(config, remote::new_registry(), None, None, rx));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while !remote::listener_serving() {
         assert!(
