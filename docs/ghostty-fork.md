@@ -199,6 +199,26 @@ over this summary.
 - Upstreamable: yes. Upstream `ghostty-org` and `manaflow-ai` both keep the
   `.forever` push, so the defect exists there too.
 
+### 6) Clear mouse tracking when the shell draws a prompt
+
+- Commit: `ac5c1c33d` (fix(termio): clear mouse tracking when the shell draws a prompt)
+- File: `src/termio/stream_handler.zig`
+- A full-screen program that dies without sending its DECRST leaves mouse
+  tracking enabled. The common way to reach that state is a dropped
+  connection: ssh to a host, run a TUI, lose the network. The remote program
+  never turns the modes off, so from then on every scroll or mouse move
+  writes an SGR mouse report onto the prompt line and the shell echoes it as
+  text.
+- `prompt_start` and `fresh_line_new_prompt` (OSC 133) now clear
+  `mouse_event_x10/normal/button/any`, reset `flags.mouse_event`, and put the
+  pointer shape back to `.text`. The guard runs only when tracking is on, so
+  an ordinary prompt costs one comparison.
+- The encodings (1005/1006/1015/1016) are deliberately left alone: they
+  select a report format and emit nothing on their own.
+- A program that both drives a prompt marker and wants the mouse would lose
+  tracking at its prompt. Shell integration is what emits these markers, so
+  that combination is not expected.
+
 ## Merge conflict notes
 
 These files change frequently upstream; be careful when rebasing the fork:
