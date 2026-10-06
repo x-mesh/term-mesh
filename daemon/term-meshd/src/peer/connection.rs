@@ -886,7 +886,9 @@ async fn reader_loop(
                 // PeerTeamCall). It is checked HERE, before anything touches
                 // the manager: a refusal must not depend on the translation
                 // below being reached.
-                let response = if !team_call_allowed(&request.method) {
+                let response = if surface_call_allowed(&request.method) {
+                    run_surface_transcript_call(&host, &attached, &request.params_json)
+                } else if !team_call_allowed(&request.method) {
                     TeamCallResponse {
                         ok: false,
                         result_json: String::new(),
@@ -2015,6 +2017,83 @@ const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
     // read. See the Swift mirror for the full reasoning.
     "team.task.diff",
 ];
+
+/// Answer `surface.transcript` for a surface this connection is attached to.
+///
+/// Attachment is the authorization: a peer that is already streaming a
+/// surface's bytes and typing into it is the one asking to read that same
+/// pane's conversation. A surface it never attached to is refused, so naming
+/// an id is not enough.
+fn run_surface_transcript_call(
+    host: &Arc<PeerHost>,
+    attached: &HashMap<Vec<u8>, AttachEntry>,
+    params_json: &str,
+) -> TeamCallResponse {
+    let refuse = |code: &str, message: String| TeamCallResponse {
+        ok: false,
+        result_json: String::new(),
+        error_code: code.to_string(),
+        error_message: message,
+    };
+    let params: serde_json::Value = match serde_json::from_str(params_json) {
+        Ok(v) => v,
+        Err(e) => return refuse("invalid_params", format!("params are not JSON: {e}")),
+    };
+    let Some(id_hex) = params.get("surface_id").and_then(serde_json::Value::as_str) else {
+        return refuse("invalid_params", "surface_id is required".to_string());
+    };
+    let Some(surface_id) = decode_hex(id_hex) else {
+        return refuse("invalid_params", "surface_id is not hex".to_string());
+    };
+    if !attached.contains_key(&surface_id) {
+        return refuse(
+            "not_attached",
+            "this connection is not attached to that surface".to_string(),
+        );
+    }
+    let limit = params
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(200)
+        .clamp(1, 2000) as usize;
+    match host.transcript(&surface_id, limit) {
+        Some(Ok(value)) => TeamCallResponse {
+            ok: true,
+            result_json: value.to_string(),
+            error_code: String::new(),
+            error_message: String::new(),
+        },
+        Some(Err(message)) => refuse("session_unavailable", message),
+        None => refuse(
+            "unsupported",
+            "this host cannot read transcripts".to_string(),
+        ),
+    }
+}
+
+/// Hex back to bytes, for ids that cross the wire as text.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Calls that act on one surface rather than on a team.
+///
+/// Kept apart from `TEAM_CALL_ALLOWED_METHODS` on purpose: that list is
+/// mirrored in Swift and in the CLI and also decides what a scoped leader
+/// grant may reach, and a surface read belongs to none of those. The rule
+/// here is attachment, checked in the handler — a peer may read only what it
+/// is already streaming.
+const SURFACE_CALL_ALLOWED_METHODS: &[&str] = &["surface.transcript"];
+
+pub(crate) fn surface_call_allowed(method: &str) -> bool {
+    SURFACE_CALL_ALLOWED_METHODS.contains(&method)
+}
 
 pub(crate) fn team_call_allowed(method: &str) -> bool {
     TEAM_CALL_ALLOWED_METHODS.contains(&method)
@@ -4226,6 +4305,48 @@ mod team_leader_capability_tests {
             .cli_bin_dirs
             .iter()
             .all(|path| !path.is_empty() && Path::new(path).is_absolute()));
+    }
+}
+
+#[cfg(test)]
+mod surface_call_tests {
+    use super::{run_surface_transcript_call, surface_call_allowed, PeerHost};
+    use crate::peer::surface::PtyManager;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Attachment is the authorization. Naming a surface is not enough, or a
+    /// peer that never attached could read a pane's whole conversation.
+    #[test]
+    fn a_transcript_is_refused_for_a_surface_this_connection_never_attached() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let attached = HashMap::new();
+        let response = run_surface_transcript_call(
+            &host,
+            &attached,
+            r#"{"surface_id":"aabb","limit":5}"#,
+        );
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "not_attached");
+    }
+
+    #[test]
+    fn a_surface_id_that_is_not_hex_is_invalid_params() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let attached = HashMap::new();
+        let response =
+            run_surface_transcript_call(&host, &attached, r#"{"surface_id":"zz"}"#);
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "invalid_params");
+    }
+
+    /// The surface boundary stays its own list: the team one is mirrored in
+    /// Swift and in the CLI and also gates scoped leader grants.
+    #[test]
+    fn the_surface_list_holds_only_the_transcript_read() {
+        assert!(surface_call_allowed("surface.transcript"));
+        assert!(!surface_call_allowed("surface.send_text"));
+        assert!(!surface_call_allowed("team.read"));
     }
 }
 

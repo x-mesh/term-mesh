@@ -662,6 +662,13 @@ async fn main() -> anyhow::Result<()> {
 
     // 5a. Peer federation server (opt-in via TERMMESH_PEER_SOCKET).
     let (peer_started_tx, peer_started_rx) = tokio::sync::watch::channel(false);
+    // A peer that attaches a surface can also ask for that pane's transcript;
+    // the reader lives here because the session logs and the pane tracker do.
+    peer::layout::set_transcript_provider(peer_transcript_provider(
+        pane_tracker.clone(),
+        usage_tracker.clone(),
+    ));
+
     let mut peer_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
         std::env::var("TERMMESH_PEER_SOCKET")
             .ok()
@@ -932,6 +939,38 @@ mod shutdown_budget_tests {
 /// bytes reach a plain shell but not a kitty-protocol TUI. Returning `None`
 /// leaves the caller to report `method_not_found` rather than type something
 /// the pane would misread.
+/// Reads a surface's agent transcript for a peer that asks over
+/// `team.call.v1` (`PeerHost::transcript`).
+///
+/// The host answers from its own state: the surface names the directory, the
+/// session resolver names the CLI and the session. Nothing about the path or
+/// the log comes from the caller.
+fn peer_transcript_provider(
+    pane_tracker: pane_tracker::PaneTracker,
+    usage_tracker: tokens::UsageTracker,
+) -> peer::layout::TranscriptProvider {
+    let resolver = mobile_session_resolver(pane_tracker, usage_tracker);
+    std::sync::Arc::new(move |surface_id: &[u8], limit: usize| {
+        let host =
+            peer::layout::PeerHost::active_host().ok_or_else(|| "no peer host".to_string())?;
+        let hex = peer::surface::hex_id(surface_id);
+        let surface = host
+            .pty
+            .list()
+            .into_iter()
+            .find(|s| peer::surface::hex_id(&s.info().surface_id) == hex)
+            .ok_or_else(|| format!("no surface {hex} on this host"))?;
+        let session = resolver(&hex)
+            .ok_or_else(|| "no claude or codex session for this surface".to_string())?;
+        http_mobile::transcript_for_peer(
+            &session.cli,
+            session.session_id.as_deref(),
+            &surface.info().cwd,
+            limit,
+        )
+    })
+}
+
 fn mobile_surface_access() -> http_mobile::SurfaceAccess {
     std::sync::Arc::new(|method: &str, params: &serde_json::Value| {
         let host = peer::layout::PeerHost::active_host()?;

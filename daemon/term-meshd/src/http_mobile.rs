@@ -456,6 +456,12 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// `code: message`, for an error that leaves this listener's HTTP surface
+    /// — a peer link carries no status code of ours.
+    pub(crate) fn message_for_peer(&self) -> String {
+        format!("{}: {}", self.code, self.message)
+    }
+
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -1818,8 +1824,8 @@ fn home_dir() -> Result<PathBuf, ApiError> {
         .ok_or_else(|| ApiError::conflict("session_unavailable", "HOME is not set"))
 }
 
-fn claude_session_path(entry: &Entry, session_id: &str) -> Result<PathBuf, ApiError> {
-    let encoded = entry.cwd.replace('/', "-");
+fn claude_session_path_in(cwd: &str, session_id: &str) -> Result<PathBuf, ApiError> {
+    let encoded = cwd.replace('/', "-");
     Ok(home_dir()?
         .join(".claude/projects")
         .join(encoded)
@@ -2204,15 +2210,35 @@ fn log_is_fresh(path: &FsPath, within: Duration) -> bool {
         .is_some_and(|age| age <= within)
 }
 
-fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
-    let session_id = entry.session_id.as_deref().ok_or_else(|| {
+/// Read one agent session's transcript without an exposure record.
+///
+/// The peer-facing path has a surface, not an `Entry`: a host answering
+/// `surface.transcript` resolves the CLI, the session and the directory from
+/// its own state. Errors come back as text because they cross a peer link,
+/// where this listener's HTTP error shape means nothing.
+pub(crate) fn transcript_for_peer(
+    agent_cli: &str,
+    session_id: Option<&str>,
+    cwd: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    session_transcript(agent_cli, session_id, cwd, limit).map_err(|e| e.message_for_peer())
+}
+
+fn session_transcript(
+    agent_cli: &str,
+    session_id: Option<&str>,
+    cwd: &str,
+    limit: usize,
+) -> Result<Value, ApiError> {
+    let session_id = session_id.ok_or_else(|| {
         ApiError::conflict(
             "session_unavailable",
             "the CLI session id is not available yet",
         )
     })?;
-    let path = match entry.agent_cli.as_str() {
-        "claude" => claude_session_path(entry, session_id)?,
+    let path = match agent_cli {
+        "claude" => claude_session_path_in(cwd, session_id)?,
         "codex" => codex_session_path(session_id)?,
         _ => {
             return Err(ApiError::conflict(
@@ -2222,7 +2248,7 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
         }
     };
     let lines = tail_json_lines(&path)?;
-    let mut entries = match entry.agent_cli.as_str() {
+    let mut entries = match agent_cli {
         "claude" => claude_entries(&lines),
         "codex" => codex_entries(&lines),
         _ => Vec::new(),
@@ -2230,7 +2256,7 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
     if entries.len() > limit {
         entries = entries.split_off(entries.len() - limit);
     }
-    let in_flight = if entry.agent_cli == "codex" {
+    let in_flight = if agent_cli == "codex" {
         codex_turn_in_flight(&lines)
     } else {
         claude_turn_in_flight(&lines).map(|open| open && log_is_fresh(&path, CLAUDE_OPEN_TURN_STALE))
@@ -2240,7 +2266,7 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
         "running": true,
         "thinking": false,
         "in_flight": in_flight,
-        "summary": format!("{} · terminal", entry.agent_cli),
+        "summary": format!("{agent_cli} · terminal"),
         "total": entries.len(),
         "entries": entries,
     }))
@@ -3012,8 +3038,14 @@ async fn transcript_handler(
         .await?;
         let running = surface_roster_contains(&surfaces, &entry.surface_id);
         let session_entry = entry.clone();
-        let mut value =
-            tokio::task::spawn_blocking(move || session_transcript(&session_entry, limit as usize))
+        let mut value = tokio::task::spawn_blocking(move || {
+            session_transcript(
+                &session_entry.agent_cli,
+                session_entry.session_id.as_deref(),
+                &session_entry.cwd,
+                limit as usize,
+            )
+        })
                 .await
                 .map_err(|e| {
                     ApiError::conflict("session_unavailable", format!("session reader failed: {e}"))

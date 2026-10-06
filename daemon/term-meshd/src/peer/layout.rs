@@ -1373,6 +1373,26 @@ pub struct PeerStateResetReport {
 /// nested), `surface_workspace` — but no code path takes either lock while
 /// holding a manager guard, so the order is consistent and cannot
 /// deadlock.
+/// Reads one surface's agent transcript for a peer that asks for it over
+/// `team.call.v1`.
+///
+/// The reader lives where the session logs and the pane tracker are, so the
+/// daemon installs it at boot instead of this module reaching for either.
+/// Unset leaves the call refused, which is what every test wants and what any
+/// build that cannot resolve sessions has to say.
+pub type TranscriptProvider =
+    Arc<dyn Fn(&[u8], usize) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// Installed once at boot, read whenever a peer asks. A global for the same
+/// reason `ACTIVE_HOST` is one: the reader is built where the session logs and
+/// the pane tracker live, and the host is built inside the peer server.
+static TRANSCRIPT_PROVIDER: std::sync::OnceLock<TranscriptProvider> = std::sync::OnceLock::new();
+
+/// Install the transcript reader. Called once, at boot.
+pub fn set_transcript_provider(provider: TranscriptProvider) {
+    let _ = TRANSCRIPT_PROVIDER.set(provider);
+}
+
 pub struct PeerHost {
     pub pty: Arc<PtyManager>,
     /// Every workspace this host currently serves, keyed by workspace id.
@@ -1709,6 +1729,17 @@ impl PeerHost {
             .filter(|surface| surface.info().attachable)
             .map(|surface| surface.surface_id.clone())
             .collect()
+    }
+
+    /// Read one surface's transcript, or `None` when no reader is installed.
+    pub fn transcript(
+        &self,
+        surface_id: &[u8],
+        limit: usize,
+    ) -> Option<Result<serde_json::Value, String>> {
+        TRANSCRIPT_PROVIDER
+            .get()
+            .map(|provider| provider(surface_id, limit))
     }
 
     pub(crate) fn has_live_attachable_surfaces(&self) -> bool {
