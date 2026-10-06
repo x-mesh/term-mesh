@@ -647,6 +647,7 @@ async fn main() -> anyhow::Result<()> {
                         pane_tracker.clone(),
                         usage_tracker.clone(),
                     )),
+                    Some(mobile_surface_access()),
                     shutdown_rx.clone(),
                 ))),
                 Err(e) => {
@@ -923,6 +924,59 @@ mod shutdown_budget_tests {
 /// file only with its first reply — comes back with `session_id: None`, so
 /// the phone offers Chat before the first turn. Resolved per request, so
 /// starting or restarting a CLI is picked up without re-exposing the pane.
+/// Serves the listener's `surface.*` calls from this daemon's own surfaces.
+///
+/// Only the calls a surface can answer by itself. Input is deliberately absent:
+/// `surface.send_key` names a key so the app can encode it for the keyboard
+/// protocol the pane negotiated, and this daemon has no such encoder — raw CSI
+/// bytes reach a plain shell but not a kitty-protocol TUI. Returning `None`
+/// leaves the caller to report `method_not_found` rather than type something
+/// the pane would misread.
+fn mobile_surface_access() -> http_mobile::SurfaceAccess {
+    std::sync::Arc::new(|method: &str, params: &serde_json::Value| {
+        let host = peer::layout::PeerHost::active_host()?;
+        let want = |key: &str| {
+            params
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        match method {
+            // The roster the listener reads liveness from.
+            "surface.list" => {
+                let surfaces: Vec<serde_json::Value> = host
+                    .pty
+                    .list()
+                    .into_iter()
+                    .map(|surface| {
+                        serde_json::json!({
+                            "id": peer::surface::hex_id(&surface.info().surface_id),
+                        })
+                    })
+                    .collect();
+                Some(Ok(serde_json::json!({ "surfaces": surfaces })))
+            }
+            "surface.read_text" => {
+                let id = want("surface_id");
+                let found = host
+                    .pty
+                    .list()
+                    .into_iter()
+                    .find(|s| peer::surface::hex_id(&s.info().surface_id) == id);
+                let Some(surface) = found else {
+                    return Some(Err(format!("no surface {id} on this host")));
+                };
+                match surface.screen_text() {
+                    Some(text) => Some(Ok(serde_json::json!({ "text": text }))),
+                    None => Some(Err("surface has no screen to read".to_string())),
+                }
+            }
+            _ => None,
+        }
+    })
+}
+
 fn mobile_session_resolver(
     pane_tracker: pane_tracker::PaneTracker,
     usage_tracker: tokens::UsageTracker,

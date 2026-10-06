@@ -1968,6 +1968,23 @@ impl PtySurface {
         Some((out, screen.fed_through))
     }
 
+    /// Plain-text render of the visible screen.
+    ///
+    /// The attach path sends the ANSI stream; a reader that wants text has no
+    /// way to get it from that. The mobile listener needs text for a surface
+    /// this daemon owns itself, where there is no app to ask
+    /// (`surface.read_text`).
+    ///
+    /// Only the live view: scrollback stays out of it, so the offset this
+    /// reads at is always absolute 0 and cannot drift the way
+    /// [`PtySurface::scrollback_render`] documents. `None` on an agent
+    /// surface (no screen model) or a poisoned lock, matching the other
+    /// snapshot readers.
+    pub fn screen_text(&self) -> Option<String> {
+        let screen = self.pty_io()?.screen.lock().ok()?;
+        Some(screen.parser.screen().contents())
+    }
+
     /// Render the scrollback window whose bottom sits `offset_rows` above
     /// the live view's bottom, as a full-screen replacement (clear+home
     /// first) — what a `ScrollbackRequest` gets back.
@@ -2550,7 +2567,7 @@ fn terminfo_entry_exists(name: &str) -> bool {
     })
 }
 
-fn hex_id(bytes: &[u8]) -> String {
+pub(crate) fn hex_id(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

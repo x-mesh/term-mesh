@@ -171,12 +171,28 @@ pub struct PaneSession {
 /// together, and the trackers behind this reach the rest of the daemon.
 pub type SessionResolver = Arc<dyn Fn(&str) -> Option<PaneSession> + Send + Sync>;
 
+/// Answers the `surface.*` calls for a surface this daemon owns itself.
+///
+/// A pane the app owns is read and typed into through `entry.app_socket`. A
+/// peer host's own surface has no app behind it, so those calls have to be
+/// served from this daemon's PTY registry instead. Injected rather than
+/// imported for the same reason [`SessionResolver`] is: this module stays on
+/// `crate::remote` and `crate::app_socket` alone.
+///
+/// `None` means the method is not one this accessor serves, which the caller
+/// turns into `method_not_found` so an optional call (`surface.read_screen_grid`)
+/// keeps its documented fallback.
+pub type SurfaceAccess =
+    Arc<dyn Fn(&str, &Value) -> Option<Result<Value, String>> + Send + Sync>;
+
 pub struct MobileState {
     pub config: MobileConfig,
     pub registry: SharedRegistry,
     /// None in tests and wherever the daemon cannot correlate panes, which
     /// leaves the record's own answer standing.
     session_resolver: Option<SessionResolver>,
+    /// None in tests and wherever this daemon owns no surfaces of its own.
+    surface_access: Option<SurfaceAccess>,
     /// Request ids are reserved while delivery is in flight and become
     /// deduplicable only after the app acknowledges the write.
     dedupe: Mutex<HashMap<String, (Instant, DedupeState)>>,
@@ -257,11 +273,13 @@ pub fn new_state(
     config: MobileConfig,
     registry: SharedRegistry,
     session_resolver: Option<SessionResolver>,
+    surface_access: Option<SurfaceAccess>,
 ) -> SharedState {
     Arc::new(MobileState {
         config,
         registry,
         session_resolver,
+        surface_access,
         dedupe: Mutex::new(HashMap::new()),
         model_busy: Mutex::new(BTreeSet::new()),
     })
@@ -273,13 +291,14 @@ pub async fn serve(
     config: MobileConfig,
     registry: SharedRegistry,
     session_resolver: Option<SessionResolver>,
+    surface_access: Option<SurfaceAccess>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.addr).await?;
     let _serving = crate::remote::ListenerServing::begin();
     serve_listener(
         listener,
-        new_state(config, registry, session_resolver),
+        new_state(config, registry, session_resolver, surface_access),
         shutdown_rx,
     )
     .await
@@ -2269,6 +2288,33 @@ fn app_socket_of(entry: &Entry) -> Result<&str, ApiError> {
     })
 }
 
+/// Serve one `surface.*` call from this daemon's own surfaces.
+///
+/// Without an accessor the listener keeps the answer it gave before this
+/// path existed, so a build that cannot reach a surface registry still says
+/// so plainly instead of pretending the call failed.
+fn native_surface_call(
+    state: &MobileState,
+    method: &str,
+    params: &Value,
+) -> Result<Value, ApiError> {
+    let Some(access) = state.surface_access.as_ref() else {
+        return Err(ApiError::conflict(
+            "not_readable",
+            "daemon-owned surfaces are not served by this listener yet",
+        ));
+    };
+    match access(method, params) {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(message)) => Err(ApiError::conflict("surface_unavailable", message)),
+        // Keeps `surface.read_screen_grid`'s documented fallback to plain text.
+        None => Err(ApiError::conflict(
+            "method_not_found",
+            format!("{method} is not served for daemon-owned surfaces"),
+        )),
+    }
+}
+
 /// Run one app RPC for an entry. A `not_found` from the app means the surface
 /// (or its team) is gone: drop the exposure so it stops being listed.
 async fn app_call(
@@ -2277,6 +2323,11 @@ async fn app_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ApiError> {
+    // A surface this daemon owns has no app to ask. Serving it from the PTY
+    // registry is what lets a peer host's own listener show its panes.
+    if entry.app_socket.is_none() {
+        return native_surface_call(state, method, &params);
+    }
     let socket = app_socket_of(entry)?;
     match app_socket::call(socket, method, params).await {
         Ok(v) => Ok(v),
