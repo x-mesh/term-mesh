@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.267.0] - 2026-10-06
+
+### Added
+
+- A Linux or other host that runs only the term-mesh daemon now serves its own terminals on its mobile page. You can open that host's page, read a terminal, and type into it, including the Chat view for an agent CLI that runs there. Before this, those terminals did not appear at all, and `remote on` refused to expose them.
+- A remote terminal opened on your Mac now shows its Chat view on the Mac's mobile page too. The conversation lives on the host that owns the terminal, so the Mac asks that host for it over the same connection the pane already uses.
+
+### Fixed
+
+- Closing a remote terminal no longer freezes the whole app. A pane that was shutting down could stop the app for as long as it stayed open; one host left an app frozen for 69 hours.
+- A dropped network connection no longer leaves the mouse reporting stray characters on your prompt. When a full-screen program over SSH dies with the connection, it cannot turn mouse tracking off, and every later scroll printed sequences like `35;77;30M` on the command line. The terminal now clears mouse tracking when the shell draws a new prompt.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.266.0] - 2026-10-05
 
 ### Fixed
