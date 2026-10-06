@@ -909,19 +909,28 @@ extension TerminalController {
         }
         let limit = max(1, min(v2Int(params, "limit") ?? 200, 2000))
 
+        var panelExists = false
         var relay: PeerRelaySession?
         let resolved = v2MainExec {
-            relay = self.v2ResolveWorkspace(params: params, tabManager: tabManager)?
-                .terminalPanel(for: surfaceId)?
-                .peerPaneSession?
-                .relaySession
+            guard let panel = self.v2ResolveWorkspace(params: params, tabManager: tabManager)?
+                .terminalPanel(for: surfaceId)
+            else { return }
+            panelExists = true
+            relay = panel.peerPaneSession?.relaySession
         }
         guard resolved else {
             return v2Error(id: id, code: "timeout", message: "Main thread busy")
         }
+        // `not_found` is reserved for a surface that is gone: the listener
+        // drops the mobile exposure when it sees that code (`app_call`). A
+        // pane that exists but mirrors nothing — a torn-down relay, a stale
+        // record — must not cost the user their exposure.
+        guard panelExists else {
+            return v2Error(id: id, code: "not_found", message: "No such surface")
+        }
         guard let relay else {
             return v2Error(
-                id: id, code: "not_found", message: "This surface is not a remote pane"
+                id: id, code: "unavailable", message: "This surface is not a remote pane"
             )
         }
 

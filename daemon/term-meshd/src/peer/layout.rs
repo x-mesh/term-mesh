@@ -1388,6 +1388,22 @@ pub type TranscriptProvider =
 /// the pane tracker live, and the host is built inside the peer server.
 static TRANSCRIPT_PROVIDER: std::sync::OnceLock<TranscriptProvider> = std::sync::OnceLock::new();
 
+/// Read a surface's transcript without occupying the caller's task.
+///
+/// The provider touches the filesystem, and a peer connection's reader task
+/// also pumps that connection's PTY bytes: a session log read on it stalls
+/// the pane. `None` means this build has no provider installed.
+pub async fn transcript_off_thread(
+    surface_id: Vec<u8>,
+    limit: usize,
+) -> Option<Result<serde_json::Value, String>> {
+    let provider = TRANSCRIPT_PROVIDER.get()?.clone();
+    match tokio::task::spawn_blocking(move || provider(&surface_id, limit)).await {
+        Ok(value) => Some(value),
+        Err(e) => Some(Err(format!("transcript reader failed: {e}"))),
+    }
+}
+
 /// Install the transcript reader. Called once, at boot.
 pub fn set_transcript_provider(provider: TranscriptProvider) {
     let _ = TRANSCRIPT_PROVIDER.set(provider);
