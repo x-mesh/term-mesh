@@ -631,6 +631,15 @@ extension ReviewBoardPanelView {
         return text
     }
 
+    private func waitMetricsText(_ metrics: LeaderTurnLog.LeaderWaitMetrics) -> Text {
+        let peak = metrics.peakConcurrentWorkers.map { Text("Peak \($0) concurrent") }
+            ?? Text("Peak concurrency unmeasured")
+        let wait = metrics.blockedSeconds.map {
+            Text("Leader blocked \(ReviewBoardViewModel.compactDuration($0))")
+        } ?? Text("Leader wait unmeasured")
+        return peak + Text(" · ") + wait
+    }
+
     private var needsCollaborationRepair: Bool {
         guard let panel = viewModel.collaboration else { return false }
         return ReviewBoardViewModel.shouldShowCollaborationRepair(
@@ -784,6 +793,9 @@ extension ReviewBoardPanelView {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
                 Text("Recent history · \(panel.dispatchCount) dispatches · \(panel.completionCount) completed")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                waitMetricsText(panel.waitMetrics)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
                 if let lastActivity = panel.lastActivity {

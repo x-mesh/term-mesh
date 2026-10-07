@@ -100,6 +100,9 @@ STATE_FILE="$LOG_DIR/.turn-current-$STATE_KEY"
 # the one Start wrote, and the floor only needs "did anything get dispatched
 # since this pane's last prompt".
 DISPATCH_BASELINE_FILE="$LOG_DIR/.turn-dispatch-$STATE_KEY"
+# Where this surface's previous turn_end landed, so a collection turn can find
+# it even after a busy log has pushed it out of the floor's lookback.
+LAST_END_FILE="$LOG_DIR/.turn-last-end-$STATE_KEY"
 STATE_LOCK="$STATE_FILE.lock"
 STATE_LOCK_HELD=0
 
@@ -404,6 +407,10 @@ fi
 # than claimed by the leader, so this is the one participation signal that does
 # not depend on the leader choosing to report anything. Anything unreadable
 # leaves the field off entirely rather than guessing "met".
+#
+# An asynchronous leader may finish a no-dispatch turn only by reading work it
+# dispatched earlier in the same session. Work merely remaining in flight does
+# not justify unrelated direct work while a worker runs.
 DELEGATION_FLOOR=""
 if [ "$MODE" = --end ] \
     && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
@@ -411,12 +418,25 @@ if [ "$MODE" = --end ] \
     && [ -r "$LOG_FILE" ] \
     && [ -r "$DISPATCH_BASELINE_FILE" ] \
     && command -v python3 >/dev/null 2>&1; then
-    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" <<'TURN_HOOK_MET' 2>/dev/null || true
+    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" "$LAST_END_FILE" "$TURN_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
-control_path, log_path, team, baseline_path = sys.argv[1:5]
+(
+    control_path, log_path, team, baseline_path, surface_id, leader_session, last_end_path, turn_id,
+) = sys.argv[1:9]
+
+# Bounds the read behind the baseline of this turn, so a long-lived log never makes
+# Stop slow. Daemon GC rotates turns.log every six hours anyway.
+LOOKBACK_BYTES = 4 * 1024 * 1024
+# The app logs no terminal record for most dispatches (abandoned, cleaned up,
+# or from before lifecycle logging), so an unbounded "still in flight" would
+# exempt a leader forever. The longest observed dispatch-to-terminal span was
+# about 42 minutes.
+IN_FLIGHT_MAX_AGE_SECONDS = 2 * 60 * 60
+TERMINAL_TASK_STATUSES = {"completed", "review_ready", "failed", "blocked"}
 
 try:
     with open(control_path, "r", encoding="utf-8") as handle:
@@ -464,24 +484,39 @@ if baseline < 0:
     sys.exit(0)
 
 try:
-    size = os.path.getsize(log_path)
+    log_stat = os.stat(log_path)
 except Exception:
     sys.exit(0)
 # A file shorter than the offset means the log rotated under us. Say nothing
 # rather than report a truncation as "the leader delegated nothing".
-if size < baseline:
+if log_stat.st_size < baseline:
     sys.exit(0)
 
+
+def parse_ts(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+read_from = max(0, baseline - LOOKBACK_BYTES)
 try:
     # Binary, because a text-mode seek only accepts offsets tell() produced.
     with open(log_path, "rb") as handle:
-        handle.seek(baseline)
-        appended = handle.read().split(b"\n")
+        handle.seek(read_from)
+        chunks = handle.read().split(b"\n")
 except Exception:
     sys.exit(0)
 
-dispatched = 0
-for raw in appended:
+records = []
+offset = read_from
+for index, raw in enumerate(chunks):
+    line_offset = offset
+    offset += len(raw) + 1
+    # A lookback that starts mid-file starts mid-line.
+    if index == 0 and read_from > 0:
+        continue
     raw = raw.strip()
     if not raw:
         continue
@@ -489,20 +524,105 @@ for raw in appended:
         record = json.loads(raw)
     except Exception:
         continue
-    if (
-        isinstance(record, dict)
-        and record.get("event") == "task_dispatch"
-        and record.get("team") == team
+    if isinstance(record, dict) and record.get("team") == team:
+        records.append((line_offset, record))
+
+dispatched = sum(
+    1
+    for line_offset, record in records
+    if line_offset >= baseline and record.get("event") == "task_dispatch"
+)
+if dispatched > 0:
+    print("met", end="")
+    sys.exit(0)
+
+# Outstanding work is attributed by leader session. Without one, a task of
+# another leader in the same team would exempt this leader, so no exemption.
+if not leader_session:
+    print("unmet", end="")
+    sys.exit(0)
+
+# Only explicit collection in this turn can exempt a no-dispatch turn. Both
+# task_collect and a completed leader_wait carry the ids actually observed.
+prior_dispatches = set()
+collected_ids = set()
+
+# A worker can outlive the 4 MiB lookback used for this turn's activity. Keep
+# the bounded window for collection evidence, but find this leader's earlier
+# dispatch ids across the current six-hour log generation. Most lines are not
+# dispatches, so avoid JSON parsing them before the byte prefilter matches.
+try:
+    session_bytes = leader_session.encode("utf-8")
+    with open(log_path, "rb") as handle:
+        for raw in handle:
+            if b'"task_dispatch"' not in raw or session_bytes not in raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except Exception:
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("team") == team
+                and record.get("event") == "task_dispatch"
+                and record.get("leader_session_id") == leader_session
+                and isinstance(record.get("task_id"), str)
+            ):
+                prior_dispatches.add(record["task_id"])
+except Exception:
+    pass
+
+for line_offset, record in records:
+    task_id = record.get("task_id")
+    if record.get("leader_session_id") != leader_session:
+        continue
+    event = record.get("event")
+    if line_offset < baseline:
+        continue
+    if event == "task_collect":
+        task_ids = record.get("task_ids")
+    elif (
+        event == "leader_wait"
+        and record.get("phase") == "end"
+        and record.get("turn_id") == turn_id
     ):
-        dispatched += 1
-print("met" if dispatched > 0 else "unmet", end="")
+        task_ids = record.get("task_ids")
+    else:
+        continue
+    if isinstance(task_ids, list):
+        collected_ids.update(task_id for task_id in task_ids if isinstance(task_id, str))
+
+print("met_by_inflight_or_collected" if prior_dispatches.intersection(collected_ids) else "unmet", end="")
 TURN_HOOK_MET
 )"
     case "$DELEGATION_FLOOR" in
-        met|unmet) ;;
+        met|unmet|met_by_inflight_or_collected) ;;
         *) DELEGATION_FLOOR="" ;;
     esac
     rm -f "$DISPATCH_BASELINE_FILE" 2>/dev/null || true
+fi
+
+# Taken before this turn's turn_end lines are appended, so the next turn's
+# "since the previous turn_end" can miss no record written from here on.
+if [ "$MODE" = --end ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$LOG_FILE" "$LAST_END_FILE" "$TS" <<'TURN_HOOK_LAST_END' 2>/dev/null || true
+import os
+import sys
+
+log_path, last_end_path, ts = sys.argv[1:4]
+tmp = last_end_path + ".tmp"
+try:
+    log_stat = os.stat(log_path)
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write("%d %d %s" % (log_stat.st_size, log_stat.st_ino, ts))
+    os.replace(tmp, last_end_path)
+except Exception:
+    # No log yet, or no way to record it: the next turn falls back to its scan.
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+TURN_HOOK_LAST_END
 fi
 
 # Entries newer than the routed turn were prompts absorbed into that running

@@ -198,9 +198,9 @@ Read ALL agents' terminal output at once:
 tm-agent collect --lines 100
 \`\`\`
 
-Wait for all agents to post results (blocks until done):
+Start a task-scoped result wait in the background when the harness supports it (Claude Code Bash `run_in_background:true`); continue leader-lane work or return interim status until completion notification:
 \`\`\`bash
-tm-agent wait --timeout 120
+tm-agent wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>
 \`\`\`
 
 Wait for a blocked or review-ready item:
@@ -235,8 +235,8 @@ tm-agent task done <id> '<result summary>'
 1. For each non-trivial request, first identify independently completable units and delegate eligible units before doing that work yourself; use direct execution only for trivial, same-file, dependency-serial, or worker-ineligible work and state that constraint
    Classify each request as direct, probe, or parallel: direct uses zero workers, probe uses one read-only worker for 60-90 seconds, and parallel uses two to ten dependency-ready workers within the Project limit
 2. Use the agent names and their specialties to route work effectively
-3. **AFTER delegating, ALWAYS read agent results** using \`read\`, \`collect\`, or \`wait\` before responding
-4. Check \`inbox\` before responding to the user
+3. Never present a final answer or claim completion that depends on uncollected agent results; interim status is allowed while work is running
+4. Check \`inbox\` before presenting final results, not before an interim status
 5. Treat \`blocked\` and \`review_ready\` as first-class control points
 6. Coordinate between agents when tasks have dependencies
 7. Synthesize agent results and report back to the user
