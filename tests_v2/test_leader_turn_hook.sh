@@ -1017,7 +1017,6 @@ async_hook --end '{"session_id":"async-far-dispatch"}' >/dev/null \
     || fail "far dispatch end returned nonzero"
 async_floor met "far dispatching turn"
 
-async_task task_lifecycle far1 completed 0 async-leader
 python3 - "$ASYNC_LOG" <<'PY' || exit 1
 import sys
 
@@ -1028,7 +1027,23 @@ line = (
 with open(sys.argv[1], "a", encoding="utf-8") as handle:
     handle.write(line * (5 * 1024 * 1024 // len(line) + 1))
 PY
-ASYNC_OUT=$(async_turn far-collect)
+async_hook --start '{"prompt":"far collect","session_id":"async-far-collect"}' >/dev/null \
+    || fail "far collect start returned nonzero"
+async_task task_collect far1 "" 0 async-leader
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+records[-1]["event"] = "task_collect"
+records[-1]["task_ids"] = ["far1"]
+records[-1].pop("task_id", None)
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-far-collect","stop_hook_active":false}') \
+    || fail "far collect end returned nonzero"
 async_floor met_by_inflight_or_collected "collection turn past the lookback"
 [ -z "$ASYNC_OUT" ] || fail "collection turn past the lookback was blocked: $ASYNC_OUT"
 
