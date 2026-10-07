@@ -22747,10 +22747,7 @@ fn run_wait(
         if let Some(tid) = task_id {
             let st = task_status.as_deref().unwrap_or("unknown");
             eprintln!("  [{elapsed}/{timeout}s] task={tid} status={st}");
-            if matches!(
-                st,
-                "blocked" | "review_ready" | "completed" | "failed" | "abandoned"
-            ) {
+            if wait_task_settled(st) {
                 println!(
                     "{}",
                     pretty(&json!({ "result": { "team_name": team, "task": task_obj } }))
@@ -22965,6 +22962,7 @@ fn wait_outcome_for_status(status: &str) -> &'static str {
         "review_ready" => "review_ready",
         "completed" => "completed",
         "failed" => "failed",
+        "cancelled" => "cancelled",
         _ => "error",
     }
 }
@@ -23023,7 +23021,9 @@ mod wait_any_scope_tests {
         for status in ["completed", "review_ready", "blocked", "failed", "cancelled"] {
             assert!(wait_task_settled(status), "{status}");
         }
-        for status in ["pending", "assigned", "in_progress", ""] {
+        // `abandoned` is not a TaskStatus the daemon accepts; it was a stale
+        // name in the single-task exit.
+        for status in ["pending", "assigned", "in_progress", "abandoned", ""] {
             assert!(!wait_task_settled(status), "{status:?}");
         }
     }
@@ -23067,6 +23067,7 @@ mod rwait_tests {
         assert_eq!(wait_outcome_for_status("review_ready"), "review_ready");
         assert_eq!(wait_outcome_for_status("blocked"), "blocked");
         assert_eq!(wait_outcome_for_status("failed"), "failed");
+        assert_eq!(wait_outcome_for_status("cancelled"), "cancelled");
         assert_eq!(wait_outcome_for_status("abandoned"), "error");
     }
 }
