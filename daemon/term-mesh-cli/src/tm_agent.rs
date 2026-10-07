@@ -2815,9 +2815,7 @@ enum LeaderTurnCommands {
         #[arg(long = "task-shape")]
         task_shape: Option<String>,
         /// Authoritative worker-capacity snapshot for this turn. Omit it and
-        /// the roster count the app wrote into the validated leader control
-        /// file is used; with no such file capacity stays unknown, which always
-        /// fails closed and cannot produce an applied canary directive.
+        /// Omit when the roster is unavailable; unknown capacity always fails closed.
         #[arg(long = "available-workers")]
         available_workers: Option<u32>,
         /// A risk condition that applied to this turn. Repeatable; every
@@ -9061,7 +9059,7 @@ fn main() {
                         "include_completed": include_completed,
                         "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
                     }),
-                ).map(|value| { append_rcollect(&team, "task_get", &value); value }),
+                ),
                 LeaderRequestCommands::Take { request_id } => rpc_call(
                     &sock,
                     "team.leader.request.take",
@@ -9246,7 +9244,7 @@ fn main() {
                     json!({
                         "team_name": team, "task_id": id,
                     }),
-                ),
+                ).map(|value| { append_rcollect(&team, "task_get", &value); value }),
                 TaskCommands::List {
                     json: as_json,
                     assignee,
@@ -9442,7 +9440,7 @@ fn main() {
             json!({
                 "team_name": team, "task_id": id,
             }),
-        ),
+        ).map(|value| { append_rcollect(&team, "task_get", &value); value }),
         Commands::TaskStart { task_id } => rpc_call(
             &sock,
             "team.task.update",
@@ -19641,8 +19639,6 @@ fn run_leader_turn_route_with_evidence(
         || control.and_then(|_| control_file_available_workers()),
         || route_team_checkout_mode(&team_resolution.name),
     );
-    let checkout_mode = derived.checkout_mode.as_deref();
-    let available_workers = derived.available_workers;
     let mut record = turn_route_record_with_policy_input(
         turn_id,
         route,
@@ -19705,6 +19701,12 @@ fn run_leader_turn_route_with_evidence(
         "resource_health": resource_health,
     });
     record["derived_evidence"] = json!(derived.derived);
+    if let Some(mode) = derived.checkout_mode.filter(|_| checkout_mode.is_none()) {
+        record["derived_checkout_mode"] = json!(mode);
+    }
+    if let Some(workers) = derived.available_workers.filter(|_| available_workers.is_none()) {
+        record["derived_available_workers"] = json!(workers);
+    }
     if let Some(route) = remote_leader_route() {
         record["team_uuid"] = json!(route.team_uuid);
     }
@@ -19978,6 +19980,7 @@ mod leader_turn_record_tests {
         let mut control = control_snapshot_value();
         control["project_id"] = json!("project-a");
         control["session_id"] = json!("session-a");
+        control["available_workers"] = json!(2);
         fs::write(&control_path, serde_json::to_vec(&control).expect("serialize control"))
             .expect("write control");
         use std::os::unix::fs::PermissionsExt;
@@ -20054,6 +20057,28 @@ mod leader_turn_record_tests {
         }
 
         env::set_var("TERMMESH_LEADER_SESSION_ID", "session-a");
+        let derived_only = run_leader_turn_route_with_evidence(
+            &team,
+            "turn-derived-evidence-only",
+            "parallel",
+            Some("multi_unit"),
+            None,
+            &[],
+            None,
+            None,
+            Some(2),
+            true,
+            true,
+            Some(0),
+            true,
+            Some("passed"),
+            None,
+        )
+        .expect("route evaluation");
+        assert_eq!(derived_only["record"]["derived_available_workers"], 2);
+        assert_eq!(derived_only["record"]["policy_applied"], false);
+        assert!(derived_only["directive"].is_null());
+
         env::set_var("TERMMESH_LEADER_PARTICIPATION_MODE", "canary");
         env::set_var("TERMMESH_LEADER_PARTICIPATION_PERCENT", "100");
         env::set_var("TERMMESH_LEADER_PARTICIPATION_SUPPORTED", "true");
@@ -22284,9 +22309,7 @@ fn run_wait(
         ($outcome:expr, $collected:expr) => {{
             if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
                 append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
-                if $collected {
-                    append_task_collect_record(team, "wait", task_ids);
-                }
+                let _ = $collected;
             }
             return;
         }};
@@ -22715,7 +22738,12 @@ fn run_wait(
                         rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
                     {
                         let mut result = r;
-                        result["result"]["outcome"] = json!(outcome);
+                        if result["result"].is_null() {
+                            result["result"] = json!({});
+                        }
+                        if let Some(body) = result["result"].as_object_mut() {
+                            body.insert("outcome".to_string(), json!(outcome));
+                        }
                         println!("{}", pretty(&result));
                     }
                     finish_wait!(outcome, true);
@@ -22867,14 +22895,6 @@ fn append_wait_record(team: &str, wait_id: &str, phase: &str, outcome: Option<&s
     if let Some(outcome) = outcome { record["outcome"] = json!(outcome); }
     if let Some(session) = leader_session_id { record["leader_session_id"] = json!(session); }
     if let Some(turn_id) = turn_id { record["turn_id"] = json!(turn_id); }
-    let _ = append_turn_record(&path, &record);
-}
-
-fn append_task_collect_record(team: &str, via: &str, task_ids: &[String]) {
-    let Ok(path) = turn_log_path() else { return };
-    let mut record = json!({"event":"task_collect","via":via,"task_ids":task_ids,"team":team,"ts":iso8601_utc_now()});
-    if let Some(session) = current_leader_session_id() { record["leader_session_id"] = json!(session); }
-    if let Some(turn_id) = turn_id_from_hook_state() { record["turn_id"] = json!(turn_id); }
     let _ = append_turn_record(&path, &record);
 }
 
