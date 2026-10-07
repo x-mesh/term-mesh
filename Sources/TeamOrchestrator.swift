@@ -2633,22 +2633,27 @@ final class TeamOrchestrator: ObservableObject {
 
     // MARK: - Team Lifecycle
 
+    private nonisolated static func worktreeBranchComponent(_ value: String, fallback: String) -> String {
+        let mapped = value.lowercased().unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
+                ? Character(String(scalar)) : "-"
+        }
+        let normalized = String(mapped)
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        return normalized.isEmpty ? fallback : normalized
+    }
+
+    nonisolated static func sharedWorktreeBranch(teamName: String) -> String {
+        "team-shared/\(worktreeBranchComponent(teamName, fallback: "team"))"
+    }
+
     nonisolated static func isolatedWorktreeBranch(
         teamName: String,
         agentName: String,
         agentInstanceId: String
     ) -> String {
-        func component(_ value: String, fallback: String) -> String {
-            let mapped = value.lowercased().unicodeScalars.map { scalar -> Character in
-                CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
-                    ? Character(String(scalar)) : "-"
-            }
-            let normalized = String(mapped)
-                .split(separator: "-", omittingEmptySubsequences: true)
-                .joined(separator: "-")
-            return normalized.isEmpty ? fallback : normalized
-        }
-        return "team/\(component(teamName, fallback: "team"))/\(component(agentName, fallback: "agent"))/\(component(agentInstanceId, fallback: "instance"))"
+        "team/\(worktreeBranchComponent(teamName, fallback: "team"))/\(worktreeBranchComponent(agentName, fallback: "agent"))/\(worktreeBranchComponent(agentInstanceId, fallback: "instance"))"
     }
 
     struct IsolatedWorktreeProvisioningFailure: Error {
@@ -3048,7 +3053,7 @@ final class TeamOrchestrator: ObservableObject {
         }
 
         if worktreeMode == "shared", let repoRoot = gitRepoRoot {
-            let branchName = "team/\(name)"
+            let branchName = Self.sharedWorktreeBranch(teamName: name)
             let result = daemon.createWorktreeWithError(repoPath: repoRoot, branch: branchName)
             switch result {
             case .success(let info):
