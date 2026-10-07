@@ -30,11 +30,102 @@ fn wt_log(msg: &str) {
 }
 
 fn worktree_metadata_branch(repo: &Repository, name: &str) -> Option<String> {
-    let head = std::fs::read_to_string(repo.path().join("worktrees").join(name).join("HEAD"))
-        .ok()?;
+    let head =
+        std::fs::read_to_string(repo.path().join("worktrees").join(name).join("HEAD")).ok()?;
     head.trim()
         .strip_prefix("ref: refs/heads/")
         .map(str::to_owned)
+}
+
+fn resolve_ref_path_conflicts(repo: &Repository, branch_name: &str) -> Result<(), String> {
+    let branch_names = repo
+        .branches(Some(git2::BranchType::Local))
+        .map_err(|e| format!("cannot enumerate local branches: {e}"))?
+        .filter_map(|branch| {
+            branch
+                .ok()
+                .and_then(|(branch, _)| branch.name().ok().flatten().map(str::to_owned))
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(descendant) = branch_names
+        .iter()
+        .find(|name| name.starts_with(&format!("{branch_name}/")))
+    {
+        return Err(format!(
+            "branch path conflict: existing per-agent instance branch '{descendant}' blocks '{branch_name}'"
+        ));
+    }
+
+    let main_head = repo
+        .head()
+        .ok()
+        .and_then(|head| head.shorthand().map(str::to_owned));
+    for ancestor in branch_names
+        .iter()
+        .filter(|name| branch_name.starts_with(&format!("{name}/")))
+    {
+        if main_head.as_deref() == Some(ancestor) {
+            return Err(format!(
+                "branch path conflict: legacy branch '{ancestor}' (checked out at '{}') blocks '{branch_name}'; finish or remove that worktree, or rename the branch",
+                repo.workdir().unwrap_or_else(|| repo.path()).display()
+            ));
+        }
+
+        if let Ok(worktree_names) = repo.worktrees() {
+            for worktree_name in worktree_names.iter().flatten() {
+                let worktree = repo
+                    .find_worktree(worktree_name)
+                    .map_err(|e| format!("cannot inspect worktree '{worktree_name}': {e}"))?;
+                let worktree_path = worktree.path().to_path_buf();
+                let checked_out_branch = Repository::open(&worktree_path)
+                    .ok()
+                    .and_then(|worktree_repo| {
+                        worktree_repo
+                            .head()
+                            .ok()
+                            .and_then(|head| head.shorthand().map(str::to_owned))
+                    })
+                    .or_else(|| worktree_metadata_branch(repo, worktree_name));
+                if checked_out_branch.as_deref() == Some(ancestor) {
+                    return Err(format!(
+                        "branch path conflict: legacy branch '{ancestor}' (checked out at '{}') blocks '{branch_name}'; finish or remove that worktree, or rename the branch",
+                        worktree_path.display()
+                    ));
+                }
+            }
+        }
+
+        let mut legacy_branch = repo
+            .find_branch(ancestor, git2::BranchType::Local)
+            .map_err(|e| format!("cannot find legacy branch '{ancestor}': {e}"))?;
+        let short_sha = legacy_branch
+            .get()
+            .target()
+            .ok_or_else(|| format!("legacy branch '{ancestor}' has no direct target"))?
+            .to_string()[..7]
+            .to_owned();
+        let legacy_base = format!("{ancestor}-legacy-{short_sha}");
+        let mut legacy_name = legacy_base.clone();
+        let mut suffix = 2;
+        while repo
+            .find_branch(&legacy_name, git2::BranchType::Local)
+            .is_ok()
+        {
+            legacy_name = format!("{legacy_base}-{suffix}");
+            suffix += 1;
+        }
+        legacy_branch.rename(&legacy_name, false).map_err(|e| {
+            format!("cannot rename legacy branch '{ancestor}' to '{legacy_name}': {e}")
+        })?;
+        let message = format!(
+            "renamed legacy branch '{ancestor}' to '{legacy_name}' before creating '{branch_name}'"
+        );
+        wt_log(&message);
+        tracing::info!("{message}");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +322,7 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
             .map_err(|e| format!("cannot delete stale branch '{branch_name}': {e}"))?;
         tracing::info!("deleted stale branch '{branch_name}' for re-creation");
     }
+    resolve_ref_path_conflicts(&repo, &branch_name)?;
     repo.branch(&branch_name, &commit, false)
         .map_err(|e| format!("cannot create branch '{branch_name}': {e}"))?;
 
@@ -860,6 +952,96 @@ mod tests {
         });
         let info = create(params).unwrap();
         assert_eq!(info.branch, "custom-branch");
+    }
+
+    #[test]
+    fn create_renames_unowned_ancestor_leaf_branch() {
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let repo = Repository::open(&repo_path).unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("team/x/executor", &commit, false).unwrap();
+        let legacy_target = repo
+            .find_branch("team/x/executor", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+
+        let created = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/x/executor/inst-1",
+        }))
+        .unwrap();
+
+        assert_eq!(created.branch, "team/x/executor/inst-1");
+        assert!(repo
+            .find_branch("team/x/executor", git2::BranchType::Local)
+            .is_err());
+        let legacy = repo
+            .branches(Some(git2::BranchType::Local))
+            .unwrap()
+            .filter_map(|branch| {
+                branch
+                    .ok()
+                    .and_then(|(branch, _)| branch.name().ok().flatten().map(str::to_owned))
+            })
+            .find(|name| name.starts_with("team/x/executor-legacy-"))
+            .unwrap();
+        assert_eq!(
+            repo.find_branch(&legacy, git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .target(),
+            Some(legacy_target)
+        );
+    }
+
+    #[test]
+    fn create_rejects_ancestor_leaf_checked_out_by_live_worktree() {
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let live = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/x/executor",
+        }))
+        .unwrap();
+
+        let error = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/x/executor/inst-1",
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("branch path conflict"), "{error}");
+        assert!(error.contains(&live.path), "{error}");
+        assert!(Repository::open(&repo_path)
+            .unwrap()
+            .find_branch("team/x/executor", git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn create_rejects_descendant_instance_branch() {
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let repo = Repository::open(&repo_path).unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("team/y/executor/inst-1", &commit, false)
+            .unwrap();
+
+        let error = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/y",
+        }))
+        .unwrap_err();
+
+        assert!(
+            error.contains("existing per-agent instance branch"),
+            "{error}"
+        );
+        assert!(error.contains("team/y/executor/inst-1"), "{error}");
     }
 
     #[test]
