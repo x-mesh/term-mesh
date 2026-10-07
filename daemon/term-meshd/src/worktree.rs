@@ -331,12 +331,15 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
                             let checked_out_branch =
                                 repo.find_worktree(remaining).ok().and_then(|other| {
                                     let other_path = other.path().to_path_buf();
-                                    Repository::open(&other_path).ok().and_then(|wt_repo| {
-                                        wt_repo
-                                            .head()
-                                            .ok()
-                                            .and_then(|head| head.shorthand().map(str::to_owned))
-                                    })
+                                    Repository::open(&other_path)
+                                        .ok()
+                                        .and_then(|wt_repo| {
+                                            wt_repo
+                                                .head()
+                                                .ok()
+                                                .and_then(|head| head.shorthand().map(str::to_owned))
+                                        })
+                                        .or_else(|| worktree_metadata_branch(&repo, remaining))
                                 });
                             if checked_out_branch.as_deref() == Some(&branch_name) {
                                 return Err(format!(
@@ -1251,6 +1254,43 @@ mod tests {
         assert_eq!(replacement.branch, "team/stale-team");
         assert_ne!(replacement.name, first.name);
         assert!(std::path::Path::new(&replacement.path).exists());
+    }
+
+    #[test]
+    fn create_same_branch_keeps_branch_owned_by_second_missing_worktree() {
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let first = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/double-stale",
+        }))
+        .unwrap();
+        let second = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/other",
+        }))
+        .unwrap();
+        std::fs::remove_dir_all(&first.path).unwrap();
+        std::fs::remove_dir_all(&second.path).unwrap();
+        let repo = Repository::open(&repo_path).unwrap();
+        std::fs::write(
+            repo.path().join("worktrees").join(&second.name).join("HEAD"),
+            "ref: refs/heads/team/double-stale\n",
+        )
+        .unwrap();
+
+        let error = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/double-stale",
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("still checked out"), "{error}");
+        assert!(repo
+            .find_branch("team/double-stale", git2::BranchType::Local)
+            .is_ok());
     }
 
     #[test]
