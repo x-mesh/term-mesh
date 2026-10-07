@@ -278,6 +278,8 @@ tm-agent wait --timeout <timeout> --mode any --tasks <comma-separated-task-ids>
 
 `<timeout>`은 `/tm --timeout` 값이며, 지정하지 않으면 기본 300초다. Claude Code에서는 Bash `run_in_background:true`로 이 명령을 시작한 뒤 acceptance check, unowned investigation, integration 준비를 계속하거나 짧은 interim status를 응답하고 turn을 끝낸다. 완료 notification이 leader를 다시 호출하면 Step 4를 수행한다. harness가 background command를 지원하지 않으면 leader-lane 작업을 먼저 끝낸 뒤 blocking wait를 사용한다. uncollected 결과에 의존하는 final answer나 완료 주장은 금지한다.
 
+wait가 `timeout`으로 끝나면 `tm-agent status`로 상태를 보고, 아직 pending인 task id만으로 wait를 다시 건 뒤 soft deadline에 부분 결과를 보고한다. `blocked`로 끝나면 막힌 task를 읽고 unblock·답변·재할당한 다음에 다시 건다.
+
 ### Step 4 — Read & synthesize (= /team collect + leader synthesis)
 
 **(a) 헤더 수집 — 3-tier 읽기 룰**

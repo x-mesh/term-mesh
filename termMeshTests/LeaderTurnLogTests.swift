@@ -1030,4 +1030,107 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertTrue(ts.hasSuffix("Z"), "ts must be UTC with a Z suffix: \(ts)")
         XCTAssertEqual(ts.count, 20, "expected YYYY-MM-DDTHH:MM:SSZ, got \(ts)")
     }
+
+    private func waitFixture(_ lines: [String]) -> [LeaderTurnLog.Record] {
+        LeaderTurnLog.readAll(from: lines.joined(separator: "\n") + "\n")
+    }
+
+    func testLeaderWaitMetricsCountOnlyWaitsThatEndBeforeTheirTurnEnds() {
+        let records = waitFixture([
+            #"{"event":"turn_start","turn_id":"t1","ts":"2026-10-07T10:00:00Z","team":"alpha","surface_id":"s","prompt_bytes":1,"prompt_sha256":"x"}"#,
+            #"{"event":"leader_wait","phase":"start","wait_id":"w1","task_ids":["a"],"mode":"any","timeout_s":1800,"team":"alpha","turn_id":"t1","ts":"2026-10-07T10:00:00Z"}"#,
+            #"{"event":"leader_wait","phase":"end","wait_id":"w1","outcome":"completed","task_ids":["a"],"team":"alpha","turn_id":"t1","ts":"2026-10-07T10:04:30Z"}"#,
+            #"{"event":"leader_wait","phase":"start","wait_id":"w2","task_ids":["b"],"mode":"any","timeout_s":1800,"team":"alpha","turn_id":"t1","ts":"2026-10-07T10:05:00Z"}"#,
+            #"{"event":"leader_wait","phase":"start","wait_id":"w3","task_ids":["c"],"mode":"any","timeout_s":1800,"team":"alpha","turn_id":"t1","ts":"2026-10-07T10:06:00Z"}"#,
+            #"{"event":"turn_end","turn_id":"t1","ts":"2026-10-07T10:10:00Z","team":"alpha","surface_id":"s"}"#,
+            #"{"event":"leader_wait","phase":"end","wait_id":"w2","outcome":"completed","task_ids":["b"],"team":"alpha","turn_id":"t1","ts":"2026-10-07T10:20:00Z"}"#,
+            #"{"event":"leader_wait","phase":"start","wait_id":"w4","task_ids":["d"],"mode":"any","timeout_s":1800,"team":"alpha","turn_id":"t2","ts":"2026-10-07T10:21:00Z"}"#,
+            #"{"event":"leader_wait","phase":"end","wait_id":"w4","outcome":"timeout","task_ids":["d"],"team":"alpha","turn_id":"t2","ts":"2026-10-07T10:22:00Z"}"#,
+            #"{"event":"leader_wait","phase":"start","wait_id":"w5","task_ids":["e"],"mode":"any","timeout_s":60,"team":"beta","turn_id":"t1","ts":"2026-10-07T10:00:00Z"}"#,
+            #"{"event":"leader_wait","phase":"end","wait_id":"w5","outcome":"completed","task_ids":["e"],"team":"beta","turn_id":"t1","ts":"2026-10-07T10:09:00Z"}"#,
+        ])
+
+        let metrics = LeaderTurnLog.leaderWaitMetrics(records: records, team: "alpha", leaderSessionID: nil)
+
+        // w1 ended inside t1; w2 outlived t1's end; w3 never ended; w4's turn
+        // has no turn_end yet, so it is not guessed; w5 is another Project.
+        XCTAssertEqual(metrics.blockingWaits, 1)
+        XCTAssertEqual(metrics.backgroundWaits, 2)
+        XCTAssertEqual(metrics.blockedSeconds, 270)
+    }
+
+    func testLeaderWaitMetricsAreUnmeasuredWithoutWaitOrTaskRecords() {
+        let records = waitFixture([
+            #"{"event":"turn_start","turn_id":"t1","ts":"2026-10-07T10:00:00Z","team":"alpha","surface_id":"s","prompt_bytes":1,"prompt_sha256":"x"}"#,
+            #"{"event":"turn_end","turn_id":"t1","ts":"2026-10-07T10:10:00Z","team":"alpha","surface_id":"s"}"#,
+        ])
+
+        XCTAssertEqual(
+            LeaderTurnLog.leaderWaitMetrics(records: records, team: "alpha", leaderSessionID: nil),
+            .unmeasured
+        )
+    }
+
+    func testLeaderWaitWithoutATurnEndStaysUnmeasuredRatherThanZero() {
+        let records = waitFixture([
+            #"{"event":"leader_wait","phase":"start","wait_id":"w1","task_ids":["a"],"mode":"any","timeout_s":1800,"team":"alpha","turn_id":"t1","ts":"2026-10-07T10:00:00Z"}"#,
+            #"{"event":"leader_wait","phase":"end","wait_id":"w1","outcome":"completed","task_ids":["a"],"team":"alpha","turn_id":"t1","ts":"2026-10-07T10:01:00Z"}"#,
+        ])
+
+        XCTAssertNil(
+            LeaderTurnLog.leaderWaitMetrics(records: records, team: "alpha", leaderSessionID: nil).blockedSeconds
+        )
+    }
+
+    func testPeakConcurrentWorkersCountsDistinctWorkersOverClosedTaskIntervals() {
+        let records = waitFixture([
+            #"{"event":"task_dispatch","turn_id":"w","ts":"2026-10-07T10:00:00Z","team":"alpha","task_id":"a","worker":"x","task_delivery":"delivered"}"#,
+            #"{"event":"task_dispatch","turn_id":"w","ts":"2026-10-07T10:05:00Z","team":"alpha","task_id":"b","worker":"y","task_delivery":"delivered"}"#,
+            #"{"event":"task_dispatch","turn_id":"w","ts":"2026-10-07T10:06:00Z","team":"alpha","task_id":"c","worker":"x","task_delivery":"delivered"}"#,
+            #"{"event":"task_dispatch","turn_id":"w","ts":"2026-10-07T10:07:00Z","team":"alpha","task_id":"d","worker":"z","task_delivery":"delivered"}"#,
+            #"{"event":"task_dispatch","turn_id":"w","ts":"2026-10-07T10:30:00Z","team":"alpha","task_id":"e","worker":"q","task_delivery":"delivered"}"#,
+            #"{"event":"task_lifecycle","turn_id":"w","ts":"2026-10-07T10:07:00Z","team":"alpha","task_id":"b","worker":"y","task_status":"completed"}"#,
+            #"{"event":"task_lifecycle","turn_id":"w","ts":"2026-10-07T10:08:00Z","team":"alpha","task_id":"c","worker":"x","task_status":"blocked"}"#,
+            #"{"event":"task_lifecycle","turn_id":"w","ts":"2026-10-07T10:09:00Z","team":"alpha","task_id":"d","worker":"z","task_status":"review_ready"}"#,
+            #"{"event":"task_lifecycle","turn_id":"w","ts":"2026-10-07T10:20:00Z","team":"alpha","task_id":"a","worker":"x","task_status":"completed"}"#,
+        ])
+
+        // b ends the instant d starts, so x and z overlap but y does not join
+        // them; c shares worker x; e never finished and is not counted.
+        XCTAssertEqual(
+            LeaderTurnLog.leaderWaitMetrics(records: records, team: "alpha", leaderSessionID: nil)
+                .peakConcurrentWorkers,
+            2
+        )
+    }
+
+    func testWaitEvidenceDecodesAndStaysOutOfQuarantineAndCollaboration() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = [
+            #"{"event":"leader_wait","phase":"start","wait_id":"w1","task_ids":["a"],"mode":"any","timeout_s":1800,"team":"alpha","ts":"2026-10-07T10:00:00Z"}"#,
+            #"{"event":"task_collect","via":"collect","task_ids":["a"],"team":"alpha","leader_session_id":"s1","turn_id":"t1","ts":"2026-10-07T10:01:00Z"}"#,
+        ].joined(separator: "\n") + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let records = LeaderTurnLog.readAll(from: log)
+        XCTAssertEqual(records.map(\.event), [.leaderWait, .taskCollect])
+        XCTAssertEqual(records.first?.turnID, "")
+        XCTAssertEqual(records.first?.timeoutSeconds, 1800)
+        XCTAssertEqual(records.last?.via, "collect")
+        XCTAssertEqual(LeaderTurnLog.quarantineMalformedLines(in: log), 0)
+        XCTAssertEqual(LeaderTurnLog.health(from: log).malformedLines, 0)
+
+        let summary = LeaderTurnLog.collaborationSummary(
+            records: records, team: "alpha", teamUUID: "uuid", leaderSessionID: nil, workerCount: 2
+        )
+        XCTAssertEqual(summary.legacyRecordCount, 0)
+        XCTAssertEqual(summary.state, .unmeasured)
+
+        let encoded = try JSONEncoder().encode(records[0])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(object["turn_id"], "an absent turn id must stay absent, not become an empty one")
+    }
 }

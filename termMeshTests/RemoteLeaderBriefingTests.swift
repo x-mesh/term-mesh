@@ -185,6 +185,21 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         )
     }
 
+    func test_bothLeaderKindsAreToldHowToHandleAWaitThatTimesOutOrBlocks() {
+        let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        for prompt in [claude, nonClaudePrompt()] {
+            XCTAssertTrue(prompt.contains("If the wait ends with `timeout`"))
+            XCTAssertTrue(prompt.contains("re-arm it only for task ids still pending"))
+            XCTAssertTrue(prompt.contains("If it ends with `blocked`, read the blocked task"))
+        }
+    }
+
     func test_bothLeaderKindsDecomposeFirstAndKeepDirectAsAnExplicitException() {
         let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
             teamName: "xm",

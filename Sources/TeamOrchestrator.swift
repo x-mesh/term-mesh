@@ -4915,7 +4915,7 @@ final class TeamOrchestrator: ObservableObject {
         3. Form the structured direct/probe/parallel decision from the canonical policy
         4. Execute direct yourself, run one 60-90 second read-only probe, or dispatch the admitted two-to-three-task parallel wave
         5. While workers run, prepare acceptance checks and integration order without editing worker-owned paths
-        6. Start `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the background when supported (Claude Code Bash `run_in_background:true`); then finish leader-lane work or send a short interim status and end the turn. On its completion notification, collect headers and process the result.
+        6. Start `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the background when supported (Claude Code Bash `run_in_background:true`); then finish leader-lane work or send a short interim status and end the turn. On its completion notification, collect headers and process the result. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
         If the harness cannot re-invoke you on background completion (e.g. Codex), finish leader-lane work first, then run the wait in the foreground; never end a turn with uncollected required results and no background wait running.
         7. Process the first completed result; wait/collect at most once more only for results required to finish
         8. Review and integrate completed worktrees serially, validate, and respond to the user
@@ -5520,7 +5520,7 @@ final class TeamOrchestrator: ObservableObject {
         3. **Decide** — Form the canonical direct/probe/parallel decision
         4. **Execute** — Work directly, run one read-only probe, or dispatch exactly two to three admitted tasks
         5. **Prepare** — Build acceptance checks and integration order while workers run; do not edit their owned paths
-        6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the foreground. Never end a turn with uncollected required results and no background wait running. Collect and process the first result; wait/collect at most once more only if required.
+        6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the foreground. Never end a turn with uncollected required results and no background wait running. Collect and process the first result; wait/collect at most once more only if required. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
         7. **Integrate** — Review completed worktrees serially and validate the combined result
         8. **Review gate** — Only for a high-risk actual diff, dispatch one bounded read-only reviewer after integration
         9. **Acknowledge** — After all work and validation succeed, run exactly `\(tmAgent) leader request complete <id>` once immediately before the final response, with no verification command afterward; leave blocked or failed work incomplete

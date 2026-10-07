@@ -13,6 +13,14 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(ProjectDelegationLevel.allCases.count, 3)
     }
 
+    func testCompactDurationReadsAsMinutesAndSeconds() {
+        XCTAssertEqual(ReviewBoardViewModel.compactDuration(45), "45s")
+        XCTAssertEqual(ReviewBoardViewModel.compactDuration(270), "4m30s")
+        XCTAssertEqual(ReviewBoardViewModel.compactDuration(240), "4m")
+        XCTAssertEqual(ReviewBoardViewModel.compactDuration(3_900), "1h05m")
+        XCTAssertEqual(ReviewBoardViewModel.compactDuration(0), "0s")
+    }
+
     /// x-kit panel runs are part of what the board's snapshot reads, so a run
     /// arriving has to publish like every other change. Without this the board
     /// saw new runs only because its timer rebuilt the whole snapshot.
