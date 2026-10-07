@@ -870,6 +870,111 @@ if last_end.get("delegation_floor") != "met":
     )
 PY
 
+# An asynchronous leader is re-invoked to collect work it dispatched in an
+# earlier turn. That turn dispatches nothing, and it was blocked as if the
+# leader had done the work itself. Work this leader session already has out —
+# still in flight, or finished since the previous turn — satisfies the floor
+# under its own name; work that is stale or another session's does not.
+ASYNC_HOME="$TEST_TMP/async"
+ASYNC_CTL="$TEST_TMP/async-ctl"
+mkdir -p "$ASYNC_HOME/.term-mesh/logs" "$ASYNC_CTL" || exit 1
+ASYNC_LOG="$ASYNC_HOME/.term-mesh/logs/turns.log"
+
+cat > "$ASYNC_CTL/delegated.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine",
+ "session_id":"async-leader"}
+JSON
+
+async_hook() {
+    HOME="$ASYNC_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=async-surface \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_SESSION_ID=async-leader \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$ASYNC_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+# async_task <event> <task_id> <status-or-empty> <age-seconds> <session>
+async_task() {
+    python3 - "$ASYNC_LOG" "$@" <<'PY' || exit 1
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+log_path, event, task_id, status, age, session = sys.argv[1:7]
+ts = (datetime.now(timezone.utc) - timedelta(seconds=int(age))).strftime("%Y-%m-%dT%H:%M:%SZ")
+record = {"event": event, "turn_id": task_id, "ts": ts, "team": "mine",
+          "task_id": task_id, "worker": "a", "leader_session_id": session}
+if event == "task_dispatch":
+    record["task_delivery"] = "created"
+else:
+    record["task_status"] = status
+with open(log_path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record) + "\n")
+PY
+}
+
+# async_turn <name>: one prompt that dispatches nothing; prints Stop's stdout.
+async_turn() {
+    async_hook --start "{\"prompt\":\"$1\",\"session_id\":\"async-$1\"}" >/dev/null \
+        || fail "async $1 start returned nonzero"
+    async_hook --end "{\"session_id\":\"async-$1\",\"stop_hook_active\":false}" \
+        || fail "async $1 end returned nonzero"
+}
+
+async_floor() {
+    python3 - "$ASYNC_LOG" "$1" "$2" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+log_path, expected, label = sys.argv[1:4]
+records = [
+    json.loads(line)
+    for line in pathlib.Path(log_path).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+actual = [r for r in records if r["event"] == "turn_end"][-1].get("delegation_floor")
+if actual != expected:
+    raise SystemExit("FAIL: %s: expected %r, got %r" % (label, expected, actual))
+PY
+}
+
+# Turn 1 dispatches two tasks, so it meets the floor the ordinary way.
+async_hook --start '{"prompt":"dispatch","session_id":"async-dispatch"}' >/dev/null \
+    || fail "async dispatch start returned nonzero"
+async_task task_dispatch t1 "" 0 async-leader
+async_task task_dispatch t2 "" 0 async-leader
+async_hook --end '{"session_id":"async-dispatch"}' >/dev/null \
+    || fail "async dispatch end returned nonzero"
+async_floor met "dispatching turn"
+
+# Turn 2: the user asks something while both workers run.
+ASYNC_OUT=$(async_turn inflight)
+async_floor met_by_inflight_or_collected "turn with prior work in flight"
+[ -z "$ASYNC_OUT" ] || fail "in-flight turn was blocked: $ASYNC_OUT"
+
+# Turn 3: a background wait returns and the leader collects the results.
+async_task task_lifecycle t1 completed 0 async-leader
+async_task task_lifecycle t2 review_ready 0 async-leader
+ASYNC_OUT=$(async_turn collect)
+async_floor met_by_inflight_or_collected "collection turn"
+[ -z "$ASYNC_OUT" ] || fail "collection turn was blocked: $ASYNC_OUT"
+
+# Turn 4: everything was collected last turn. Doing the work directly now is
+# exactly what the floor exists to stop. A stale dispatch with no terminal
+# record and another session's in-flight task change nothing.
+async_task task_dispatch stale "" 10800 async-leader
+async_task task_dispatch foreign "" 0 other-leader
+ASYNC_OUT=$(async_turn direct)
+async_floor unmet "turn with only collected, stale, or foreign work"
+case "$ASYNC_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "a direct turn with nothing outstanding was not blocked: $ASYNC_OUT" ;;
+esac
+
 # New hook records carry Project identity when the leader launch provides it.
 IDENTITY_HOME="$TEST_TMP/identity"
 mkdir -p "$IDENTITY_HOME/.term-mesh/logs" || exit 1
@@ -908,4 +1013,5 @@ PY
 printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
 printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
 printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tail'
+printf '%s\n' 'PASS: delegation floor lets an async leader collect work it already dispatched'
 printf '%s\n' 'PASS: leader turn hook records scoped Project identity'

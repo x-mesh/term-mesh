@@ -404,6 +404,12 @@ fi
 # than claimed by the leader, so this is the one participation signal that does
 # not depend on the leader choosing to report anything. Anything unreadable
 # leaves the field off entirely rather than guessing "met".
+#
+# An asynchronous leader is re-invoked to collect work it dispatched in an
+# earlier turn, and that turn dispatches nothing. It reads
+# `met_by_inflight_or_collected`, distinct from `met`, when this leader session
+# has a prior dispatch still in flight or a task that reached a terminal state
+# since this surface's previous turn_end.
 DELEGATION_FLOOR=""
 if [ "$MODE" = --end ] \
     && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
@@ -411,12 +417,23 @@ if [ "$MODE" = --end ] \
     && [ -r "$LOG_FILE" ] \
     && [ -r "$DISPATCH_BASELINE_FILE" ] \
     && command -v python3 >/dev/null 2>&1; then
-    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" <<'TURN_HOOK_MET' 2>/dev/null || true
+    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
-control_path, log_path, team, baseline_path = sys.argv[1:5]
+control_path, log_path, team, baseline_path, surface_id, leader_session = sys.argv[1:7]
+
+# Bounds the read behind the baseline of this turn, so a long-lived log never makes
+# Stop slow. Daemon GC rotates turns.log every six hours anyway.
+LOOKBACK_BYTES = 4 * 1024 * 1024
+# The app logs no terminal record for most dispatches (abandoned, cleaned up,
+# or from before lifecycle logging), so an unbounded "still in flight" would
+# exempt a leader forever. The longest observed dispatch-to-terminal span was
+# about 42 minutes.
+IN_FLIGHT_MAX_AGE_SECONDS = 2 * 60 * 60
+TERMINAL_TASK_STATUSES = {"completed", "review_ready", "failed", "blocked"}
 
 try:
     with open(control_path, "r", encoding="utf-8") as handle:
@@ -472,16 +489,23 @@ except Exception:
 if size < baseline:
     sys.exit(0)
 
+read_from = max(0, baseline - LOOKBACK_BYTES)
 try:
     # Binary, because a text-mode seek only accepts offsets tell() produced.
     with open(log_path, "rb") as handle:
-        handle.seek(baseline)
-        appended = handle.read().split(b"\n")
+        handle.seek(read_from)
+        chunks = handle.read().split(b"\n")
 except Exception:
     sys.exit(0)
 
-dispatched = 0
-for raw in appended:
+records = []
+offset = read_from
+for index, raw in enumerate(chunks):
+    line_offset = offset
+    offset += len(raw) + 1
+    # A lookback that starts mid-file starts mid-line.
+    if index == 0 and read_from > 0:
+        continue
     raw = raw.strip()
     if not raw:
         continue
@@ -489,17 +513,72 @@ for raw in appended:
         record = json.loads(raw)
     except Exception:
         continue
+    if isinstance(record, dict) and record.get("team") == team:
+        records.append((line_offset, record))
+
+dispatched = sum(
+    1
+    for line_offset, record in records
+    if line_offset >= baseline and record.get("event") == "task_dispatch"
+)
+if dispatched > 0:
+    print("met", end="")
+    sys.exit(0)
+
+
+def owned_by_this_leader(record):
+    if not leader_session:
+        return True
+    return record.get("leader_session_id") == leader_session
+
+
+def parse_ts(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+# Without a previous turn_end on this surface there is no "since", so only a
+# terminal record written during this turn counts as collected.
+previous_end = baseline
+for line_offset, record in records:
     if (
-        isinstance(record, dict)
-        and record.get("event") == "task_dispatch"
-        and record.get("team") == team
+        line_offset < baseline
+        and record.get("event") == "turn_end"
+        and record.get("surface_id") == surface_id
     ):
-        dispatched += 1
-print("met" if dispatched > 0 else "unmet", end="")
+        previous_end = line_offset
+
+now = datetime.now(timezone.utc)
+last_dispatch = {}
+last_terminal = {}
+collected = False
+for line_offset, record in records:
+    task_id = record.get("task_id")
+    if not isinstance(task_id, str) or not owned_by_this_leader(record):
+        continue
+    event = record.get("event")
+    if event == "task_dispatch" and line_offset < baseline:
+        dispatched_at = parse_ts(record.get("ts"))
+        if dispatched_at is not None and (now - dispatched_at).total_seconds() <= IN_FLIGHT_MAX_AGE_SECONDS:
+            last_dispatch[task_id] = line_offset
+        else:
+            last_dispatch.pop(task_id, None)
+    elif event == "task_lifecycle" and record.get("task_status") in TERMINAL_TASK_STATUSES:
+        last_terminal[task_id] = line_offset
+        if line_offset >= previous_end:
+            collected = True
+
+in_flight = any(
+    last_terminal.get(task_id, -1) < dispatch_offset
+    for task_id, dispatch_offset in last_dispatch.items()
+)
+print("met_by_inflight_or_collected" if collected or in_flight else "unmet", end="")
 TURN_HOOK_MET
 )"
     case "$DELEGATION_FLOOR" in
-        met|unmet) ;;
+        met|unmet|met_by_inflight_or_collected) ;;
         *) DELEGATION_FLOOR="" ;;
     esac
     rm -f "$DISPATCH_BASELINE_FILE" 2>/dev/null || true
