@@ -2815,7 +2815,8 @@ enum LeaderTurnCommands {
         #[arg(long = "task-shape")]
         task_shape: Option<String>,
         /// Authoritative worker-capacity snapshot for this turn. Omit it and
-        /// Omit when the roster is unavailable; unknown capacity always fails closed.
+        /// the roster count is read from the participation control file when
+        /// the app recorded one; unknown capacity always fails closed.
         #[arg(long = "available-workers")]
         available_workers: Option<u32>,
         /// A risk condition that applied to this turn. Repeatable; every
@@ -22306,10 +22307,9 @@ fn run_wait(
         None
     };
     macro_rules! finish_wait {
-        ($outcome:expr, $collected:expr) => {{
+        ($outcome:expr) => {{
             if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
                 append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
-                let _ = $collected;
             }
             return;
         }};
@@ -22699,7 +22699,7 @@ fn run_wait(
                     "{}",
                     pretty(&json!({ "result": { "team_name": team, "task": task_obj } }))
                 );
-                finish_wait!(wait_outcome_for_status(st), matches!(st, "blocked" | "review_ready" | "completed"));
+                finish_wait!(wait_outcome_for_status(st));
             }
         }
 
@@ -22713,7 +22713,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    finish_wait!("completed", true);
+                    finish_wait!("completed");
                 }
             }
             "msg" => {
@@ -22724,7 +22724,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    finish_wait!("completed", false);
+                    finish_wait!("completed");
                 }
             }
             "any" => {
@@ -22746,7 +22746,7 @@ fn run_wait(
                         }
                         println!("{}", pretty(&result));
                     }
-                    finish_wait!(outcome, true);
+                    finish_wait!(outcome);
                 }
                 if msg_done {
                     eprintln!("All agents have posted messages.");
@@ -22754,7 +22754,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    finish_wait!("completed", false);
+                    finish_wait!("completed");
                 }
             }
             "blocked" => {
@@ -22767,7 +22767,7 @@ fn run_wait(
                             "result": { "team_name": team, "items": inbox_blocked, "count": inbox_blocked.len() }
                         }))
                     );
-                    finish_wait!("blocked", true);
+                    finish_wait!("blocked");
                 }
             }
             "review_ready" => {
@@ -22783,7 +22783,7 @@ fn run_wait(
                             "result": { "team_name": team, "items": inbox_review, "count": inbox_review.len() }
                         }))
                     );
-                    finish_wait!("review_ready", true);
+                    finish_wait!("review_ready");
                 }
             }
             "idle" => {
@@ -22828,7 +22828,7 @@ fn run_wait(
                                     "result": { "team_name": team, "agents": idle_agents, "count": idle_count }
                                 }))
                             );
-                            finish_wait!("completed", false);
+                            finish_wait!("completed");
                         }
                     }
                 }
