@@ -546,14 +546,37 @@ if not leader_session:
 # task_collect and a completed leader_wait carry the ids actually observed.
 prior_dispatches = set()
 collected_ids = set()
+
+# A worker can outlive the 4 MiB lookback used for this turn's activity. Keep
+# the bounded window for collection evidence, but find this leader's earlier
+# dispatch ids across the current six-hour log generation. Most lines are not
+# dispatches, so avoid JSON parsing them before the byte prefilter matches.
+try:
+    session_bytes = leader_session.encode("utf-8")
+    with open(log_path, "rb") as handle:
+        for raw in handle:
+            if b'"task_dispatch"' not in raw or session_bytes not in raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except Exception:
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("team") == team
+                and record.get("event") == "task_dispatch"
+                and record.get("leader_session_id") == leader_session
+                and isinstance(record.get("task_id"), str)
+            ):
+                prior_dispatches.add(record["task_id"])
+except Exception:
+    pass
+
 for line_offset, record in records:
     task_id = record.get("task_id")
     if record.get("leader_session_id") != leader_session:
         continue
     event = record.get("event")
-    if event == "task_dispatch" and line_offset < baseline and isinstance(task_id, str):
-        prior_dispatches.add(task_id)
-        continue
     if line_offset < baseline:
         continue
     if event == "task_collect":
