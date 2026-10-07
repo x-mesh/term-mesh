@@ -256,7 +256,7 @@ Contents:
 
 Instructions are passed to `tm-agent delegate` as a single argument (RPC arg vector, no shell expansion). Wrap in double-quotes; do NOT use unquoted `$VAR` substitution.
 
-All `tm-agent delegate &` + `wait` MUST live inside ONE Bash tool call. Spawning across multiple Bash calls breaks parallelism because background processes belong to different shells.
+All `tm-agent delegate &` commands and their shell `wait` MUST live inside ONE Bash tool call. This dispatch barrier is separate from the leader's result wait.
 
 ```bash
 # double-quote + INSTR variable form (single-quote-safe)
@@ -270,13 +270,13 @@ wait
 
 > **주의**: `broadcast` + `tm-agent claim` 패턴은 claude-CLI 전용이며 codex/gemini/kiro 패널에서는 silent no-op. 반드시 `delegate` 개별 발행.
 
-### Step 3 — Sync barrier (= /team wait)
+### Step 3 — Result notification wait (= /team wait)
 
 ```bash
-tm-agent wait --timeout <timeout> --mode report  # = /team wait --timeout <n> --mode report
+tm-agent wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>
 ```
 
-timeout 만료 시에도 Step 4로 진행 (부분 결과 수렴).
+Claude Code에서는 Bash `run_in_background:true`로 이 명령을 시작한 뒤 acceptance check, unowned investigation, integration 준비를 계속하거나 짧은 interim status를 응답하고 turn을 끝낸다. 완료 notification이 leader를 다시 호출하면 Step 4를 수행한다. harness가 background command를 지원하지 않으면 leader-lane 작업을 먼저 끝낸 뒤 blocking wait를 사용한다. uncollected 결과에 의존하는 final answer나 완료 주장은 금지한다.
 
 ### Step 4 — Read & synthesize (= /team collect + leader synthesis)
 

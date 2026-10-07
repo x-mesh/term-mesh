@@ -163,6 +163,8 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         XCTAssertTrue(prompt.contains("tm-agent delegate"))
         XCTAssertTrue(prompt.contains("tm-agent status"))
         XCTAssertTrue(prompt.contains("tm-agent wait"))
+        XCTAssertTrue(prompt.contains("run_in_background:true"))
+        XCTAssertFalse(prompt.contains("MUST collect results before responding"))
     }
 
     /// The peer's socket, not this machine's — the leader runs over there.
@@ -198,7 +200,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertTrue(prompt.contains("State the concrete constraint when choosing it"))
             XCTAssertTrue(prompt.contains("at least two units are"))
             XCTAssertTrue(prompt.contains("direct, probe, or parallel"))
-            XCTAssertTrue(prompt.contains("\"route\": \"direct|probe|parallel\""))
+            XCTAssertTrue(prompt.contains("\"route\": \"direct|probe|parallel|delegated\""))
             XCTAssertTrue(prompt.contains("--worktree always --from <base_ref>"))
             XCTAssertTrue(prompt.contains("wait --mode any --tasks"))
             XCTAssertTrue(prompt.contains("at most once more"))

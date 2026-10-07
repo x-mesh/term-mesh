@@ -198,9 +198,9 @@ Read ALL agents' terminal output at once:
 tm-agent collect --lines 100
 \`\`\`
 
-Wait for all agents to post results (blocks until done):
+Start a task-scoped result wait in the background when the harness supports it (Claude Code Bash `run_in_background:true`); continue leader-lane work or return interim status until completion notification:
 \`\`\`bash
-tm-agent wait --timeout 120
+tm-agent wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>
 \`\`\`
 
 Wait for a blocked or review-ready item:
