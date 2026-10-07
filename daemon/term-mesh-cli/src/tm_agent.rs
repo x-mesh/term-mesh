@@ -9020,7 +9020,7 @@ fn main() {
                         "include_completed": include_completed,
                         "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
                     }),
-                ),
+                ).map(|value| { append_rcollect(&team, "task_get", &value); value }),
                 LeaderRequestCommands::Take { request_id } => rpc_call(
                     &sock,
                     "team.leader.request.take",
@@ -9669,7 +9669,7 @@ fn main() {
                     "team_name": team, "agent_name": agent_name, "lines": lines,
                     "agent_instance_id": agent_instance_id,
                 }),
-            )
+            ).map(|value| { append_rcollect(&team, "read", &value); value })
         }
         Commands::Collect {
             lines,
@@ -9678,7 +9678,7 @@ fn main() {
         } => {
             if headers || summary {
                 rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
-                    .map(|resp| compact_result_collect_response(resp, summary))
+                    .map(|resp| { append_rcollect(&team, "collect", &resp); compact_result_collect_response(resp, summary) })
             } else {
                 rpc_call(
                     &sock,
@@ -9686,11 +9686,12 @@ fn main() {
                     json!({
                         "team_name": team, "lines": lines,
                     }),
-                )
+                ).map(|value| { append_rcollect(&team, "collect", &value); value })
             }
         }
         Commands::Reports { headers, summary } => {
             rpc_call(&sock, "team.result.collect", json!({ "team_name": team })).map(|resp| {
+                append_rcollect(&team, "reports", &resp);
                 if headers || summary {
                     compact_result_collect_response(resp, summary)
                 } else {
@@ -19351,6 +19352,23 @@ fn append_turn_record(path: &Path, record: &Value) -> Result<(), String> {
         .map_err(|e| format!("append {}: {e}", path.display()))
 }
 
+fn rcollect_record(team: &str, via: &str, payload: &Value) -> Value {
+    let mut task_ids = Vec::new();
+    for path in ["/result/task/id", "/result/task_id"] {
+        if let Some(id) = payload.pointer(path).and_then(Value::as_str) { task_ids.push(id.to_string()); }
+    }
+    for path in ["/result/tasks", "/result/items", "/result/results"] {
+        if let Some(items) = payload.pointer(path).and_then(Value::as_array) { task_ids.extend(items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))); }
+    }
+    task_ids.sort(); task_ids.dedup();
+    let mut record = json!({"event":"task_collect","via":via,"task_ids":task_ids,"team":team,"ts":iso8601_utc_now()});
+    if let Some(session) = current_leader_session_id() { record["leader_session_id"] = json!(session); }
+    if let Some(turn_id) = turn_id_from_hook_state() { record["turn_id"] = json!(turn_id); }
+    record
+}
+
+fn append_rcollect(team: &str, via: &str, payload: &Value) { if let Ok(path) = turn_log_path() { let _ = append_turn_record(&path, &rcollect_record(team, via, payload)); } }
+
 /// `leader turn route` — record this turn's route and print what was written.
 ///
 /// A missing team is an explicit error here, unlike the harness hook that
@@ -25423,5 +25441,18 @@ mod worktree_availability_tests {
             WorktreePolicyArg::Auto,
             &wrapped
         ));
+    }
+}
+
+#[cfg(test)]
+mod rcollect_tests {
+    use super::*;
+    #[test]
+    fn rcollect_shape_and_evidence_events_are_ignored_by_health() {
+        let record = rcollect_record("p", "collect", &json!({"result":{"tasks":[{"id":"b"},{"id":"a"}]}}));
+        assert_eq!(record["event"], "task_collect"); assert_eq!(record["task_ids"], json!(["a","b"]));
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("turns.log");
+        fs::write(&path, b"{\"event\":\"leader_wait\"}\n{\"event\":\"task_collect\"}\n").unwrap();
+        assert_eq!(leader_participation_health(&path, "p", None).malformed_lines, 0);
     }
 }
