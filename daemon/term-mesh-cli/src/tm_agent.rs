@@ -22658,12 +22658,15 @@ fn run_wait(
                 );
                 if report_done {
                     eprintln!("All agents have reported results.");
+                    let outcome = if !inbox_blocked.is_empty() { "blocked" } else { "completed" };
                     if let Ok(r) =
                         rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
                     {
-                        println!("{}", pretty(&r));
+                        let mut result = r;
+                        result["result"]["outcome"] = json!(outcome);
+                        println!("{}", pretty(&result));
                     }
-                    finish_wait!(if !inbox_blocked.is_empty() { "blocked" } else { "completed" }, true);
+                    finish_wait!(outcome, true);
                 }
                 if msg_done {
                     eprintln!("All agents have posted messages.");
