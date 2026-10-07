@@ -22228,6 +22228,30 @@ fn run_wait(
         agent_filter.iter().cloned().collect::<Vec<_>>().join(",")
     };
     eprintln!("Waiting for agents in team '{team}' (timeout: {timeout}s, mode: {mode}, agents: {filter_label})...");
+    let wait_leader_session = current_leader_session_id();
+    let wait_log = if explicit_task_ids.is_some() || wait_leader_session.is_some() {
+        let task_ids = explicit_task_ids
+            .map(|ids| ids.iter().cloned().collect())
+            .or_else(|| task_id.map(|id| vec![id.to_string()]))
+            .unwrap_or_default();
+        let wait_id = wait_id();
+        let turn_id = turn_id_from_hook_state();
+        append_wait_record(team, &wait_id, "start", None, &task_ids, mode, timeout, wait_leader_session.as_deref(), turn_id.as_deref());
+        Some((wait_id, task_ids, wait_leader_session, turn_id))
+    } else {
+        None
+    };
+    macro_rules! finish_wait {
+        ($outcome:expr, $collected:expr) => {{
+            if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                if $collected {
+                    append_task_collect_record(team, "wait", task_ids);
+                }
+            }
+            return;
+        }};
+    }
 
     let needs_team_status = matches!(mode, "report" | "msg" | "any");
     let team_status = if needs_team_status {
@@ -22235,6 +22259,9 @@ fn run_wait(
             Ok(response) => Some(response),
             Err(error) => {
                 eprintln!("wait: could not inspect team '{team}': {error}");
+                if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                    append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                }
                 process::exit(1);
             }
         }
@@ -22272,25 +22299,6 @@ fn run_wait(
     // subscribing or polling and point callers to the tracked healthcheck.
     let (mut initial_task_ids, explicit_task_scope) =
         initialize_wait_task_scope(explicit_task_ids, task_id);
-    let wait_log = explicit_task_ids.map(|ids| {
-        let task_ids: Vec<String> = ids.iter().cloned().collect();
-        let wait_id = wait_id();
-        let leader_session_id = current_leader_session_id();
-        let turn_id = turn_id_from_hook_state();
-        append_wait_record(team, &wait_id, "start", None, &task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
-        (wait_id, task_ids, leader_session_id, turn_id)
-    });
-    macro_rules! finish_wait {
-        ($outcome:expr, $collected:expr) => {{
-            if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
-                append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
-                if $collected {
-                    append_task_collect_record(team, "wait", task_ids);
-                }
-            }
-            return;
-        }};
-    }
     let mut initial_tracked_agents = std::collections::HashSet::new();
     if matches!(mode, "report" | "any") && initial_task_ids.is_empty() {
         if let Some(agents) = status_agents {
@@ -22316,6 +22324,9 @@ fn run_wait(
             eprintln!(
                 "wait: mode '{mode}' has no task or correlation to track; plain broadcast replies cannot be matched. Use 'tm-agent warmup' for ping/pong healthchecks, 'tm-agent fan-out' for tracked work, or pass --tasks <ids>."
             );
+            if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+            }
             process::exit(1);
         }
     }
@@ -22757,6 +22768,9 @@ fn run_wait(
             }
             _ => {
                 eprintln!("Unknown wait mode: {mode}");
+                if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                    append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                }
                 process::exit(1);
             }
         }
