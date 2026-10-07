@@ -200,6 +200,17 @@ final class AgentSessionTests: XCTestCase {
         )
     }
 
+    func testSharedWorktreeBranchUsesDisjointNamespace() {
+        let shared = TeamOrchestrator.sharedWorktreeBranch(teamName: "My Team!")
+        let isolated = TeamOrchestrator.isolatedWorktreeBranch(
+            teamName: "My Team!", agentName: "executor", agentInstanceId: "instance-1"
+        )
+
+        XCTAssertEqual(shared, "team-shared/my-team")
+        XCTAssertFalse(shared.hasPrefix(isolated + "/"))
+        XCTAssertFalse(isolated.hasPrefix(shared + "/"))
+    }
+
     func testIsolatedProvisioningRollsBackPartialSuccessAndStops() {
         var attempted: [String] = []
         var rolledBack: [String] = []
