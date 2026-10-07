@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.267.1] - 2026-10-07
+
+### Fixed
+
+- The app no longer crashes when the screen changes after you closed terminal panes. A closed pane's view could keep its drawing layer, and a later screen change, such as the display going to sleep, made the app draw through memory that the pane had already freed. One app crashed 95 minutes after the panes closed.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.267.0] - 2026-10-06
 
 ### Added
