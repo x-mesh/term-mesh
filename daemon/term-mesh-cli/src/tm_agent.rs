@@ -22272,6 +22272,23 @@ fn run_wait(
     // subscribing or polling and point callers to the tracked healthcheck.
     let (mut initial_task_ids, explicit_task_scope) =
         initialize_wait_task_scope(explicit_task_ids, task_id);
+    let wait_log = explicit_task_ids.map(|ids| {
+        let task_ids: Vec<String> = ids.iter().cloned().collect();
+        let wait_id = wait_id();
+        append_wait_record(team, &wait_id, "start", None, &task_ids, mode, timeout);
+        (wait_id, task_ids)
+    });
+    macro_rules! finish_wait {
+        ($outcome:expr, $collected:expr) => {{
+            if let Some((wait_id, task_ids)) = &wait_log {
+                append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout);
+                if $collected {
+                    append_task_collect_record(team, "wait", task_ids);
+                }
+            }
+            return;
+        }};
+    }
     let mut initial_tracked_agents = std::collections::HashSet::new();
     if matches!(mode, "report" | "any") && initial_task_ids.is_empty() {
         if let Some(agents) = status_agents {
@@ -22607,7 +22624,7 @@ fn run_wait(
                     "{}",
                     pretty(&json!({ "result": { "team_name": team, "task": task_obj } }))
                 );
-                return;
+                finish_wait!(wait_outcome_for_status(st), matches!(st, "blocked" | "review_ready" | "completed"));
             }
         }
 
@@ -22621,7 +22638,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    return;
+                    finish_wait!("completed", true);
                 }
             }
             "msg" => {
@@ -22632,7 +22649,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    return;
+                    finish_wait!("completed", false);
                 }
             }
             "any" => {
@@ -22646,7 +22663,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    return;
+                    finish_wait!(if !inbox_blocked.is_empty() { "blocked" } else { "completed" }, true);
                 }
                 if msg_done {
                     eprintln!("All agents have posted messages.");
@@ -22654,7 +22671,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    return;
+                    finish_wait!("completed", false);
                 }
             }
             "blocked" => {
@@ -22667,7 +22684,7 @@ fn run_wait(
                             "result": { "team_name": team, "items": inbox_blocked, "count": inbox_blocked.len() }
                         }))
                     );
-                    return;
+                    finish_wait!("blocked", true);
                 }
             }
             "review_ready" => {
@@ -22683,7 +22700,7 @@ fn run_wait(
                             "result": { "team_name": team, "items": inbox_review, "count": inbox_review.len() }
                         }))
                     );
-                    return;
+                    finish_wait!("review_ready", true);
                 }
             }
             "idle" => {
@@ -22728,7 +22745,7 @@ fn run_wait(
                                     "result": { "team_name": team, "agents": idle_agents, "count": idle_count }
                                 }))
                             );
-                            return;
+                            finish_wait!("completed", false);
                         }
                     }
                 }
@@ -22765,7 +22782,42 @@ fn run_wait(
     if let Ok(r) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
         println!("{}", pretty(&r));
     }
+    if let Some((wait_id, task_ids)) = &wait_log {
+        append_wait_record(team, wait_id, "end", Some("timeout"), task_ids, mode, timeout);
+    }
     process::exit(1);
+}
+
+fn wait_id() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let pid = process::id() as u128;
+    format!("{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}", (nanos >> 96) as u32, (nanos >> 80) as u16, ((nanos >> 68) as u16) & 0x0fff, ((nanos >> 56) as u16) & 0x0fff, (nanos ^ pid) & 0xffffffffffff)
+}
+
+fn wait_outcome_for_status(status: &str) -> &'static str {
+    match status {
+        "blocked" => "blocked",
+        "review_ready" => "review_ready",
+        "completed" => "completed",
+        _ => "error",
+    }
+}
+
+fn append_wait_record(team: &str, wait_id: &str, phase: &str, outcome: Option<&str>, task_ids: &[String], mode: &str, timeout: u32) {
+    let Ok(path) = turn_log_path() else { return };
+    let mut record = json!({"event":"leader_wait","phase":phase,"wait_id":wait_id,"task_ids":task_ids,"mode":mode,"timeout_s":timeout,"team":team,"ts":iso8601_utc_now()});
+    if let Some(outcome) = outcome { record["outcome"] = json!(outcome); }
+    if let Some(session) = current_leader_session_id() { record["leader_session_id"] = json!(session); }
+    if let Some(turn_id) = turn_id_from_hook_state() { record["turn_id"] = json!(turn_id); }
+    let _ = append_turn_record(&path, &record);
+}
+
+fn append_task_collect_record(team: &str, via: &str, task_ids: &[String]) {
+    let Ok(path) = turn_log_path() else { return };
+    let mut record = json!({"event":"task_collect","via":via,"task_ids":task_ids,"team":team,"ts":iso8601_utc_now()});
+    if let Some(session) = current_leader_session_id() { record["leader_session_id"] = json!(session); }
+    if let Some(turn_id) = turn_id_from_hook_state() { record["turn_id"] = json!(turn_id); }
+    let _ = append_turn_record(&path, &record);
 }
 
 #[cfg(test)]
@@ -22801,6 +22853,19 @@ mod wait_task_scope_tests {
         assert!(!is_explicit);
         assert!(scope.is_empty());
         assert!(should_discover_wait_tasks(is_explicit, false, true));
+    }
+}
+
+#[cfg(test)]
+mod rwait_tests {
+    use super::*;
+
+    #[test]
+    fn maps_terminal_task_statuses_to_wait_outcomes() {
+        assert_eq!(wait_outcome_for_status("completed"), "completed");
+        assert_eq!(wait_outcome_for_status("review_ready"), "review_ready");
+        assert_eq!(wait_outcome_for_status("blocked"), "blocked");
+        assert_eq!(wait_outcome_for_status("failed"), "error");
     }
 }
 
