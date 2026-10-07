@@ -26,6 +26,64 @@ final class CodexLeaderWakeTests: XCTestCase {
         XCTAssertFalse(CodexLeaderWake.isCodexLeader(leaderMode: "repl", leaderCli: "codex"))
     }
 
+    func testATeamWakesOnlyWhenItsLeaderWasToldSoAtCreation() throws {
+        let suite = "CodexLeaderWakeTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func wakes(_ injected: Bool, _ mode: String, _ cli: String? = nil) -> Bool {
+            CodexLeaderWake.newTeamWakes(
+                leaderPromptInjected: injected, leaderMode: mode, leaderCli: cli, defaults: defaults
+            )
+        }
+        XCTAssertFalse(wakes(true, "codex"), "setting off at creation")
+        defaults.set(true, forKey: CodexLeaderWake.enabledKey)
+        XCTAssertTrue(wakes(true, "codex"))
+        XCTAssertFalse(wakes(false, "codex"), "no prompt was written, so no wake was promised")
+        XCTAssertFalse(wakes(true, "claude"))
+        XCTAssertFalse(wakes(false, "adopted", "codex"))
+    }
+
+    func testDeliveryFollowsTheTeamSnapshotNotTheLiveSetting() {
+        XCTAssertTrue(CodexLeaderWake.shouldDeliver(
+            teamWakes: true, leaderReady: true, leaderMode: "codex", leaderCli: nil
+        ))
+        XCTAssertFalse(CodexLeaderWake.shouldDeliver(
+            teamWakes: false, leaderReady: true, leaderMode: "codex", leaderCli: nil
+        ))
+        XCTAssertFalse(CodexLeaderWake.shouldDeliver(
+            teamWakes: true, leaderReady: false, leaderMode: "codex", leaderCli: nil
+        ))
+        XCTAssertFalse(CodexLeaderWake.shouldDeliver(
+            teamWakes: true, leaderReady: true, leaderMode: "claude", leaderCli: nil
+        ))
+    }
+
+    func testOnlyTeamsWithTheSnapshotCollectWakes() {
+        var state = CodexLeaderWakeState()
+        XCTAssertFalse(state.note(teamName: "mine", taskId: "ab12", status: "completed"))
+        state.setTeamWakes("mine", true)
+        XCTAssertTrue(state.note(teamName: "mine", taskId: "ab12", status: "completed"))
+        XCTAssertFalse(state.note(teamName: "other", taskId: "cd34", status: "completed"))
+        XCTAssertEqual(
+            state.flushLine(teamName: "mine"),
+            "[term-mesh] task ab12 completed — run tm-agent collect --headers"
+        )
+        XCTAssertNil(state.flushLine(teamName: "other"))
+    }
+
+    func testFlushRechecksTheTeamAfterTheCoalesceWindow() {
+        var state = CodexLeaderWakeState()
+        state.setTeamWakes("mine", true)
+        XCTAssertTrue(state.note(teamName: "mine", taskId: "ab12", status: "completed"))
+        state.setTeamWakes("mine", false)
+        XCTAssertNil(state.flushLine(teamName: "mine"))
+        state.setTeamWakes("mine", true)
+        XCTAssertTrue(
+            state.note(teamName: "mine", taskId: "ab12", status: "completed"),
+            "a recreated team starts with fresh dedupe"
+        )
+    }
+
     func testAnnouncesEachTaskStatusOnce() {
         var batch = CodexLeaderWakeBatch()
         XCTAssertTrue(batch.admit(taskId: "ab12", status: "completed"))
@@ -100,6 +158,15 @@ final class CodexLeaderWakeTests: XCTestCase {
             arguments: ["codex", "-m", "gpt-5", "queue", "--thread", "x"]
         ))
         XCTAssertFalse(CodexLeaderThreadLocator.isCodexService(arguments: ["codex", "--", "queue"]))
+        for subcommand in ["exec", "e", "review", "mcp-server", "exec-server", "apply"] {
+            XCTAssertTrue(
+                CodexLeaderThreadLocator.isCodexService(arguments: ["codex", "-m", "gpt-5", subcommand, "x"]),
+                subcommand
+            )
+        }
+        XCTAssertFalse(CodexLeaderThreadLocator.isCodexService(arguments: ["codex", "resume", "--last"]))
+        XCTAssertFalse(CodexLeaderThreadLocator.isCodexService(arguments: ["codex", "fork", "--last"]))
+        XCTAssertFalse(CodexLeaderThreadLocator.isCodexService(arguments: ["codex", "explain the exec path"]))
         XCTAssertFalse(CodexLeaderThreadLocator.isCodexService(arguments: ["codex", "--unknown", "queue"]))
     }
 

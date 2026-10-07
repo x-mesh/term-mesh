@@ -589,6 +589,10 @@ final class TeamOrchestrator: ObservableObject {
         /// to launch. A placeholder pane may exist locally, but it must never
         /// receive leader instructions as if it were a running CLI.
         var leaderReady: Bool = true
+        /// Snapshot of `CodexLeaderWake.enabledKey` taken when the leader
+        /// prompt was written. The prompt and the wakes both read this, never
+        /// the live setting, so they cannot disagree.
+        var codexLeaderWake: Bool = false
         var leaderFailureDescription: String? = nil
         /// Remote worker attach failures survive after the async callback so
         /// socket/UI observers do not mistake an empty roster for "still starting".
@@ -3772,6 +3776,13 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderPolicyState = Self.supportsLeaderTurnMeasurement(cli: leaderMode) ? "injected" : "pending"
         team.leaderMeasurementCapability = Self.supportsLeaderTurnMeasurement(cli: leaderMode)
             && leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? .supported : .unsupported
+        team.codexLeaderWake = CodexLeaderWake.newTeamWakes(
+            leaderPromptInjected: Self.shouldInjectLocalLeaderPrompt(
+                launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
+            ),
+            leaderMode: leaderMode, leaderCli: team.leaderCli
+        )
+        CodexLeaderWake.shared.setTeamWakes(teamName: name, wakes: team.codexLeaderWake)
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
         TeamDataStore.shared.registerTeam(
@@ -5275,10 +5286,7 @@ final class TeamOrchestrator: ObservableObject {
             worktreeSection: topologySection + worktreeSection,
             tmAgent: tmAgent,
             socketPath: socketPath,
-            codexLeaderWake: Self.nonClaudeLeaderWakesOnResults(
-                leaderMode: teams[teamName]?.leaderMode ?? "",
-                leaderCli: teams[teamName]?.leaderCli
-            )
+            codexLeaderWake: teams[teamName]?.codexLeaderWake ?? false
         )
     }
 

@@ -14,6 +14,11 @@ import Foundation
 final class CodexLeaderWake: @unchecked Sendable {
     static let shared = CodexLeaderWake()
 
+    /// Read once per team, when the team is created and its Codex leader
+    /// prompt is written. Changing it affects only teams created afterwards:
+    /// a team keeps the behaviour its leader was told about, so a leader told
+    /// to end its turn always gets the wake, and a leader told to wait in the
+    /// foreground never gets one.
     static let enabledKey = "teamLeaderWake.codex.enabled"
 
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
@@ -23,6 +28,26 @@ final class CodexLeaderWake: @unchecked Sendable {
     static func isCodexLeader(leaderMode: String, leaderCli: String?) -> Bool {
         if leaderMode.lowercased() == "codex" { return true }
         return leaderMode == "adopted" && leaderCli?.lowercased() == "codex"
+    }
+
+    /// The per-team snapshot. Only a leader whose prompt term-mesh writes at
+    /// creation can be told that a wake will come.
+    static func newTeamWakes(
+        leaderPromptInjected: Bool,
+        leaderMode: String,
+        leaderCli: String?,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        leaderPromptInjected
+            && isEnabled(defaults: defaults)
+            && isCodexLeader(leaderMode: leaderMode, leaderCli: leaderCli)
+    }
+
+    /// Checked on the main actor right before delivery, against the live team.
+    static func shouldDeliver(
+        teamWakes: Bool, leaderReady: Bool, leaderMode: String, leaderCli: String?
+    ) -> Bool {
+        teamWakes && leaderReady && isCodexLeader(leaderMode: leaderMode, leaderCli: leaderCli)
     }
 
     /// Workers that finish together, such as one parallel wave, produce one
@@ -36,15 +61,20 @@ final class CodexLeaderWake: @unchecked Sendable {
     private let deliveryQueue = DispatchQueue(
         label: "com.termmesh.codex-leader-wake.delivery", qos: .utility
     )
-    private var batches: [String: CodexLeaderWakeBatch] = [:]
+    private var state = CodexLeaderWakeState()
     private var flushScheduled: Set<String> = []
+
+    /// Records the team's snapshot. Team creation always calls this, so a
+    /// reused team name never inherits the previous team's answer.
+    func setTeamWakes(teamName: String, wakes: Bool) {
+        stateQueue.async { [self] in
+            state.setTeamWakes(teamName, wakes)
+        }
+    }
 
     func noteTaskStatus(teamName: String, taskId: String, status: String) {
         stateQueue.async { [self] in
-            guard Self.isEnabled() else { return }
-            guard batches[teamName, default: CodexLeaderWakeBatch()]
-                .admit(taskId: taskId, status: status)
-            else { return }
+            guard state.note(teamName: teamName, taskId: taskId, status: status) else { return }
             guard flushScheduled.insert(teamName).inserted else { return }
             stateQueue.asyncAfter(deadline: .now() + Self.coalesceWindow) { [self] in
                 flush(teamName: teamName)
@@ -54,13 +84,13 @@ final class CodexLeaderWake: @unchecked Sendable {
 
     private func flush(teamName: String) {
         flushScheduled.remove(teamName)
-        guard let events = batches[teamName]?.drain(),
-              let line = CodexLeaderWakeBatch.wakeLine(for: events)
-        else { return }
+        guard let line = state.flushLine(teamName: teamName) else { return }
         Task { @MainActor in
             guard let team = TeamOrchestrator.shared.teams[teamName],
-                  team.leaderReady,
-                  Self.isCodexLeader(leaderMode: team.leaderMode, leaderCli: team.leaderCli)
+                  Self.shouldDeliver(
+                      teamWakes: team.codexLeaderWake, leaderReady: team.leaderReady,
+                      leaderMode: team.leaderMode, leaderCli: team.leaderCli
+                  )
             else { return }
             var isPeer = false
             if case .peer = team.leaderEndpoint { isPeer = true }
@@ -117,6 +147,37 @@ final class CodexLeaderWake: @unchecked Sendable {
             return false
         }
         return process.terminationStatus == 0
+    }
+}
+
+/// Which teams wake, and what each is waiting to say.
+struct CodexLeaderWakeState {
+    private var wakingTeams: Set<String> = []
+    private var batches: [String: CodexLeaderWakeBatch] = [:]
+
+    mutating func setTeamWakes(_ teamName: String, _ wakes: Bool) {
+        if wakes {
+            wakingTeams.insert(teamName)
+        } else {
+            wakingTeams.remove(teamName)
+            batches[teamName] = nil
+        }
+    }
+
+    /// True when the team wakes and this (task, status) pair is new.
+    mutating func note(teamName: String, taskId: String, status: String) -> Bool {
+        guard wakingTeams.contains(teamName) else { return false }
+        return batches[teamName, default: CodexLeaderWakeBatch()]
+            .admit(taskId: taskId, status: status)
+    }
+
+    /// Re-checks the team at flush time: one that stopped waking during the
+    /// coalesce window sends nothing.
+    mutating func flushLine(teamName: String) -> String? {
+        guard let events = batches[teamName]?.drain(), wakingTeams.contains(teamName) else {
+            return nil
+        }
+        return CodexLeaderWakeBatch.wakeLine(for: events)
     }
 }
 
@@ -209,7 +270,7 @@ enum CodexLeaderThreadLocator {
             for threadId in threadIds(inOpenPaths: openVnodePaths(pid: pid)) {
                 targets.append(Target(
                     threadId: threadId,
-                    executable: image.executable.isEmpty ? nil : image.executable,
+                    executable: executablePath(pid: pid),
                     codexHome: image.environment["CODEX_HOME"]
                 ))
             }
@@ -247,17 +308,28 @@ enum CodexLeaderThreadLocator {
         "--worktree", "--search", "--no-alt-screen", "--no-daemon", "-h", "--help",
         "-V", "--version",
     ]
+    /// Every `codex` subcommand (codex-cli 0.160) except `resume` and `fork`,
+    /// which reopen an interactive session. `exec` matters most: a leader can
+    /// run it as a tool, the child inherits the pane's TERMMESH_SURFACE_ID, and
+    /// it holds a writer lock for a thread that is not the leader's.
+    private static let nonInteractiveSubcommands: Set<String> = [
+        "agents", "exec", "e", "review", "login", "logout", "mcp", "mcp-server", "plugin",
+        "app-server", "remote-control", "app", "completion", "update", "doctor", "sandbox",
+        "debug", "apply", "a", "queue", "archive", "delete", "migrate-rollouts", "unarchive",
+        "cloud", "exec-server", "features", "help",
+    ]
 
-    /// `codex app-server` and `codex queue` also hold thread locks but are
-    /// services, not the interactive session. Mirrors x-kit relay
-    /// `isCodexService`: the first positional argument names the subcommand.
+    /// True for a `codex` process that is not an interactive session: a
+    /// service such as `app-server` or `queue`, or a one-shot command such as
+    /// `exec`. Option parsing mirrors x-kit relay `isCodexService`; a first
+    /// positional that is not a subcommand is the TUI's initial prompt.
     static func isCodexService(arguments: [String]) -> Bool {
         var index = 1
         while index < arguments.count {
             let argument = arguments[index]
             if argument == "--" { return false }
             if !argument.hasPrefix("-") {
-                return argument == "app-server" || argument == "queue"
+                return nonInteractiveSubcommands.contains(argument)
             }
             let shortOption = String(argument.prefix(2))
             let option = valueOptions.contains(shortOption)
@@ -320,6 +392,16 @@ enum CodexLeaderThreadLocator {
             guard proc_name(pid, &name, UInt32(name.count)) > 0 else { return false }
             return String(cString: name) == "codex"
         }
+    }
+
+    /// The kernel's record of the executable. argv[0] and the exec path in
+    /// `KERN_PROCARGS2` live in memory the process itself can rewrite.
+    private static func executablePath(pid: pid_t) -> String? {
+        // PROC_PIDPATHINFO_MAXSIZE is a macro Swift does not import.
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        let path = String(cString: buffer)
+        return path.isEmpty ? nil : path
     }
 
     private static func processImage(pid: pid_t) -> ProcessImage? {
