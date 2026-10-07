@@ -1807,8 +1807,10 @@ enum Commands {
         force: bool,
     },
     /// Wait for agent signals (report, msg, blocked, review_ready, idle, any).
-    /// any requires a tracked task and succeeds when its report completes or
-    /// a message arrives; use msg for uncorrelated messages.
+    /// any requires a tracked task and ends once every tracked task has
+    /// settled (completed, review_ready, blocked, failed, cancelled). Only
+    /// without --tasks/--task does a message from every agent end it too;
+    /// use msg for uncorrelated messages.
     Wait {
         #[arg(long, default_value_t = 120)]
         timeout: u32,
@@ -22275,6 +22277,53 @@ fn should_discover_wait_tasks(
     !explicit_task_scope && (!tracked_initialized || tracked_agents_empty)
 }
 
+/// Statuses after which the worker no longer works on the task, so a wait
+/// scoped to it has nothing left to wait for. Leaving `failed` out made a
+/// wait run to its timeout whenever one tracked task failed.
+fn wait_task_settled(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "review_ready" | "blocked" | "failed" | "cancelled"
+    )
+}
+
+/// Messages carry no task correlation. When the caller named the tasks it is
+/// waiting for, an interim report from every agent says nothing about them and
+/// must not end the wait.
+fn messages_end_any_wait(explicit_task_scope: bool) -> bool {
+    !explicit_task_scope
+}
+
+/// The one word the leader branches on. A blocked task needs the leader before
+/// anything else, a failed one needs a decision, and only without either is
+/// the wave done.
+fn wait_report_outcome<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'static str {
+    let mut failed = false;
+    for status in statuses {
+        match status {
+            "blocked" => return "blocked",
+            "failed" => failed = true,
+            _ => {}
+        }
+    }
+    if failed { "failed" } else { "completed" }
+}
+
+/// Tracked tasks a timed-out wait should be re-armed for. A task the list never
+/// returned is still pending: absence is not completion.
+fn wait_pending_tasks(
+    tracked: &std::collections::HashSet<String>,
+    statuses: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut pending: Vec<String> = tracked
+        .iter()
+        .filter(|id| !statuses.get(*id).is_some_and(|status| wait_task_settled(status)))
+        .cloned()
+        .collect();
+    pending.sort();
+    pending
+}
+
 fn run_wait(
     sock: &PathBuf,
     team: &str,
@@ -22315,6 +22364,10 @@ fn run_wait(
         }};
     }
 
+    let (mut initial_task_ids, explicit_task_scope) =
+        initialize_wait_task_scope(explicit_task_ids, task_id);
+    let track_messages =
+        mode == "msg" || (mode == "any" && messages_end_any_wait(explicit_task_scope));
     let needs_team_status = matches!(mode, "report" | "msg" | "any");
     let team_status = if needs_team_status {
         match rpc_call(sock, "team.status", json!({ "team_name": team })) {
@@ -22333,7 +22386,7 @@ fn run_wait(
     let status_agents = team_status
         .as_ref()
         .and_then(|response| response["result"]["agents"].as_array());
-    let agent_names: Vec<String> = if mode == "msg" || mode == "any" {
+    let agent_names: Vec<String> = if track_messages {
         status_agents
             .into_iter()
             .flatten()
@@ -22343,7 +22396,7 @@ fn run_wait(
     } else {
         Vec::new()
     };
-    let message_baseline: std::collections::HashSet<String> = if mode == "msg" || mode == "any" {
+    let message_baseline: std::collections::HashSet<String> = if track_messages {
         rpc_call(sock, "team.message.list", json!({ "team_name": team }))
             .ok()
             .and_then(|response| response["result"]["messages"].as_array().cloned())
@@ -22359,8 +22412,6 @@ fn run_wait(
     // A plain broadcast has no task or correlation ID, so waiting for it used
     // to consume the entire timeout while displaying report=0/0. Fail before
     // subscribing or polling and point callers to the tracked healthcheck.
-    let (mut initial_task_ids, explicit_task_scope) =
-        initialize_wait_task_scope(explicit_task_ids, task_id);
     let mut initial_tracked_agents = std::collections::HashSet::new();
     if matches!(mode, "report" | "any") && initial_task_ids.is_empty() {
         if let Some(agents) = status_agents {
@@ -22446,6 +22497,10 @@ fn run_wait(
     // the result.status fallback so it doesn't count team members who were never
     // delegated to in this round (the root cause of wait hangs on partial fan-out).
     let mut tracked_agents = initial_tracked_agents;
+    // Last status seen per tracked task: the outcome word and the timeout
+    // report come from here, not from another round of RPCs.
+    let mut tracked_statuses: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     while elapsed < timeout {
         if current_interval > 0 {
             // B1: push channel replaces sleep. Decay toward interval deadline in
@@ -22529,17 +22584,18 @@ fn run_wait(
                 if let Ok(r) = rpc_call(sock, "team.task.list", json!({ "team_name": team })) {
                     if let Some(tasks) = r["result"]["tasks"].as_array() {
                         let total = tracked_task_ids.len() as u64;
-                        let done = tasks
-                            .iter()
-                            .filter(|t| {
-                                let tid = t["id"].as_str().unwrap_or("");
-                                tracked_task_ids.contains(tid)
-                                    && matches!(
-                                        t["status"].as_str(),
-                                        Some("completed") | Some("review_ready") | Some("blocked")
-                                    )
-                            })
-                            .count() as u64;
+                        let mut done = 0u64;
+                        for task in tasks {
+                            let tid = task["id"].as_str().unwrap_or("");
+                            if !tracked_task_ids.contains(tid) {
+                                continue;
+                            }
+                            let status = task["status"].as_str().unwrap_or("");
+                            tracked_statuses.insert(tid.to_string(), status.to_string());
+                            if wait_task_settled(status) {
+                                done += 1;
+                            }
+                        }
                         report_done = total > 0 && done >= total;
                         report_progress = format!("{done}/{total}");
                     }
@@ -22569,7 +22625,7 @@ fn run_wait(
             }
         }
 
-        if mode == "msg" || mode == "any" {
+        if track_messages {
             match rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
                 Ok(r) => {
                     if let Some(messages) = r["result"]["messages"].as_array() {
@@ -22713,7 +22769,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    finish_wait!("completed");
+                    finish_wait!(wait_report_outcome(tracked_statuses.values().map(String::as_str)));
                 }
             }
             "msg" => {
@@ -22728,12 +22784,20 @@ fn run_wait(
                 }
             }
             "any" => {
-                eprintln!(
-                    "  [{elapsed}/{timeout}s] report={report_progress} msg={msg_progress} (any)"
-                );
+                if track_messages {
+                    eprintln!(
+                        "  [{elapsed}/{timeout}s] report={report_progress} msg={msg_progress} (any)"
+                    );
+                } else {
+                    eprintln!("  [{elapsed}/{timeout}s] report={report_progress} (any, tasks)");
+                }
                 if report_done {
-                    eprintln!("All agents have reported results.");
-                    let outcome = if !inbox_blocked.is_empty() { "blocked" } else { "completed" };
+                    let outcome = if !inbox_blocked.is_empty() {
+                        "blocked"
+                    } else {
+                        wait_report_outcome(tracked_statuses.values().map(String::as_str))
+                    };
+                    eprintln!("All tracked tasks have settled: {outcome}.");
                     if let Ok(r) =
                         rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
                     {
@@ -22865,7 +22929,22 @@ fn run_wait(
     }
 
     eprintln!("Timeout: not all agents reported within {timeout}s");
-    if let Ok(r) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
+    if tracked_initialized && !tracked_task_ids.is_empty() {
+        // The leader re-arms for `pending` only; a team-wide result.status
+        // would hand it other waits' tasks.
+        let pending = wait_pending_tasks(&tracked_task_ids, &tracked_statuses);
+        let mut tasks: Vec<Value> = tracked_task_ids
+            .iter()
+            .map(|id| json!({ "id": id, "status": tracked_statuses.get(id) }))
+            .collect();
+        tasks.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        println!(
+            "{}",
+            pretty(&json!({
+                "result": { "team_name": team, "outcome": "timeout", "tasks": tasks, "pending": pending }
+            }))
+        );
+    } else if let Ok(r) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
         println!("{}", pretty(&r));
     }
     if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
@@ -22885,6 +22964,7 @@ fn wait_outcome_for_status(status: &str) -> &'static str {
         "blocked" => "blocked",
         "review_ready" => "review_ready",
         "completed" => "completed",
+        "failed" => "failed",
         _ => "error",
     }
 }
@@ -22935,6 +23015,49 @@ mod wait_task_scope_tests {
 }
 
 #[cfg(test)]
+mod wait_any_scope_tests {
+    use super::*;
+
+    #[test]
+    fn failed_and_cancelled_tasks_settle_a_tracked_wait() {
+        for status in ["completed", "review_ready", "blocked", "failed", "cancelled"] {
+            assert!(wait_task_settled(status), "{status}");
+        }
+        for status in ["pending", "assigned", "in_progress", ""] {
+            assert!(!wait_task_settled(status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn messages_end_any_only_without_a_task_scope() {
+        assert!(!messages_end_any_wait(true));
+        assert!(messages_end_any_wait(false));
+    }
+
+    #[test]
+    fn blocked_outranks_failed_outranks_completed() {
+        assert_eq!(wait_report_outcome(["completed", "completed"]), "completed");
+        assert_eq!(wait_report_outcome(["completed", "failed"]), "failed");
+        assert_eq!(wait_report_outcome(["failed", "blocked", "completed"]), "blocked");
+        assert_eq!(wait_report_outcome(std::iter::empty::<&str>()), "completed");
+    }
+
+    #[test]
+    fn timeout_reports_tracked_tasks_that_have_not_settled() {
+        let tracked = std::collections::HashSet::from([
+            "done".to_string(),
+            "running".to_string(),
+            "unseen".to_string(),
+        ]);
+        let statuses = std::collections::HashMap::from([
+            ("done".to_string(), "failed".to_string()),
+            ("running".to_string(), "in_progress".to_string()),
+        ]);
+        assert_eq!(wait_pending_tasks(&tracked, &statuses), vec!["running", "unseen"]);
+    }
+}
+
+#[cfg(test)]
 mod rwait_tests {
     use super::*;
 
@@ -22943,7 +23066,8 @@ mod rwait_tests {
         assert_eq!(wait_outcome_for_status("completed"), "completed");
         assert_eq!(wait_outcome_for_status("review_ready"), "review_ready");
         assert_eq!(wait_outcome_for_status("blocked"), "blocked");
-        assert_eq!(wait_outcome_for_status("failed"), "error");
+        assert_eq!(wait_outcome_for_status("failed"), "failed");
+        assert_eq!(wait_outcome_for_status("abandoned"), "error");
     }
 }
 
