@@ -871,10 +871,8 @@ if last_end.get("delegation_floor") != "met":
 PY
 
 # An asynchronous leader is re-invoked to collect work it dispatched in an
-# earlier turn. That turn dispatches nothing, and it was blocked as if the
-# leader had done the work itself. Work this leader session already has out —
-# still in flight, or finished since the previous turn — satisfies the floor
-# under its own name; work that is stale or another session's does not.
+# earlier turn. A no-dispatch turn is exempt only when it explicitly records
+# collection of that session's prior task.
 ASYNC_HOME="$TEST_TMP/async"
 ASYNC_CTL="$TEST_TMP/async-ctl"
 mkdir -p "$ASYNC_HOME/.term-mesh/logs" "$ASYNC_CTL" || exit 1
@@ -951,28 +949,58 @@ async_hook --end '{"session_id":"async-dispatch"}' >/dev/null \
     || fail "async dispatch end returned nonzero"
 async_floor met "dispatching turn"
 
-# Turn 2: the user asks something while both workers run.
+# Turn 2: the user asks something while both workers run. In-flight work alone
+# must not exempt unrelated direct work.
 ASYNC_OUT=$(async_turn inflight)
-async_floor met_by_inflight_or_collected "turn with prior work in flight"
-[ -z "$ASYNC_OUT" ] || fail "in-flight turn was blocked: $ASYNC_OUT"
+async_floor unmet "turn with prior work in flight but no collection"
+case "$ASYNC_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "in-flight-only turn was not blocked: $ASYNC_OUT" ;;
+esac
 
-# Turn 3: a background wait returns and the leader collects the results.
-async_task task_lifecycle t1 completed 0 async-leader
-async_task task_lifecycle t2 review_ready 0 async-leader
-ASYNC_OUT=$(async_turn collect)
+# Turn 3: collection in this turn for a prior task is the narrow exemption.
+async_hook --start '{"prompt":"collect","session_id":"async-collect"}' >/dev/null \
+    || fail "collect start returned nonzero"
+async_task task_collect t1 "" 0 async-leader
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+records[-1]["event"] = "task_collect"
+records[-1]["task_ids"] = ["t1"]
+records[-1].pop("task_id", None)
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-collect","stop_hook_active":false}') \
+    || fail "collect end returned nonzero"
 async_floor met_by_inflight_or_collected "collection turn"
 [ -z "$ASYNC_OUT" ] || fail "collection turn was blocked: $ASYNC_OUT"
 
-# Turn 4: everything was collected last turn. Doing the work directly now is
-# exactly what the floor exists to stop. A stale dispatch with no terminal
-# record and another session's in-flight task change nothing.
-async_task task_dispatch stale "" 10800 async-leader
-async_task task_dispatch foreign "" 0 other-leader
-ASYNC_OUT=$(async_turn direct)
-async_floor unmet "turn with only collected, stale, or foreign work"
+# Turn 4: another session's collection cannot exempt this leader.
+async_hook --start '{"prompt":"foreign collect","session_id":"async-foreign"}' >/dev/null \
+    || fail "foreign collect start returned nonzero"
+async_task task_collect t2 "" 0 other-leader
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+records[-1]["event"] = "task_collect"
+records[-1]["task_ids"] = ["t2"]
+records[-1].pop("task_id", None)
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-foreign","stop_hook_active":false}') \
+    || fail "foreign collect end returned nonzero"
+async_floor unmet "turn with another session's collection"
 case "$ASYNC_OUT" in
     *'"decision":"block"'*) ;;
-    *) fail "a direct turn with nothing outstanding was not blocked: $ASYNC_OUT" ;;
+    *) fail "another session's collection exempted this leader: $ASYNC_OUT" ;;
 esac
 
 # Collection must not depend on the previous turn_end still being inside the

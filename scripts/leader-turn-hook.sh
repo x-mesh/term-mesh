@@ -408,11 +408,9 @@ fi
 # not depend on the leader choosing to report anything. Anything unreadable
 # leaves the field off entirely rather than guessing "met".
 #
-# An asynchronous leader is re-invoked to collect work it dispatched in an
-# earlier turn, and that turn dispatches nothing. It reads
-# `met_by_inflight_or_collected`, distinct from `met`, when this leader session
-# has a prior dispatch still in flight or a task that reached a terminal state
-# since this surface's previous turn_end.
+# An asynchronous leader may finish a no-dispatch turn only by reading work it
+# dispatched earlier in the same session. Work merely remaining in flight does
+# not justify unrelated direct work while a worker runs.
 DELEGATION_FLOOR=""
 if [ "$MODE" = --end ] \
     && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
@@ -502,23 +500,7 @@ def parse_ts(value):
         return None
 
 
-# The saved offset is only meaningful in the file it was taken from. After a
-# rotation the inode differs, and the saved time is the remaining evidence.
-previous_end_offset = None
-previous_end_at = None
-try:
-    with open(last_end_path, "r", encoding="utf-8") as handle:
-        saved_offset, saved_inode, saved_ts = handle.read().split()
-    if int(saved_inode) == log_stat.st_ino and 0 <= int(saved_offset) <= baseline:
-        previous_end_offset = int(saved_offset)
-    else:
-        previous_end_at = parse_ts(saved_ts)
-except Exception:
-    pass
-
 read_from = max(0, baseline - LOOKBACK_BYTES)
-if previous_end_offset is not None:
-    read_from = min(read_from, previous_end_offset)
 try:
     # Binary, because a text-mode seek only accepts offsets tell() produced.
     with open(log_path, "rb") as handle:
@@ -532,9 +514,8 @@ offset = read_from
 for index, raw in enumerate(chunks):
     line_offset = offset
     offset += len(raw) + 1
-    # A lookback that starts mid-file starts mid-line. A saved turn_end offset
-    # is a line start.
-    if index == 0 and read_from > 0 and read_from != previous_end_offset:
+    # A lookback that starts mid-file starts mid-line.
+    if index == 0 and read_from > 0:
         continue
     raw = raw.strip()
     if not raw:
@@ -561,52 +542,30 @@ if not leader_session:
     print("unmet", end="")
     sys.exit(0)
 
-# Without a previous turn_end on this surface there is no "since", so only a
-# terminal record written during this turn counts as collected.
-scanned_previous_end = baseline
-for line_offset, record in records:
-    if (
-        line_offset < baseline
-        and record.get("event") == "turn_end"
-        and record.get("surface_id") == surface_id
-    ):
-        scanned_previous_end = line_offset
-
-
-def since_previous_end(line_offset, record):
-    if previous_end_offset is not None:
-        return line_offset >= previous_end_offset
-    if previous_end_at is not None:
-        at = parse_ts(record.get("ts"))
-        return at is not None and at >= previous_end_at
-    return line_offset >= scanned_previous_end
-
-
-now = datetime.now(timezone.utc)
-last_dispatch = {}
-last_terminal = {}
-collected = False
+# Only explicit collection in this turn can exempt a no-dispatch turn. Both
+# task_collect and a completed leader_wait carry the ids actually observed.
+prior_dispatches = set()
+collected_ids = set()
 for line_offset, record in records:
     task_id = record.get("task_id")
-    if not isinstance(task_id, str) or record.get("leader_session_id") != leader_session:
+    if record.get("leader_session_id") != leader_session:
         continue
     event = record.get("event")
-    if event == "task_dispatch" and line_offset < baseline:
-        dispatched_at = parse_ts(record.get("ts"))
-        if dispatched_at is not None and (now - dispatched_at).total_seconds() <= IN_FLIGHT_MAX_AGE_SECONDS:
-            last_dispatch[task_id] = line_offset
-        else:
-            last_dispatch.pop(task_id, None)
-    elif event == "task_lifecycle" and record.get("task_status") in TERMINAL_TASK_STATUSES:
-        last_terminal[task_id] = line_offset
-        if since_previous_end(line_offset, record):
-            collected = True
+    if event == "task_dispatch" and line_offset < baseline and isinstance(task_id, str):
+        prior_dispatches.add(task_id)
+        continue
+    if line_offset < baseline:
+        continue
+    if event == "task_collect":
+        task_ids = record.get("task_ids")
+    elif event == "leader_wait" and record.get("phase") == "end":
+        task_ids = record.get("task_ids")
+    else:
+        continue
+    if isinstance(task_ids, list):
+        collected_ids.update(task_id for task_id in task_ids if isinstance(task_id, str))
 
-in_flight = any(
-    last_terminal.get(task_id, -1) < dispatch_offset
-    for task_id, dispatch_offset in last_dispatch.items()
-)
-print("met_by_inflight_or_collected" if collected or in_flight else "unmet", end="")
+print("met_by_inflight_or_collected" if prior_dispatches.intersection(collected_ids) else "unmet", end="")
 TURN_HOOK_MET
 )"
     case "$DELEGATION_FLOOR" in
