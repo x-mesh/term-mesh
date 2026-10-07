@@ -418,15 +418,15 @@ if [ "$MODE" = --end ] \
     && [ -r "$LOG_FILE" ] \
     && [ -r "$DISPATCH_BASELINE_FILE" ] \
     && command -v python3 >/dev/null 2>&1; then
-    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" "$LAST_END_FILE" <<'TURN_HOOK_MET' 2>/dev/null || true
+    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" "$LAST_END_FILE" "$TURN_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
 (
-    control_path, log_path, team, baseline_path, surface_id, leader_session, last_end_path,
-) = sys.argv[1:8]
+    control_path, log_path, team, baseline_path, surface_id, leader_session, last_end_path, turn_id,
+) = sys.argv[1:9]
 
 # Bounds the read behind the baseline of this turn, so a long-lived log never makes
 # Stop slow. Daemon GC rotates turns.log every six hours anyway.
@@ -581,7 +581,11 @@ for line_offset, record in records:
         continue
     if event == "task_collect":
         task_ids = record.get("task_ids")
-    elif event == "leader_wait" and record.get("phase") == "end":
+    elif (
+        event == "leader_wait"
+        and record.get("phase") == "end"
+        and record.get("turn_id") == turn_id
+    ):
         task_ids = record.get("task_ids")
     else:
         continue

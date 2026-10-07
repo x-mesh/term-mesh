@@ -979,6 +979,52 @@ ASYNC_OUT=$(async_hook --end '{"session_id":"async-collect","stop_hook_active":f
 async_floor met_by_inflight_or_collected "collection turn"
 [ -z "$ASYNC_OUT" ] || fail "collection turn was blocked: $ASYNC_OUT"
 
+# A background wait keeps the turn id from when it began, and is not evidence
+# that this later turn collected the task.
+async_hook --start '{"prompt":"background wait end","session_id":"async-background-wait"}' >/dev/null \
+    || fail "background wait start returned nonzero"
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+prior_turn_id = next(record["turn_id"] for record in records if record["event"] == "turn_start")
+records.append({"event": "leader_wait", "phase": "end", "turn_id": prior_turn_id,
+                "ts": records[-1]["ts"], "team": "mine",
+                "leader_session_id": "async-leader", "task_ids": ["t1"]})
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-background-wait","stop_hook_active":false}') \
+    || fail "background wait end returned nonzero"
+async_floor unmet "background wait ending in a later turn"
+case "$ASYNC_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "background wait end exempted this turn: $ASYNC_OUT" ;;
+esac
+
+# A foreground wait end uses this turn's id and is collection evidence.
+async_hook --start '{"prompt":"foreground wait end","session_id":"async-foreground-wait"}' >/dev/null \
+    || fail "foreground wait start returned nonzero"
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+turn_id = [record["turn_id"] for record in records if record["event"] == "turn_start"][-1]
+records.append({"event": "leader_wait", "phase": "end", "turn_id": turn_id,
+                "ts": records[-1]["ts"], "team": "mine",
+                "leader_session_id": "async-leader", "task_ids": ["t1"]})
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-foreground-wait","stop_hook_active":false}') \
+    || fail "foreground wait end returned nonzero"
+async_floor met_by_inflight_or_collected "foreground wait ending in this turn"
+[ -z "$ASYNC_OUT" ] || fail "foreground wait end was blocked: $ASYNC_OUT"
+
 # Turn 4: another session's collection cannot exempt this leader.
 async_hook --start '{"prompt":"foreign collect","session_id":"async-foreign"}' >/dev/null \
     || fail "foreign collect start returned nonzero"
