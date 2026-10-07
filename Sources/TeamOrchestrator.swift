@@ -5065,13 +5065,23 @@ final class TeamOrchestrator: ObservableObject {
         adopted ? "\(base) --team \(shellQuoted(teamName))" : base
     }
 
+    /// Only a Codex leader can be woken by `CodexLeaderWake`, so only its
+    /// prompt may tell it to end the turn instead of waiting for results.
+    nonisolated static func nonClaudeLeaderWakesOnResults(
+        leaderMode: String, leaderCli: String?, defaults: UserDefaults = .standard
+    ) -> Bool {
+        CodexLeaderWake.isEnabled(defaults: defaults)
+            && CodexLeaderWake.isCodexLeader(leaderMode: leaderMode, leaderCli: leaderCli)
+    }
+
     static func remoteLeaderNonClaudeSystemPrompt(
         teamName: String,
         rows: [TeamAgentRow],
         checkoutMode: String,
         remoteWorkingDirectory: String,
         remoteSocketPath: String,
-        hostCLIBinDirs: [String] = []
+        hostCLIBinDirs: [String] = [],
+        codexLeaderWake: Bool = false
     ) -> String {
         let agentList = rows.enumerated().map { leaderRosterLine(index: $0.offset, row: $0.element) }
             .joined(separator: "\n")
@@ -5116,7 +5126,8 @@ final class TeamOrchestrator: ObservableObject {
                 pathsAreCreationTime: true
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
-            socketPath: remoteSocketPath
+            socketPath: remoteSocketPath,
+            codexLeaderWake: codexLeaderWake
         )
     }
 
@@ -5130,7 +5141,8 @@ final class TeamOrchestrator: ObservableObject {
         checkoutMode: String,
         remoteWorkingDirectory: String,
         remoteSocketPath: String,
-        hostCLIBinDirs: [String] = []
+        hostCLIBinDirs: [String] = [],
+        codexLeaderWake: Bool = false
     ) -> String {
         let agentList = agents.enumerated().map { leaderRosterLine(index: $0.offset, agent: $0.element) }
             .joined(separator: "\n")
@@ -5149,7 +5161,8 @@ final class TeamOrchestrator: ObservableObject {
                 workers: workers
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
-            socketPath: remoteSocketPath
+            socketPath: remoteSocketPath,
+            codexLeaderWake: codexLeaderWake
         )
     }
 
@@ -5261,7 +5274,11 @@ final class TeamOrchestrator: ObservableObject {
             runbookSection: runbookSection,
             worktreeSection: topologySection + worktreeSection,
             tmAgent: tmAgent,
-            socketPath: socketPath
+            socketPath: socketPath,
+            codexLeaderWake: Self.nonClaudeLeaderWakesOnResults(
+                leaderMode: teams[teamName]?.leaderMode ?? "",
+                leaderCli: teams[teamName]?.leaderCli
+            )
         )
     }
 
@@ -5395,8 +5412,21 @@ final class TeamOrchestrator: ObservableObject {
         runbookSection: String,
         worktreeSection: String,
         tmAgent: String,
-        socketPath: String
+        socketPath: String,
+        codexLeaderWake: Bool = false
     ) -> String {
+        let resultWaitRule = codexLeaderWake
+            ? "As a Codex leader with result wakes on, do not run a foreground result wait: end the turn after dispatch, and term-mesh starts your next turn with a `[term-mesh] task` line when a task finishes."
+            : "As a non-Claude leader, finish leader-lane work first, then run the task-scoped wait in the foreground; never end a turn with uncollected required results and no background wait running."
+        let collectSteps = codexLeaderWake
+            ? """
+            6. **Collect** — After dispatch, prepare acceptance checks, then end your turn instead of a foreground `\(tmAgent) wait`.
+            7. **Integrate** — When a line starting `[term-mesh] task` arrives, run `\(tmAgent) collect --headers` for those ids only, review completed worktrees serially, integrate, and end the turn again until every dispatched task is collected. For a `blocked` task, read it and unblock, answer, or reassign it. Never claim completion before all are collected.
+            """
+            : """
+            6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the foreground. Never end a turn with uncollected required results and no background wait running. Collect and process the first result; wait/collect at most once more only if required. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
+            7. **Integrate** — Review completed worktrees serially and validate the combined result
+            """
         return """
         You are the TEAM LEADER for team '\(teamName)'. You direct agent workers running in terminal split panes.
 
@@ -5480,7 +5510,7 @@ final class TeamOrchestrator: ObservableObject {
 
         After delegating tasks, never present a FINAL answer or claim completion that depends on uncollected results.
         Interim status is allowed and encouraged while delegated work is running.
-        As a non-Claude leader, finish leader-lane work first, then run the task-scoped wait in the foreground; never end a turn with uncollected required results and no background wait running.
+        \(resultWaitRule)
 
         ```
         \(tmAgent) read <agent_name> --lines 100
@@ -5520,8 +5550,7 @@ final class TeamOrchestrator: ObservableObject {
         3. **Decide** — Form the canonical direct/probe/parallel decision
         4. **Execute** — Work directly, run one read-only probe, or dispatch exactly two to three admitted tasks
         5. **Prepare** — Build acceptance checks and integration order while workers run; do not edit their owned paths
-        6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the foreground. Never end a turn with uncollected required results and no background wait running. Collect and process the first result; wait/collect at most once more only if required. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
-        7. **Integrate** — Review completed worktrees serially and validate the combined result
+        \(collectSteps)
         8. **Review gate** — Only for a high-risk actual diff, dispatch one bounded read-only reviewer after integration
         9. **Acknowledge** — After all work and validation succeed, run exactly `\(tmAgent) leader request complete <id>` once immediately before the final response, with no verification command afterward; leave blocked or failed work incomplete
 
