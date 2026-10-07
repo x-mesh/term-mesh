@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.268.0] - 2026-10-08
+
+### Added
+
+- A team leader no longer stops while its workers run. The leader prompt now tells a Claude Code leader to start the result wait in the background, keep working or send a short status, and collect the results when the wait finishes. Other leaders still wait in the foreground. The Review Board's collaboration panel shows how long the leader sat blocked in waits and the peak number of workers that ran at once.
+- A Codex leader can be woken when its workers finish. Turn on `teamLeaderWake.codex.enabled` before you create a team, and a finished task starts the leader's next turn with a `[term-mesh] task` line instead of making it wait. The setting is off by default and applies only to teams created after you change it.
+
+### Fixed
+
+- A team with isolated worktrees now starts when an older branch such as `team/<team>/executor` is left over. The old branch blocked the new `team/<team>/executor/<id>` branch, and the team failed with "path to reference collides with existing one". The old branch is renamed to `<name>-legacy-<sha>` instead of deleted, and it is left alone while a worktree, rebase, or bisect still uses it. Shared worktrees now use `team-shared/<team>`, which cannot collide with the per-agent branches.
+- `tm-agent wait --mode any --tasks <ids>` no longer ends early when every agent has posted a message. It now ends only when every listed task is completed, in review, blocked, failed, or cancelled, so a failed or cancelled task no longer keeps it waiting until the timeout. When it times out, it lists the tasks that have not finished.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.267.1] - 2026-10-07
 
 ### Fixed
