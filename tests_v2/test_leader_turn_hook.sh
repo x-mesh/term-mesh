@@ -976,7 +976,7 @@ path.write_text("".join(json.dumps(record) + "\n" for record in records), encodi
 PY
 ASYNC_OUT=$(async_hook --end '{"session_id":"async-collect","stop_hook_active":false}') \
     || fail "collect end returned nonzero"
-async_floor met_by_inflight_or_collected "collection turn"
+async_floor met_by_collection "collection turn"
 [ -z "$ASYNC_OUT" ] || fail "collection turn was blocked: $ASYNC_OUT"
 
 # A background wait keeps the turn id from when it began, and is not evidence
@@ -1022,7 +1022,7 @@ path.write_text("".join(json.dumps(record) + "\n" for record in records), encodi
 PY
 ASYNC_OUT=$(async_hook --end '{"session_id":"async-foreground-wait","stop_hook_active":false}') \
     || fail "foreground wait end returned nonzero"
-async_floor met_by_inflight_or_collected "foreground wait ending in this turn"
+async_floor met_by_collection "foreground wait ending in this turn"
 [ -z "$ASYNC_OUT" ] || fail "foreground wait end was blocked: $ASYNC_OUT"
 
 # Turn 4: another session's collection cannot exempt this leader.
@@ -1090,7 +1090,7 @@ path.write_text("".join(json.dumps(record) + "\n" for record in records), encodi
 PY
 ASYNC_OUT=$(async_hook --end '{"session_id":"async-far-collect","stop_hook_active":false}') \
     || fail "far collect end returned nonzero"
-async_floor met_by_inflight_or_collected "collection turn past the lookback"
+async_floor met_by_collection "collection turn past the lookback"
 [ -z "$ASYNC_OUT" ] || fail "collection turn past the lookback was blocked: $ASYNC_OUT"
 
 # Outstanding work is attributed by leader session. A leader without one must

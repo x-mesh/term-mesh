@@ -100,9 +100,6 @@ STATE_FILE="$LOG_DIR/.turn-current-$STATE_KEY"
 # the one Start wrote, and the floor only needs "did anything get dispatched
 # since this pane's last prompt".
 DISPATCH_BASELINE_FILE="$LOG_DIR/.turn-dispatch-$STATE_KEY"
-# Where this surface's previous turn_end landed, so a collection turn can find
-# it even after a busy log has pushed it out of the floor's lookback.
-LAST_END_FILE="$LOG_DIR/.turn-last-end-$STATE_KEY"
 STATE_LOCK="$STATE_FILE.lock"
 STATE_LOCK_HELD=0
 
@@ -418,15 +415,15 @@ if [ "$MODE" = --end ] \
     && [ -r "$LOG_FILE" ] \
     && [ -r "$DISPATCH_BASELINE_FILE" ] \
     && command -v python3 >/dev/null 2>&1; then
-    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" "$LAST_END_FILE" "$TURN_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
+    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" "$TURN_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
 (
-    control_path, log_path, team, baseline_path, surface_id, leader_session, last_end_path, turn_id,
-) = sys.argv[1:9]
+    control_path, log_path, team, baseline_path, surface_id, leader_session, turn_id,
+) = sys.argv[1:8]
 
 # Bounds the read behind the baseline of this turn, so a long-lived log never makes
 # Stop slow. Daemon GC rotates turns.log every six hours anyway.
@@ -592,37 +589,14 @@ for line_offset, record in records:
     if isinstance(task_ids, list):
         collected_ids.update(task_id for task_id in task_ids if isinstance(task_id, str))
 
-print("met_by_inflight_or_collected" if prior_dispatches.intersection(collected_ids) else "unmet", end="")
+print("met_by_collection" if prior_dispatches.intersection(collected_ids) else "unmet", end="")
 TURN_HOOK_MET
 )"
     case "$DELEGATION_FLOOR" in
-        met|unmet|met_by_inflight_or_collected) ;;
+        met|unmet|met_by_collection) ;;
         *) DELEGATION_FLOOR="" ;;
     esac
     rm -f "$DISPATCH_BASELINE_FILE" 2>/dev/null || true
-fi
-
-# Taken before this turn's turn_end lines are appended, so the next turn's
-# "since the previous turn_end" can miss no record written from here on.
-if [ "$MODE" = --end ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$LOG_FILE" "$LAST_END_FILE" "$TS" <<'TURN_HOOK_LAST_END' 2>/dev/null || true
-import os
-import sys
-
-log_path, last_end_path, ts = sys.argv[1:4]
-tmp = last_end_path + ".tmp"
-try:
-    log_stat = os.stat(log_path)
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write("%d %d %s" % (log_stat.st_size, log_stat.st_ino, ts))
-    os.replace(tmp, last_end_path)
-except Exception:
-    # No log yet, or no way to record it: the next turn falls back to its scan.
-    try:
-        os.unlink(tmp)
-    except Exception:
-        pass
-TURN_HOOK_LAST_END
 fi
 
 # Entries newer than the routed turn were prompts absorbed into that running
