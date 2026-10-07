@@ -93,12 +93,38 @@ enum LeaderTurnLog {
         }
     }
 
+    /// How long the leader sat in a result wait, and how many workers ran at
+    /// once, over the same bounded window the collaboration reading uses.
+    struct LeaderWaitMetrics: Equatable {
+        /// Sum of BLOCKING waits. `nil` when no wait in the window could be
+        /// classified, so missing evidence never reads as zero seconds.
+        let blockedSeconds: TimeInterval?
+        let blockingWaits: Int
+        let backgroundWaits: Int
+        /// `nil` when no dispatched task in the window reached a terminal state.
+        let peakConcurrentWorkers: Int?
+
+        static let unmeasured = LeaderWaitMetrics(
+            blockedSeconds: nil, blockingWaits: 0, backgroundWaits: 0, peakConcurrentWorkers: nil
+        )
+    }
+
     enum Event: String, Codable, CaseIterable {
         case turnStart = "turn_start"
         case turnRoute = "turn_route"
         case turnEnd = "turn_end"
         case taskDispatch = "task_dispatch"
         case taskLifecycle = "task_lifecycle"
+        case leaderWait = "leader_wait"
+        case taskCollect = "task_collect"
+
+        /// `tm-agent` writes these two about the leader's own waiting and
+        /// reading. They are evidence about how the leader spent a turn, not
+        /// about whether work was routed, so the collaboration reading leaves
+        /// them out: they carry no `team_uuid` and would count as legacy rows.
+        var isLeaderWaitEvidence: Bool {
+            self == .leaderWait || self == .taskCollect
+        }
     }
 
     struct Record: Codable, Equatable {
@@ -135,6 +161,13 @@ enum LeaderTurnLog {
         let teamUUID: String?
         let leaderSessionID: String?
         let delegationFloor: String?
+        let phase: String?
+        let waitID: String?
+        let taskIDs: [String]?
+        let waitMode: String?
+        let timeoutSeconds: Double?
+        let outcome: String?
+        let via: String?
 
         private enum CodingKeys: String, CodingKey {
             case event
@@ -166,6 +199,13 @@ enum LeaderTurnLog {
             case teamUUID = "team_uuid"
             case leaderSessionID = "leader_session_id"
             case delegationFloor = "delegation_floor"
+            case phase
+            case waitID = "wait_id"
+            case taskIDs = "task_ids"
+            case waitMode = "mode"
+            case timeoutSeconds = "timeout_s"
+            case outcome
+            case via
         }
 
         private init(
@@ -197,7 +237,14 @@ enum LeaderTurnLog {
             taskDelivery: String? = nil,
             teamUUID: String? = nil,
             leaderSessionID: String? = nil,
-            delegationFloor: String? = nil
+            delegationFloor: String? = nil,
+            phase: String? = nil,
+            waitID: String? = nil,
+            taskIDs: [String]? = nil,
+            waitMode: String? = nil,
+            timeoutSeconds: Double? = nil,
+            outcome: String? = nil,
+            via: String? = nil
         ) {
             self.event = event
             self.turnID = turnID
@@ -228,6 +275,13 @@ enum LeaderTurnLog {
             self.teamUUID = teamUUID
             self.leaderSessionID = leaderSessionID
             self.delegationFloor = delegationFloor
+            self.phase = phase
+            self.waitID = waitID
+            self.taskIDs = taskIDs
+            self.waitMode = waitMode
+            self.timeoutSeconds = timeoutSeconds
+            self.outcome = outcome
+            self.via = via
         }
 
         static func turnStart(
@@ -351,7 +405,11 @@ enum LeaderTurnLog {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             event = try container.decode(Event.self, forKey: .event)
-            turnID = try container.decode(String.self, forKey: .turnID)
+            // The wait writer omits turn_id when the hook left no turn to name
+            // rather than inventing one; an empty id joins no turn.
+            turnID = event.isLeaderWaitEvidence
+                ? try container.decodeIfPresent(String.self, forKey: .turnID) ?? ""
+                : try container.decode(String.self, forKey: .turnID)
             timestamp = try container.decode(String.self, forKey: .timestamp)
             team = try container.decode(String.self, forKey: .team)
             // Absent, not empty: the Rust writer omits surface_id entirely when
@@ -365,7 +423,7 @@ enum LeaderTurnLog {
             case .turnStart:
                 promptBytes = try container.decodeIfPresent(Int.self, forKey: .promptBytes)
                 promptSHA256 = try container.decodeIfPresent(String.self, forKey: .promptSHA256)
-            case .turnRoute, .turnEnd, .taskDispatch, .taskLifecycle:
+            case .turnRoute, .turnEnd, .taskDispatch, .taskLifecycle, .leaderWait, .taskCollect:
                 promptBytes = nil
                 promptSHA256 = nil
             }
@@ -391,12 +449,24 @@ enum LeaderTurnLog {
             teamUUID = try container.decodeIfPresent(String.self, forKey: .teamUUID)
             leaderSessionID = try container.decodeIfPresent(String.self, forKey: .leaderSessionID)
             delegationFloor = try container.decodeIfPresent(String.self, forKey: .delegationFloor)
+            // An unexpected shape in one of these must not make the whole line
+            // undecodable: undecodable lines are quarantined out of the log and
+            // hold the health gate shut.
+            phase = (try? container.decodeIfPresent(String.self, forKey: .phase)) ?? nil
+            waitID = (try? container.decodeIfPresent(String.self, forKey: .waitID)) ?? nil
+            taskIDs = (try? container.decodeIfPresent([String].self, forKey: .taskIDs)) ?? nil
+            waitMode = (try? container.decodeIfPresent(String.self, forKey: .waitMode)) ?? nil
+            timeoutSeconds = (try? container.decodeIfPresent(Double.self, forKey: .timeoutSeconds)) ?? nil
+            outcome = (try? container.decodeIfPresent(String.self, forKey: .outcome)) ?? nil
+            via = (try? container.decodeIfPresent(String.self, forKey: .via)) ?? nil
         }
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(event, forKey: .event)
-            try container.encode(turnID, forKey: .turnID)
+            if !(event.isLeaderWaitEvidence && turnID.isEmpty) {
+                try container.encode(turnID, forKey: .turnID)
+            }
             try container.encode(timestamp, forKey: .timestamp)
             try container.encode(team, forKey: .team)
             if !surfaceID.isEmpty {
@@ -430,6 +500,13 @@ enum LeaderTurnLog {
             try container.encodeIfPresent(teamUUID, forKey: .teamUUID)
             try container.encodeIfPresent(leaderSessionID, forKey: .leaderSessionID)
             try container.encodeIfPresent(delegationFloor, forKey: .delegationFloor)
+            try container.encodeIfPresent(phase, forKey: .phase)
+            try container.encodeIfPresent(waitID, forKey: .waitID)
+            try container.encodeIfPresent(taskIDs, forKey: .taskIDs)
+            try container.encodeIfPresent(waitMode, forKey: .waitMode)
+            try container.encodeIfPresent(timeoutSeconds, forKey: .timeoutSeconds)
+            try container.encodeIfPresent(outcome, forKey: .outcome)
+            try container.encodeIfPresent(via, forKey: .via)
         }
     }
 
@@ -1151,7 +1228,9 @@ enum LeaderTurnLog {
         // Bound this Project's history, not the shared log's history. Applying
         // the window first lets a noisy sibling Project evict every current
         // record and makes healthy collaboration appear unmeasured.
-        let ordered = records.enumerated().filter { $0.element.team == team }.sorted { lhs, rhs in
+        let ordered = records.enumerated().filter {
+            $0.element.team == team && !$0.element.event.isLeaderWaitEvidence
+        }.sorted { lhs, rhs in
             if lhs.element.timestamp != rhs.element.timestamp {
                 return lhs.element.timestamp < rhs.element.timestamp
             }
@@ -1235,6 +1314,112 @@ enum LeaderTurnLog {
 
     private static func normalizedSurfaceID(_ value: String) -> String {
         value.lowercased().filter { $0.isASCII && $0.isHexDigit }
+    }
+
+    /// A wait that ends no later than the `turn_end` of the turn it started in
+    /// held that turn open: it is BLOCKING and its duration counts. A wait
+    /// still open at that `turn_end` ran in the background. A wait whose start
+    /// turn has no `turn_end` in the window is left unclassified rather than
+    /// guessed.
+    static func leaderWaitMetrics(
+        records: [Record], team: String, leaderSessionID: String?
+    ) -> LeaderWaitMetrics {
+        let scoped = records.filter { record in
+            guard record.team == team else { return false }
+            guard let leaderSessionID, !leaderSessionID.isEmpty,
+                  let recordSession = record.leaderSessionID else { return true }
+            return recordSession == leaderSessionID
+        }
+        let parser = ISO8601DateFormatter()
+        func date(_ record: Record) -> Date? { parser.date(from: record.timestamp) }
+
+        var turnEnds: [String: Date] = [:]
+        for record in scoped where record.event == .turnEnd && !record.turnID.isEmpty {
+            guard let ended = date(record) else { continue }
+            turnEnds[record.turnID] = min(turnEnds[record.turnID] ?? ended, ended)
+        }
+        var starts: [String: Record] = [:]
+        var ends: [String: Record] = [:]
+        for record in scoped where record.event == .leaderWait {
+            guard let waitID = record.waitID, !waitID.isEmpty else { continue }
+            switch record.phase {
+            case "start": starts[waitID] = starts[waitID] ?? record
+            case "end": ends[waitID] = ends[waitID] ?? record
+            default: continue
+            }
+        }
+        var blockedSeconds: TimeInterval = 0
+        var blocking = 0
+        var background = 0
+        for (waitID, start) in starts {
+            let turnID = start.turnID.isEmpty ? (ends[waitID]?.turnID ?? "") : start.turnID
+            guard !turnID.isEmpty, let startedAt = date(start),
+                  let turnEnded = turnEnds[turnID], turnEnded >= startedAt else { continue }
+            if let end = ends[waitID], let endedAt = date(end), endedAt <= turnEnded {
+                blocking += 1
+                blockedSeconds += max(0, endedAt.timeIntervalSince(startedAt))
+            } else {
+                background += 1
+            }
+        }
+        return LeaderWaitMetrics(
+            blockedSeconds: blocking + background > 0 ? blockedSeconds : nil,
+            blockingWaits: blocking,
+            backgroundWaits: background,
+            peakConcurrentWorkers: peakConcurrentWorkers(in: scoped, date: date)
+        )
+    }
+
+    /// Statuses after which a task no longer occupies its worker.
+    private static let terminalTaskStatuses: Set<String> = [
+        "completed", "review_ready", "blocked", "failed",
+        "delivery_failed", "route_failed", "timeout", "cancelled",
+    ]
+
+    /// Only closed intervals count: most dispatches in a long log never get a
+    /// terminal record, and treating those as still running would report every
+    /// worker busy forever.
+    private static func peakConcurrentWorkers(
+        in records: [Record], date: (Record) -> Date?
+    ) -> Int? {
+        var dispatched: [String: (at: Date, worker: String)] = [:]
+        for record in records where record.event == .taskDispatch {
+            guard let taskID = record.taskID, let at = date(record) else { continue }
+            if let existing = dispatched[taskID], existing.at <= at { continue }
+            dispatched[taskID] = (at, record.workerInstanceID ?? record.worker ?? taskID)
+        }
+        var finished: [String: Date] = [:]
+        for record in records where record.event == .taskLifecycle {
+            guard let taskID = record.taskID,
+                  let status = record.taskStatus, terminalTaskStatuses.contains(status),
+                  let at = date(record), let start = dispatched[taskID]?.at, at >= start
+            else { continue }
+            finished[taskID] = min(finished[taskID] ?? at, at)
+        }
+        struct Boundary {
+            let at: Date
+            let worker: String
+            let delta: Int
+        }
+        var boundaries: [Boundary] = []
+        for (taskID, end) in finished {
+            guard let start = dispatched[taskID] else { continue }
+            boundaries.append(Boundary(at: start.at, worker: start.worker, delta: 1))
+            boundaries.append(Boundary(at: end, worker: start.worker, delta: -1))
+        }
+        guard !boundaries.isEmpty else { return nil }
+        // A task that ends at the instant another starts did not overlap it.
+        boundaries.sort { lhs, rhs in
+            lhs.at == rhs.at ? lhs.delta < rhs.delta : lhs.at < rhs.at
+        }
+        var open: [String: Int] = [:]
+        var peak = 0
+        for boundary in boundaries {
+            let count = (open[boundary.worker] ?? 0) + boundary.delta
+            open[boundary.worker] = count > 0 ? count : nil
+            peak = max(peak, open.count)
+        }
+        return peak
     }
 
     /// `fleet.state` asks for this on the Review Board's beat, and the report

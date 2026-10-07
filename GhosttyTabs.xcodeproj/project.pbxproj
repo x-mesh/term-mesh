@@ -170,6 +170,7 @@
 		APT0000000000000000003 /* AgentPipeTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = APT0000000000000000006 /* AgentPipeTransport.swift */; };
 		APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = APC0000000000000000006 /* AgentPipeCompletion.swift */; };
 		CIB0000000000000000003 /* ClaudeInboxDelivery.swift in Sources */ = {isa = PBXBuildFile; fileRef = CIB0000000000000000006 /* ClaudeInboxDelivery.swift */; };
+		CLW0000000000000000003 /* CodexLeaderWake.swift in Sources */ = {isa = PBXBuildFile; fileRef = CLW0000000000000000006 /* CodexLeaderWake.swift */; };
 		MCL0000000000000000001 /* ModelContextLimits.swift in Sources */ = {isa = PBXBuildFile; fileRef = MCL0000000000000000002 /* ModelContextLimits.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
@@ -284,6 +285,7 @@
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */; };
 		APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = APCT000000000000000006 /* AgentPipeCompletionTests.swift */; };
 		CIBT000000000000000003 /* ClaudeInboxDeliveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CIBT000000000000000006 /* ClaudeInboxDeliveryTests.swift */; };
+		CLWT000000000000000003 /* CodexLeaderWakeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CLWT000000000000000006 /* CodexLeaderWakeTests.swift */; };
 		RB169000000000000003 /* ReviewBoardMergeSafetyRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */; };
 		AP169000000000000003 /* AgentPaneRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AP169000000000000006 /* AgentPaneRegression169Tests.swift */; };
 		IR169000000000000003 /* InstanceRoutingRegression169Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */; };
@@ -552,6 +554,7 @@
 			APT0000000000000000006 /* AgentPipeTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeTransport.swift; sourceTree = "<group>"; };
 			APC0000000000000000006 /* AgentPipeCompletion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletion.swift; sourceTree = "<group>"; };
 			CIB0000000000000000006 /* ClaudeInboxDelivery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeInboxDelivery.swift; sourceTree = "<group>"; };
+			CLW0000000000000000006 /* CodexLeaderWake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexLeaderWake.swift; sourceTree = "<group>"; };
 			MCL0000000000000000002 /* ModelContextLimits.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelContextLimits.swift; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
@@ -667,6 +670,7 @@
 			F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetectorTests.swift; sourceTree = "<group>"; };
 			APCT000000000000000006 /* AgentPipeCompletionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletionTests.swift; sourceTree = "<group>"; };
 			CIBT000000000000000006 /* ClaudeInboxDeliveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeInboxDeliveryTests.swift; sourceTree = "<group>"; };
+			CLWT000000000000000006 /* CodexLeaderWakeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexLeaderWakeTests.swift; sourceTree = "<group>"; };
 		RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardMergeSafetyRegression169Tests.swift; sourceTree = "<group>"; };
 		AP169000000000000006 /* AgentPaneRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPaneRegression169Tests.swift; sourceTree = "<group>"; };
 		IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstanceRoutingRegression169Tests.swift; sourceTree = "<group>"; };
@@ -983,6 +987,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				APT0000000000000000006 /* AgentPipeTransport.swift */,
 				APC0000000000000000006 /* AgentPipeCompletion.swift */,
 				CIB0000000000000000006 /* ClaudeInboxDelivery.swift */,
+				CLW0000000000000000006 /* CodexLeaderWake.swift */,
 				MCL0000000000000000002 /* ModelContextLimits.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
@@ -1118,6 +1123,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				F9000001A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift */,
 				APCT000000000000000006 /* AgentPipeCompletionTests.swift */,
 				CIBT000000000000000006 /* ClaudeInboxDeliveryTests.swift */,
+				CLWT000000000000000006 /* CodexLeaderWakeTests.swift */,
 				RB169000000000000006 /* ReviewBoardMergeSafetyRegression169Tests.swift */,
 				AP169000000000000006 /* AgentPaneRegression169Tests.swift */,
 				IR169000000000000006 /* InstanceRoutingRegression169Tests.swift */,
@@ -1481,6 +1487,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				APT0000000000000000003 /* AgentPipeTransport.swift in Sources */,
 				APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */,
 				CIB0000000000000000003 /* ClaudeInboxDelivery.swift in Sources */,
+				CLW0000000000000000003 /* CodexLeaderWake.swift in Sources */,
 				MCL0000000000000000001 /* ModelContextLimits.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
@@ -1586,6 +1593,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				F9000000A1B2C3D4E5F60718 /* AutoReplyDetectorTests.swift in Sources */,
 				APCT000000000000000003 /* AgentPipeCompletionTests.swift in Sources */,
 				CIBT000000000000000003 /* ClaudeInboxDeliveryTests.swift in Sources */,
+				CLWT000000000000000003 /* CodexLeaderWakeTests.swift in Sources */,
 				RB169000000000000003 /* ReviewBoardMergeSafetyRegression169Tests.swift in Sources */,
 				AP169000000000000003 /* AgentPaneRegression169Tests.swift in Sources */,
 				IR169000000000000003 /* InstanceRoutingRegression169Tests.swift in Sources */,

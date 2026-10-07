@@ -1321,6 +1321,16 @@
         }
       }
     },
+    "Leader blocked %@": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 동기 대기 %@"
+          }
+        }
+      }
+    },
     "Leader experiments": {
       "localizations": {
         "ko": {
@@ -1352,6 +1362,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "리더 턴 측정"
+          }
+        }
+      }
+    },
+    "Leader wait unmeasured": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 동기 대기 측정 안 됨"
           }
         }
       }
@@ -1489,6 +1509,26 @@
     "Panes disconnect and reattach. Agent and shell processes on the host keep running. Shell records left behind by processes that already exited are cleared — this is the way to remove the ones Clean Up Panes reports it cannot close.": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "pane이 끊겼다가 다시 붙습니다. 호스트에서 실행 중인 에이전트와 셸 프로세스는 그대로 유지됩니다. 이미 종료된 프로세스가 남긴 셸 기록은 지워집니다 — Clean Up Panes가 닫지 못한다고 표시하는 항목을 없애는 방법입니다." } }
+      }
+    },
+    "Peak %lld concurrent": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "동시 최대 %lld명"
+          }
+        }
+      }
+    },
+    "Peak concurrency unmeasured": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "동시 최대 측정 안 됨"
+          }
+        }
       }
     },
     "Record only": {

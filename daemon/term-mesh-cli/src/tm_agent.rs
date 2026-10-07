@@ -1807,8 +1807,10 @@ enum Commands {
         force: bool,
     },
     /// Wait for agent signals (report, msg, blocked, review_ready, idle, any).
-    /// any requires a tracked task and succeeds when its report completes or
-    /// a message arrives; use msg for uncorrelated messages.
+    /// any requires a tracked task and ends once every tracked task has
+    /// settled (completed, review_ready, blocked, failed, cancelled). Only
+    /// without --tasks/--task does a message from every agent end it too;
+    /// use msg for uncorrelated messages.
     Wait {
         #[arg(long, default_value_t = 120)]
         timeout: u32,
@@ -2789,8 +2791,10 @@ enum LeaderCommands {
 #[derive(Subcommand)]
 enum LeaderTurnCommands {
     /// Record the route this turn took. Measurement only: appends one line to
-    /// `~/.term-mesh/logs/turns.log` and touches no socket, so it works with no
-    /// daemon running and costs a leader nothing on a plain direct-answer turn.
+    /// `~/.term-mesh/logs/turns.log`, so it works with no daemon running and
+    /// costs a leader nothing on a plain direct-answer turn. The one socket
+    /// read, a bounded `team.status` for an omitted `--checkout-mode`, is
+    /// best-effort and never stops the line from being written.
     ///
     /// The count of these lines is only half the measurement. The harness hooks
     /// write `turn_start`/`turn_end` independently; the gap
@@ -2812,9 +2816,9 @@ enum LeaderTurnCommands {
         /// How the request was classified before the route was chosen.
         #[arg(long = "task-shape")]
         task_shape: Option<String>,
-        /// Authoritative worker-capacity snapshot for this turn. Omit when the
-        /// roster is unavailable; unknown capacity always fails closed and
-        /// cannot produce an applied canary directive.
+        /// Authoritative worker-capacity snapshot for this turn. Omit it and
+        /// the roster count is read from the participation control file when
+        /// the app recorded one; unknown capacity always fails closed.
         #[arg(long = "available-workers")]
         available_workers: Option<u32>,
         /// A risk condition that applied to this turn. Repeatable; every
@@ -2825,7 +2829,8 @@ enum LeaderTurnCommands {
         /// the `--wave-id` passed to `delegate`.
         #[arg(long = "wave-id")]
         wave_id: Option<String>,
-        /// Checkout mode used by the candidate worker worktrees.
+        /// Checkout mode used by the candidate worker worktrees. Omit it and
+        /// the team's own `checkout_mode` is recorded when the app reports one.
         #[arg(long = "checkout-mode")]
         checkout_mode: Option<String>,
         /// Number of dependency-ready mutating slices.
@@ -5494,6 +5499,43 @@ impl ProcessEnvGuard {
 impl Drop for ProcessEnvGuard {
     fn drop(&mut self) {
         REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
+#[cfg(test)]
+struct RouteDerivationEnv {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+#[cfg(test)]
+impl RouteDerivationEnv {
+    fn isolated() -> Self {
+        let keys = [
+            "TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE",
+            "TERMMESH_SOCKET",
+            "TERMMESH_SOCKET_PATH",
+        ];
+        let saved = keys
+            .into_iter()
+            .map(|key| {
+                let value = env::var_os(key);
+                env::remove_var(key);
+                (key, value)
+            })
+            .collect();
+        Self { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RouteDerivationEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
     }
 }
 
@@ -8814,8 +8856,8 @@ fn main() {
         return;
     }
 
-    // `leader turn route` writes a local append-only record and talks to nothing.
-    // It returns before socket resolution on purpose: the measurement is worthless
+    // `leader turn route` writes a local append-only record; its only socket read
+    // is best-effort evidence. It returns before socket resolution on purpose: the measurement is worthless
     // if a leader skips the call whenever the daemon happens to be down, and the
     // gap it measures would then read as "the leader chose not to classify".
     if let Commands::Leader(LeaderCommands::Turn(LeaderTurnCommands::Route {
@@ -9205,7 +9247,7 @@ fn main() {
                     json!({
                         "team_name": team, "task_id": id,
                     }),
-                ),
+                ).map(|value| { append_rcollect(&team, "task_get", &value); value }),
                 TaskCommands::List {
                     json: as_json,
                     assignee,
@@ -9401,7 +9443,7 @@ fn main() {
             json!({
                 "team_name": team, "task_id": id,
             }),
-        ),
+        ).map(|value| { append_rcollect(&team, "task_get", &value); value }),
         Commands::TaskStart { task_id } => rpc_call(
             &sock,
             "team.task.update",
@@ -9669,7 +9711,7 @@ fn main() {
                     "team_name": team, "agent_name": agent_name, "lines": lines,
                     "agent_instance_id": agent_instance_id,
                 }),
-            )
+            ).map(|value| { append_rcollect(&team, "read", &value); value })
         }
         Commands::Collect {
             lines,
@@ -9678,7 +9720,7 @@ fn main() {
         } => {
             if headers || summary {
                 rpc_call(&sock, "team.result.collect", json!({ "team_name": team }))
-                    .map(|resp| compact_result_collect_response(resp, summary))
+                    .map(|resp| { append_rcollect(&team, "collect", &resp); compact_result_collect_response(resp, summary) })
             } else {
                 rpc_call(
                     &sock,
@@ -9686,11 +9728,12 @@ fn main() {
                     json!({
                         "team_name": team, "lines": lines,
                     }),
-                )
+                ).map(|value| { append_rcollect(&team, "collect", &value); value })
             }
         }
         Commands::Reports { headers, summary } => {
             rpc_call(&sock, "team.result.collect", json!({ "team_name": team })).map(|resp| {
+                append_rcollect(&team, "reports", &resp);
                 if headers || summary {
                     compact_result_collect_response(resp, summary)
                 } else {
@@ -19351,6 +19394,23 @@ fn append_turn_record(path: &Path, record: &Value) -> Result<(), String> {
         .map_err(|e| format!("append {}: {e}", path.display()))
 }
 
+fn rcollect_record(team: &str, via: &str, payload: &Value) -> Value {
+    let mut task_ids = Vec::new();
+    for path in ["/result/task/id", "/result/task_id"] {
+        if let Some(id) = payload.pointer(path).and_then(Value::as_str) { task_ids.push(id.to_string()); }
+    }
+    for path in ["/result/tasks", "/result/items", "/result/results"] {
+        if let Some(items) = payload.pointer(path).and_then(Value::as_array) { task_ids.extend(items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))); }
+    }
+    task_ids.sort(); task_ids.dedup();
+    let mut record = json!({"event":"task_collect","via":via,"task_ids":task_ids,"team":team,"ts":iso8601_utc_now()});
+    if let Some(session) = current_leader_session_id() { record["leader_session_id"] = json!(session); }
+    if let Some(turn_id) = turn_id_from_hook_state() { record["turn_id"] = json!(turn_id); }
+    record
+}
+
+fn append_rcollect(team: &str, via: &str, payload: &Value) { if let Ok(path) = turn_log_path() { let _ = append_turn_record(&path, &rcollect_record(team, via, payload)); } }
+
 /// `leader turn route` — record this turn's route and print what was written.
 ///
 /// A missing team is an explicit error here, unlike the harness hook that
@@ -19440,6 +19500,91 @@ fn turn_route_marker_path(path: &Path, turn_id: &str) -> Option<PathBuf> {
     (!key.is_empty()).then(|| path.with_file_name(format!(".turn-route-{key}")))
 }
 
+/// Bounds the one `team.status` read `leader turn route` makes for an omitted
+/// `--checkout-mode`. The record is written whether or not it answers.
+const ROUTE_TOPOLOGY_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Facts `leader turn route` filled in itself because the leader omitted the
+/// flag. Only facts the app already recorded qualify: ownership, lane, overlap
+/// and integration flags are claims about the leader's plan and are never
+/// derived.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DerivedRouteEvidence {
+    checkout_mode: Option<String>,
+    available_workers: Option<u32>,
+    derived: Vec<&'static str>,
+}
+
+fn derive_route_evidence(
+    explicit_checkout_mode: Option<&str>,
+    explicit_available_workers: Option<u32>,
+    control_available_workers: impl FnOnce() -> Option<u32>,
+    team_checkout_mode: impl FnOnce() -> Option<String>,
+) -> DerivedRouteEvidence {
+    let mut evidence = DerivedRouteEvidence::default();
+    evidence.checkout_mode = match explicit_checkout_mode {
+        Some(mode) => Some(mode.to_string()),
+        None => team_checkout_mode().map(|mode| {
+            evidence.derived.push("checkout_mode");
+            mode
+        }),
+    };
+    evidence.available_workers = match explicit_available_workers {
+        Some(workers) => Some(workers),
+        None => control_available_workers().map(|workers| {
+            evidence.derived.push("available_workers");
+            workers
+        }),
+    };
+    evidence
+}
+
+/// The layout the app briefs workers with as `TEAM_CHECKOUT_MODE`. "unknown"
+/// is the app saying nobody recorded one, so it stays absent.
+fn checkout_mode_from_team_status(result: &Value, team: &str) -> Option<String> {
+    if result["team_name"].as_str() != Some(team) {
+        return None;
+    }
+    result["checkout_mode"]
+        .as_str()
+        .map(str::trim)
+        .filter(|mode| matches!(*mode, "isolated" | "shared" | "off"))
+        .map(str::to_string)
+}
+
+fn route_team_checkout_mode(team: &str) -> Option<String> {
+    // A remote leader's local socket belongs to another app than the Project's.
+    if remote_leader_route().is_some() {
+        return None;
+    }
+    let sock = detect_socket()?;
+    let response = rpc_call_timeout_duration(
+        &sock,
+        "team.status",
+        json!({ "team_name": team }),
+        ROUTE_TOPOLOGY_RPC_TIMEOUT,
+    )
+    .ok()?;
+    checkout_mode_from_team_status(&response["result"], team)
+}
+
+fn available_workers_from_control(value: &Value) -> Option<u32> {
+    value["available_workers"]
+        .as_u64()
+        .map(|workers| workers.min(u64::from(u32::MAX)) as u32)
+}
+
+/// Called only after the same file passed the project and session check in
+/// `read_leader_control_snapshot`, which does not keep this field.
+fn control_file_available_workers() -> Option<u32> {
+    let path = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE").ok()?;
+    let data = fs::read(Path::new(&path)).ok()?;
+    if data.len() > LEADER_CONTROL_MAX_BYTES {
+        return None;
+    }
+    available_workers_from_control(&serde_json::from_slice::<Value>(&data).ok()?)
+}
+
 fn run_leader_turn_route_with_evidence(
     team_resolution: &TeamNameResolution,
     turn_id: &str,
@@ -19491,6 +19636,12 @@ fn run_leader_turn_route_with_evidence(
         },
     };
     let control = control_state.snapshot();
+    let derived = derive_route_evidence(
+        checkout_mode,
+        available_workers,
+        || control.and_then(|_| control_file_available_workers()),
+        || route_team_checkout_mode(&team_resolution.name),
+    );
     let mut record = turn_route_record_with_policy_input(
         turn_id,
         route,
@@ -19552,6 +19703,13 @@ fn run_leader_turn_route_with_evidence(
         "serial_integration": serial_integration,
         "resource_health": resource_health,
     });
+    record["derived_evidence"] = json!(derived.derived);
+    if let Some(mode) = derived.checkout_mode.filter(|_| checkout_mode.is_none()) {
+        record["derived_checkout_mode"] = json!(mode);
+    }
+    if let Some(workers) = derived.available_workers.filter(|_| available_workers.is_none()) {
+        record["derived_available_workers"] = json!(workers);
+    }
     if let Some(route) = remote_leader_route() {
         record["team_uuid"] = json!(route.team_uuid);
     }
@@ -19825,6 +19983,7 @@ mod leader_turn_record_tests {
         let mut control = control_snapshot_value();
         control["project_id"] = json!("project-a");
         control["session_id"] = json!("session-a");
+        control["available_workers"] = json!(2);
         fs::write(&control_path, serde_json::to_vec(&control).expect("serialize control"))
             .expect("write control");
         use std::os::unix::fs::PermissionsExt;
@@ -19901,6 +20060,28 @@ mod leader_turn_record_tests {
         }
 
         env::set_var("TERMMESH_LEADER_SESSION_ID", "session-a");
+        let derived_only = run_leader_turn_route_with_evidence(
+            &team,
+            "turn-derived-evidence-only",
+            "parallel",
+            Some("multi_unit"),
+            None,
+            &[],
+            None,
+            None,
+            Some(2),
+            true,
+            true,
+            Some(0),
+            true,
+            Some("passed"),
+            None,
+        )
+        .expect("route evaluation");
+        assert_eq!(derived_only["record"]["derived_available_workers"], 2);
+        assert_eq!(derived_only["record"]["policy_applied"], false);
+        assert!(derived_only["directive"].is_null());
+
         env::set_var("TERMMESH_LEADER_PARTICIPATION_MODE", "canary");
         env::set_var("TERMMESH_LEADER_PARTICIPATION_PERCENT", "100");
         env::set_var("TERMMESH_LEADER_PARTICIPATION_SUPPORTED", "true");
@@ -20940,6 +21121,7 @@ mod leader_turn_record_tests {
     #[test]
     fn route_deviation_is_null_when_stated_route_matches_the_suggestion() {
         let _env = ProcessEnvGuard::acquire();
+        let _route_env = RouteDerivationEnv::isolated();
         let home = std::env::temp_dir().join(format!("tm-routedev-match-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
@@ -20973,6 +21155,7 @@ mod leader_turn_record_tests {
     #[test]
     fn route_deviation_reports_suggested_and_stated_when_they_differ() {
         let _env = ProcessEnvGuard::acquire();
+        let _route_env = RouteDerivationEnv::isolated();
         let home = std::env::temp_dir().join(format!("tm-routedev-diff-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
@@ -22094,6 +22277,53 @@ fn should_discover_wait_tasks(
     !explicit_task_scope && (!tracked_initialized || tracked_agents_empty)
 }
 
+/// Statuses after which the worker no longer works on the task, so a wait
+/// scoped to it has nothing left to wait for. Leaving `failed` out made a
+/// wait run to its timeout whenever one tracked task failed.
+fn wait_task_settled(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "review_ready" | "blocked" | "failed" | "cancelled"
+    )
+}
+
+/// Messages carry no task correlation. When the caller named the tasks it is
+/// waiting for, an interim report from every agent says nothing about them and
+/// must not end the wait.
+fn messages_end_any_wait(explicit_task_scope: bool) -> bool {
+    !explicit_task_scope
+}
+
+/// The one word the leader branches on. A blocked task needs the leader before
+/// anything else, a failed one needs a decision, and only without either is
+/// the wave done.
+fn wait_report_outcome<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'static str {
+    let mut failed = false;
+    for status in statuses {
+        match status {
+            "blocked" => return "blocked",
+            "failed" => failed = true,
+            _ => {}
+        }
+    }
+    if failed { "failed" } else { "completed" }
+}
+
+/// Tracked tasks a timed-out wait should be re-armed for. A task the list never
+/// returned is still pending: absence is not completion.
+fn wait_pending_tasks(
+    tracked: &std::collections::HashSet<String>,
+    statuses: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut pending: Vec<String> = tracked
+        .iter()
+        .filter(|id| !statuses.get(*id).is_some_and(|status| wait_task_settled(status)))
+        .cloned()
+        .collect();
+    pending.sort();
+    pending
+}
+
 fn run_wait(
     sock: &PathBuf,
     team: &str,
@@ -22112,13 +22342,41 @@ fn run_wait(
         agent_filter.iter().cloned().collect::<Vec<_>>().join(",")
     };
     eprintln!("Waiting for agents in team '{team}' (timeout: {timeout}s, mode: {mode}, agents: {filter_label})...");
+    let wait_leader_session = current_leader_session_id();
+    let wait_log = if explicit_task_ids.is_some() || wait_leader_session.is_some() {
+        let task_ids = explicit_task_ids
+            .map(|ids| ids.iter().cloned().collect())
+            .or_else(|| task_id.map(|id| vec![id.to_string()]))
+            .unwrap_or_default();
+        let wait_id = wait_id();
+        let turn_id = turn_id_from_hook_state();
+        append_wait_record(team, &wait_id, "start", None, &task_ids, mode, timeout, wait_leader_session.as_deref(), turn_id.as_deref());
+        Some((wait_id, task_ids, wait_leader_session, turn_id))
+    } else {
+        None
+    };
+    macro_rules! finish_wait {
+        ($outcome:expr) => {{
+            if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+            }
+            return;
+        }};
+    }
 
+    let (mut initial_task_ids, explicit_task_scope) =
+        initialize_wait_task_scope(explicit_task_ids, task_id);
+    let track_messages =
+        mode == "msg" || (mode == "any" && messages_end_any_wait(explicit_task_scope));
     let needs_team_status = matches!(mode, "report" | "msg" | "any");
     let team_status = if needs_team_status {
         match rpc_call(sock, "team.status", json!({ "team_name": team })) {
             Ok(response) => Some(response),
             Err(error) => {
                 eprintln!("wait: could not inspect team '{team}': {error}");
+                if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                    append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                }
                 process::exit(1);
             }
         }
@@ -22128,7 +22386,7 @@ fn run_wait(
     let status_agents = team_status
         .as_ref()
         .and_then(|response| response["result"]["agents"].as_array());
-    let agent_names: Vec<String> = if mode == "msg" || mode == "any" {
+    let agent_names: Vec<String> = if track_messages {
         status_agents
             .into_iter()
             .flatten()
@@ -22138,7 +22396,7 @@ fn run_wait(
     } else {
         Vec::new()
     };
-    let message_baseline: std::collections::HashSet<String> = if mode == "msg" || mode == "any" {
+    let message_baseline: std::collections::HashSet<String> = if track_messages {
         rpc_call(sock, "team.message.list", json!({ "team_name": team }))
             .ok()
             .and_then(|response| response["result"]["messages"].as_array().cloned())
@@ -22154,8 +22412,6 @@ fn run_wait(
     // A plain broadcast has no task or correlation ID, so waiting for it used
     // to consume the entire timeout while displaying report=0/0. Fail before
     // subscribing or polling and point callers to the tracked healthcheck.
-    let (mut initial_task_ids, explicit_task_scope) =
-        initialize_wait_task_scope(explicit_task_ids, task_id);
     let mut initial_tracked_agents = std::collections::HashSet::new();
     if matches!(mode, "report" | "any") && initial_task_ids.is_empty() {
         if let Some(agents) = status_agents {
@@ -22181,6 +22437,9 @@ fn run_wait(
             eprintln!(
                 "wait: mode '{mode}' has no task or correlation to track; plain broadcast replies cannot be matched. Use 'tm-agent warmup' for ping/pong healthchecks, 'tm-agent fan-out' for tracked work, or pass --tasks <ids>."
             );
+            if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+            }
             process::exit(1);
         }
     }
@@ -22238,6 +22497,10 @@ fn run_wait(
     // the result.status fallback so it doesn't count team members who were never
     // delegated to in this round (the root cause of wait hangs on partial fan-out).
     let mut tracked_agents = initial_tracked_agents;
+    // Last status seen per tracked task: the outcome word and the timeout
+    // report come from here, not from another round of RPCs.
+    let mut tracked_statuses: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     while elapsed < timeout {
         if current_interval > 0 {
             // B1: push channel replaces sleep. Decay toward interval deadline in
@@ -22321,17 +22584,18 @@ fn run_wait(
                 if let Ok(r) = rpc_call(sock, "team.task.list", json!({ "team_name": team })) {
                     if let Some(tasks) = r["result"]["tasks"].as_array() {
                         let total = tracked_task_ids.len() as u64;
-                        let done = tasks
-                            .iter()
-                            .filter(|t| {
-                                let tid = t["id"].as_str().unwrap_or("");
-                                tracked_task_ids.contains(tid)
-                                    && matches!(
-                                        t["status"].as_str(),
-                                        Some("completed") | Some("review_ready") | Some("blocked")
-                                    )
-                            })
-                            .count() as u64;
+                        let mut done = 0u64;
+                        for task in tasks {
+                            let tid = task["id"].as_str().unwrap_or("");
+                            if !tracked_task_ids.contains(tid) {
+                                continue;
+                            }
+                            let status = task["status"].as_str().unwrap_or("");
+                            tracked_statuses.insert(tid.to_string(), status.to_string());
+                            if wait_task_settled(status) {
+                                done += 1;
+                            }
+                        }
                         report_done = total > 0 && done >= total;
                         report_progress = format!("{done}/{total}");
                     }
@@ -22361,7 +22625,7 @@ fn run_wait(
             }
         }
 
-        if mode == "msg" || mode == "any" {
+        if track_messages {
             match rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
                 Ok(r) => {
                     if let Some(messages) = r["result"]["messages"].as_array() {
@@ -22483,15 +22747,12 @@ fn run_wait(
         if let Some(tid) = task_id {
             let st = task_status.as_deref().unwrap_or("unknown");
             eprintln!("  [{elapsed}/{timeout}s] task={tid} status={st}");
-            if matches!(
-                st,
-                "blocked" | "review_ready" | "completed" | "failed" | "abandoned"
-            ) {
+            if wait_task_settled(st) {
                 println!(
                     "{}",
                     pretty(&json!({ "result": { "team_name": team, "task": task_obj } }))
                 );
-                return;
+                finish_wait!(wait_outcome_for_status(st));
             }
         }
 
@@ -22505,7 +22766,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    return;
+                    finish_wait!(wait_report_outcome(tracked_statuses.values().map(String::as_str)));
                 }
             }
             "msg" => {
@@ -22516,21 +22777,37 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    return;
+                    finish_wait!("completed");
                 }
             }
             "any" => {
-                eprintln!(
-                    "  [{elapsed}/{timeout}s] report={report_progress} msg={msg_progress} (any)"
-                );
+                if track_messages {
+                    eprintln!(
+                        "  [{elapsed}/{timeout}s] report={report_progress} msg={msg_progress} (any)"
+                    );
+                } else {
+                    eprintln!("  [{elapsed}/{timeout}s] report={report_progress} (any, tasks)");
+                }
                 if report_done {
-                    eprintln!("All agents have reported results.");
+                    let outcome = if !inbox_blocked.is_empty() {
+                        "blocked"
+                    } else {
+                        wait_report_outcome(tracked_statuses.values().map(String::as_str))
+                    };
+                    eprintln!("All tracked tasks have settled: {outcome}.");
                     if let Ok(r) =
                         rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
                     {
-                        println!("{}", pretty(&r));
+                        let mut result = r;
+                        if result["result"].is_null() {
+                            result["result"] = json!({});
+                        }
+                        if let Some(body) = result["result"].as_object_mut() {
+                            body.insert("outcome".to_string(), json!(outcome));
+                        }
+                        println!("{}", pretty(&result));
                     }
-                    return;
+                    finish_wait!(outcome);
                 }
                 if msg_done {
                     eprintln!("All agents have posted messages.");
@@ -22538,7 +22815,7 @@ fn run_wait(
                     {
                         println!("{}", pretty(&r));
                     }
-                    return;
+                    finish_wait!("completed");
                 }
             }
             "blocked" => {
@@ -22551,7 +22828,7 @@ fn run_wait(
                             "result": { "team_name": team, "items": inbox_blocked, "count": inbox_blocked.len() }
                         }))
                     );
-                    return;
+                    finish_wait!("blocked");
                 }
             }
             "review_ready" => {
@@ -22567,7 +22844,7 @@ fn run_wait(
                             "result": { "team_name": team, "items": inbox_review, "count": inbox_review.len() }
                         }))
                     );
-                    return;
+                    finish_wait!("review_ready");
                 }
             }
             "idle" => {
@@ -22612,13 +22889,16 @@ fn run_wait(
                                     "result": { "team_name": team, "agents": idle_agents, "count": idle_count }
                                 }))
                             );
-                            return;
+                            finish_wait!("completed");
                         }
                     }
                 }
             }
             _ => {
                 eprintln!("Unknown wait mode: {mode}");
+                if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                    append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                }
                 process::exit(1);
             }
         }
@@ -22646,10 +22926,54 @@ fn run_wait(
     }
 
     eprintln!("Timeout: not all agents reported within {timeout}s");
-    if let Ok(r) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
+    if tracked_initialized && !tracked_task_ids.is_empty() {
+        // The leader re-arms for `pending` only; a team-wide result.status
+        // would hand it other waits' tasks.
+        let pending = wait_pending_tasks(&tracked_task_ids, &tracked_statuses);
+        let mut tasks: Vec<Value> = tracked_task_ids
+            .iter()
+            .map(|id| json!({ "id": id, "status": tracked_statuses.get(id) }))
+            .collect();
+        tasks.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        println!(
+            "{}",
+            pretty(&json!({
+                "result": { "team_name": team, "outcome": "timeout", "tasks": tasks, "pending": pending }
+            }))
+        );
+    } else if let Ok(r) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
         println!("{}", pretty(&r));
     }
+    if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+        append_wait_record(team, wait_id, "end", Some("timeout"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+    }
     process::exit(1);
+}
+
+fn wait_id() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let pid = process::id() as u128;
+    format!("{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}", (nanos >> 96) as u32, (nanos >> 80) as u16, ((nanos >> 68) as u16) & 0x0fff, ((nanos >> 56) as u16) & 0x0fff, (nanos ^ pid) & 0xffffffffffff)
+}
+
+fn wait_outcome_for_status(status: &str) -> &'static str {
+    match status {
+        "blocked" => "blocked",
+        "review_ready" => "review_ready",
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "error",
+    }
+}
+
+fn append_wait_record(team: &str, wait_id: &str, phase: &str, outcome: Option<&str>, task_ids: &[String], mode: &str, timeout: u32, leader_session_id: Option<&str>, turn_id: Option<&str>) {
+    let Ok(path) = turn_log_path() else { return };
+    let mut record = json!({"event":"leader_wait","phase":phase,"wait_id":wait_id,"task_ids":task_ids,"mode":mode,"timeout_s":timeout,"team":team,"ts":iso8601_utc_now()});
+    if let Some(outcome) = outcome { record["outcome"] = json!(outcome); }
+    if let Some(session) = leader_session_id { record["leader_session_id"] = json!(session); }
+    if let Some(turn_id) = turn_id { record["turn_id"] = json!(turn_id); }
+    let _ = append_turn_record(&path, &record);
 }
 
 #[cfg(test)]
@@ -22685,6 +23009,66 @@ mod wait_task_scope_tests {
         assert!(!is_explicit);
         assert!(scope.is_empty());
         assert!(should_discover_wait_tasks(is_explicit, false, true));
+    }
+}
+
+#[cfg(test)]
+mod wait_any_scope_tests {
+    use super::*;
+
+    #[test]
+    fn failed_and_cancelled_tasks_settle_a_tracked_wait() {
+        for status in ["completed", "review_ready", "blocked", "failed", "cancelled"] {
+            assert!(wait_task_settled(status), "{status}");
+        }
+        // `abandoned` is not a TaskStatus the daemon accepts; it was a stale
+        // name in the single-task exit.
+        for status in ["pending", "assigned", "in_progress", "abandoned", ""] {
+            assert!(!wait_task_settled(status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn messages_end_any_only_without_a_task_scope() {
+        assert!(!messages_end_any_wait(true));
+        assert!(messages_end_any_wait(false));
+    }
+
+    #[test]
+    fn blocked_outranks_failed_outranks_completed() {
+        assert_eq!(wait_report_outcome(["completed", "completed"]), "completed");
+        assert_eq!(wait_report_outcome(["completed", "failed"]), "failed");
+        assert_eq!(wait_report_outcome(["failed", "blocked", "completed"]), "blocked");
+        assert_eq!(wait_report_outcome(std::iter::empty::<&str>()), "completed");
+    }
+
+    #[test]
+    fn timeout_reports_tracked_tasks_that_have_not_settled() {
+        let tracked = std::collections::HashSet::from([
+            "done".to_string(),
+            "running".to_string(),
+            "unseen".to_string(),
+        ]);
+        let statuses = std::collections::HashMap::from([
+            ("done".to_string(), "failed".to_string()),
+            ("running".to_string(), "in_progress".to_string()),
+        ]);
+        assert_eq!(wait_pending_tasks(&tracked, &statuses), vec!["running", "unseen"]);
+    }
+}
+
+#[cfg(test)]
+mod rwait_tests {
+    use super::*;
+
+    #[test]
+    fn maps_terminal_task_statuses_to_wait_outcomes() {
+        assert_eq!(wait_outcome_for_status("completed"), "completed");
+        assert_eq!(wait_outcome_for_status("review_ready"), "review_ready");
+        assert_eq!(wait_outcome_for_status("blocked"), "blocked");
+        assert_eq!(wait_outcome_for_status("failed"), "failed");
+        assert_eq!(wait_outcome_for_status("cancelled"), "cancelled");
+        assert_eq!(wait_outcome_for_status("abandoned"), "error");
     }
 }
 
@@ -25423,5 +25807,83 @@ mod worktree_availability_tests {
             WorktreePolicyArg::Auto,
             &wrapped
         ));
+    }
+}
+
+#[cfg(test)]
+mod rcollect_tests {
+    use super::*;
+    #[test]
+    fn rcollect_shape_and_evidence_events_are_ignored_by_health() {
+        let record = rcollect_record("p", "collect", &json!({"result":{"tasks":[{"id":"b"},{"id":"a"}]}}));
+        assert_eq!(record["event"], "task_collect"); assert_eq!(record["task_ids"], json!(["a","b"]));
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("turns.log");
+        fs::write(&path, b"{\"event\":\"leader_wait\"}\n{\"event\":\"task_collect\"}\n").unwrap();
+        assert_eq!(leader_participation_health(&path, "p", None).malformed_lines, 0);
+    }
+}
+
+#[cfg(test)]
+mod rroute_tests {
+    use super::*;
+
+    #[test]
+    fn rroute_explicit_flags_win_and_are_not_marked_derived() {
+        let evidence = derive_route_evidence(
+            Some("shared"),
+            Some(4),
+            || panic!("control must not be read when --available-workers is given"),
+            || panic!("team.status must not be read when --checkout-mode is given"),
+        );
+        assert_eq!(evidence.checkout_mode.as_deref(), Some("shared"));
+        assert_eq!(evidence.available_workers, Some(4));
+        assert!(evidence.derived.is_empty());
+    }
+
+    #[test]
+    fn rroute_omitted_flags_are_filled_from_recorded_facts() {
+        let evidence = derive_route_evidence(
+            None,
+            None,
+            || Some(3),
+            || Some("isolated".to_string()),
+        );
+        assert_eq!(evidence.checkout_mode.as_deref(), Some("isolated"));
+        assert_eq!(evidence.available_workers, Some(3));
+        assert_eq!(evidence.derived, vec!["checkout_mode", "available_workers"]);
+    }
+
+    #[test]
+    fn rroute_unknown_sources_stay_absent() {
+        let evidence = derive_route_evidence(None, None, || None, || None);
+        assert_eq!(evidence, DerivedRouteEvidence::default());
+    }
+
+    #[test]
+    fn rroute_reads_only_a_recorded_layout_of_this_team() {
+        let status = json!({"team_name": "mine", "checkout_mode": " isolated "});
+        assert_eq!(checkout_mode_from_team_status(&status, "mine").as_deref(), Some("isolated"));
+        assert_eq!(checkout_mode_from_team_status(&status, "other"), None);
+        for mode in ["shared", "off"] {
+            let status = json!({"team_name": "mine", "checkout_mode": mode});
+            assert_eq!(checkout_mode_from_team_status(&status, "mine").as_deref(), Some(mode));
+        }
+        for status in [
+            json!({"team_name": "mine", "checkout_mode": "unknown"}),
+            json!({"team_name": "mine", "checkout_mode": ""}),
+            json!({"team_name": "mine", "worktree_mode": "isolated"}),
+            json!({"team_name": "mine", "checkout_mode": 1}),
+        ] {
+            assert_eq!(checkout_mode_from_team_status(&status, "mine"), None, "{status}");
+        }
+    }
+
+    #[test]
+    fn rroute_reads_the_roster_count_from_the_control_payload() {
+        assert_eq!(available_workers_from_control(&json!({"available_workers": 2})), Some(2));
+        assert_eq!(available_workers_from_control(&json!({"available_workers": 0})), Some(0));
+        assert_eq!(available_workers_from_control(&json!({})), None);
+        assert_eq!(available_workers_from_control(&json!({"available_workers": "2"})), None);
+        assert_eq!(available_workers_from_control(&json!({"available_workers": -1})), None);
     }
 }

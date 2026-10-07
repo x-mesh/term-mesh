@@ -163,6 +163,72 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         XCTAssertTrue(prompt.contains("tm-agent delegate"))
         XCTAssertTrue(prompt.contains("tm-agent status"))
         XCTAssertTrue(prompt.contains("tm-agent wait"))
+        XCTAssertFalse(prompt.contains("run_in_background:true"))
+        XCTAssertFalse(prompt.contains("MUST collect results before responding"))
+        XCTAssertTrue(prompt.contains("As a non-Claude leader, finish leader-lane work first, then run the task-scoped wait in the foreground"))
+        XCTAssertFalse(prompt.contains("send a short interim status and end the turn"))
+    }
+
+    private func codexLeaderPrompt(wakeSetting: Bool?, rows: [TeamAgentRow]) throws -> String {
+        let suite = "RemoteLeaderBriefingTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        if let wakeSetting { defaults.set(wakeSetting, forKey: CodexLeaderWake.enabledKey) }
+        return TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock",
+            codexLeaderWake: TeamOrchestrator.nonClaudeLeaderWakesOnResults(
+                leaderMode: "codex", leaderCli: nil, defaults: defaults
+            )
+        )
+    }
+
+    /// With wakes on, a foreground wait would hold the turn the wake is meant
+    /// to start, so the Codex leader is told to end the turn and come back.
+    func test_aCodexLeaderWithWakesOnEndsTheTurnInsteadOfWaiting() throws {
+        let prompt = try codexLeaderPrompt(wakeSetting: true, rows: rows)
+        XCTAssertTrue(prompt.contains("then end your turn instead of a foreground `tm-agent wait`"))
+        XCTAssertTrue(prompt.contains("When a line starting `[term-mesh] task` arrives, run `tm-agent collect --headers` for those ids only"))
+        XCTAssertTrue(prompt.contains("Never claim completion before all are collected."))
+        XCTAssertFalse(prompt.contains("in the foreground"))
+        XCTAssertFalse(prompt.contains("finish leader-lane work first, then run the task-scoped wait"))
+    }
+
+    func test_aCodexLeaderWithWakesOffKeepsTheForegroundWait() throws {
+        // `rows` mints fresh instance ids on every read, so both renders share one.
+        let fixedRows = rows
+        let unchanged = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
+            teamName: "xm",
+            rows: fixedRows,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        for setting in [nil, false] as [Bool?] {
+            let prompt = try codexLeaderPrompt(wakeSetting: setting, rows: fixedRows)
+            XCTAssertEqual(prompt, unchanged)
+            XCTAssertTrue(prompt.contains("As a non-Claude leader, finish leader-lane work first, then run the task-scoped wait in the foreground"))
+            XCTAssertFalse(prompt.contains("`[term-mesh] task`"))
+        }
+    }
+
+    func test_onlyACodexLeaderIsToldItWillBeWoken() throws {
+        let suite = "RemoteLeaderBriefingTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: CodexLeaderWake.enabledKey)
+        XCTAssertTrue(TeamOrchestrator.nonClaudeLeaderWakesOnResults(
+            leaderMode: "adopted", leaderCli: "codex", defaults: defaults
+        ))
+        XCTAssertFalse(TeamOrchestrator.nonClaudeLeaderWakesOnResults(
+            leaderMode: "gemini", leaderCli: nil, defaults: defaults
+        ))
+        XCTAssertFalse(TeamOrchestrator.nonClaudeLeaderWakesOnResults(
+            leaderMode: "kiro", leaderCli: nil, defaults: defaults
+        ))
     }
 
     /// The peer's socket, not this machine's — the leader runs over there.
@@ -179,6 +245,21 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             prompt.contains(LeaderParallelPolicy.renderedInstructions),
             "the fix must add the team around the policy, not swap one for the other"
         )
+    }
+
+    func test_bothLeaderKindsAreToldHowToHandleAWaitThatTimesOutOrBlocks() {
+        let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        for prompt in [claude, nonClaudePrompt()] {
+            XCTAssertTrue(prompt.contains("If the wait ends with `timeout`"))
+            XCTAssertTrue(prompt.contains("re-arm it only for task ids still pending"))
+            XCTAssertTrue(prompt.contains("If it ends with `blocked`, read the blocked task"))
+        }
     }
 
     func test_bothLeaderKindsDecomposeFirstAndKeepDirectAsAnExplicitException() {
@@ -198,7 +279,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertTrue(prompt.contains("State the concrete constraint when choosing it"))
             XCTAssertTrue(prompt.contains("at least two units are"))
             XCTAssertTrue(prompt.contains("direct, probe, or parallel"))
-            XCTAssertTrue(prompt.contains("\"route\": \"direct|probe|parallel\""))
+            XCTAssertTrue(prompt.contains("\"route\": \"direct|probe|parallel|delegated\""))
             XCTAssertTrue(prompt.contains("--worktree always --from <base_ref>"))
             XCTAssertTrue(prompt.contains("wait --mode any --tasks"))
             XCTAssertTrue(prompt.contains("at most once more"))

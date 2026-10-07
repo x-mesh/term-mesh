@@ -870,6 +870,283 @@ if last_end.get("delegation_floor") != "met":
     )
 PY
 
+# An asynchronous leader is re-invoked to collect work it dispatched in an
+# earlier turn. A no-dispatch turn is exempt only when it explicitly records
+# collection of that session's prior task.
+ASYNC_HOME="$TEST_TMP/async"
+ASYNC_CTL="$TEST_TMP/async-ctl"
+mkdir -p "$ASYNC_HOME/.term-mesh/logs" "$ASYNC_CTL" || exit 1
+ASYNC_LOG="$ASYNC_HOME/.term-mesh/logs/turns.log"
+
+cat > "$ASYNC_CTL/delegated.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine",
+ "session_id":"async-leader"}
+JSON
+
+async_hook() {
+    HOME="$ASYNC_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=async-surface \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_SESSION_ID=async-leader \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$ASYNC_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+# async_task <event> <task_id> <status-or-empty> <age-seconds> <session>
+async_task() {
+    python3 - "$ASYNC_LOG" "$@" <<'PY' || exit 1
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+log_path, event, task_id, status, age, session = sys.argv[1:7]
+ts = (datetime.now(timezone.utc) - timedelta(seconds=int(age))).strftime("%Y-%m-%dT%H:%M:%SZ")
+record = {"event": event, "turn_id": task_id, "ts": ts, "team": "mine",
+          "task_id": task_id, "worker": "a", "leader_session_id": session}
+if event == "task_dispatch":
+    record["task_delivery"] = "created"
+else:
+    record["task_status"] = status
+with open(log_path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record) + "\n")
+PY
+}
+
+# async_turn <name>: one prompt that dispatches nothing; prints Stop's stdout.
+async_turn() {
+    async_hook --start "{\"prompt\":\"$1\",\"session_id\":\"async-$1\"}" >/dev/null \
+        || fail "async $1 start returned nonzero"
+    async_hook --end "{\"session_id\":\"async-$1\",\"stop_hook_active\":false}" \
+        || fail "async $1 end returned nonzero"
+}
+
+async_floor() {
+    python3 - "$ASYNC_LOG" "$1" "$2" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+log_path, expected, label = sys.argv[1:4]
+records = [
+    json.loads(line)
+    for line in pathlib.Path(log_path).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+actual = [r for r in records if r["event"] == "turn_end"][-1].get("delegation_floor")
+if actual != expected:
+    raise SystemExit("FAIL: %s: expected %r, got %r" % (label, expected, actual))
+PY
+}
+
+# Turn 1 dispatches two tasks, so it meets the floor the ordinary way.
+async_hook --start '{"prompt":"dispatch","session_id":"async-dispatch"}' >/dev/null \
+    || fail "async dispatch start returned nonzero"
+async_task task_dispatch t1 "" 0 async-leader
+async_task task_dispatch t2 "" 0 async-leader
+async_hook --end '{"session_id":"async-dispatch"}' >/dev/null \
+    || fail "async dispatch end returned nonzero"
+async_floor met "dispatching turn"
+
+# Turn 2: the user asks something while both workers run. In-flight work alone
+# must not exempt unrelated direct work.
+ASYNC_OUT=$(async_turn inflight)
+async_floor unmet "turn with prior work in flight but no collection"
+case "$ASYNC_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "in-flight-only turn was not blocked: $ASYNC_OUT" ;;
+esac
+
+# Turn 3: collection in this turn for a prior task is the narrow exemption.
+async_hook --start '{"prompt":"collect","session_id":"async-collect"}' >/dev/null \
+    || fail "collect start returned nonzero"
+async_task task_collect t1 "" 0 async-leader
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+records[-1]["event"] = "task_collect"
+records[-1]["task_ids"] = ["t1"]
+records[-1].pop("task_id", None)
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-collect","stop_hook_active":false}') \
+    || fail "collect end returned nonzero"
+async_floor met_by_collection "collection turn"
+[ -z "$ASYNC_OUT" ] || fail "collection turn was blocked: $ASYNC_OUT"
+
+# A background wait keeps the turn id from when it began, and is not evidence
+# that this later turn collected the task.
+async_hook --start '{"prompt":"background wait end","session_id":"async-background-wait"}' >/dev/null \
+    || fail "background wait start returned nonzero"
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+prior_turn_id = next(record["turn_id"] for record in records if record["event"] == "turn_start")
+records.append({"event": "leader_wait", "phase": "end", "turn_id": prior_turn_id,
+                "ts": records[-1]["ts"], "team": "mine",
+                "leader_session_id": "async-leader", "task_ids": ["t1"]})
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-background-wait","stop_hook_active":false}') \
+    || fail "background wait end returned nonzero"
+async_floor unmet "background wait ending in a later turn"
+case "$ASYNC_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "background wait end exempted this turn: $ASYNC_OUT" ;;
+esac
+
+# A foreground wait end uses this turn's id and is collection evidence.
+async_hook --start '{"prompt":"foreground wait end","session_id":"async-foreground-wait"}' >/dev/null \
+    || fail "foreground wait start returned nonzero"
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+turn_id = [record["turn_id"] for record in records if record["event"] == "turn_start"][-1]
+records.append({"event": "leader_wait", "phase": "end", "turn_id": turn_id,
+                "ts": records[-1]["ts"], "team": "mine",
+                "leader_session_id": "async-leader", "task_ids": ["t1"]})
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-foreground-wait","stop_hook_active":false}') \
+    || fail "foreground wait end returned nonzero"
+async_floor met_by_collection "foreground wait ending in this turn"
+[ -z "$ASYNC_OUT" ] || fail "foreground wait end was blocked: $ASYNC_OUT"
+
+# Turn 4: another session's collection cannot exempt this leader.
+async_hook --start '{"prompt":"foreign collect","session_id":"async-foreign"}' >/dev/null \
+    || fail "foreign collect start returned nonzero"
+async_task task_collect t2 "" 0 other-leader
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+records[-1]["event"] = "task_collect"
+records[-1]["task_ids"] = ["t2"]
+records[-1].pop("task_id", None)
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-foreign","stop_hook_active":false}') \
+    || fail "foreign collect end returned nonzero"
+async_floor unmet "turn with another session's collection"
+case "$ASYNC_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "another session's collection exempted this leader: $ASYNC_OUT" ;;
+esac
+
+# Collection must not depend on the previous turn_end still being inside the
+# floor's 4 MiB lookback: a busy log between two turns pushes it out, and the
+# collection turn was then judged as if nothing had been collected.
+ASYNC_HOME="$TEST_TMP/async-far"
+mkdir -p "$ASYNC_HOME/.term-mesh/logs" || exit 1
+ASYNC_LOG="$ASYNC_HOME/.term-mesh/logs/turns.log"
+
+async_hook --start '{"prompt":"far dispatch","session_id":"async-far-dispatch"}' >/dev/null \
+    || fail "far dispatch start returned nonzero"
+async_task task_dispatch far1 "" 0 async-leader
+async_hook --end '{"session_id":"async-far-dispatch"}' >/dev/null \
+    || fail "far dispatch end returned nonzero"
+async_floor met "far dispatching turn"
+
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import sys
+
+line = (
+    '{"event":"task_lifecycle","turn_id":"n","ts":"2026-01-01T00:00:00Z",'
+    '"team":"noise","task_status":"running","pad":"%s"}\n' % ("x" * 100)
+)
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(line * (5 * 1024 * 1024 // len(line) + 1))
+PY
+async_hook --start '{"prompt":"far collect","session_id":"async-far-collect"}' >/dev/null \
+    || fail "far collect start returned nonzero"
+async_task task_collect far1 "" 0 async-leader
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+records[-1]["event"] = "task_collect"
+records[-1]["task_ids"] = ["far1"]
+records[-1].pop("task_id", None)
+path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+PY
+ASYNC_OUT=$(async_hook --end '{"session_id":"async-far-collect","stop_hook_active":false}') \
+    || fail "far collect end returned nonzero"
+async_floor met_by_collection "collection turn past the lookback"
+[ -z "$ASYNC_OUT" ] || fail "collection turn past the lookback was blocked: $ASYNC_OUT"
+
+# Outstanding work is attributed by leader session. A leader without one must
+# not be exempted by another session-less leader's work in the same team.
+NOSESSION_HOME="$TEST_TMP/no-session"
+NOSESSION_CTL="$TEST_TMP/no-session-ctl"
+mkdir -p "$NOSESSION_HOME/.term-mesh/logs" "$NOSESSION_CTL" || exit 1
+NOSESSION_LOG="$NOSESSION_HOME/.term-mesh/logs/turns.log"
+
+cat > "$NOSESSION_CTL/delegated.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine"}
+JSON
+
+nosession_hook() {
+    env -u TERMMESH_LEADER_SESSION_ID \
+        HOME="$NOSESSION_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=no-session-b \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$NOSESSION_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+python3 - "$NOSESSION_LOG" <<'PY' || exit 1
+import json
+import sys
+from datetime import datetime, timezone
+
+ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"event": "task_dispatch", "turn_id": "a1", "ts": ts,
+                             "team": "mine", "task_id": "a1", "worker": "a",
+                             "task_delivery": "created"}) + "\n")
+PY
+nosession_hook --start '{"prompt":"leader b","session_id":"no-session-b"}' >/dev/null \
+    || fail "no-session start returned nonzero"
+python3 - "$NOSESSION_LOG" <<'PY' || exit 1
+import json
+import sys
+from datetime import datetime, timezone
+
+ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"event": "task_lifecycle", "turn_id": "a0", "ts": ts,
+                             "team": "mine", "task_id": "a0", "worker": "a",
+                             "task_status": "completed"}) + "\n")
+PY
+NOSESSION_OUT=$(nosession_hook --end '{"session_id":"no-session-b","stop_hook_active":false}') \
+    || fail "no-session end returned nonzero"
+ASYNC_LOG="$NOSESSION_LOG" async_floor unmet "session-less leader with another leader's work"
+case "$NOSESSION_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "a session-less leader was exempted by another leader's work: $NOSESSION_OUT" ;;
+esac
+
 # New hook records carry Project identity when the leader launch provides it.
 IDENTITY_HOME="$TEST_TMP/identity"
 mkdir -p "$IDENTITY_HOME/.term-mesh/logs" || exit 1
@@ -908,4 +1185,7 @@ PY
 printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
 printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
 printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tail'
+printf '%s\n' 'PASS: delegation floor lets an async leader collect work it already dispatched'
+printf '%s\n' 'PASS: delegation floor finds the previous turn_end beyond its lookback'
+printf '%s\n' 'PASS: delegation floor gives a session-less leader no exemption'
 printf '%s\n' 'PASS: leader turn hook records scoped Project identity'

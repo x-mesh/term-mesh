@@ -1555,7 +1555,7 @@ struct TeamCreationView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.triangle.branch")
                         .foregroundStyle(.blue)
-                    Text("All agents share one worktree: team/\(teamName)")
+                    Text("All agents share one worktree: \(TeamOrchestrator.sharedWorktreeBranch(teamName: teamName))")
                         .foregroundStyle(.secondary)
                 }
                 .font(.caption)
