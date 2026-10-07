@@ -22275,13 +22275,15 @@ fn run_wait(
     let wait_log = explicit_task_ids.map(|ids| {
         let task_ids: Vec<String> = ids.iter().cloned().collect();
         let wait_id = wait_id();
-        append_wait_record(team, &wait_id, "start", None, &task_ids, mode, timeout);
-        (wait_id, task_ids)
+        let leader_session_id = current_leader_session_id();
+        let turn_id = turn_id_from_hook_state();
+        append_wait_record(team, &wait_id, "start", None, &task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+        (wait_id, task_ids, leader_session_id, turn_id)
     });
     macro_rules! finish_wait {
         ($outcome:expr, $collected:expr) => {{
-            if let Some((wait_id, task_ids)) = &wait_log {
-                append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout);
+            if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+                append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
                 if $collected {
                     append_task_collect_record(team, "wait", task_ids);
                 }
@@ -22785,8 +22787,8 @@ fn run_wait(
     if let Ok(r) = rpc_call(sock, "team.result.status", json!({ "team_name": team })) {
         println!("{}", pretty(&r));
     }
-    if let Some((wait_id, task_ids)) = &wait_log {
-        append_wait_record(team, wait_id, "end", Some("timeout"), task_ids, mode, timeout);
+    if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
+        append_wait_record(team, wait_id, "end", Some("timeout"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
     }
     process::exit(1);
 }
@@ -22806,12 +22808,12 @@ fn wait_outcome_for_status(status: &str) -> &'static str {
     }
 }
 
-fn append_wait_record(team: &str, wait_id: &str, phase: &str, outcome: Option<&str>, task_ids: &[String], mode: &str, timeout: u32) {
+fn append_wait_record(team: &str, wait_id: &str, phase: &str, outcome: Option<&str>, task_ids: &[String], mode: &str, timeout: u32, leader_session_id: Option<&str>, turn_id: Option<&str>) {
     let Ok(path) = turn_log_path() else { return };
     let mut record = json!({"event":"leader_wait","phase":phase,"wait_id":wait_id,"task_ids":task_ids,"mode":mode,"timeout_s":timeout,"team":team,"ts":iso8601_utc_now()});
     if let Some(outcome) = outcome { record["outcome"] = json!(outcome); }
-    if let Some(session) = current_leader_session_id() { record["leader_session_id"] = json!(session); }
-    if let Some(turn_id) = turn_id_from_hook_state() { record["turn_id"] = json!(turn_id); }
+    if let Some(session) = leader_session_id { record["leader_session_id"] = json!(session); }
+    if let Some(turn_id) = turn_id { record["turn_id"] = json!(turn_id); }
     let _ = append_turn_record(&path, &record);
 }
 
