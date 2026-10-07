@@ -219,6 +219,25 @@ over this summary.
   tracking at its prompt. Shell integration is what emits these markers, so
   that combination is not expected.
 
+### 7) Detach the macOS layer display callback before the renderer is freed
+
+- Commit: `de35a51a7` (fix(renderer): detach IOSurfaceLayer display callback before freeing renderer (macOS))
+- Files: `src/renderer/Metal.zig`, `src/renderer/metal/IOSurfaceLayer.zig`
+- `IOSurfaceLayer` keeps raw renderer pointers in the `display_cb` and
+  `display_ctx` ivars. Commit `adee7043f` cleared them before renderer free on
+  iOS only.
+- On macOS the NSView keeps its hosted layer after `ghostty_surface_free`. A
+  later Core Animation commit called `display` with the freed renderer. The
+  crash was `object_getClass` in `drawFrame`. It occurred on a screen change,
+  95 minutes after the last pane close.
+- `prepareDeinit` now calls `detachFromHostIfDisplayCallbackOwned` on all
+  platforms. On macOS the call clears the ivars and the update flag only. It
+  does not clear `contents` and does not remove the layer, because the view
+  owns the layer.
+- term-mesh calls `ghostty_surface_free` on the main actor, so the detach runs
+  inline and does not wait on the main queue.
+- Upstreamable: yes, if upstream also lets the host view outlive the renderer.
+
 ## Merge conflict notes
 
 These files change frequently upstream; be careful when rebasing the fork:
