@@ -100,6 +100,9 @@ STATE_FILE="$LOG_DIR/.turn-current-$STATE_KEY"
 # the one Start wrote, and the floor only needs "did anything get dispatched
 # since this pane's last prompt".
 DISPATCH_BASELINE_FILE="$LOG_DIR/.turn-dispatch-$STATE_KEY"
+# Where this surface's previous turn_end landed, so a collection turn can find
+# it even after a busy log has pushed it out of the floor's lookback.
+LAST_END_FILE="$LOG_DIR/.turn-last-end-$STATE_KEY"
 STATE_LOCK="$STATE_FILE.lock"
 STATE_LOCK_HELD=0
 
@@ -417,13 +420,15 @@ if [ "$MODE" = --end ] \
     && [ -r "$LOG_FILE" ] \
     && [ -r "$DISPATCH_BASELINE_FILE" ] \
     && command -v python3 >/dev/null 2>&1; then
-    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
+    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" "$SURFACE_ID" "$LEADER_SESSION_ID" "$LAST_END_FILE" <<'TURN_HOOK_MET' 2>/dev/null || true
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
-control_path, log_path, team, baseline_path, surface_id, leader_session = sys.argv[1:7]
+(
+    control_path, log_path, team, baseline_path, surface_id, leader_session, last_end_path,
+) = sys.argv[1:8]
 
 # Bounds the read behind the baseline of this turn, so a long-lived log never makes
 # Stop slow. Daemon GC rotates turns.log every six hours anyway.
@@ -481,15 +486,39 @@ if baseline < 0:
     sys.exit(0)
 
 try:
-    size = os.path.getsize(log_path)
+    log_stat = os.stat(log_path)
 except Exception:
     sys.exit(0)
 # A file shorter than the offset means the log rotated under us. Say nothing
 # rather than report a truncation as "the leader delegated nothing".
-if size < baseline:
+if log_stat.st_size < baseline:
     sys.exit(0)
 
+
+def parse_ts(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+# The saved offset is only meaningful in the file it was taken from. After a
+# rotation the inode differs, and the saved time is the remaining evidence.
+previous_end_offset = None
+previous_end_at = None
+try:
+    with open(last_end_path, "r", encoding="utf-8") as handle:
+        saved_offset, saved_inode, saved_ts = handle.read().split()
+    if int(saved_inode) == log_stat.st_ino and 0 <= int(saved_offset) <= baseline:
+        previous_end_offset = int(saved_offset)
+    else:
+        previous_end_at = parse_ts(saved_ts)
+except Exception:
+    pass
+
 read_from = max(0, baseline - LOOKBACK_BYTES)
+if previous_end_offset is not None:
+    read_from = min(read_from, previous_end_offset)
 try:
     # Binary, because a text-mode seek only accepts offsets tell() produced.
     with open(log_path, "rb") as handle:
@@ -503,8 +532,9 @@ offset = read_from
 for index, raw in enumerate(chunks):
     line_offset = offset
     offset += len(raw) + 1
-    # A lookback that starts mid-file starts mid-line.
-    if index == 0 and read_from > 0:
+    # A lookback that starts mid-file starts mid-line. A saved turn_end offset
+    # is a line start.
+    if index == 0 and read_from > 0 and read_from != previous_end_offset:
         continue
     raw = raw.strip()
     if not raw:
@@ -525,30 +555,32 @@ if dispatched > 0:
     print("met", end="")
     sys.exit(0)
 
-
-def owned_by_this_leader(record):
-    if not leader_session:
-        return True
-    return record.get("leader_session_id") == leader_session
-
-
-def parse_ts(value):
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
+# Outstanding work is attributed by leader session. Without one, a task of
+# another leader in the same team would exempt this leader, so no exemption.
+if not leader_session:
+    print("unmet", end="")
+    sys.exit(0)
 
 # Without a previous turn_end on this surface there is no "since", so only a
 # terminal record written during this turn counts as collected.
-previous_end = baseline
+scanned_previous_end = baseline
 for line_offset, record in records:
     if (
         line_offset < baseline
         and record.get("event") == "turn_end"
         and record.get("surface_id") == surface_id
     ):
-        previous_end = line_offset
+        scanned_previous_end = line_offset
+
+
+def since_previous_end(line_offset, record):
+    if previous_end_offset is not None:
+        return line_offset >= previous_end_offset
+    if previous_end_at is not None:
+        at = parse_ts(record.get("ts"))
+        return at is not None and at >= previous_end_at
+    return line_offset >= scanned_previous_end
+
 
 now = datetime.now(timezone.utc)
 last_dispatch = {}
@@ -556,7 +588,7 @@ last_terminal = {}
 collected = False
 for line_offset, record in records:
     task_id = record.get("task_id")
-    if not isinstance(task_id, str) or not owned_by_this_leader(record):
+    if not isinstance(task_id, str) or record.get("leader_session_id") != leader_session:
         continue
     event = record.get("event")
     if event == "task_dispatch" and line_offset < baseline:
@@ -567,7 +599,7 @@ for line_offset, record in records:
             last_dispatch.pop(task_id, None)
     elif event == "task_lifecycle" and record.get("task_status") in TERMINAL_TASK_STATUSES:
         last_terminal[task_id] = line_offset
-        if line_offset >= previous_end:
+        if since_previous_end(line_offset, record):
             collected = True
 
 in_flight = any(
@@ -582,6 +614,29 @@ TURN_HOOK_MET
         *) DELEGATION_FLOOR="" ;;
     esac
     rm -f "$DISPATCH_BASELINE_FILE" 2>/dev/null || true
+fi
+
+# Taken before this turn's turn_end lines are appended, so the next turn's
+# "since the previous turn_end" can miss no record written from here on.
+if [ "$MODE" = --end ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$LOG_FILE" "$LAST_END_FILE" "$TS" <<'TURN_HOOK_LAST_END' 2>/dev/null || true
+import os
+import sys
+
+log_path, last_end_path, ts = sys.argv[1:4]
+tmp = last_end_path + ".tmp"
+try:
+    log_stat = os.stat(log_path)
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write("%d %d %s" % (log_stat.st_size, log_stat.st_ino, ts))
+    os.replace(tmp, last_end_path)
+except Exception:
+    # No log yet, or no way to record it: the next turn falls back to its scan.
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+TURN_HOOK_LAST_END
 fi
 
 # Entries newer than the routed turn were prompts absorbed into that running

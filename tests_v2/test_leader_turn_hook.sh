@@ -975,6 +975,89 @@ case "$ASYNC_OUT" in
     *) fail "a direct turn with nothing outstanding was not blocked: $ASYNC_OUT" ;;
 esac
 
+# Collection must not depend on the previous turn_end still being inside the
+# floor's 4 MiB lookback: a busy log between two turns pushes it out, and the
+# collection turn was then judged as if nothing had been collected.
+ASYNC_HOME="$TEST_TMP/async-far"
+mkdir -p "$ASYNC_HOME/.term-mesh/logs" || exit 1
+ASYNC_LOG="$ASYNC_HOME/.term-mesh/logs/turns.log"
+
+async_hook --start '{"prompt":"far dispatch","session_id":"async-far-dispatch"}' >/dev/null \
+    || fail "far dispatch start returned nonzero"
+async_task task_dispatch far1 "" 0 async-leader
+async_hook --end '{"session_id":"async-far-dispatch"}' >/dev/null \
+    || fail "far dispatch end returned nonzero"
+async_floor met "far dispatching turn"
+
+async_task task_lifecycle far1 completed 0 async-leader
+python3 - "$ASYNC_LOG" <<'PY' || exit 1
+import sys
+
+line = (
+    '{"event":"task_lifecycle","turn_id":"n","ts":"2026-01-01T00:00:00Z",'
+    '"team":"noise","task_status":"running","pad":"%s"}\n' % ("x" * 100)
+)
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(line * (5 * 1024 * 1024 // len(line) + 1))
+PY
+ASYNC_OUT=$(async_turn far-collect)
+async_floor met_by_inflight_or_collected "collection turn past the lookback"
+[ -z "$ASYNC_OUT" ] || fail "collection turn past the lookback was blocked: $ASYNC_OUT"
+
+# Outstanding work is attributed by leader session. A leader without one must
+# not be exempted by another session-less leader's work in the same team.
+NOSESSION_HOME="$TEST_TMP/no-session"
+NOSESSION_CTL="$TEST_TMP/no-session-ctl"
+mkdir -p "$NOSESSION_HOME/.term-mesh/logs" "$NOSESSION_CTL" || exit 1
+NOSESSION_LOG="$NOSESSION_HOME/.term-mesh/logs/turns.log"
+
+cat > "$NOSESSION_CTL/delegated.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine"}
+JSON
+
+nosession_hook() {
+    env -u TERMMESH_LEADER_SESSION_ID \
+        HOME="$NOSESSION_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=no-session-b \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$NOSESSION_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+python3 - "$NOSESSION_LOG" <<'PY' || exit 1
+import json
+import sys
+from datetime import datetime, timezone
+
+ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"event": "task_dispatch", "turn_id": "a1", "ts": ts,
+                             "team": "mine", "task_id": "a1", "worker": "a",
+                             "task_delivery": "created"}) + "\n")
+PY
+nosession_hook --start '{"prompt":"leader b","session_id":"no-session-b"}' >/dev/null \
+    || fail "no-session start returned nonzero"
+python3 - "$NOSESSION_LOG" <<'PY' || exit 1
+import json
+import sys
+from datetime import datetime, timezone
+
+ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"event": "task_lifecycle", "turn_id": "a0", "ts": ts,
+                             "team": "mine", "task_id": "a0", "worker": "a",
+                             "task_status": "completed"}) + "\n")
+PY
+NOSESSION_OUT=$(nosession_hook --end '{"session_id":"no-session-b","stop_hook_active":false}') \
+    || fail "no-session end returned nonzero"
+ASYNC_LOG="$NOSESSION_LOG" async_floor unmet "session-less leader with another leader's work"
+case "$NOSESSION_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "a session-less leader was exempted by another leader's work: $NOSESSION_OUT" ;;
+esac
+
 # New hook records carry Project identity when the leader launch provides it.
 IDENTITY_HOME="$TEST_TMP/identity"
 mkdir -p "$IDENTITY_HOME/.term-mesh/logs" || exit 1
@@ -1014,4 +1097,6 @@ printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
 printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
 printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tail'
 printf '%s\n' 'PASS: delegation floor lets an async leader collect work it already dispatched'
+printf '%s\n' 'PASS: delegation floor finds the previous turn_end beyond its lookback'
+printf '%s\n' 'PASS: delegation floor gives a session-less leader no exemption'
 printf '%s\n' 'PASS: leader turn hook records scoped Project identity'
