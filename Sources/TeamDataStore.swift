@@ -1833,6 +1833,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 waveID: lifecycleTask.waveId,
                 status: normalizedStatus
             )
+            CodexLeaderWake.shared.noteTaskStatus(
+                teamName: teamName, taskId: lifecycleTask.id, status: normalizedStatus
+            )
             switch normalizedStatus {
             case "in_progress":
                 tasks[idx].startedAt = tasks[idx].startedAt ?? now
