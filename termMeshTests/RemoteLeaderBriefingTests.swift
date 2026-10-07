@@ -163,8 +163,10 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         XCTAssertTrue(prompt.contains("tm-agent delegate"))
         XCTAssertTrue(prompt.contains("tm-agent status"))
         XCTAssertTrue(prompt.contains("tm-agent wait"))
-        XCTAssertTrue(prompt.contains("run_in_background:true"))
+        XCTAssertFalse(prompt.contains("run_in_background:true"))
         XCTAssertFalse(prompt.contains("MUST collect results before responding"))
+        XCTAssertTrue(prompt.contains("As a non-Claude leader, finish leader-lane work first, then run the task-scoped wait in the foreground"))
+        XCTAssertFalse(prompt.contains("send a short interim status and end the turn"))
     }
 
     /// The peer's socket, not this machine's — the leader runs over there.
