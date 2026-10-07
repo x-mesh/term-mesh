@@ -5501,6 +5501,43 @@ impl Drop for ProcessEnvGuard {
     }
 }
 
+#[cfg(test)]
+struct RouteDerivationEnv {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+#[cfg(test)]
+impl RouteDerivationEnv {
+    fn isolated() -> Self {
+        let keys = [
+            "TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE",
+            "TERMMESH_SOCKET",
+            "TERMMESH_SOCKET_PATH",
+        ];
+        let saved = keys
+            .into_iter()
+            .map(|key| {
+                let value = env::var_os(key);
+                env::remove_var(key);
+                (key, value)
+            })
+            .collect();
+        Self { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RouteDerivationEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// Names the file holding this process's scoped route. The value is a path,
 /// never a bearer, so it is safe in a process environment that outlives the
 /// app that wrote it.
@@ -21056,6 +21093,7 @@ mod leader_turn_record_tests {
     #[test]
     fn route_deviation_is_null_when_stated_route_matches_the_suggestion() {
         let _env = ProcessEnvGuard::acquire();
+        let _route_env = RouteDerivationEnv::isolated();
         let home = std::env::temp_dir().join(format!("tm-routedev-match-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
@@ -21089,6 +21127,7 @@ mod leader_turn_record_tests {
     #[test]
     fn route_deviation_reports_suggested_and_stated_when_they_differ() {
         let _env = ProcessEnvGuard::acquire();
+        let _route_env = RouteDerivationEnv::isolated();
         let home = std::env::temp_dir().join(format!("tm-routedev-diff-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
