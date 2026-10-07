@@ -2789,8 +2789,10 @@ enum LeaderCommands {
 #[derive(Subcommand)]
 enum LeaderTurnCommands {
     /// Record the route this turn took. Measurement only: appends one line to
-    /// `~/.term-mesh/logs/turns.log` and touches no socket, so it works with no
-    /// daemon running and costs a leader nothing on a plain direct-answer turn.
+    /// `~/.term-mesh/logs/turns.log`, so it works with no daemon running and
+    /// costs a leader nothing on a plain direct-answer turn. The one socket
+    /// read, a bounded `team.status` for an omitted `--checkout-mode`, is
+    /// best-effort and never stops the line from being written.
     ///
     /// The count of these lines is only half the measurement. The harness hooks
     /// write `turn_start`/`turn_end` independently; the gap
@@ -2812,9 +2814,10 @@ enum LeaderTurnCommands {
         /// How the request was classified before the route was chosen.
         #[arg(long = "task-shape")]
         task_shape: Option<String>,
-        /// Authoritative worker-capacity snapshot for this turn. Omit when the
-        /// roster is unavailable; unknown capacity always fails closed and
-        /// cannot produce an applied canary directive.
+        /// Authoritative worker-capacity snapshot for this turn. Omit it and
+        /// the roster count the app wrote into the validated leader control
+        /// file is used; with no such file capacity stays unknown, which always
+        /// fails closed and cannot produce an applied canary directive.
         #[arg(long = "available-workers")]
         available_workers: Option<u32>,
         /// A risk condition that applied to this turn. Repeatable; every
@@ -2825,7 +2828,8 @@ enum LeaderTurnCommands {
         /// the `--wave-id` passed to `delegate`.
         #[arg(long = "wave-id")]
         wave_id: Option<String>,
-        /// Checkout mode used by the candidate worker worktrees.
+        /// Checkout mode used by the candidate worker worktrees. Omit it and
+        /// the team's own `checkout_mode` is recorded when the app reports one.
         #[arg(long = "checkout-mode")]
         checkout_mode: Option<String>,
         /// Number of dependency-ready mutating slices.
@@ -8814,8 +8818,8 @@ fn main() {
         return;
     }
 
-    // `leader turn route` writes a local append-only record and talks to nothing.
-    // It returns before socket resolution on purpose: the measurement is worthless
+    // `leader turn route` writes a local append-only record; its only socket read
+    // is best-effort evidence. It returns before socket resolution on purpose: the measurement is worthless
     // if a leader skips the call whenever the daemon happens to be down, and the
     // gap it measures would then read as "the leader chose not to classify".
     if let Commands::Leader(LeaderCommands::Turn(LeaderTurnCommands::Route {
@@ -19458,6 +19462,91 @@ fn turn_route_marker_path(path: &Path, turn_id: &str) -> Option<PathBuf> {
     (!key.is_empty()).then(|| path.with_file_name(format!(".turn-route-{key}")))
 }
 
+/// Bounds the one `team.status` read `leader turn route` makes for an omitted
+/// `--checkout-mode`. The record is written whether or not it answers.
+const ROUTE_TOPOLOGY_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Facts `leader turn route` filled in itself because the leader omitted the
+/// flag. Only facts the app already recorded qualify: ownership, lane, overlap
+/// and integration flags are claims about the leader's plan and are never
+/// derived.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DerivedRouteEvidence {
+    checkout_mode: Option<String>,
+    available_workers: Option<u32>,
+    derived: Vec<&'static str>,
+}
+
+fn derive_route_evidence(
+    explicit_checkout_mode: Option<&str>,
+    explicit_available_workers: Option<u32>,
+    control_available_workers: impl FnOnce() -> Option<u32>,
+    team_checkout_mode: impl FnOnce() -> Option<String>,
+) -> DerivedRouteEvidence {
+    let mut evidence = DerivedRouteEvidence::default();
+    evidence.checkout_mode = match explicit_checkout_mode {
+        Some(mode) => Some(mode.to_string()),
+        None => team_checkout_mode().map(|mode| {
+            evidence.derived.push("checkout_mode");
+            mode
+        }),
+    };
+    evidence.available_workers = match explicit_available_workers {
+        Some(workers) => Some(workers),
+        None => control_available_workers().map(|workers| {
+            evidence.derived.push("available_workers");
+            workers
+        }),
+    };
+    evidence
+}
+
+/// The layout the app briefs workers with as `TEAM_CHECKOUT_MODE`. "unknown"
+/// is the app saying nobody recorded one, so it stays absent.
+fn checkout_mode_from_team_status(result: &Value, team: &str) -> Option<String> {
+    if result["team_name"].as_str() != Some(team) {
+        return None;
+    }
+    result["checkout_mode"]
+        .as_str()
+        .map(str::trim)
+        .filter(|mode| matches!(*mode, "isolated" | "shared" | "off"))
+        .map(str::to_string)
+}
+
+fn route_team_checkout_mode(team: &str) -> Option<String> {
+    // A remote leader's local socket belongs to another app than the Project's.
+    if remote_leader_route().is_some() {
+        return None;
+    }
+    let sock = detect_socket()?;
+    let response = rpc_call_timeout_duration(
+        &sock,
+        "team.status",
+        json!({ "team_name": team }),
+        ROUTE_TOPOLOGY_RPC_TIMEOUT,
+    )
+    .ok()?;
+    checkout_mode_from_team_status(&response["result"], team)
+}
+
+fn available_workers_from_control(value: &Value) -> Option<u32> {
+    value["available_workers"]
+        .as_u64()
+        .map(|workers| workers.min(u64::from(u32::MAX)) as u32)
+}
+
+/// Called only after the same file passed the project and session check in
+/// `read_leader_control_snapshot`, which does not keep this field.
+fn control_file_available_workers() -> Option<u32> {
+    let path = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE").ok()?;
+    let data = fs::read(Path::new(&path)).ok()?;
+    if data.len() > LEADER_CONTROL_MAX_BYTES {
+        return None;
+    }
+    available_workers_from_control(&serde_json::from_slice::<Value>(&data).ok()?)
+}
+
 fn run_leader_turn_route_with_evidence(
     team_resolution: &TeamNameResolution,
     turn_id: &str,
@@ -19509,6 +19598,14 @@ fn run_leader_turn_route_with_evidence(
         },
     };
     let control = control_state.snapshot();
+    let derived = derive_route_evidence(
+        checkout_mode,
+        available_workers,
+        || control.and_then(|_| control_file_available_workers()),
+        || route_team_checkout_mode(&team_resolution.name),
+    );
+    let checkout_mode = derived.checkout_mode.as_deref();
+    let available_workers = derived.available_workers;
     let mut record = turn_route_record_with_policy_input(
         turn_id,
         route,
@@ -19570,6 +19667,7 @@ fn run_leader_turn_route_with_evidence(
         "serial_integration": serial_integration,
         "resource_health": resource_health,
     });
+    record["derived_evidence"] = json!(derived.derived);
     if let Some(route) = remote_leader_route() {
         record["team_uuid"] = json!(route.team_uuid);
     }
@@ -25454,5 +25552,70 @@ mod rcollect_tests {
         let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("turns.log");
         fs::write(&path, b"{\"event\":\"leader_wait\"}\n{\"event\":\"task_collect\"}\n").unwrap();
         assert_eq!(leader_participation_health(&path, "p", None).malformed_lines, 0);
+    }
+}
+
+#[cfg(test)]
+mod rroute_tests {
+    use super::*;
+
+    #[test]
+    fn rroute_explicit_flags_win_and_are_not_marked_derived() {
+        let evidence = derive_route_evidence(
+            Some("shared"),
+            Some(4),
+            || panic!("control must not be read when --available-workers is given"),
+            || panic!("team.status must not be read when --checkout-mode is given"),
+        );
+        assert_eq!(evidence.checkout_mode.as_deref(), Some("shared"));
+        assert_eq!(evidence.available_workers, Some(4));
+        assert!(evidence.derived.is_empty());
+    }
+
+    #[test]
+    fn rroute_omitted_flags_are_filled_from_recorded_facts() {
+        let evidence = derive_route_evidence(
+            None,
+            None,
+            || Some(3),
+            || Some("isolated".to_string()),
+        );
+        assert_eq!(evidence.checkout_mode.as_deref(), Some("isolated"));
+        assert_eq!(evidence.available_workers, Some(3));
+        assert_eq!(evidence.derived, vec!["checkout_mode", "available_workers"]);
+    }
+
+    #[test]
+    fn rroute_unknown_sources_stay_absent() {
+        let evidence = derive_route_evidence(None, None, || None, || None);
+        assert_eq!(evidence, DerivedRouteEvidence::default());
+    }
+
+    #[test]
+    fn rroute_reads_only_a_recorded_layout_of_this_team() {
+        let status = json!({"team_name": "mine", "checkout_mode": " isolated "});
+        assert_eq!(checkout_mode_from_team_status(&status, "mine").as_deref(), Some("isolated"));
+        assert_eq!(checkout_mode_from_team_status(&status, "other"), None);
+        for mode in ["shared", "off"] {
+            let status = json!({"team_name": "mine", "checkout_mode": mode});
+            assert_eq!(checkout_mode_from_team_status(&status, "mine").as_deref(), Some(mode));
+        }
+        for status in [
+            json!({"team_name": "mine", "checkout_mode": "unknown"}),
+            json!({"team_name": "mine", "checkout_mode": ""}),
+            json!({"team_name": "mine", "worktree_mode": "isolated"}),
+            json!({"team_name": "mine", "checkout_mode": 1}),
+        ] {
+            assert_eq!(checkout_mode_from_team_status(&status, "mine"), None, "{status}");
+        }
+    }
+
+    #[test]
+    fn rroute_reads_the_roster_count_from_the_control_payload() {
+        assert_eq!(available_workers_from_control(&json!({"available_workers": 2})), Some(2));
+        assert_eq!(available_workers_from_control(&json!({"available_workers": 0})), Some(0));
+        assert_eq!(available_workers_from_control(&json!({})), None);
+        assert_eq!(available_workers_from_control(&json!({"available_workers": "2"})), None);
+        assert_eq!(available_workers_from_control(&json!({"available_workers": -1})), None);
     }
 }
