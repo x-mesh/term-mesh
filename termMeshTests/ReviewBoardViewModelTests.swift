@@ -8,8 +8,9 @@ import XCTest
 
 final class ReviewBoardViewModelTests: XCTestCase {
     func testDelegatedDetailAndHelpDescribeConditionalOverlap() {
-        XCTAssertTrue(ProjectDelegationLevel.delegated.overlapExplanation?.contains("opt-in overlap canary") == true)
-        XCTAssertTrue(ProjectDelegationLevel.delegated.helpText.contains("does not validate ownership automatically"))
+        XCTAssertTrue(ProjectDelegationLevel.delegated.overlapExplanation?.contains("requires isolated writes, explicit disjoint ownership") == true)
+        XCTAssertTrue(ProjectDelegationLevel.delegated.helpText.contains("Delegated guidance is mandatory"))
+        XCTAssertTrue(ProjectDelegationLevel.delegated.helpText.contains("ownership-disjoint with isolated writes and serial integration"))
         XCTAssertEqual(ProjectDelegationLevel.allCases.count, 3)
     }
 
