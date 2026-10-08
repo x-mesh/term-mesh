@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.268.1] - 2026-10-08
+
+### Fixed
+
+- The details button at the end of an agent turn in a native agent pane no longer breaks into one letter per line. In a narrow pane, or when the turn summary was long, the summary took the button's width. The summary is now cut short instead.
+- `tm-agent wait` now refuses task arguments that name no task. An empty `--tasks ""` or a blank `--task` made it wait on every active task of the team, which a script with an empty variable could do without notice. It also refuses `--task` together with `--tasks`, because that pair ended the wait as soon as the `--task` id finished. Each case now exits with status 2 and says what to pass instead.
+- `tm-agent wait --tasks` no longer runs until its timeout when a finished task leaves the task list.
+- A team start that fails no longer leaves an old team branch under its `-legacy-` name. When creating the worktree fails after the rename, the branch gets its original name back.
+- A Codex leader with `teamLeaderWake.codex.enabled` now wakes for cancelled tasks too. A wake that cannot be delivered, for example because the leader pane is not found, is tried again up to three times. A team created again under the same name no longer receives wakes meant for the earlier team.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.268.0] - 2026-10-08
 
 ### Added
