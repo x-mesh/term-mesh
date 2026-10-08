@@ -169,6 +169,40 @@ echo "cleanup_failed_build"
   exit $FAIL
 ) || FAIL=$((FAIL + $?))
 
+(
+  sandbox
+  seed_tag aborted
+  TAG_SLUG=aborted
+  DERIVED_DATA="${TAG_TMP_ROOT}/term-mesh-aborted"
+  MANAGED_DERIVED=1
+  BUILD_LAUNCHED=0
+  DERIVED_PREEXISTING=0
+  RELOAD_FINISHED=0            # bash 3.2 set -u abort: the trap sees status 0
+  tag_is_running() { return 1; }
+  (exit 0); cleanup_failed_build 2>/dev/null && rc=0 || rc=$?
+  check "an unfinished run exits nonzero even when the trap sees status 0" "$rc" "1"
+  [[ -e "${TAG_TMP_ROOT}/term-mesh-aborted" ]] && r=yes || r=no
+  check "an unfinished first build is reclaimed" "$r" "no"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  seed_tag finished
+  TAG_SLUG=finished
+  DERIVED_DATA="${TAG_TMP_ROOT}/term-mesh-finished"
+  MANAGED_DERIVED=1
+  BUILD_LAUNCHED=1
+  DERIVED_PREEXISTING=0
+  RELOAD_FINISHED=1
+  tag_is_running() { return 1; }
+  (exit 0); cleanup_failed_build 2>/dev/null && rc=0 || rc=$?
+  check "a finished run keeps status 0" "$rc" "0"
+  [[ -d "${TAG_TMP_ROOT}/term-mesh-finished" ]] && r=yes || r=no
+  check "a finished run keeps its build" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
 echo
 if [[ "$FAIL" -eq 0 ]]; then
   echo "reload cleanup: all checks passed"

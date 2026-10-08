@@ -50,6 +50,27 @@ final class CodexLeaderWake: @unchecked Sendable {
         teamWakes && leaderReady && isCodexLeader(leaderMode: leaderMode, leaderCli: leaderCli)
     }
 
+    enum Preflight: Equatable {
+        case drop
+        case retry
+        case deliver
+    }
+
+    /// What to do with a drained line, given the live team (`nil` when the
+    /// team no longer exists). A team that is gone, not waking, or not led by
+    /// Codex will not come back; a leader that is not ready yet will.
+    static func preflight(
+        teamWakes: Bool?, leaderReady: Bool, leaderMode: String, leaderCli: String?
+    ) -> Preflight {
+        guard let teamWakes,
+              shouldDeliver(
+                  teamWakes: teamWakes, leaderReady: true,
+                  leaderMode: leaderMode, leaderCli: leaderCli
+              )
+        else { return .drop }
+        return leaderReady ? .deliver : .retry
+    }
+
     /// Workers that finish together, such as one parallel wave, produce one
     /// line, so the leader starts one turn rather than one per task.
     static let coalesceWindow: TimeInterval = 2
@@ -86,20 +107,21 @@ final class CodexLeaderWake: @unchecked Sendable {
         flushScheduled.remove(teamName)
         guard let wake = state.flush(teamName: teamName) else { return }
         Task { @MainActor in
-            guard let team = TeamOrchestrator.shared.teams[teamName],
-                  Self.shouldDeliver(
-                      teamWakes: team.codexLeaderWake, leaderReady: true,
-                      leaderMode: team.leaderMode, leaderCli: team.leaderCli
-                  )
-            else {
+            let team = TeamOrchestrator.shared.teams[teamName]
+            switch Self.preflight(
+                teamWakes: team?.codexLeaderWake, leaderReady: team?.leaderReady ?? false,
+                leaderMode: team?.leaderMode ?? "", leaderCli: team?.leaderCli
+            ) {
+            case .drop:
                 self.finish(teamName: teamName, flush: wake, retry: false)
                 return
-            }
-            // A team that wakes but whose leader is not ready yet is retried.
-            guard team.leaderReady else {
+            case .retry:
                 self.finish(teamName: teamName, flush: wake, retry: true)
                 return
+            case .deliver:
+                break
             }
+            guard let team else { return }
             var isPeer = false
             if case .peer = team.leaderEndpoint { isPeer = true }
             let panelId = team.leaderPanelId
@@ -210,11 +232,11 @@ struct CodexLeaderWakeState {
 
     mutating func setTeamWakes(_ teamName: String, _ wakes: Bool) {
         generations[teamName, default: 0] += 1
+        batches[teamName] = nil
         if wakes {
             wakingTeams.insert(teamName)
         } else {
             wakingTeams.remove(teamName)
-            batches[teamName] = nil
         }
     }
 

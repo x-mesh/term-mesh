@@ -210,6 +210,44 @@ final class CodexLeaderWakeTests: XCTestCase {
         )
     }
 
+    func testARecreatedTeamStartsWithAnEmptyBatch() throws {
+        var state = CodexLeaderWakeState()
+        state.setTeamWakes("mine", true)
+        _ = state.note(teamName: "mine", taskId: "ab12", status: "completed")
+        state.setTeamWakes("mine", true)
+        XCTAssertNil(state.flushLine(teamName: "mine"), "the old team's pending line is gone")
+        XCTAssertTrue(
+            state.note(teamName: "mine", taskId: "ab12", status: "completed"),
+            "the old team's dedupe record is gone"
+        )
+
+        let flush = try XCTUnwrap(state.flush(teamName: "mine"))
+        XCTAssertEqual(state.retry(teamName: "mine", flush: flush), .scheduled(attempt: 1))
+        state.setTeamWakes("mine", true)
+        _ = state.note(teamName: "mine", taskId: "cd34", status: "completed")
+        let fresh = try XCTUnwrap(state.flush(teamName: "mine"))
+        XCTAssertEqual(
+            state.retry(teamName: "mine", flush: fresh), .scheduled(attempt: 1),
+            "the old team's failed attempts are gone"
+        )
+    }
+
+    func testPreflightDropsWhatWillNotComeBackAndRetriesAnUnreadyLeader() {
+        func decide(_ wakes: Bool?, ready: Bool = true, _ mode: String = "codex", _ cli: String? = nil)
+            -> CodexLeaderWake.Preflight {
+            CodexLeaderWake.preflight(teamWakes: wakes, leaderReady: ready, leaderMode: mode, leaderCli: cli)
+        }
+        XCTAssertEqual(decide(nil), .drop, "team is gone")
+        XCTAssertEqual(decide(false), .drop, "team does not wake")
+        XCTAssertEqual(decide(true, "claude"), .drop, "not a Codex leader")
+        XCTAssertEqual(decide(false, ready: false), .drop)
+        XCTAssertEqual(decide(true, ready: false, "claude"), .drop)
+        XCTAssertEqual(decide(true, ready: false), .retry, "leader not ready yet")
+        XCTAssertEqual(decide(true, ready: false, "adopted", "codex"), .retry)
+        XCTAssertEqual(decide(true), .deliver)
+        XCTAssertEqual(decide(true, "adopted", "codex"), .deliver)
+    }
+
     func testFindsTheThreadFromItsWriterLock() {
         let thread = "01a1165f-02ce-7e70-b34d-4c3989f2f163"
         let ids = CodexLeaderThreadLocator.threadIds(inOpenPaths: [

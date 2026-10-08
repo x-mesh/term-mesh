@@ -1820,7 +1820,8 @@ enum Commands {
         mode: String,
         #[arg(long)]
         task: Option<String>,
-        /// Comma-separated list of task IDs to wait for (overrides agent-based tracking)
+        /// Comma-separated list of task IDs to wait for (overrides agent-based
+        /// tracking). Cannot be combined with --task.
         #[arg(long)]
         tasks: Option<String>,
         /// Comma-separated list of agent names to wait for (default: all agents)
@@ -22264,6 +22265,11 @@ fn parse_wait_task_arguments(
     tasks: Option<&str>,
     task: Option<&str>,
 ) -> Result<Option<std::collections::HashSet<String>>, String> {
+    // The single-task exit in run_wait ignores the --tasks set, so the pair
+    // would end the wait on one task while the others still run.
+    if task.is_some() && tasks.is_some() {
+        return Err("--task and --tasks cannot be combined; pass every id in one --tasks list, e.g. --tasks a,b".to_string());
+    }
     if task.is_some_and(|id| id.trim().is_empty()) {
         return Err("--task is empty; pass a task id or omit the flag".to_string());
     }
@@ -23044,6 +23050,14 @@ mod wait_task_scope_tests {
         }
         for task in ["", "  "] {
             assert!(parse_wait_task_arguments(None, Some(task)).is_err(), "{task:?}");
+        }
+    }
+
+    #[test]
+    fn task_and_tasks_together_are_rejected() {
+        for (tasks, task) in [("a,b", "x"), ("a", "a"), ("", "x"), (",", "")] {
+            let error = parse_wait_task_arguments(Some(tasks), Some(task)).unwrap_err();
+            assert!(error.contains("--tasks"), "{tasks:?} {task:?}: {error}");
         }
     }
 
