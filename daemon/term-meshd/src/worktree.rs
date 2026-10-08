@@ -64,7 +64,11 @@ fn worktree_metadata_branch(repo: &Repository, name: &str) -> Option<String> {
         .next()
 }
 
-fn resolve_ref_path_conflicts(repo: &Repository, branch_name: &str) -> Result<(), String> {
+fn resolve_ref_path_conflicts(
+    repo: &Repository,
+    branch_name: &str,
+    renamed: &mut Vec<(String, String)>,
+) -> Result<(), String> {
     let branch_names = repo
         .branches(Some(git2::BranchType::Local))
         .map_err(|e| format!("cannot enumerate local branches: {e}"))?
@@ -166,6 +170,7 @@ fn resolve_ref_path_conflicts(repo: &Repository, branch_name: &str) -> Result<()
         legacy_branch.rename(&legacy_name, false).map_err(|e| {
             format!("cannot rename legacy branch '{ancestor}' to '{legacy_name}': {e}")
         })?;
+        renamed.push((ancestor.clone(), legacy_name.clone()));
         let message = format!(
             "renamed legacy branch '{ancestor}' to '{legacy_name}' before creating '{branch_name}'"
         );
@@ -208,6 +213,128 @@ pub fn create(params: serde_json::Value) -> Result<WorktreeInfo, String> {
         wt_log(&format!("CREATE FAIL {e}"));
     }
     result
+}
+
+fn add_branch_and_worktree(
+    repo: &Repository,
+    branch_name: &str,
+    commit: &git2::Commit<'_>,
+    wt_name: &str,
+    base_dir: Option<&str>,
+    renamed: &mut Vec<(String, String)>,
+    created_branch: &mut bool,
+    attempted_worktree: &mut bool,
+) -> Result<std::path::PathBuf, String> {
+    resolve_ref_path_conflicts(repo, branch_name, renamed)?;
+    repo.branch(branch_name, commit, false)
+        .map_err(|e| format!("cannot create branch '{branch_name}': {e}"))?;
+    *created_branch = true;
+
+    // Worktree path: use base_dir if provided, otherwise default to ~/.term-mesh/worktrees/{repo_name}/
+    let repo_root = repo.workdir().ok_or("bare repos not supported")?;
+    let wt_path = if let Some(base) = base_dir {
+        let base_path = std::path::PathBuf::from(base);
+        let repo_name = repo_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let target_dir = base_path.join(&repo_name);
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("cannot create worktree base dir: {e}"))?;
+        target_dir.join(wt_name)
+    } else {
+        let home = dirs::home_dir().ok_or("cannot determine home directory")?;
+        let default_base = home.join(".term-mesh").join("worktrees");
+        let repo_name = repo_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let target_dir = default_base.join(&repo_name);
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("cannot create worktree base dir: {e}"))?;
+        target_dir.join(wt_name)
+    };
+
+    // Rollback prunes this name with its working tree, so it must never
+    // reach a worktree that existed before this call.
+    if repo.find_worktree(wt_name).is_ok() {
+        return Err(format!("worktree name '{wt_name}' is already in use"));
+    }
+    *attempted_worktree = true;
+    repo.worktree(
+        wt_name,
+        &wt_path,
+        Some(
+            git2::WorktreeAddOptions::new().reference(Some(
+                &repo
+                    .find_branch(branch_name, git2::BranchType::Local)
+                    .map_err(|e| format!("branch lookup failed: {e}"))?
+                    .into_reference(),
+            )),
+        ),
+    )
+    .map_err(|e| format!("cannot create worktree: {e}"))?;
+    Ok(wt_path)
+}
+
+/// Undo this call's legacy renames after a later create step failed. The new
+/// branch and any half-created worktree metadata must go first: the new branch
+/// path (`a/b/c`) occupies the directory the original name (`a/b`) needs.
+fn rollback_legacy_renames(
+    repo: &Repository,
+    branch_name: &str,
+    wt_name: &str,
+    created_branch: bool,
+    attempted_worktree: bool,
+    renamed: &[(String, String)],
+    original_error: String,
+) -> String {
+    if renamed.is_empty() {
+        return original_error;
+    }
+    let mut failures = Vec::new();
+    if let Some(wt) = attempted_worktree
+        .then(|| repo.find_worktree(wt_name).ok())
+        .flatten()
+    {
+        let mut flags = git2::WorktreePruneOptions::new();
+        flags.valid(true).working_tree(true);
+        if let Err(e) = wt.prune(Some(&mut flags)) {
+            failures.push(format!("cannot prune partial worktree '{wt_name}': {e}"));
+        }
+    }
+    if created_branch {
+        let deleted = repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .and_then(|mut branch| branch.delete());
+        if let Err(e) = deleted {
+            failures.push(format!("cannot delete new branch '{branch_name}': {e}"));
+        }
+    }
+    for (original, legacy) in renamed.iter().rev() {
+        let restored = repo
+            .find_branch(legacy, git2::BranchType::Local)
+            .and_then(|mut branch| branch.rename(original, false).map(|_| ()));
+        match restored {
+            Ok(()) => {
+                let message = format!(
+                    "restored legacy branch '{legacy}' to '{original}' after create failure"
+                );
+                wt_log(&message);
+                tracing::info!("{message}");
+            }
+            Err(e) => failures.push(format!(
+                "cannot restore branch '{original}' from '{legacy}': {e}"
+            )),
+        }
+    }
+    if failures.is_empty() {
+        return original_error;
+    }
+    let message = format!("{original_error}; rollback failed: {}", failures.join("; "));
+    wt_log(&format!("ROLLBACK FAIL {message}"));
+    tracing::error!("{message}");
+    message
 }
 
 fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
@@ -371,49 +498,32 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
             .map_err(|e| format!("cannot delete stale branch '{branch_name}': {e}"))?;
         tracing::info!("deleted stale branch '{branch_name}' for re-creation");
     }
-    resolve_ref_path_conflicts(&repo, &branch_name)?;
-    repo.branch(&branch_name, &commit, false)
-        .map_err(|e| format!("cannot create branch '{branch_name}': {e}"))?;
-
-    // Worktree path: use base_dir if provided, otherwise default to ~/.term-mesh/worktrees/{repo_name}/
-    let repo_root = repo.workdir().ok_or("bare repos not supported")?;
-    let wt_path = if let Some(ref base) = params.base_dir {
-        let base_path = std::path::PathBuf::from(base);
-        let repo_name = repo_root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-        let target_dir = base_path.join(&repo_name);
-        std::fs::create_dir_all(&target_dir)
-            .map_err(|e| format!("cannot create worktree base dir: {e}"))?;
-        target_dir.join(&wt_name)
-    } else {
-        let home = dirs::home_dir().ok_or("cannot determine home directory")?;
-        let default_base = home.join(".term-mesh").join("worktrees");
-        let repo_name = repo_root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-        let target_dir = default_base.join(&repo_name);
-        std::fs::create_dir_all(&target_dir)
-            .map_err(|e| format!("cannot create worktree base dir: {e}"))?;
-        target_dir.join(&wt_name)
-    };
-
-    // Create worktree
-    repo.worktree(
+    let mut renamed = Vec::new();
+    let mut created_branch = false;
+    let mut attempted_worktree = false;
+    let wt_path = match add_branch_and_worktree(
+        &repo,
+        &branch_name,
+        &commit,
         &wt_name,
-        &wt_path,
-        Some(
-            git2::WorktreeAddOptions::new().reference(Some(
-                &repo
-                    .find_branch(&branch_name, git2::BranchType::Local)
-                    .map_err(|e| format!("branch lookup failed: {e}"))?
-                    .into_reference(),
-            )),
-        ),
-    )
-    .map_err(|e| format!("cannot create worktree: {e}"))?;
+        params.base_dir.as_deref(),
+        &mut renamed,
+        &mut created_branch,
+        &mut attempted_worktree,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(rollback_legacy_renames(
+                &repo,
+                &branch_name,
+                &wt_name,
+                created_branch,
+                attempted_worktree,
+                &renamed,
+                error,
+            ));
+        }
+    };
 
     let path_str = wt_path.to_string_lossy().into_owned();
     tracing::info!("created worktree {wt_name} at {}", wt_path.display());
@@ -1044,6 +1154,85 @@ mod tests {
                 .target(),
             Some(legacy_target)
         );
+    }
+
+    #[test]
+    fn rollback_keeps_a_worktree_this_call_did_not_create() {
+        let (dir, repo_path, _base_dir) = init_temp_repo();
+        let repo = Repository::open(&repo_path).unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("keep-branch", &commit, false).unwrap();
+        let keep_path = dir.path().join("keep-wt");
+        let keep_ref = repo
+            .find_branch("keep-branch", git2::BranchType::Local)
+            .unwrap()
+            .into_reference();
+        repo.worktree(
+            "keep",
+            &keep_path,
+            Some(git2::WorktreeAddOptions::new().reference(Some(&keep_ref))),
+        )
+        .unwrap();
+        std::fs::write(keep_path.join("user-work.txt"), "unsaved").unwrap();
+        repo.branch("team/x/executor-legacy-abc", &commit, false).unwrap();
+
+        let error = rollback_legacy_renames(
+            &repo,
+            "team/x/executor/inst-1",
+            "keep",
+            false,
+            false,
+            &[(
+                "team/x/executor".to_string(),
+                "team/x/executor-legacy-abc".to_string(),
+            )],
+            "cannot create worktree: name in use".to_string(),
+        );
+
+        assert!(!error.contains("rollback failed"), "{error}");
+        assert!(repo.find_worktree("keep").is_ok());
+        assert!(keep_path.join("user-work.txt").exists());
+        assert!(repo
+            .find_branch("team/x/executor", git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn create_restores_renamed_legacy_branch_when_worktree_creation_fails() {
+        let (dir, repo_path, base_dir) = init_temp_repo();
+        let repo = Repository::open(&repo_path).unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("team/x/executor", &commit, false).unwrap();
+        // A file where the per-repo directory belongs fails create_dir_all
+        // after the legacy rename and the new branch creation.
+        std::fs::write(std::path::Path::new(&base_dir).join("repo"), "blocker").unwrap();
+
+        let error = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/x/executor/inst-1",
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("cannot create worktree base dir"), "{error}");
+        assert!(!error.contains("rollback failed"), "{error}");
+        assert_eq!(
+            repo.find_branch("team/x/executor", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .target(),
+            Some(commit.id())
+        );
+        let names: Vec<String> = repo
+            .branches(Some(git2::BranchType::Local))
+            .unwrap()
+            .filter_map(|b| b.ok().and_then(|(b, _)| b.name().ok().flatten().map(str::to_owned)))
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains("-legacy-") || n == "team/x/executor/inst-1"),
+            "{names:?}"
+        );
+        drop(dir);
     }
 
     #[test]
