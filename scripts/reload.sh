@@ -119,6 +119,7 @@ SHARED_CARGO_TARGET=""
 MIN_FREE_GIB="${TERMMESH_BUILD_MIN_FREE_GIB:-10}"
 MANAGED_DERIVED=0
 BUILD_LAUNCHED=0
+RELOAD_FINISHED=0
 # Set before the build when this tag's derived data is already on disk, so the
 # failure trap can tell "the build I just started" from "the build that is
 # already working".
@@ -231,6 +232,12 @@ cleanup_failed_build() {
     remove_tag_artifacts "${TAG_SLUG:-}" || true
     rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG:-}.session"
     echo "  reclaimed failed tag build ${TAG_SLUG:-unknown}" >&2
+  fi
+  # bash 3.2 reports status 0 here when set -u aborts on an expansion such as
+  # an empty "${arr[@]}", so reaching the trap without finishing is a failure.
+  if [[ "$status" -eq 0 && "$RELOAD_FINISHED" -eq 0 ]]; then
+    echo "error: reload.sh stopped before completing" >&2
+    exit 1
   fi
   return "$status"
 }
@@ -759,19 +766,19 @@ if [[ ${#USER_ENV[@]} -gt 0 ]]; then
 fi
 if [[ -n "${TAG_SLUG:-}" && -n "${TERMMESH_SOCKET:-}" ]]; then
   # Ensure tag-specific socket paths win even if the caller has TERMMESH_* overrides.
-  open_clean "${EXTRA_ENV[@]}" \
+  open_clean ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
     "TERMMESH_TAG=$TAG_SLUG" \
     "TERMMESH_SOCKET_PATH=$TERMMESH_SOCKET" \
     "TERMMESH_DAEMON_UNIX_PATH=$TERMMESH_DAEMON_SOCKET" \
     "TERMMESH_DEBUG_LOG=$TERMMESH_DEBUG_LOG" \
     "TERM_MESH_MOBILE_ADDR=${TERM_MESH_MOBILE_ADDR:-}"
 elif [[ -n "${TAG_SLUG:-}" ]]; then
-  open_clean "${EXTRA_ENV[@]}" \
+  open_clean ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
     "TERMMESH_TAG=$TAG_SLUG" \
     "TERMMESH_DEBUG_LOG=$TERMMESH_DEBUG_LOG"
 else
   echo "/tmp/term-mesh-debug.log" > /tmp/term-mesh-last-debug-log-path || true
-  open_clean "${EXTRA_ENV[@]}"
+  open_clean ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}
 fi
 # `open` returns before LaunchServices finishes registering the app's bundle id,
 # so an immediate `osascript ... activate` fails with -1728 (errAENoSuchObject).
@@ -809,3 +816,4 @@ if [[ -n "${TAG_SLUG:-}" ]]; then
   fi
   print_tag_cleanup_reminder "$TAG_SLUG"
 fi
+RELOAD_FINISHED=1
