@@ -227,17 +227,17 @@ ensure_build_space() {
 # target. A rebuild that fails must leave the working build alone.
 cleanup_failed_build() {
   local status="$?"
+  # bash 3.2 reports status 0 here when set -u aborts on an expansion such as
+  # an empty "${arr[@]}", so reaching the trap without finishing is a failure.
+  if [[ "$status" -eq 0 && "$RELOAD_FINISHED" -eq 0 ]]; then
+    echo "error: reload.sh stopped before completing" >&2
+    status=1
+  fi
   if [[ "$status" -ne 0 && "$MANAGED_DERIVED" -eq 1 && "$BUILD_LAUNCHED" -eq 0 \
      && "$DERIVED_PREEXISTING" -eq 0 ]] && ! tag_is_running "${TAG_SLUG:-}"; then
     remove_tag_artifacts "${TAG_SLUG:-}" || true
     rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG:-}.session"
     echo "  reclaimed failed tag build ${TAG_SLUG:-unknown}" >&2
-  fi
-  # bash 3.2 reports status 0 here when set -u aborts on an expansion such as
-  # an empty "${arr[@]}", so reaching the trap without finishing is a failure.
-  if [[ "$status" -eq 0 && "$RELOAD_FINISHED" -eq 0 ]]; then
-    echo "error: reload.sh stopped before completing" >&2
-    exit 1
   fi
   return "$status"
 }
