@@ -269,6 +269,14 @@ class ReleaseStateMachineTests(unittest.TestCase):
             source,
         )
 
+    def test_release_resync_fast_forwards_only(self):
+        source = (ROOT / "scripts/release.py").read_text()
+        self.assertIn(
+            '"merge", "--no-ai", "--autostash", "--ff-only",\n'
+            '                "origin/main", "--into", "develop", cwd=develop_wt,',
+            source,
+        )
+
     def test_cargo_path_raises_release_error_when_cargo_is_nowhere(self):
         with tempfile.TemporaryDirectory() as home:
             with unittest.mock.patch.object(release.shutil, "which", return_value=None), \
