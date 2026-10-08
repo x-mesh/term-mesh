@@ -1186,6 +1186,11 @@ private struct TurnFooter: View {
                         .buttonStyle(.plain)
                         .font(.system(size: 9))
                         .foregroundStyle(.tint)
+                        // Without this the button yields to the facts text and
+                        // wraps one character per line in a narrow pane.
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(2)
                 }
             }
             if expanded, let v = end.verdict {
