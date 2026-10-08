@@ -98,7 +98,7 @@ final class CodexLeaderWakeTests: XCTestCase {
         for status in ["pending", "in_progress", "delivered", "assigned"] {
             XCTAssertFalse(batch.admit(taskId: "ab12", status: status), status)
         }
-        for status in ["completed", "review_ready", "blocked", "failed"] {
+        for status in ["completed", "review_ready", "blocked", "failed", "cancelled"] {
             XCTAssertTrue(batch.admit(taskId: "t-\(status)", status: status), status)
         }
         XCTAssertFalse(batch.admit(taskId: "", status: "completed"))
@@ -133,6 +133,119 @@ final class CodexLeaderWakeTests: XCTestCase {
         XCTAssertTrue(batch.admit(taskId: "c", status: "completed"))
         XCTAssertTrue(batch.admit(taskId: "a", status: "completed"), "evicted pair is admitted again")
         XCTAssertFalse(batch.admit(taskId: "c", status: "completed"))
+    }
+
+    func testACancelledTaskWakesTheLeader() {
+        var state = CodexLeaderWakeState()
+        state.setTeamWakes("mine", true)
+        XCTAssertTrue(state.note(teamName: "mine", taskId: "ab12", status: "cancelled"))
+        XCTAssertEqual(
+            state.flushLine(teamName: "mine"),
+            "[term-mesh] task ab12 cancelled — run tm-agent collect --headers"
+        )
+    }
+
+    func testAFailedDeliveryComesBackOnTheNextFlushWithoutBreakingDedupe() throws {
+        var state = CodexLeaderWakeState()
+        state.setTeamWakes("mine", true)
+        XCTAssertTrue(state.note(teamName: "mine", taskId: "ab12", status: "completed"))
+        let first = try XCTUnwrap(state.flush(teamName: "mine"))
+        XCTAssertNil(state.flush(teamName: "mine"))
+        XCTAssertEqual(state.retry(teamName: "mine", flush: first), .scheduled(attempt: 1))
+        XCTAssertFalse(
+            state.note(teamName: "mine", taskId: "ab12", status: "completed"),
+            "the retried pair is still announced once"
+        )
+        XCTAssertTrue(state.note(teamName: "mine", taskId: "cd34", status: "failed"))
+        XCTAssertEqual(
+            state.flushLine(teamName: "mine"),
+            "[term-mesh] tasks ab12 completed, cd34 failed — run tm-agent collect --headers"
+        )
+    }
+
+    func testRetriesStopAfterTheBoundAndStartAgainAfterADelivery() throws {
+        var state = CodexLeaderWakeState()
+        state.setTeamWakes("mine", true)
+        _ = state.note(teamName: "mine", taskId: "ab12", status: "completed")
+        for attempt in 1...CodexLeaderWakeBatch.maxRetries {
+            let flush = try XCTUnwrap(state.flush(teamName: "mine"))
+            XCTAssertEqual(state.retry(teamName: "mine", flush: flush), .scheduled(attempt: attempt))
+        }
+        let last = try XCTUnwrap(state.flush(teamName: "mine"))
+        XCTAssertEqual(state.retry(teamName: "mine", flush: last), .gaveUp)
+        XCTAssertNil(state.flush(teamName: "mine"), "a dropped wake is not retried again")
+
+        _ = state.note(teamName: "mine", taskId: "cd34", status: "completed")
+        let next = try XCTUnwrap(state.flush(teamName: "mine"))
+        XCTAssertEqual(state.retry(teamName: "mine", flush: next), .scheduled(attempt: 1))
+        let again = try XCTUnwrap(state.flush(teamName: "mine"))
+        state.delivered(teamName: "mine", flush: again)
+        XCTAssertEqual(
+            state.retry(teamName: "mine", flush: again), .scheduled(attempt: 1),
+            "a delivery resets the count"
+        )
+    }
+
+    func testARetryForATeamThatStoppedWakingOrWasRecreatedIsDiscarded() throws {
+        var state = CodexLeaderWakeState()
+        state.setTeamWakes("mine", true)
+        _ = state.note(teamName: "mine", taskId: "ab12", status: "completed")
+        let stale = try XCTUnwrap(state.flush(teamName: "mine"))
+        state.setTeamWakes("mine", true)
+        _ = state.note(teamName: "mine", taskId: "cd34", status: "completed")
+        XCTAssertEqual(state.retry(teamName: "mine", flush: stale), .discarded)
+        XCTAssertEqual(
+            state.flushLine(teamName: "mine"),
+            "[term-mesh] task cd34 completed — run tm-agent collect --headers"
+        )
+        state.setTeamWakes("mine", false)
+        XCTAssertEqual(state.retry(teamName: "mine", flush: stale), .discarded)
+        XCTAssertEqual(state.retry(teamName: "other", flush: stale), .discarded)
+    }
+
+    func testRetryBacksOffAndKeepsAheadOfTheCoalesceWindow() {
+        XCTAssertGreaterThan(CodexLeaderWakeBatch.retryDelay(attempt: 1), CodexLeaderWake.coalesceWindow)
+        XCTAssertGreaterThan(
+            CodexLeaderWakeBatch.retryDelay(attempt: 2), CodexLeaderWakeBatch.retryDelay(attempt: 1)
+        )
+    }
+
+    func testARecreatedTeamStartsWithAnEmptyBatch() throws {
+        var state = CodexLeaderWakeState()
+        state.setTeamWakes("mine", true)
+        _ = state.note(teamName: "mine", taskId: "ab12", status: "completed")
+        state.setTeamWakes("mine", true)
+        XCTAssertNil(state.flushLine(teamName: "mine"), "the old team's pending line is gone")
+        XCTAssertTrue(
+            state.note(teamName: "mine", taskId: "ab12", status: "completed"),
+            "the old team's dedupe record is gone"
+        )
+
+        let flush = try XCTUnwrap(state.flush(teamName: "mine"))
+        XCTAssertEqual(state.retry(teamName: "mine", flush: flush), .scheduled(attempt: 1))
+        state.setTeamWakes("mine", true)
+        _ = state.note(teamName: "mine", taskId: "cd34", status: "completed")
+        let fresh = try XCTUnwrap(state.flush(teamName: "mine"))
+        XCTAssertEqual(
+            state.retry(teamName: "mine", flush: fresh), .scheduled(attempt: 1),
+            "the old team's failed attempts are gone"
+        )
+    }
+
+    func testPreflightDropsWhatWillNotComeBackAndRetriesAnUnreadyLeader() {
+        func decide(_ wakes: Bool?, ready: Bool = true, _ mode: String = "codex", _ cli: String? = nil)
+            -> CodexLeaderWake.Preflight {
+            CodexLeaderWake.preflight(teamWakes: wakes, leaderReady: ready, leaderMode: mode, leaderCli: cli)
+        }
+        XCTAssertEqual(decide(nil), .drop, "team is gone")
+        XCTAssertEqual(decide(false), .drop, "team does not wake")
+        XCTAssertEqual(decide(true, "claude"), .drop, "not a Codex leader")
+        XCTAssertEqual(decide(false, ready: false), .drop)
+        XCTAssertEqual(decide(true, ready: false, "claude"), .drop)
+        XCTAssertEqual(decide(true, ready: false), .retry, "leader not ready yet")
+        XCTAssertEqual(decide(true, ready: false, "adopted", "codex"), .retry)
+        XCTAssertEqual(decide(true), .deliver)
+        XCTAssertEqual(decide(true, "adopted", "codex"), .deliver)
     }
 
     func testFindsTheThreadFromItsWriterLock() {

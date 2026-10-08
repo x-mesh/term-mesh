@@ -50,6 +50,27 @@ final class CodexLeaderWake: @unchecked Sendable {
         teamWakes && leaderReady && isCodexLeader(leaderMode: leaderMode, leaderCli: leaderCli)
     }
 
+    enum Preflight: Equatable {
+        case drop
+        case retry
+        case deliver
+    }
+
+    /// What to do with a drained line, given the live team (`nil` when the
+    /// team no longer exists). A team that is gone, not waking, or not led by
+    /// Codex will not come back; a leader that is not ready yet will.
+    static func preflight(
+        teamWakes: Bool?, leaderReady: Bool, leaderMode: String, leaderCli: String?
+    ) -> Preflight {
+        guard let teamWakes,
+              shouldDeliver(
+                  teamWakes: teamWakes, leaderReady: true,
+                  leaderMode: leaderMode, leaderCli: leaderCli
+              )
+        else { return .drop }
+        return leaderReady ? .deliver : .retry
+    }
+
     /// Workers that finish together, such as one parallel wave, produce one
     /// line, so the leader starts one turn rather than one per task.
     static let coalesceWindow: TimeInterval = 2
@@ -84,14 +105,23 @@ final class CodexLeaderWake: @unchecked Sendable {
 
     private func flush(teamName: String) {
         flushScheduled.remove(teamName)
-        guard let line = state.flushLine(teamName: teamName) else { return }
+        guard let wake = state.flush(teamName: teamName) else { return }
         Task { @MainActor in
-            guard let team = TeamOrchestrator.shared.teams[teamName],
-                  Self.shouldDeliver(
-                      teamWakes: team.codexLeaderWake, leaderReady: team.leaderReady,
-                      leaderMode: team.leaderMode, leaderCli: team.leaderCli
-                  )
-            else { return }
+            let team = TeamOrchestrator.shared.teams[teamName]
+            switch Self.preflight(
+                teamWakes: team?.codexLeaderWake, leaderReady: team?.leaderReady ?? false,
+                leaderMode: team?.leaderMode ?? "", leaderCli: team?.leaderCli
+            ) {
+            case .drop:
+                self.finish(teamName: teamName, flush: wake, retry: false)
+                return
+            case .retry:
+                self.finish(teamName: teamName, flush: wake, retry: true)
+                return
+            case .deliver:
+                break
+            }
+            guard let team else { return }
             var isPeer = false
             if case .peer = team.leaderEndpoint { isPeer = true }
             let panelId = team.leaderPanelId
@@ -101,16 +131,45 @@ final class CodexLeaderWake: @unchecked Sendable {
                 // `codex queue`; the text path already crosses the relay.
                 if !isPeer,
                    let target = CodexLeaderThreadLocator.locate(surfaceId: panelId),
-                   Self.queue(line, to: target, fallbackBinary: fallbackBinary) {
+                   Self.queue(wake.line, to: target, fallbackBinary: fallbackBinary) {
+                    self.finish(teamName: teamName, flush: wake, retry: false, delivered: true)
                     return
                 }
                 Task { @MainActor in
                     guard let manager = AppDelegate.shared?.locateSurface(surfaceId: panelId)?.tabManager
-                    else { return }
-                    _ = TeamOrchestrator.shared.sendToLeader(
-                        teamName: teamName, text: line, tabManager: manager
+                    else {
+                        self.finish(teamName: teamName, flush: wake, retry: true)
+                        return
+                    }
+                    let sent = TeamOrchestrator.shared.sendToLeader(
+                        teamName: teamName, text: wake.line, tabManager: manager
                     )
+                    self.finish(teamName: teamName, flush: wake, retry: !sent, delivered: sent)
                 }
+            }
+        }
+    }
+
+    /// Settles one flush on `stateQueue`. A failed delivery puts its events
+    /// back and schedules the next try with backoff; the dedupe record is
+    /// untouched, so the same pair is not announced twice.
+    private func finish(
+        teamName: String, flush wake: CodexLeaderWakeState.Flush, retry: Bool, delivered: Bool = false
+    ) {
+        stateQueue.async { [self] in
+            if delivered { state.delivered(teamName: teamName, flush: wake) }
+            guard retry else { return }
+            switch state.retry(teamName: teamName, flush: wake) {
+            case .scheduled(let attempt):
+                guard flushScheduled.insert(teamName).inserted else { return }
+                stateQueue.asyncAfter(deadline: .now() + CodexLeaderWakeBatch.retryDelay(attempt: attempt)) { [self] in
+                    flush(teamName: teamName)
+                }
+            case .gaveUp:
+                NSLog("[codex-wake] dropped wake team=%@ line=%@ after %ld failed attempts",
+                      teamName, wake.line, CodexLeaderWakeBatch.maxRetries + 1)
+            case .discarded:
+                break
             }
         }
     }
@@ -152,15 +211,32 @@ final class CodexLeaderWake: @unchecked Sendable {
 
 /// Which teams wake, and what each is waiting to say.
 struct CodexLeaderWakeState {
+    /// One drained line. `generation` ties it to the team incarnation that
+    /// produced it, so a failure that settles after the team was recreated
+    /// cannot put old events into the new team's batch.
+    struct Flush: Equatable {
+        let events: [CodexLeaderWakeBatch.Event]
+        let line: String
+        fileprivate let generation: Int
+    }
+
+    enum RetryOutcome: Equatable {
+        case scheduled(attempt: Int)
+        case gaveUp
+        case discarded
+    }
+
     private var wakingTeams: Set<String> = []
     private var batches: [String: CodexLeaderWakeBatch] = [:]
+    private var generations: [String: Int] = [:]
 
     mutating func setTeamWakes(_ teamName: String, _ wakes: Bool) {
+        generations[teamName, default: 0] += 1
+        batches[teamName] = nil
         if wakes {
             wakingTeams.insert(teamName)
         } else {
             wakingTeams.remove(teamName)
-            batches[teamName] = nil
         }
     }
 
@@ -173,11 +249,32 @@ struct CodexLeaderWakeState {
 
     /// Re-checks the team at flush time: one that stopped waking during the
     /// coalesce window sends nothing.
+    mutating func flush(teamName: String) -> Flush? {
+        guard let events = batches[teamName]?.drain(), wakingTeams.contains(teamName),
+              let line = CodexLeaderWakeBatch.wakeLine(for: events)
+        else { return nil }
+        return Flush(events: events, line: line, generation: generations[teamName, default: 0])
+    }
+
     mutating func flushLine(teamName: String) -> String? {
-        guard let events = batches[teamName]?.drain(), wakingTeams.contains(teamName) else {
-            return nil
+        flush(teamName: teamName)?.line
+    }
+
+    /// Puts a failed flush back ahead of newer events, within the retry bound.
+    mutating func retry(teamName: String, flush: Flush) -> RetryOutcome {
+        guard wakingTeams.contains(teamName),
+              generations[teamName, default: 0] == flush.generation,
+              batches[teamName] != nil
+        else { return .discarded }
+        if let attempt = batches[teamName]?.requeue(flush.events) {
+            return .scheduled(attempt: attempt)
         }
-        return CodexLeaderWakeBatch.wakeLine(for: events)
+        return .gaveUp
+    }
+
+    mutating func delivered(teamName: String, flush: Flush) {
+        guard generations[teamName, default: 0] == flush.generation else { return }
+        batches[teamName]?.resetRetries()
     }
 }
 
@@ -188,7 +285,14 @@ struct CodexLeaderWakeBatch {
         let status: String
     }
 
-    static let wakeStatuses: Set<String> = ["completed", "review_ready", "blocked", "failed"]
+    static let wakeStatuses: Set<String> = ["completed", "review_ready", "blocked", "failed", "cancelled"]
+
+    /// A leader that is not ready yet, or a pane that cannot be found for a
+    /// moment, recovers within seconds; a longer outage drops the wake.
+    static let maxRetries = 3
+    static func retryDelay(attempt: Int) -> TimeInterval {
+        CodexLeaderWake.coalesceWindow * pow(2, Double(max(1, attempt)))
+    }
 
     /// Bounds memory for a long-lived team. A task id is eight hex characters
     /// and a team runs far fewer tasks than this between restarts.
@@ -198,6 +302,7 @@ struct CodexLeaderWakeBatch {
     private var announced: Set<String> = []
     private var announcedOrder: [String] = []
     private(set) var pending: [Event] = []
+    private var failedAttempts = 0
 
     init(rememberLimit: Int = defaultRememberLimit) {
         self.rememberLimit = max(1, rememberLimit)
@@ -220,6 +325,22 @@ struct CodexLeaderWakeBatch {
     mutating func drain() -> [Event] {
         defer { pending = [] }
         return pending
+    }
+
+    /// Returns the attempt number, or nil once the retry bound is spent, in
+    /// which case the events are dropped.
+    mutating func requeue(_ events: [Event]) -> Int? {
+        failedAttempts += 1
+        guard failedAttempts <= Self.maxRetries else {
+            failedAttempts = 0
+            return nil
+        }
+        pending = events + pending
+        return failedAttempts
+    }
+
+    mutating func resetRetries() {
+        failedAttempts = 0
     }
 
     /// One line, because the text fallback flattens newlines and a Codex turn

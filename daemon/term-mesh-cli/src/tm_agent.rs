@@ -1820,7 +1820,8 @@ enum Commands {
         mode: String,
         #[arg(long)]
         task: Option<String>,
-        /// Comma-separated list of task IDs to wait for (overrides agent-based tracking)
+        /// Comma-separated list of task IDs to wait for (overrides agent-based
+        /// tracking). Cannot be combined with --task.
         #[arg(long)]
         tasks: Option<String>,
         /// Comma-separated list of agent names to wait for (default: all agents)
@@ -10407,12 +10408,13 @@ fn main() {
             agents,
         } => {
             let filter = parse_cli_flag(&agents);
-            let task_ids: Option<std::collections::HashSet<String>> = tasks.map(|t| {
-                t.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            });
+            let task_ids = match parse_wait_task_arguments(tasks.as_deref(), task.as_deref()) {
+                Ok(ids) => ids,
+                Err(message) => {
+                    eprintln!("wait: {message}");
+                    process::exit(2);
+                }
+            };
             run_wait(
                 &sock,
                 &team,
@@ -22256,6 +22258,48 @@ fn subscribe_events_channel(
     Ok(rx)
 }
 
+/// A task argument that was given but names nothing is an error, not an
+/// absent argument: an empty shell variable must not silently turn into
+/// "track every active task".
+fn parse_wait_task_arguments(
+    tasks: Option<&str>,
+    task: Option<&str>,
+) -> Result<Option<std::collections::HashSet<String>>, String> {
+    // The single-task exit in run_wait ignores the --tasks set, so the pair
+    // would end the wait on one task while the others still run.
+    if task.is_some() && tasks.is_some() {
+        return Err("--task and --tasks cannot be combined; pass every id in one --tasks list, e.g. --tasks a,b".to_string());
+    }
+    if task.is_some_and(|id| id.trim().is_empty()) {
+        return Err("--task is empty; pass a task id or omit the flag".to_string());
+    }
+    let Some(tasks) = tasks else {
+        return Ok(None);
+    };
+    let ids: std::collections::HashSet<String> = tasks
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Err("--tasks names no task ids; pass a comma-separated list or omit the flag".to_string());
+    }
+    Ok(Some(ids))
+}
+
+/// Tasks of `tracked` that have settled according to the last observed status.
+/// Judging from the observed map, not the current list, keeps a settled task
+/// that later leaves the list from stalling the wait.
+fn wait_settled_count(
+    tracked: &std::collections::HashSet<String>,
+    statuses: &std::collections::HashMap<String, String>,
+) -> u64 {
+    tracked
+        .iter()
+        .filter(|id| statuses.get(*id).is_some_and(|status| wait_task_settled(status)))
+        .count() as u64
+}
+
 fn initialize_wait_task_scope(
     explicit_task_ids: Option<&std::collections::HashSet<String>>,
     task_id: Option<&str>,
@@ -22584,7 +22628,6 @@ fn run_wait(
                 if let Ok(r) = rpc_call(sock, "team.task.list", json!({ "team_name": team })) {
                     if let Some(tasks) = r["result"]["tasks"].as_array() {
                         let total = tracked_task_ids.len() as u64;
-                        let mut done = 0u64;
                         for task in tasks {
                             let tid = task["id"].as_str().unwrap_or("");
                             if !tracked_task_ids.contains(tid) {
@@ -22592,10 +22635,8 @@ fn run_wait(
                             }
                             let status = task["status"].as_str().unwrap_or("");
                             tracked_statuses.insert(tid.to_string(), status.to_string());
-                            if wait_task_settled(status) {
-                                done += 1;
-                            }
                         }
+                        let done = wait_settled_count(&tracked_task_ids, &tracked_statuses);
                         report_done = total > 0 && done >= total;
                         report_progress = format!("{done}/{total}");
                     }
@@ -23003,6 +23044,37 @@ mod wait_task_scope_tests {
     }
 
     #[test]
+    fn given_but_empty_task_arguments_are_rejected() {
+        for tasks in ["", ",", " , ,"] {
+            assert!(parse_wait_task_arguments(Some(tasks), None).is_err(), "{tasks:?}");
+        }
+        for task in ["", "  "] {
+            assert!(parse_wait_task_arguments(None, Some(task)).is_err(), "{task:?}");
+        }
+    }
+
+    #[test]
+    fn task_and_tasks_together_are_rejected() {
+        for (tasks, task) in [("a,b", "x"), ("a", "a"), ("", "x"), (",", "")] {
+            let error = parse_wait_task_arguments(Some(tasks), Some(task)).unwrap_err();
+            assert!(error.contains("--tasks"), "{tasks:?} {task:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn omitted_or_populated_task_arguments_are_accepted() {
+        assert_eq!(parse_wait_task_arguments(None, None), Ok(None));
+        assert_eq!(
+            parse_wait_task_arguments(Some(" a, b ,,"), None),
+            Ok(Some(std::collections::HashSet::from(["a".to_string(), "b".to_string()])))
+        );
+        assert_eq!(
+            parse_wait_task_arguments(None, Some("a")),
+            Ok(None)
+        );
+    }
+
+    #[test]
     fn absent_task_arguments_allow_active_task_discovery() {
         let (scope, is_explicit) = initialize_wait_task_scope(None, None);
 
@@ -23040,6 +23112,27 @@ mod wait_any_scope_tests {
         assert_eq!(wait_report_outcome(["completed", "failed"]), "failed");
         assert_eq!(wait_report_outcome(["failed", "blocked", "completed"]), "blocked");
         assert_eq!(wait_report_outcome(std::iter::empty::<&str>()), "completed");
+    }
+
+    #[test]
+    fn a_settled_task_that_leaves_the_list_still_counts_as_done() {
+        let tracked = std::collections::HashSet::from([
+            "gone".to_string(),
+            "running".to_string(),
+            "unseen".to_string(),
+        ]);
+        let mut statuses = std::collections::HashMap::from([
+            ("gone".to_string(), "completed".to_string()),
+            ("running".to_string(), "in_progress".to_string()),
+        ]);
+        assert_eq!(wait_settled_count(&tracked, &statuses), 1);
+        assert_eq!(wait_pending_tasks(&tracked, &statuses), vec!["running", "unseen"]);
+
+        statuses.insert("running".to_string(), "failed".to_string());
+        assert_eq!(wait_settled_count(&tracked, &statuses), 2);
+        statuses.insert("unseen".to_string(), "cancelled".to_string());
+        assert_eq!(wait_settled_count(&tracked, &statuses), 3);
+        assert!(wait_pending_tasks(&tracked, &statuses).is_empty());
     }
 
     #[test]
