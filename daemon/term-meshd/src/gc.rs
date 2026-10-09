@@ -212,6 +212,24 @@ impl GcRefs {
     }
 }
 
+/// Checkouts of the members of app-managed teams, from the Swift-synced
+/// `team.sync` state. The app owns those panes without registering a daemon
+/// agent session, so the session table alone leaves their worktrees looking
+/// idle. Anything that is not a non-empty string is ignored.
+pub fn team_member_worktree_paths(team_state: &serde_json::Value) -> HashSet<PathBuf> {
+    team_state
+        .get("teams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|team| team.get("agents").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|agent| agent.get("worktree_path").and_then(serde_json::Value::as_str))
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GcOptions {
     /// Restrict the scan to these category ids. Empty/absent means all.
@@ -1953,6 +1971,61 @@ mod tests {
         let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &refs);
         let candidate = &category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0];
         assert!(candidate.blockers.iter().any(|b| b == "active_session"));
+    }
+
+    #[test]
+    fn team_member_worktree_paths_ignore_missing_empty_and_non_string_values() {
+        let state = serde_json::json!({"teams": [
+            {"agents": [
+                {"name": "a", "worktree_path": "/wt/a"},
+                {"name": "b"},
+                {"name": "c", "worktree_path": ""},
+                {"name": "d", "worktree_path": "  "},
+                {"name": "e", "worktree_path": 7},
+                {"name": "f", "worktree_path": null},
+            ]},
+            {"agents": "not-a-list"},
+            {"name": "no-agents"},
+        ]});
+
+        assert_eq!(
+            team_member_worktree_paths(&state),
+            HashSet::from([PathBuf::from("/wt/a")])
+        );
+        assert!(team_member_worktree_paths(&serde_json::json!({})).is_empty());
+        assert!(team_member_worktree_paths(&serde_json::json!({"teams": 3})).is_empty());
+    }
+
+    #[test]
+    fn a_synced_team_member_worktree_is_blocked_until_the_team_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_5570b2e8");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, "team/t/executor/5570b2e8");
+        let synced = serde_json::json!({"teams": [
+            {"agents": [{"name": "executor", "worktree_path": wt.to_string_lossy()}]}
+        ]});
+
+        let live = GcRefs {
+            active_session_worktrees: team_member_worktree_paths(&synced),
+            ..Default::default()
+        };
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &live);
+        let candidate = &category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0];
+        assert!(candidate.blockers.iter().any(|b| b == "active_session"));
+
+        let gone = GcRefs {
+            active_session_worktrees: team_member_worktree_paths(&serde_json::json!({"teams": []})),
+            ..Default::default()
+        };
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &gone);
+        let candidate = &category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0];
+        assert!(!candidate.blockers.iter().any(|b| b == "active_session"));
     }
 
     #[test]
