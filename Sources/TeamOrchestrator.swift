@@ -8705,6 +8705,11 @@ final class TeamOrchestrator: ObservableObject {
                     if let pid = agent.panelId {
                         info["panel_id"] = pid.uuidString
                     }
+                    // Same source as teamStatus. The daemon's gc reads it to keep
+                    // a live member checkout out of its reclaim candidates.
+                    if let path = agent.worktreePath, path.nilIfBlank != nil {
+                        info["worktree_path"] = path
+                    }
                     return info
                 },
                 "attention_count": teamInbox.count,
