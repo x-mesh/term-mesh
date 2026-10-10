@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.268.3] - 2026-10-10
+
+### Fixed
+
+- `tm-agent gc sweep --apply` now reclaims the empty folders that removed worktrees leave in `~/.term-mesh/worktrees`. Deleting a team with isolated worktrees, or sweeping its worktrees, removed each worktree but kept its repository folder, so one empty folder stayed behind per repository. The sweep removes such a folder only if it is still empty, so a worktree created in it after the plan stays untouched.
+- `tm-agent gc sweep --force` no longer shows a worktree as a removal that the sweep then refuses. A worktree folder whose `.git` link no longer pointed to a registered worktree appeared as "would remove" in the dry run and was then skipped. The plan now marks it blocked with `registration_missing` or `registration_mismatch`, and `--force` keeps it.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.268.2] - 2026-10-10
 
 ### Fixed
