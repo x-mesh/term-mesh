@@ -1198,8 +1198,10 @@ def publish(args: argparse.Namespace, state: dict[str, Any] | None = None) -> di
         else:
             develop_wt = branch_worktree("develop", allow_dirty=True)
             gk("pull", cwd=develop_wt)
+            # verify requires develop == the release merge SHA. Without
+            # --ff-only, a user's merge.ff=false makes a merge commit here.
             gk(
-                "merge", "--no-ai", "--autostash",
+                "merge", "--no-ai", "--autostash", "--ff-only",
                 "origin/main", "--into", "develop", cwd=develop_wt,
             )
             gk("push", "--from", "develop", cwd=develop_wt)

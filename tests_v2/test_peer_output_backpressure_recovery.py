@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -176,10 +177,12 @@ def _process_evidence() -> Dict[str, Any]:
 
 
 def _fd_count(pid: int) -> int:
-    result = subprocess.run(["lsof", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+    # lsof also lists mapped dylibs, frameworks and fonts (txt) and cwd. Those
+    # grow as the app loads code, so only numbered entries count as descriptors.
+    result = subprocess.run(["lsof", "-p", str(pid), "-F", "f"], capture_output=True, text=True, timeout=10)
     if result.returncode not in (0, 1):
         raise termmeshError(f"cannot measure GUI FD count: {result.stderr.strip()}")
-    return max(0, len(result.stdout.splitlines()) - 1)
+    return sum(1 for line in result.stdout.splitlines() if line.startswith("f") and line[1:2].isdigit())
 
 
 def _peer_sockets(pid: int) -> List[str]:
@@ -196,11 +199,64 @@ def _peer_sockets(pid: int) -> List[str]:
     return sockets
 
 
-def _count_markers(path: str, offset: int) -> Dict[str, int]:
-    try:
-        data = Path(path).read_bytes()[offset:].decode("utf-8", "replace")
-    except OSError:
-        data = ""
+class _PeerLogTail:
+    # PeerServerDiagnostics replaces the log with a single line once it reaches
+    # 256 KiB. A byte offset taken before the run then points into the new file
+    # and every earlier marker is lost, so the replaced file stays open and is
+    # drained before the new one is followed.
+    def __init__(self, path: str):
+        self._path = path
+        self._data = bytearray()
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._file = self._open()
+        if self._file is not None:
+            self._file.seek(0, os.SEEK_END)
+        self._thread = threading.Thread(target=self._follow, daemon=True)
+        self._thread.start()
+
+    def _open(self):
+        try:
+            return open(self._path, "rb")
+        except OSError:
+            return None
+
+    def _drain(self) -> None:
+        if self._file is None:
+            self._file = self._open()
+            if self._file is None:
+                return
+        self._data.extend(self._file.read())
+        try:
+            replaced = os.stat(self._path).st_ino != os.fstat(self._file.fileno()).st_ino
+        except OSError:
+            return
+        if replaced:
+            self._data.extend(self._file.read())
+            self._file.close()
+            self._file = None
+            self._drain()
+
+    def _follow(self) -> None:
+        while not self._stopped.wait(POLL_INTERVAL_SECONDS):
+            with self._lock:
+                self._drain()
+
+    def text(self) -> str:
+        with self._lock:
+            self._drain()
+            return self._data.decode("utf-8", "replace")
+
+    def close(self) -> None:
+        self._stopped.set()
+        self._thread.join(timeout=5)
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
+
+def _count_markers(data: str) -> Dict[str, int]:
     return {
         "unexpected_eof": data.count("unexpectedEof"),
         "overflow_episodes": data.count("overflow-episode"),
@@ -215,11 +271,7 @@ def _count_markers(path: str, offset: int) -> Dict[str, int]:
     }
 
 
-def _queue_measurement_lines(path: str, offset: int) -> List[str]:
-    try:
-        data = Path(path).read_bytes()[offset:].decode("utf-8", "replace")
-    except OSError:
-        return []
+def _queue_measurement_lines(data: str) -> List[str]:
     return [
         line for line in data.splitlines()
         if "queue-watermark " in line or "queue-observation " in line
@@ -275,7 +327,9 @@ def _stop_stall_watcher(process, output_path: Path) -> Dict[str, Any]:
     return summary
 
 
-def _run_gui_listener_stress(client, process: Dict[str, Any], log_path: str, log_offset: int) -> Dict[str, Any]:
+def _run_gui_listener_stress(
+    client, process: Dict[str, Any], peer_log: _PeerLogTail, fd_baseline: int
+) -> Dict[str, Any]:
     source_surface = client.new_surface(panel_type="terminal")
     remote_panel = None
     try:
@@ -352,13 +406,10 @@ def _run_gui_listener_stress(client, process: Dict[str, Any], log_path: str, log
         write_delay_marker = (
             f"test-write-delay active ms={os.environ['TERMMESH_E2E_PEER_SERVER_WRITE_DELAY_MS']} "
             f"surface={short_surface}"
-        ).encode()
+        )
 
         def write_delay_active():
-            try:
-                return write_delay_marker in Path(log_path).read_bytes()[log_offset:]
-            except OSError:
-                return False
+            return write_delay_marker in peer_log.text()
 
         if not _wait(write_delay_active, timeout_s=5):
             raise termmeshError(f"GUI writer delay did not reach the peer server: surface={short_surface}")
@@ -366,7 +417,7 @@ def _run_gui_listener_stress(client, process: Dict[str, Any], log_path: str, log
         pressure_line = _wait(
             lambda: next(
                 (
-                    line for line in _queue_measurement_lines(log_path, log_offset)
+                    line for line in _queue_measurement_lines(peer_log.text())
                     if "queue-watermark " in line and f"surface={short_surface}" in line
                 ),
                 None,
@@ -388,7 +439,7 @@ def _run_gui_listener_stress(client, process: Dict[str, Any], log_path: str, log
             )
 
         deadline = time.time() + 90
-        max_fd = int(process["fd_count"])
+        max_fd = fd_baseline
         final = None
         attachment_failed = False
         marker_seen = False
@@ -423,7 +474,7 @@ def _run_gui_listener_stress(client, process: Dict[str, Any], log_path: str, log
             final,
         ) if final is not None else None
         io_after = dict((final or {}).get("io") or {})
-        markers = _count_markers(log_path, log_offset)
+        markers = _count_markers(peer_log.text())
         boundary_observed = (
             markers["overflow_episodes"] > 0
             or markers["queue_drops"] > 0
@@ -453,7 +504,7 @@ def _run_gui_listener_stress(client, process: Dict[str, Any], log_path: str, log
             "final_relay": final,
             "log_markers": markers,
             "outcome": "completed_output" if marker_seen else "bounded_attachment_failure",
-            "fd_baseline": int(process["fd_count"]),
+            "fd_baseline": fd_baseline,
             "fd_max": max_fd,
             "output_bytes_per_burst": GUI_OUTPUT_BYTES,
             "output_bursts": GUI_OUTPUT_BURSTS,
@@ -514,6 +565,7 @@ def _run() -> int:
         relay_debug_log_offset = Path(relay_debug_log_path).stat().st_size
     except OSError:
         relay_debug_log_offset = 0
+    peer_log = _PeerLogTail(log_path)
     evidence: Dict[str, Any] = {
         "candidate_sha": values["TERMMESH_E2E_CANDIDATE_SHA"],
         "remote_fixture_candidate_sha": values["TERMMESH_E2E_REMOTE_FIXTURE_CANDIDATE_SHA"],
@@ -653,7 +705,10 @@ def _run() -> int:
                     raise termmeshError(f"candidate relay telemetry is missing {key!r}: {io_before!r}")
 
             watcher_process, watcher_path = _start_stall_watcher(state_dir, log_path, log_offset)
-            gui_stress = _run_gui_listener_stress(client, process, log_path, log_offset)
+            # Measured with the Project and its panes already open, so the bound
+            # covers what output pressure and recovery add, not Project setup.
+            fd_baseline = _fd_count(process["pid"])
+            gui_stress = _run_gui_listener_stress(client, process, peer_log, fd_baseline)
             evidence["gui_listener_stress"] = gui_stress
             read_delay_starts = _count_test_read_delay_starts(
                 relay_debug_log_path, relay_debug_log_offset
@@ -672,13 +727,14 @@ def _run() -> int:
             if not io_after.get("saw_first_byte") or int(io_after.get("bytes_received") or 0) <= 0:
                 raise termmeshError(f"leader relay did not receive output: {io_after!r}")
             fd_after = _fd_count(process["pid"])
-            if fd_after - int(process["fd_count"]) > MAX_FD_GROWTH:
+            if fd_after - fd_baseline > MAX_FD_GROWTH:
                 raise termmeshError(
                     f"GUI FD growth exceeded bound after recovery: "
-                    f"baseline={process['fd_count']} after={fd_after}"
+                    f"baseline={fd_baseline} after={fd_after}"
                 )
-            markers = _count_markers(log_path, log_offset)
-            queue_measurements = _queue_measurement_lines(log_path, log_offset)
+            peer_log_text = peer_log.text()
+            markers = _count_markers(peer_log_text)
+            queue_measurements = _queue_measurement_lines(peer_log_text)
             evidence["log_markers"] = markers
             evidence["queue_measurements"] = queue_measurements
             if markers["unexpected_eof"] > MAX_RECONNECT_ATTEMPTS:
@@ -698,7 +754,7 @@ def _run() -> int:
                 "before_io": io_before,
                 "after_io": io_after,
                 "final_relay": final,
-                "fd_baseline": int(process["fd_count"]),
+                "fd_baseline": fd_baseline,
                 "fd_after": fd_after,
                 "queue_boundary_observed": boundary_observed,
                 "bounded_convergence_observed": True,
@@ -724,6 +780,7 @@ def _run() -> int:
                     evidence["cleanup_receipt"]["fallback_error"] = True
     finish_watcher()
     atexit.unregister(finish_watcher)
+    peer_log.close()
     observer = evidence.get("external_observer") or {}
     if int(observer.get("sample_count") or 0) < 1:
         raise termmeshError(f"external stall observer captured no samples: {observer!r}")

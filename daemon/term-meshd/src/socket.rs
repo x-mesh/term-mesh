@@ -2437,8 +2437,15 @@ async fn collect_gc_refs(ctx: &Context) -> gc::GcRefs {
             .unwrap_or_default()
     };
 
+    // The app's team members are not daemon agent sessions, so their checkouts
+    // come from the synced team state; a team that is gone drops out of it.
+    let mut active_session_worktrees = ctx.agent_manager.active_worktree_paths();
+    active_session_worktrees.extend(gc::team_member_worktree_paths(
+        &ctx.team_state.read().unwrap(),
+    ));
+
     gc::GcRefs {
-        active_session_worktrees: ctx.agent_manager.active_worktree_paths(),
+        active_session_worktrees,
         active_task_worktrees: ctx.agent_manager.active_task_worktree_paths(),
         repo_paths: ctx.agent_manager.known_repo_paths(),
         active_team_uuids,
