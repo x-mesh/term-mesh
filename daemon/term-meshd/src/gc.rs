@@ -407,6 +407,10 @@ fn scan_daemon_worktrees(paths: &GcPaths, refs: &GcRefs) -> GcCategoryReport {
 
     // Layout is <root>/<repo name>/term-mesh_wt_<8hex>.
     for repo_dir in real_subdirectories(root) {
+        if let Some(candidate) = empty_repo_dir_candidate(&repo_dir) {
+            report.push(candidate);
+            continue;
+        }
         for entry in real_subdirectories(&repo_dir) {
             let name = file_name(&entry);
             if !is_daemon_worktree_name(&name) {
@@ -416,6 +420,26 @@ fn scan_daemon_worktrees(paths: &GcPaths, refs: &GcRefs) -> GcCategoryReport {
         }
     }
     report
+}
+
+/// Removing a worktree leaves its `<repo name>` parent behind. Hidden files
+/// count as content, so only a directory with no entry at all qualifies.
+fn empty_repo_dir_candidate(repo_dir: &Path) -> Option<GcCandidate> {
+    let mut entries = fs::read_dir(repo_dir).ok()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(repo_dir).ok()?;
+    Some(GcCandidate {
+        path: display(repo_dir),
+        bytes: 0,
+        modified_ms: modified_ms(&metadata),
+        kind: "directory".into(),
+        branch: None,
+        reasons: vec!["empty_repo_dir".into()],
+        blockers: Vec::new(),
+        identity: Some(file_identity(&metadata)),
+    })
 }
 
 fn scan_gitkit_worktrees(paths: &GcPaths, refs: &GcRefs) -> GcCategoryReport {
@@ -1113,6 +1137,7 @@ pub fn execute_sweep(
             // the original plan reach here, and worktrees are then checked
             // again against the current filesystem and current daemon refs.
             let refreshed_worktree;
+            let refreshed_empty_dir;
             let candidate = if candidate.kind == "worktree" || candidate.kind == "checkout" {
                 refreshed_worktree =
                     worktree_candidate(Path::new(&candidate.path), &candidate.kind, current_refs);
@@ -1139,6 +1164,33 @@ pub fn execute_sweep(
                     continue;
                 }
                 &refreshed_worktree
+            } else if candidate.reasons.iter().any(|r| r == "empty_repo_dir") {
+                // Re-read only this directory instead of rescanning every
+                // worktree: one created in it since planning disqualifies it.
+                let Some(current) = empty_repo_dir_candidate(Path::new(&candidate.path)) else {
+                    summary.skipped += 1;
+                    summary.outcomes.push(SweepOutcome {
+                        path: candidate.path.clone(),
+                        category: category.category.clone(),
+                        action: "skipped".into(),
+                        reason: "candidate_changed_or_no_longer_eligible".into(),
+                        bytes: candidate.bytes,
+                    });
+                    continue;
+                };
+                if candidate.identity != current.identity {
+                    summary.skipped += 1;
+                    summary.outcomes.push(SweepOutcome {
+                        path: candidate.path.clone(),
+                        category: category.category.clone(),
+                        action: "skipped".into(),
+                        reason: "candidate_replaced_since_plan".into(),
+                        bytes: candidate.bytes,
+                    });
+                    continue;
+                }
+                refreshed_empty_dir = current;
+                &refreshed_empty_dir
             } else if let Some(refreshed) = &refreshed_category {
                 let Some(current) = refreshed
                     .candidates
@@ -1232,6 +1284,7 @@ fn reclaim(candidate: &GcCandidate, category: &str) -> Result<String, String> {
     }
 
     let is_worktree = candidate.kind == "worktree" || candidate.kind == "checkout";
+    let is_empty_repo_dir = candidate.reasons.iter().any(|r| r == "empty_repo_dir");
 
     // Never ask git/libgit2 to remove the working tree itself. The path may
     // have been replaced after the candidate refresh, and libgit2 follows a
@@ -1244,6 +1297,13 @@ fn reclaim(candidate: &GcCandidate, category: &str) -> Result<String, String> {
     }
     if candidate.identity != Some(file_identity(&metadata)) {
         return Err("candidate_replaced_after_refresh".into());
+    }
+
+    // Non-recursive on purpose: a worktree created here after planning must
+    // make this fail rather than be deleted.
+    if is_empty_repo_dir {
+        fs::remove_dir(&path).map_err(|e| e.to_string())?;
+        return Ok("removed".to_string());
     }
 
     // The registration has to be read before the directory goes: `.git` is
@@ -2227,6 +2287,107 @@ mod tests {
         assert_eq!(summary.removed, 1);
         assert_eq!(summary.outcomes[0].action, "would_remove");
         assert!(wt.exists(), "dry run must not touch the filesystem");
+    }
+
+    fn empty_repo_candidates(plan: &GcPlan) -> Vec<&GcCandidate> {
+        category(plan, CATEGORY_DAEMON_WORKTREES)
+            .candidates
+            .iter()
+            .filter(|c| c.reasons.iter().any(|r| r == "empty_repo_dir"))
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_repo_dir_is_a_candidate_and_a_populated_one_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path());
+        let paths = paths_for(temp.path());
+        let empty = paths.daemon_worktrees.join("empty-repo");
+        let hidden = paths.daemon_worktrees.join("hidden-file");
+        let with_worktree = paths.daemon_worktrees.join("repo");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(hidden.join(".keep"), "").unwrap();
+        add_worktree(
+            &repo,
+            &with_worktree.join("term-mesh_wt_0a0b0c0d"),
+            "term-mesh/0a0b0c0d",
+        );
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        let candidates = empty_repo_candidates(&plan);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, display(&empty));
+        assert_eq!(candidates[0].kind, "directory");
+        assert_eq!(candidates[0].bytes, 0);
+        assert!(candidates[0].blockers.is_empty());
+        assert!(candidates[0].identity.is_some());
+    }
+
+    #[test]
+    fn sweep_apply_removes_an_empty_repo_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let empty = paths.daemon_worktrees.join("empty-repo");
+        fs::create_dir_all(&empty).unwrap();
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 1);
+        assert!(!empty.exists());
+        assert!(paths.daemon_worktrees.exists());
+    }
+
+    #[test]
+    fn a_repo_dir_that_gains_content_after_planning_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let by_file = paths.daemon_worktrees.join("by-file");
+        let by_dir = paths.daemon_worktrees.join("by-dir");
+        fs::create_dir_all(&by_file).unwrap();
+        fs::create_dir_all(&by_dir).unwrap();
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        assert_eq!(empty_repo_candidates(&plan).len(), 2);
+        fs::write(by_file.join("late.txt"), "live").unwrap();
+        fs::create_dir_all(by_dir.join("term-mesh_wt_cafe0001")).unwrap();
+
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 2);
+        assert!(by_file.join("late.txt").exists());
+        assert!(by_dir.join("term-mesh_wt_cafe0001").exists());
+    }
+
+    #[test]
+    fn reclaim_never_recurses_into_an_empty_repo_dir_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let dir = paths.daemon_worktrees.join("raced");
+        fs::create_dir_all(&dir).unwrap();
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        let candidate = empty_repo_candidates(&plan)[0].clone();
+        fs::write(dir.join("late.txt"), "live").unwrap();
+
+        assert!(reclaim(&candidate, CATEGORY_DAEMON_WORKTREES).is_err());
+        assert!(dir.join("late.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_empty_repo_dir_is_not_a_candidate() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        fs::create_dir_all(&paths.daemon_worktrees).unwrap();
+        let target = temp.path().join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, paths.daemon_worktrees.join("linked")).unwrap();
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        assert!(empty_repo_candidates(&plan).is_empty());
+        assert!(target.exists());
     }
 
     #[test]
