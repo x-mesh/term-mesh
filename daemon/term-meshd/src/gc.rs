@@ -1164,7 +1164,9 @@ pub fn execute_sweep(
                     continue;
                 }
                 &refreshed_worktree
-            } else if candidate.reasons.iter().any(|r| r == "empty_repo_dir") {
+            } else if category.category == CATEGORY_DAEMON_WORKTREES
+                && candidate.reasons.iter().any(|r| r == "empty_repo_dir")
+            {
                 // Re-read only this directory instead of rescanning every
                 // worktree: one created in it since planning disqualifies it.
                 let Some(current) = empty_repo_dir_candidate(Path::new(&candidate.path)) else {
