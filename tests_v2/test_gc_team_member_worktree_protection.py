@@ -73,7 +73,7 @@ def _make_repo(parent: Path) -> Path:
     return repo
 
 
-def _create_project(client, repo: Path) -> None:
+def _start_project(client, repo: Path) -> str:
     started = client.debug_project_creation_attempt(
         name=TEAM_NAME, directory=str(repo), roles=ROLES,
         worker_cli="codex", isolate=True,
@@ -81,7 +81,10 @@ def _create_project(client, repo: Path) -> None:
     operation_id = str(started.get("operation_id") or "")
     if not operation_id:
         raise termmeshError(f"Project creation returned no operation id: {started!r}")
+    return operation_id
 
+
+def _wait_project_created(client, operation_id: str) -> None:
     def finished() -> Optional[Dict[str, Any]]:
         status = client.debug_project_creation_status(operation_id)
         return None if status.get("state") == "running" else status
@@ -170,75 +173,90 @@ def _assert_blocked(members: Dict[str, str], blocked: bool) -> None:
             )
 
 
-def _remove_worktrees(repo: Path, members: Dict[str, str]) -> List[str]:
+def _repo_worktree_names() -> set:
+    try:
+        return {entry.name for entry in (WORKTREE_ROOT / REPO_NAME).iterdir() if entry.is_dir()}
+    except FileNotFoundError:
+        return set()
+
+
+def _remove_worktrees(repo: Path, names: set) -> List[str]:
     problems = []
-    for name, path in members.items():
-        if not os.path.isdir(path):
-            continue
+    for name in sorted(names):
         try:
             daemon_call("worktree.remove", {
-                "repo_path": str(repo), "name": Path(path).name, "force": False,
+                "repo_path": str(repo), "name": name, "force": False,
             }, timeout=30)
         except termmeshError as exc:
             problems.append(f"{name}: {exc}")
             continue
-        if os.path.isdir(path):
-            problems.append(f"{name}: worktree.remove left {path}")
+        if (WORKTREE_ROOT / REPO_NAME / name).is_dir():
+            problems.append(f"{name}: worktree.remove left it in place")
     return problems
+
+
+def _check_protection(client, repo: Path) -> Dict[str, str]:
+    operation_id = _start_project(client, repo)
+    team_present = True
+    try:
+        _wait_project_created(client, operation_id)
+        members = _member_worktrees(client, repo)
+        expected = set(members.values())
+        # Separates a missing app sync from a gc that ignores it.
+        _wait(lambda: expected <= _synced_paths(), SYNC_TIMEOUT_SECONDS,
+              f"team.sync to carry member worktrees {sorted(expected)}")
+        _assert_blocked(members, blocked=True)
+
+        # state_only keeps the checkouts on disk, so gc can show that the
+        # protection ends with the team.
+        _delete_project(client, state_only=True)
+        team_present = False
+        _wait(lambda: not (expected & _synced_paths()), SYNC_TIMEOUT_SECONDS,
+              "team.sync to drop the removed team")
+        _assert_blocked(members, blocked=False)
+        return members
+    finally:
+        # A full delete removes the checkouts later on another queue, after the
+        # test has deleted the repository, and leaves them orphaned. state_only
+        # leaves them for the test to remove while the repository exists.
+        if team_present:
+            try:
+                _delete_project(client, state_only=True)
+            except termmeshError as exc:
+                print(f"cleanup: Project deletion failed: {exc}", file=sys.stderr)
 
 
 def main() -> int:
     old_existed, old_value = _read_default()
-    members: Dict[str, str] = {}
-    failure: Optional[BaseException] = None
-    with tempfile.TemporaryDirectory(prefix="term-mesh-gc-protect-") as tmp:
-        fake_codex = Path(tmp) / "codex"
-        fake_codex.write_text(FAKE_CODEX)
-        fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IXUSR)
-        subprocess.run(
-            ["defaults", "write", DEFAULTS_DOMAIN, DEFAULTS_KEY, "-string", str(fake_codex)],
-            check=True,
-        )
-        repo = _make_repo(Path(tmp))
-        try:
-            with termmesh() as client:
-                team_exists = False
-                try:
-                    _create_project(client, repo)
-                    team_exists = True
-                    members = _member_worktrees(client, repo)
-                    expected = set(members.values())
-                    # Separates a missing app sync from a gc that ignores it.
-                    _wait(lambda: expected <= _synced_paths(), SYNC_TIMEOUT_SECONDS,
-                          f"team.sync to carry member worktrees {sorted(expected)}")
-                    _assert_blocked(members, blocked=True)
-
-                    # state_only keeps the checkouts on disk, so gc can show
-                    # that the protection ends with the team.
-                    _delete_project(client, state_only=True)
-                    team_exists = False
-                    _wait(lambda: not (expected & _synced_paths()), SYNC_TIMEOUT_SECONDS,
-                          "team.sync to drop the removed team")
-                    _assert_blocked(members, blocked=False)
-                finally:
-                    # A failure can come before the member paths are known, so
-                    # the app removes the checkouts it created.
-                    if team_exists:
-                        try:
-                            _delete_project(client, state_only=False)
-                        except termmeshError as exc:
-                            print(f"cleanup: Project deletion failed: {exc}", file=sys.stderr)
-        except BaseException as exc:
-            failure = exc
-            raise
-        finally:
-            problems = _remove_worktrees(repo, members)
-            _restore_default(old_existed, old_value)
-            if problems:
-                message = "cleanup left test worktrees: " + "; ".join(problems)
-                if failure is None:
-                    raise termmeshError(message)
-                print(message, file=sys.stderr)
+    try:
+        with tempfile.TemporaryDirectory(prefix="term-mesh-gc-protect-") as tmp:
+            fake_codex = Path(tmp) / "codex"
+            fake_codex.write_text(FAKE_CODEX)
+            fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IXUSR)
+            subprocess.run(
+                ["defaults", "write", DEFAULTS_DOMAIN, DEFAULTS_KEY, "-string", str(fake_codex)],
+                check=True,
+            )
+            repo = _make_repo(Path(tmp))
+            # Only this test uses REPO_NAME, so a new entry there is a checkout
+            # it created, whether or not the member paths were read.
+            existing = _repo_worktree_names()
+            failure: Optional[BaseException] = None
+            try:
+                with termmesh() as client:
+                    members = _check_protection(client, repo)
+            except BaseException as exc:
+                failure = exc
+                raise
+            finally:
+                problems = _remove_worktrees(repo, _repo_worktree_names() - existing)
+                if problems:
+                    message = "cleanup left test worktrees: " + "; ".join(problems)
+                    if failure is None:
+                        raise termmeshError(message)
+                    print(message, file=sys.stderr)
+    finally:
+        _restore_default(old_existed, old_value)
 
     print(
         f"PASS: gc blocks {len(members)} running team member worktrees with "
