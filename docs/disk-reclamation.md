@@ -24,10 +24,12 @@ tm-agent gc sweep --apply                   # actually reclaim
 - **Blockers beat `--apply`.** Uncommitted changes, commits missing from the
   parent repo, and worktrees an active session or task still points at are
   never removed. `--force` relaxes exactly one blocker (`unopenable`).
-- A checkout whose `.git` pointer no longer names its registered worktree
-  also gets the `registration_missing` or `registration_mismatch` blocker.
+- A checkout that gc cannot match to a registered worktree also gets the
+  `registration_missing` or `registration_mismatch` blocker. Examples are a
+  folder without a `.git` file and a `.git` file that names a different path.
   `--force` does not relax these blockers, so the dry-run does not list the
-  checkout as a removal.
+  checkout as a removal. A checkout whose parent repository is gone is the
+  exception: `--force` still removes it.
 - Removal of a daemon worktree leaves its `<repo>` parent directory empty. The
   plan lists that directory as a `daemon_worktrees` candidate with the reason
   `empty_repo_dir`. The sweep removes it only if it is still empty.

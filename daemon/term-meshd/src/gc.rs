@@ -929,8 +929,9 @@ fn worktree_candidate(path: &Path, kind: &str, refs: &GcRefs) -> GcCandidate {
         Err(_) => blockers.push("unopenable".into()),
     }
 
-    // reclaim() refuses a checkout whose `.git` pointer no longer names its
-    // registered worktree. Block it here too, so plan and dry-run do not list
+    // reclaim() refuses a checkout it cannot match to a registered worktree
+    // (no `.git` file, a layout it cannot resolve, or a registration that
+    // names another path). Block it here too, so plan and dry-run do not list
     // a removal that the sweep then refuses.
     if !reasons.iter().any(|r| r == "parent_repo_gone") {
         match verified_worktree_owner(path) {
