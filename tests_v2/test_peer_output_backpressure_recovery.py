@@ -209,6 +209,7 @@ class _PeerLogTail:
         self._data = bytearray()
         self._lock = threading.Lock()
         self._stopped = threading.Event()
+        self._closed = False
         self._file = self._open()
         if self._file is not None:
             self._file.seek(0, os.SEEK_END)
@@ -222,6 +223,9 @@ class _PeerLogTail:
             return None
 
     def _drain(self) -> None:
+        # Reopening after close() would read the whole log again from the start.
+        if self._closed:
+            return
         if self._file is None:
             self._file = self._open()
             if self._file is None:
@@ -251,6 +255,7 @@ class _PeerLogTail:
         self._stopped.set()
         self._thread.join(timeout=5)
         with self._lock:
+            self._closed = True
             if self._file is not None:
                 self._file.close()
                 self._file = None
