@@ -929,6 +929,18 @@ fn worktree_candidate(path: &Path, kind: &str, refs: &GcRefs) -> GcCandidate {
         Err(_) => blockers.push("unopenable".into()),
     }
 
+    // reclaim() refuses a checkout it cannot match to a registered worktree
+    // (no `.git` file, a layout it cannot resolve, or a registration that
+    // names another path). Block it here too, so plan and dry-run do not list
+    // a removal that the sweep then refuses.
+    if !reasons.iter().any(|r| r == "parent_repo_gone") {
+        match verified_worktree_owner(path) {
+            Ok(Some(_)) => {}
+            Ok(None) => blockers.push("registration_missing".into()),
+            Err(_) => blockers.push("registration_mismatch".into()),
+        }
+    }
+
     GcCandidate {
         path: display(path),
         bytes: dir_size(path),
@@ -2390,6 +2402,29 @@ mod tests {
         let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
         assert!(empty_repo_candidates(&plan).is_empty());
         assert!(target.exists());
+    }
+
+    #[test]
+    fn a_worktree_without_a_git_pointer_is_not_promised_to_force() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = paths
+            .daemon_worktrees
+            .join("repo")
+            .join("term-mesh_wt_1ea758cc");
+        let session = wt.join(".omc").join("sessions").join("s.json");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(&session, "{}").unwrap();
+
+        let plan = build_plan(&paths, &only(CATEGORY_DAEMON_WORKTREES), &GcRefs::default());
+        let candidate = &category(&plan, CATEGORY_DAEMON_WORKTREES).candidates[0];
+        assert_eq!(candidate.blockers, ["unopenable", "registration_missing"]);
+
+        let dry_run = execute_sweep(&paths, &plan, false, true, &GcRefs::default()).unwrap();
+        assert!(dry_run.outcomes.iter().all(|o| o.action != "would_remove"));
+        let applied = execute_sweep(&paths, &plan, true, true, &GcRefs::default()).unwrap();
+        assert_eq!(applied.removed, 0);
+        assert!(session.exists());
     }
 
     #[test]
