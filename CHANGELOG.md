@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.268.2] - 2026-10-10
+
+### Fixed
+
+- `tm-agent gc` no longer offers the checkouts of a running team's members for reclaim. `gc plan` marked them `no_active_session`, so `gc sweep --apply` could delete the working directory of a worker that was still running. The app now tells the daemon which checkout each member uses, and gc keeps those checkouts while the team runs.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.268.1] - 2026-10-08
 
 ### Fixed
