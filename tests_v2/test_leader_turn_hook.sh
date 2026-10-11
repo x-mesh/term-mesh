@@ -431,8 +431,7 @@ if value.get("decision") != "block" or "eligible worker dispatch" not in value.g
     raise SystemExit("FAIL: unmet delegation did not block Stop: %r" % value)
 BLOCKPY
 
-floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"continued turn","session_id":"floor-continued"}' >/dev/null \
-    || fail "continued start returned nonzero"
+# A blocked Stop leaves its turn open; the continuation's Stop closes that same turn.
 FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-continued","stop_hook_active":true}') \
     || fail "continued end returned nonzero"
 [ -z "$FLOOR_OUT" ] || fail "active Stop hook blocked recursively: $FLOOR_OUT"
@@ -462,11 +461,13 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
         records.append(json.loads(line))
 
 ends = [r for r in records if r["event"] == "turn_end"]
-# The last four ends are, in order: delegated with no dispatch, its continuation,
+# The last three ends are, in order: the blocked turn closed by its continuation,
 # delegated with one dispatch, then leaderFirst. Checking them positionally keeps this honest
 # about ordering instead of counting occurrences that earlier cases also add.
-expected = ["unmet", "unmet", "met", None]
-actual = [r.get("delegation_floor") for r in ends[-4:]]
+expected = ["unmet", "met", None]
+actual = [r.get("delegation_floor") for r in ends[-3:]]
+if ends[-3].get("stop_blocked") is not True or any("stop_blocked" in r for r in ends[-2:]):
+    raise SystemExit("FAIL: stop_blocked was %r" % [r.get("stop_blocked") for r in ends[-3:]])
 if actual != expected:
     raise SystemExit(f"FAIL: delegation floors were {actual}, expected {expected}")
 PY
@@ -476,6 +477,8 @@ floor_hook "$FLOOR_CTL/mode-off.json" --start '{"prompt":"off turn","session_id"
     || fail "mode-off start returned nonzero"
 floor_hook "$FLOOR_CTL/mode-off.json" --end '{"session_id":"floor-off"}' >/dev/null \
     || fail "mode-off end returned nonzero"
+floor_hook "$FLOOR_CTL/mode-off.json" --end '{"session_id":"floor-off","stop_hook_active":true}' >/dev/null \
+    || fail "mode-off continuation end returned nonzero"
 
 python3 - "$FLOOR_LOG" <<'OFFPY' || exit 1
 import json
@@ -513,6 +516,10 @@ case "$FLOOR_OUT" in
     *'"decision":"block"'*"--no-dispatch-reason"*) ;;
     *) fail "a bare stated route skipped the delegation floor: $FLOOR_OUT" ;;
 esac
+[ -f "$FLOOR_HOME/.term-mesh/logs/.turn-route-$bare_turn" ] \
+    || fail "a blocked Stop consumed the route marker"
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-bare","stop_hook_active":true}' >/dev/null \
+    || fail "bare-route continuation end returned nonzero"
 
 floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"reasoned direct turn","session_id":"floor-routed"}' >/dev/null \
     || fail "routed start returned nonzero"
@@ -531,7 +538,7 @@ records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(enco
 ends = [r for r in records if r["event"] == "turn_end" and r["turn_id"] == sys.argv[2]]
 if len(ends) != 1:
     raise SystemExit("FAIL: routed turn has %d turn_end records" % len(ends))
-if ends[0].get("route_status") != "stated" or ends[0].get("delegation_floor") != "unmet":
+if ends[0].get("route_status") != "stated" or ends[0].get("delegation_floor") != "waived":
     raise SystemExit("FAIL: routed turn_end was %r" % ends[0])
 ROUTEDPY
 
@@ -599,6 +606,8 @@ esac
 # ...but turning injection off must not turn measurement off with it.
 floor_hook "$FLOOR_CTL/injection-off.json" --end '{"session_id":"floor-5"}' >/dev/null \
     || fail "injection-off end returned nonzero"
+floor_hook "$FLOOR_CTL/injection-off.json" --end '{"session_id":"floor-5","stop_hook_active":true}' >/dev/null \
+    || fail "injection-off continuation end returned nonzero"
 python3 - "$FLOOR_LOG" <<'PY' || exit 1
 import json
 import pathlib
@@ -754,6 +763,8 @@ printf '%s\n' '{"event":"task_dispatch","turn_id":"other","ts":"2026-01-01T00:00
 
 stray_hook --end '{"session_id":"stray-1"}' >/dev/null \
     || fail "stray end returned nonzero"
+stray_hook --end '{"session_id":"stray-1","stop_hook_active":true}' >/dev/null \
+    || fail "stray continuation end returned nonzero"
 
 python3 - "$STRAY_LOG" <<'PY' || exit 1
 import json
@@ -918,8 +929,14 @@ PY
 async_turn() {
     async_hook --start "{\"prompt\":\"$1\",\"session_id\":\"async-$1\"}" >/dev/null \
         || fail "async $1 start returned nonzero"
-    async_hook --end "{\"session_id\":\"async-$1\",\"stop_hook_active\":false}" \
+    _async_out=$(async_hook --end "{\"session_id\":\"async-$1\",\"stop_hook_active\":false}") \
         || fail "async $1 end returned nonzero"
+    # A blocked Stop leaves the turn open; its continuation closes it.
+    if [ -n "$_async_out" ]; then
+        async_hook --end "{\"session_id\":\"async-$1\",\"stop_hook_active\":true}" >/dev/null \
+            || fail "async $1 continuation end returned nonzero"
+    fi
+    printf '%s\n' "$_async_out"
 }
 
 async_floor() {
@@ -998,6 +1015,8 @@ path.write_text("".join(json.dumps(record) + "\n" for record in records), encodi
 PY
 ASYNC_OUT=$(async_hook --end '{"session_id":"async-background-wait","stop_hook_active":false}') \
     || fail "background wait end returned nonzero"
+async_hook --end '{"session_id":"async-background-wait","stop_hook_active":true}' >/dev/null \
+    || fail "background wait continuation end returned nonzero"
 async_floor unmet "background wait ending in a later turn"
 case "$ASYNC_OUT" in
     *'"decision":"block"'*) ;;
@@ -1043,6 +1062,8 @@ path.write_text("".join(json.dumps(record) + "\n" for record in records), encodi
 PY
 ASYNC_OUT=$(async_hook --end '{"session_id":"async-foreign","stop_hook_active":false}') \
     || fail "foreign collect end returned nonzero"
+async_hook --end '{"session_id":"async-foreign","stop_hook_active":true}' >/dev/null \
+    || fail "foreign collect continuation end returned nonzero"
 async_floor unmet "turn with another session's collection"
 case "$ASYNC_OUT" in
     *'"decision":"block"'*) ;;
@@ -1141,6 +1162,8 @@ with open(sys.argv[1], "a", encoding="utf-8") as handle:
 PY
 NOSESSION_OUT=$(nosession_hook --end '{"session_id":"no-session-b","stop_hook_active":false}') \
     || fail "no-session end returned nonzero"
+nosession_hook --end '{"session_id":"no-session-b","stop_hook_active":true}' >/dev/null \
+    || fail "no-session continuation end returned nonzero"
 ASYNC_LOG="$NOSESSION_LOG" async_floor unmet "session-less leader with another leader's work"
 case "$NOSESSION_OUT" in
     *'"decision":"block"'*) ;;
@@ -1181,6 +1204,104 @@ if not records or any(record.get("team_uuid") != "05AC84AA" for record in record
 if any(record.get("leader_session_id") != "adopted-session" for record in records):
     raise SystemExit("FAIL: hook records did not refresh leader_session_id")
 PY
+
+# A blocked Stop must not consume its turn: the continuation's route command
+# resolves the turn id from the state stack, and the final Stop closes the same
+# turn exactly once.
+BLOCK_HOME="$TEST_TMP/block"
+BLOCK_CTL="$TEST_TMP/block-ctl"
+mkdir -p "$BLOCK_HOME/.term-mesh/logs" "$BLOCK_CTL" || exit 1
+BLOCK_LOGS="$BLOCK_HOME/.term-mesh/logs"
+BLOCK_LOG="$BLOCK_LOGS/turns.log"
+BLOCK_SURFACE=block-surface
+cat > "$BLOCK_CTL/delegated.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine"}
+JSON
+
+block_hook() {
+    HOME="$BLOCK_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=$BLOCK_SURFACE \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$BLOCK_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+block_hook --start '{"prompt":"blocked turn","session_id":"block-1"}' >/dev/null \
+    || fail "blocked start returned nonzero"
+block_turn=$(head -n 1 "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE")
+[ -n "$block_turn" ] || fail "blocked turn id missing"
+BLOCK_OUT=$(block_hook --end '{"session_id":"block-1","stop_hook_active":false}') \
+    || fail "blocked end returned nonzero"
+case "$BLOCK_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "unmet turn was not blocked: $BLOCK_OUT" ;;
+esac
+[ "$(head -n 1 "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE" 2>/dev/null)" = "$block_turn" ] \
+    || fail "a blocked Stop consumed the turn from the state stack"
+[ -f "$BLOCK_LOGS/.turn-dispatch-$BLOCK_SURFACE" ] || fail "a blocked Stop deleted the dispatch baseline"
+[ -f "$BLOCK_LOGS/.turn-block-$block_turn" ] || fail "a blocked Stop left no block marker"
+! grep -q '"event":"turn_end"' "$BLOCK_LOG" || fail "a blocked Stop appended turn_end"
+
+# What tm-agent does in the continuation: it resolves the id from the stack,
+# appends a turn_route record and writes the route marker.
+printf '{"event":"turn_route","turn_id":"%s","ts":"2026-01-01T00:00:00Z","team":"mine","route":"direct","no_dispatch_reason":"trivial"}\n' \
+    "$(head -n 1 "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE")" >> "$BLOCK_LOG" || exit 1
+printf 'stated\nno_dispatch\n' > "$BLOCK_LOGS/.turn-route-$block_turn" || exit 1
+BLOCK_OUT=$(block_hook --end '{"session_id":"block-1","stop_hook_active":true}') \
+    || fail "continuation end returned nonzero"
+[ -z "$BLOCK_OUT" ] || fail "continuation end blocked again: $BLOCK_OUT"
+[ ! -e "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE" ] || fail "final Stop left the turn on the stack"
+[ ! -e "$BLOCK_LOGS/.turn-block-$block_turn" ] || fail "final Stop left the block marker"
+[ ! -e "$BLOCK_LOGS/.turn-route-$block_turn" ] || fail "final Stop left the route marker"
+[ ! -e "$BLOCK_LOGS/.turn-dispatch-$BLOCK_SURFACE" ] || fail "final Stop left the dispatch baseline"
+
+# A normal turn that dispatches is unchanged: no block marker, no stop_blocked.
+block_hook --start '{"prompt":"normal turn","session_id":"block-2"}' >/dev/null \
+    || fail "normal start returned nonzero"
+normal_turn=$(head -n 1 "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE")
+printf '%s\n' '{"event":"task_dispatch","turn_id":"req","ts":"2026-01-01T00:00:00Z","team":"mine","task_id":"n1","worker":"a","delivery":"created"}' \
+    >> "$BLOCK_LOG" || exit 1
+BLOCK_OUT=$(block_hook --end '{"session_id":"block-2","stop_hook_active":false}') \
+    || fail "normal end returned nonzero"
+[ -z "$BLOCK_OUT" ] || fail "a dispatching turn was blocked: $BLOCK_OUT"
+[ ! -e "$BLOCK_LOGS/.turn-block-$normal_turn" ] || fail "normal turn left a block marker"
+
+# The continuation can also finish without stating a route: the turn still
+# closes once, as unmet and blocked.
+block_hook --start '{"prompt":"stubborn turn","session_id":"block-3"}' >/dev/null \
+    || fail "stubborn start returned nonzero"
+stubborn_turn=$(head -n 1 "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE")
+block_hook --end '{"session_id":"block-3","stop_hook_active":false}' >/dev/null \
+    || fail "stubborn end returned nonzero"
+block_hook --end '{"session_id":"block-3","stop_hook_active":true}' >/dev/null \
+    || fail "stubborn continuation end returned nonzero"
+
+python3 - "$BLOCK_LOG" "$block_turn" "$normal_turn" "$stubborn_turn" <<'BLOCKEDPY' || exit 1
+import json
+import pathlib
+import sys
+
+path, blocked, normal, stubborn = sys.argv[1:5]
+records = [json.loads(line) for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+ends = [r for r in records if r["event"] == "turn_end"]
+if [r["turn_id"] for r in ends] != [blocked, normal, stubborn]:
+    raise SystemExit("FAIL: turn_end ids were %r" % [r["turn_id"] for r in ends])
+if any(r["turn_id"] in ("unknown", "unstated") for r in records):
+    raise SystemExit("FAIL: a record lost its turn id")
+first, second, third = ends
+if first.get("stop_blocked") is not True or first.get("delegation_floor") != "waived":
+    raise SystemExit("FAIL: blocked-then-routed turn_end was %r" % first)
+routes = [r for r in records if r["event"] == "turn_route"]
+if len(routes) != 1 or routes[0]["turn_id"] != blocked:
+    raise SystemExit("FAIL: route record did not carry the blocked turn id: %r" % routes)
+if "stop_blocked" in second or second.get("delegation_floor") != "met":
+    raise SystemExit("FAIL: unblocked turn_end changed: %r" % second)
+if third.get("stop_blocked") is not True or third.get("delegation_floor") != "unmet":
+    raise SystemExit("FAIL: unrouted continuation turn_end was %r" % third)
+BLOCKEDPY
+printf '%s\n' 'PASS: a blocked Stop keeps its turn open and the final Stop closes it once'
 
 printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
 printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
