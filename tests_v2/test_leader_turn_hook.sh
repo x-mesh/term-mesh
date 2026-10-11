@@ -3,6 +3,10 @@
 
 set -u
 
+# A leader pane exports its real control file. Cases that do not name one would
+# read it and block on the live delegation floor, so each case opts in instead.
+unset TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 HOOK="$ROOT/scripts/leader-turn-hook.sh"
 TEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/term-mesh-turn-hook.XXXXXX") || exit 1
