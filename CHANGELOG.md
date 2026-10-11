@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.268.4] - 2026-10-11
+
+### Fixed
+
+- Double-clicking the title bar now zooms the window and keeps it zoomed. The window grew to full width and then shrank back right away, because macOS took the second click as its own title-bar double-click and undid the zoom. Dragging now starts only once the mouse moves, so a click or a double-click no longer reaches the macOS window drag.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.268.3] - 2026-10-10
 
 ### Fixed
