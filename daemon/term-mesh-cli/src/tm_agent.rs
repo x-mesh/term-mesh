@@ -18674,6 +18674,8 @@ struct LeaderParticipationControlSnapshot {
     overlap_canary_capability_version: Option<u64>,
     delegated_overlap_resolution: bool,
     health_scope: Option<String>,
+    leader_policy_version: Option<u64>,
+    leader_policy_digest: Option<String>,
 }
 
 impl LeaderParticipationControlSnapshot {
@@ -18729,6 +18731,14 @@ fn parse_leader_control_snapshot(
     let delegation_level = delegation_effective
         .clone()
         .or_else(|| value["delegation_configured"].as_str().map(str::to_string));
+    let leader_policy_version = match value.get("leader_policy_version") {
+        Some(value) => Some(value.as_u64()?),
+        None => None,
+    };
+    let leader_policy_digest = match value.get("leader_policy_digest") {
+        Some(value) => Some(value.as_str()?.to_string()),
+        None => None,
+    };
     Some(LeaderParticipationControlSnapshot {
         // Legacy rollout fields remain optional telemetry. They never decide
         // whether mandatory delegated guidance applies.
@@ -18752,6 +18762,8 @@ fn parse_leader_control_snapshot(
         delegated_overlap_resolution: value["delegated_overlap_resolution"].as_bool()
             == Some(true),
         health_scope: value["health_scope"].as_str().map(str::to_string),
+        leader_policy_version,
+        leader_policy_digest,
     })
 }
 
@@ -19324,6 +19336,14 @@ fn turn_route_record_with_policy_input(
     record["policy_applied"] = json!(resolution.applied);
     record["cohort"] = json!(resolution.cohort);
     record["delegated_overlap_resolution"] = json!(resolution.delegated_overlap_resolution);
+    if let Some(snapshot) = control {
+        if let Some(version) = snapshot.leader_policy_version {
+            record["leader_policy_version"] = json!(version);
+        }
+        if let Some(digest) = snapshot.leader_policy_digest.as_deref() {
+            record["leader_policy_digest"] = json!(digest);
+        }
+    }
     record
 }
 
@@ -19940,6 +19960,8 @@ mod leader_turn_record_tests {
             .expect("valid control snapshot");
         assert_eq!(snapshot.delegation_level.as_deref(), Some("delegated"));
         assert_eq!(snapshot.max_parallel_workers, Some(10));
+        assert_eq!(snapshot.leader_policy_version, None);
+        assert_eq!(snapshot.leader_policy_digest, None);
         assert!(snapshot.overlap_canary_capability());
         assert!(snapshot.delegated_overlap_resolution);
 
@@ -19956,6 +19978,56 @@ mod leader_turn_record_tests {
                 "{field} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn leader_policy_identity_is_optional_in_control_snapshot_and_route_record() {
+        let value = control_snapshot_value();
+        let data = serde_json::to_vec(&value).expect("serialize control snapshot");
+        let without_identity =
+            parse_leader_control_snapshot(&data, "project-a", "session-a")
+                .expect("valid control snapshot without policy identity");
+        let absent = turn_route_record_with_policy_input(
+            "turn-identity-absent",
+            "direct",
+            None,
+            Some(1),
+            &[],
+            None,
+            "project-a",
+            None,
+            "2026-08-24T09:15:00Z",
+            Some(&without_identity),
+            false,
+        );
+        assert!(absent.get("leader_policy_version").is_none());
+        assert!(absent.get("leader_policy_digest").is_none());
+
+        let mut value_with_identity = value;
+        value_with_identity["leader_policy_version"] = json!(14);
+        value_with_identity["leader_policy_digest"] = json!("digest-14");
+        let data = serde_json::to_vec(&value_with_identity).expect("serialize control snapshot");
+        let with_identity =
+            parse_leader_control_snapshot(&data, "project-a", "session-a")
+                .expect("valid control snapshot with policy identity");
+        assert_eq!(with_identity.leader_policy_version, Some(14));
+        assert_eq!(with_identity.leader_policy_digest.as_deref(), Some("digest-14"));
+
+        let present = turn_route_record_with_policy_input(
+            "turn-identity-present",
+            "direct",
+            None,
+            Some(1),
+            &[],
+            None,
+            "project-a",
+            None,
+            "2026-08-24T09:15:00Z",
+            Some(&with_identity),
+            false,
+        );
+        assert_eq!(present["leader_policy_version"], json!(14));
+        assert_eq!(present["leader_policy_digest"], json!("digest-14"));
     }
 
     #[test]
@@ -20987,21 +21059,28 @@ mod leader_turn_record_tests {
     }
 
     /// `TERMMESH_TEAM` is injected into worker panes too, so the record must not
-    /// carry any claim that a leader produced it. `team` and `surface_id` are
-    /// recorded as given; there is no `role`, no `agent`, and no `is_leader`.
-    /// A reader counting leader turns has to join on the harness stream, not
-    /// trust a field this command could not honestly populate.
+    /// carry any claim about which actor produced it. The policy identity fields
+    /// identify the policy snapshot, not the leader or worker actor.
     #[test]
     fn record_makes_no_leader_identity_claim() {
-        let record = turn_route_record(
+        let mut control_value = control_snapshot_value();
+        control_value["leader_policy_version"] = json!(14);
+        control_value["leader_policy_digest"] = json!("digest-14");
+        let control_data = serde_json::to_vec(&control_value).expect("serialize control snapshot");
+        let control = parse_leader_control_snapshot(&control_data, "project-a", "session-a")
+            .expect("valid control snapshot");
+        let record = turn_route_record_with_policy_input(
             "turn-8",
             "direct",
             Some("single_unit"),
+            Some(1),
             &reasons(&["repeated_failure"]),
             Some("wave-1"),
-            "term-mesh",
+            "project-a",
             Some("surface-3"),
             "2026-08-24T09:15:00Z",
+            Some(&control),
+            false,
         );
         let object = record.as_object().expect("record is an object");
         for forbidden in [
@@ -21029,6 +21108,8 @@ mod leader_turn_record_tests {
                 "delegated_overlap_resolution",
                 "dispatch_bounds",
                 "event",
+                "leader_policy_digest",
+                "leader_policy_version",
                 "policy_applied",
                 "policy_mode",
                 "policy_reasons",

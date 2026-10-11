@@ -143,7 +143,7 @@ struct LeaderParticipationSettings: Equatable {
             && supportedLeader
             && !killSwitch
             && (healthScope == .executionHost || health.passesPromotionGate)
-        return [
+        var payload: [String: Any] = [
             "schema_version": 1,
             "mode": mode.rawValue,
             "percent": min(100, max(0, canaryPercent)),
@@ -166,6 +166,13 @@ struct LeaderParticipationSettings: Equatable {
             "inject_directive": executionOptions.injectDirective,
             "health_scope": healthScope.rawValue,
         ]
+        if let version = Int(LeaderParallelPolicy.version) {
+            payload["leader_policy_version"] = version
+        }
+        if !LeaderParallelPolicy.digest.isEmpty {
+            payload["leader_policy_digest"] = LeaderParallelPolicy.digest
+        }
+        return payload
     }
 }
 
