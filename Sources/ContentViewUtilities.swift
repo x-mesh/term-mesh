@@ -2,8 +2,9 @@ import AppKit
 import Bonsplit
 import SwiftUI
 
-/// AppKit-level double-click handler for the sidebar title-bar area.
-/// Uses NSView hit-testing so it isn't swallowed by the SwiftUI ScrollView underneath.
+/// Claims the sidebar title-bar area so the SwiftUI ScrollView underneath does not
+/// swallow its clicks. AppKit then zooms on a double-click there by itself; calling
+/// zoom(nil) as well ran a second zoom that undid the first.
 struct DoubleClickZoomView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         DoubleClickZoomNSView()
@@ -14,13 +15,6 @@ struct DoubleClickZoomView: NSViewRepresentable {
     private final class DoubleClickZoomNSView: NSView {
         override var mouseDownCanMoveWindow: Bool { true }
         override func hitTest(_ point: NSPoint) -> NSView? { self }
-        override func mouseDown(with event: NSEvent) {
-            if event.clickCount == 2 {
-                window?.zoom(nil)
-            } else {
-                super.mouseDown(with: event)
-            }
-        }
     }
 }
 

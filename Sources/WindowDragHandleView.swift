@@ -216,12 +216,11 @@ struct WindowDragHandleView: NSViewRepresentable {
             )
             #endif
 
+            // AppKit zooms the window on a title-bar double-click by itself, even
+            // though this view takes the mouse-down. A zoom(nil) here ran a second
+            // zoom that undid the first, so the window grew and shrank back.
             if event.clickCount >= 2 {
                 pendingDragEvent = nil
-                window?.zoom(nil)
-                #if DEBUG
-                dlog("titlebar.dragHandle.mouseDownDoubleClick zoom=1")
-                #endif
                 return
             }
 
@@ -233,11 +232,6 @@ struct WindowDragHandleView: NSViewRepresentable {
             }
 
             if window != nil {
-                // performDrag hands the gesture to the WindowServer, which then
-                // treats the next click as a title-bar double-click and zooms the
-                // window itself. That second zoom undid ours, so a double-click
-                // grew the window and shrank it back. The drag starts only once
-                // the mouse actually moves.
                 pendingDragEvent = event
             } else {
                 super.mouseDown(with: event)
