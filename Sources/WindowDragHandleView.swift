@@ -217,6 +217,7 @@ struct WindowDragHandleView: NSViewRepresentable {
             #endif
 
             if event.clickCount >= 2 {
+                pendingDragEvent = nil
                 window?.zoom(nil)
                 #if DEBUG
                 dlog("titlebar.dragHandle.mouseDownDoubleClick zoom=1")
@@ -231,17 +232,38 @@ struct WindowDragHandleView: NSViewRepresentable {
                 return
             }
 
-            if let window {
-                let previousMovableState = withTemporaryWindowMovableEnabled(window: window) {
-                    window.performDrag(with: event)
-                }
-                #if DEBUG
-                let restored = previousMovableState.map { String($0) } ?? "nil"
-                dlog("titlebar.dragHandle.mouseDownComplete restoredMovable=\(restored) nowMovable=\(window.isMovable)")
-                #endif
+            if window != nil {
+                // performDrag hands the gesture to the WindowServer, which then
+                // treats the next click as a title-bar double-click and zooms the
+                // window itself. That second zoom undid ours, so a double-click
+                // grew the window and shrank it back. The drag starts only once
+                // the mouse actually moves.
+                pendingDragEvent = event
             } else {
                 super.mouseDown(with: event)
             }
         }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let mouseDown = pendingDragEvent, let window else {
+                super.mouseDragged(with: event)
+                return
+            }
+            pendingDragEvent = nil
+            let previousMovableState = withTemporaryWindowMovableEnabled(window: window) {
+                window.performDrag(with: mouseDown)
+            }
+            #if DEBUG
+            let restored = previousMovableState.map { String($0) } ?? "nil"
+            dlog("titlebar.dragHandle.dragStarted restoredMovable=\(restored) nowMovable=\(window.isMovable)")
+            #endif
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            pendingDragEvent = nil
+            super.mouseUp(with: event)
+        }
+
+        private var pendingDragEvent: NSEvent?
     }
 }
