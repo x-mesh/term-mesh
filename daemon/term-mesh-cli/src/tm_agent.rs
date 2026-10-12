@@ -2081,7 +2081,11 @@ enum Commands {
     TaskReassign2 { id: String, agent: String },
     /// Alias: task-unblock → task unblock
     #[command(name = "task-unblock", hide = true)]
-    TaskUnblock2 { id: String },
+    TaskUnblock2 {
+        id: String,
+        #[arg(long)]
+        correction: Option<String>,
+    },
     /// Alias: task-clear → task clear
     #[command(name = "task-clear", hide = true)]
     TaskClear2,
@@ -2732,7 +2736,11 @@ enum TaskCommands {
     /// Reassign task to another agent
     Reassign { id: String, agent: String },
     /// Unblock a task
-    Unblock { id: String },
+    Unblock {
+        id: String,
+        #[arg(long)]
+        correction: Option<String>,
+    },
     /// Split a task into subtasks
     Split {
         id: String,
@@ -4745,6 +4753,41 @@ mod runbook_tests {
             Some("/tmp/full.md")
         );
         assert!(item["summary"].as_str().unwrap().contains("Changed code"));
+    }
+
+    #[test]
+    fn task_unblock_forwards_optional_correction_without_changing_default() {
+        let with_correction = task_unblock_params(
+            "team-a",
+            "task-a",
+            Some("retry after fixing input"),
+        );
+        assert_eq!(with_correction["team_name"], "team-a");
+        assert_eq!(with_correction["task_id"], "task-a");
+        assert_eq!(with_correction["correction"], "retry after fixing input");
+
+        let without_correction = task_unblock_params("team-a", "task-a", None);
+        assert!(without_correction.get("correction").is_none());
+    }
+
+    #[test]
+    fn task_unblock_cli_parses_correction() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent",
+            "task",
+            "unblock",
+            "task-a",
+            "--correction",
+            "retry after fixing input",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Task(TaskCommands::Unblock {
+                id,
+                correction: Some(correction),
+            }) if id == "task-a" && correction == "retry after fixing input"
+        ));
     }
 
     #[test]
@@ -8330,6 +8373,39 @@ fn compact_result_collect_response(mut resp: Value, include_summary: bool) -> Va
     resp
 }
 
+fn filter_result_collect_response(
+    mut resp: Value,
+    tracked_task_ids: Option<&std::collections::HashSet<String>>,
+) -> Value {
+    let Some(tracked_task_ids) = tracked_task_ids else {
+        return resp;
+    };
+    if let Some(results) = resp
+        .get_mut("result")
+        .and_then(|result| result.get_mut("results"))
+        .and_then(Value::as_array_mut)
+    {
+        results.retain(|result| {
+            result
+                .get("task_id")
+                .and_then(Value::as_str)
+                .is_some_and(|task_id| tracked_task_ids.contains(task_id))
+        });
+    }
+    resp
+}
+
+fn task_unblock_params(team: &str, task_id: &str, correction: Option<&str>) -> Value {
+    let mut params = json!({
+        "team_name": team,
+        "task_id": task_id,
+    });
+    if let Some(correction) = correction {
+        params["correction"] = json!(correction);
+    }
+    params
+}
+
 fn cleanup_old_results(team: &str) {
     let dir = results_dir(team);
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -9378,12 +9454,10 @@ fn main() {
                         "team_name": team, "task_id": id, "assignee": target,
                     }),
                 ),
-                TaskCommands::Unblock { id } => rpc_call(
+                TaskCommands::Unblock { id, correction } => rpc_call(
                     &sock,
                     "team.task.unblock",
-                    json!({
-                        "team_name": team, "task_id": id,
-                    }),
+                    task_unblock_params(&team, &id, correction.as_deref()),
                 ),
                 TaskCommands::FixAttempt { task_id } => {
                     match rpc_call(
@@ -9527,12 +9601,10 @@ fn main() {
                 "team_name": team, "task_id": id, "assignee": target,
             }),
         ),
-        Commands::TaskUnblock2 { id } => rpc_call(
+        Commands::TaskUnblock2 { id, correction } => rpc_call(
             &sock,
             "team.task.unblock",
-            json!({
-                "team_name": team, "task_id": id,
-            }),
+            task_unblock_params(&team, &id, correction.as_deref()),
         ),
         Commands::TaskClear2 => rpc_call(&sock, "team.task.clear", json!({ "team_name": team })),
         Commands::Peer(_) => unreachable!("peer commands exit before detect_socket()"),
@@ -22886,7 +22958,11 @@ fn run_wait(
                     if let Ok(r) =
                         rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
                     {
-                        println!("{}", pretty(&r));
+                        let filtered = filter_result_collect_response(
+                            r,
+                            explicit_task_scope.then_some(&tracked_task_ids),
+                        );
+                        println!("{}", pretty(&filtered));
                     }
                     finish_wait!(wait_report_outcome(tracked_statuses.values().map(String::as_str)));
                 }
@@ -22920,7 +22996,10 @@ fn run_wait(
                     if let Ok(r) =
                         rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
                     {
-                        let mut result = r;
+                        let mut result = filter_result_collect_response(
+                            r,
+                            explicit_task_scope.then_some(&tracked_task_ids),
+                        );
                         if result["result"].is_null() {
                             result["result"] = json!({});
                         }
@@ -23185,6 +23264,40 @@ mod wait_any_scope_tests {
     fn messages_end_any_only_without_a_task_scope() {
         assert!(!messages_end_any_wait(true));
         assert!(messages_end_any_wait(false));
+    }
+
+    #[test]
+    fn explicit_task_scope_filters_old_collect_results() {
+        let tracked = std::collections::HashSet::from(["requested".to_string()]);
+        let response = json!({
+            "ok": true,
+            "result": {
+                "results": [
+                    {"task_id": "old", "content": "old result"},
+                    {"task_id": "requested", "content": "requested result"},
+                    {"content": "uncorrelated result"}
+                ]
+            }
+        });
+
+        let filtered = filter_result_collect_response(response, Some(&tracked));
+        let results = filtered["result"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["task_id"], "requested");
+    }
+
+    #[test]
+    fn unscoped_collect_results_are_preserved() {
+        let response = json!({
+            "result": {
+                "results": [
+                    {"task_id": "old"},
+                    {"task_id": "requested"}
+                ]
+            }
+        });
+        let filtered = filter_result_collect_response(response.clone(), None);
+        assert_eq!(filtered, response);
     }
 
     #[test]

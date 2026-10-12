@@ -6557,6 +6557,8 @@ final class TeamOrchestrator: ObservableObject {
         taskTitle: String? = nil,
         priority: Int? = nil,
         context: String? = nil,
+        details: String? = nil,
+        acceptanceCriteria: [String] = [],
         requestId: String? = nil,
         tabManager: TabManager,
         submit: Bool = false,
@@ -6657,8 +6659,10 @@ final class TeamOrchestrator: ObservableObject {
         guard let creation = TeamDataStore.shared.createTaskWithDisposition(
             teamName: teamName,
             title: title,
+            details: details,
             assignee: agentName,
             assigneeInstanceId: target.agentInstanceId,
+            acceptanceCriteria: acceptanceCriteria,
             priority: priority ?? 2,
             requestId: requestId,
             route: route,
@@ -8949,8 +8953,10 @@ final class TeamOrchestrator: ObservableObject {
                 info["parallel_telemetry"] = [
                     // Identity standing in for the field, not a stated wave —
                     // see the same block in `TerminalController`.
-                    "wave_id": (enrichment["active_task_id"] as? String) ?? agent.agentInstanceId,
-                    "wave_id_stated": false,
+                    "wave_id": (enrichment["active_task_wave_id"] as? String)
+                        ?? (enrichment["active_task_id"] as? String)
+                        ?? agent.agentInstanceId,
+                    "wave_id_stated": enrichment["active_task_wave_id_stated"] as? Bool ?? false,
                     "task_id": enrichment["active_task_id"] ?? NSNull(),
                     "agent_instance_id": agent.agentInstanceId,
                     "host": agent.hostKey as Any? ?? NSNull(),
@@ -10890,10 +10896,15 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     @discardableResult
-    func unblockTask(teamName: String, taskId: String) -> TeamTask? {
+    func unblockTask(
+        teamName: String, taskId: String, correction: String? = nil
+    ) -> TeamTask? {
         guard var tasks = taskBoards[teamName],
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
         let now = Date()
+        if let correction = correction?.nilIfBlank {
+            tasks[idx].details = correction
+        }
         tasks[idx].blockedReason = nil
         if tasks[idx].status == "blocked" {
             if tasks[idx].startedAt != nil {
