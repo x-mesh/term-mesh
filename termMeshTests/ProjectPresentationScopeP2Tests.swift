@@ -63,6 +63,21 @@ final class ProjectPresentationScopeP2Tests: XCTestCase {
         )
     }
 
+    func testWorkspaceClosePreservesOnlyNonLastProjectWorkspace() {
+        XCTAssertTrue(TeamOrchestrator.shouldPreserveProjectPresentationOnWorkspaceClose(
+            isLastWorkspace: false,
+            hasProjectPresentation: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldPreserveProjectPresentationOnWorkspaceClose(
+            isLastWorkspace: true,
+            hasProjectPresentation: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldPreserveProjectPresentationOnWorkspaceClose(
+            isLastWorkspace: false,
+            hasProjectPresentation: false
+        ))
+    }
+
     func testAppQuitKeepsDurablePeerProjectAgentsAlive() {
         XCTAssertFalse(TeamOrchestrator.shouldReleaseRemoteAgentsOnQuit(
             ownsRemotePresentation: true,
