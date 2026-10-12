@@ -47,6 +47,34 @@ private actor LivePresentationTestProvider: PeerSurfaceProvider {
     private func recordInput() { inputs += 1 }
 }
 
+private actor HangingDetachProvider: PeerSurfaceProvider {
+    let surfaceID = Data(repeating: 0x5D, count: 16)
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        return [surface]
+    }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? {
+        guard surfaceID == self.surfaceID else { return nil }
+        let pair = AsyncStream<PtyTapChunk>.makeStream()
+        return PeerSurfaceAttachment(
+            byteStream: pair.stream,
+            input: { _ in },
+            detach: { await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in } }
+        )
+    }
+}
+
 private actor GapResyncTestProvider: PeerSurfaceProvider {
     let surfaceID = Data(repeating: 0xA7, count: 16)
     private var continuation: AsyncStream<PtyTapChunk>.Continuation?
@@ -600,6 +628,31 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
         try await counts.waitFor(last: 0)
         XCTAssertEqual(counts.values, [1, 0])
+    }
+
+    func testSessionSlotIsReleasedWhenAttachmentDetachNeverReturns() async throws {
+        let sockPath = "/tmp/tm-peer-swift-hang-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let counts = SessionCountRecorder()
+        var config = PeerServerConfig()
+        config.onActiveSessionCountChange = { count in counts.record(count) }
+        let provider = HangingDetachProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider, config: config)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake(options: PeerSessionOptions())
+        _ = try await session.attachSurface(id: await provider.surfaceID, cols: 80, rows: 24)
+        try await counts.waitFor(last: 1)
+
+        await transport.close()
+        try await counts.waitFor(last: 0)
+        XCTAssertEqual(counts.values.last, 0)
     }
 
     /// End-to-end: Swift `PeerServer` accepts a Swift `PeerSession`

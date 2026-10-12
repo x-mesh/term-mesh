@@ -920,7 +920,12 @@ public actor PeerServer {
     /// `activeSessions` past `maxPeerServerSessions`. Doing both inside
     /// the same actor-isolated call eliminates that race.
     fileprivate func tryRegister(_ session: PeerServerSession) -> Bool {
-        guard activeSessions.count < maxPeerServerSessions else { return false }
+        guard activeSessions.count < maxPeerServerSessions else {
+            PeerServerDiagnostics.record(
+                "session-rejected reason=capacity active=\(activeSessions.count) max=\(maxPeerServerSessions)"
+            )
+            return false
+        }
         activeSessions.append(session)
         config.onActiveSessionCountChange?(activeSessions.count)
         return true
@@ -1094,7 +1099,8 @@ public actor PeerServer {
                 connection: connection,
                 config: config,
                 provider: provider,
-                teamLeaderControlPlane: teamLeaderControlPlane
+                teamLeaderControlPlane: teamLeaderControlPlane,
+                onEnded: { await server.sessionFinished($0) }
             )
             guard await server.tryRegister(session) else {
                 // Cap reached. Explicit close keeps the fd recovery
@@ -2049,6 +2055,7 @@ actor PeerServerSession {
     private let config: PeerServerConfig
     private let provider: any PeerSurfaceProvider
     private let teamLeaderControlPlane: PeerTeamLeaderControlPlane
+    private let onEnded: (@Sendable (PeerServerSession) async -> Void)?
     private var state: State = .initial
     private var seq: UInt64 = 0
     private var pendingInbound = Data()
@@ -2099,8 +2106,10 @@ actor PeerServerSession {
         connection: AcceptedUnixConnection,
         config: PeerServerConfig,
         provider: any PeerSurfaceProvider,
-        teamLeaderControlPlane: PeerTeamLeaderControlPlane = .shared
+        teamLeaderControlPlane: PeerTeamLeaderControlPlane = .shared,
+        onEnded: (@Sendable (PeerServerSession) async -> Void)? = nil
     ) {
+        self.onEnded = onEnded
         self.connection = connection
         self.config = config
         self.provider = provider
@@ -2133,6 +2142,8 @@ actor PeerServerSession {
             )
         }
         failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
+        // Free the slot before teardown: a detach that never returns must not hold it.
+        await onEnded?(self)
         await teardownAttachments()
         await connection.close()
     }
