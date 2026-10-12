@@ -326,6 +326,46 @@ enum NativeWindowRestorationPolicy {
     }
 }
 
+enum TermMeshUserDefaultsObserver {
+    static let appearanceModeKey = AppearanceSettings.appearanceModeKey
+    static let terminalKeys = [
+        TerminalSettingsOverride.fontFamilyKey,
+        TerminalSettingsOverride.fontSizeKey,
+        TerminalSettingsOverride.themeLightKey,
+        TerminalSettingsOverride.themeDarkKey,
+        TerminalSettingsOverride.backgroundOpacityKey,
+        TerminalSettingsOverride.cursorColorKey,
+        TerminalSettingsOverride.cursorStyleKey,
+        TerminalSettingsOverride.scrollbackLimitKey,
+        TerminalSettingsOverride.unfocusedSplitOpacityKey,
+        TerminalSettingsOverride.splitDividerColorKey,
+    ]
+    static let observedKeys = [appearanceModeKey] + terminalKeys
+
+    struct Snapshot: Equatable {
+        let values: [String: String]
+
+        static func capture(defaults: UserDefaults) -> Snapshot {
+            Snapshot(values: Dictionary(uniqueKeysWithValues: TermMeshUserDefaultsObserver.observedKeys.map { key in
+                (key, serializedValue(defaults.object(forKey: key)))
+            }))
+        }
+
+        func changedKeys(from previous: Snapshot) -> Set<String> {
+            Set(TermMeshUserDefaultsObserver.observedKeys.filter { values[$0] != previous.values[$0] })
+        }
+
+        private static func serializedValue(_ value: Any?) -> String {
+            guard let value else { return "<missing>" }
+            if let value = value as? String { return "string:\(value)" }
+            if let value = value as? NSNumber {
+                return "number:\(String(cString: value.objCType)):\(value)"
+            }
+            return "value:\(String(reflecting: value))"
+        }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuItemValidation {
     static var shared: AppDelegate?
@@ -389,6 +429,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var windowKeyObserver: NSObjectProtocol?
     var shortcutMonitor: Any?
     var shortcutDefaultsObserver: NSObjectProtocol?
+    private var terminalSettingsDefaultsObserver: NSObjectProtocol?
+    private var terminalSettingsDefaultsSnapshot: TermMeshUserDefaultsObserver.Snapshot?
+    private var applyingTerminalSettingsDefaults = false
     var splitButtonTooltipRefreshScheduled = false
     var ghosttyConfigObserver: NSObjectProtocol?
     private var systemAppearanceObserver: NSObjectProtocol?
@@ -1106,6 +1149,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    private func observeTerminalSettingsChanges() {
+        guard terminalSettingsDefaultsObserver == nil else { return }
+        let defaults = UserDefaults.standard
+        terminalSettingsDefaultsSnapshot = TermMeshUserDefaultsObserver.Snapshot.capture(
+            defaults: defaults
+        )
+        terminalSettingsDefaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+            guard let self, !self.applyingTerminalSettingsDefaults else { return }
+            let current = TermMeshUserDefaultsObserver.Snapshot.capture(defaults: defaults)
+            let previous = self.terminalSettingsDefaultsSnapshot ?? current
+            let changedKeys = current.changedKeys(from: previous)
+            self.terminalSettingsDefaultsSnapshot = current
+            guard !changedKeys.isEmpty else { return }
+
+            self.applyingTerminalSettingsDefaults = true
+            defer {
+                self.applyingTerminalSettingsDefaults = false
+                self.terminalSettingsDefaultsSnapshot = TermMeshUserDefaultsObserver.Snapshot.capture(
+                    defaults: defaults
+                )
+            }
+
+            if changedKeys.contains(TermMeshUserDefaultsObserver.appearanceModeKey) {
+                let mode = AppearanceSettings.resolvedMode(defaults: defaults)
+                TermMeshApp.applyAppearance(mode)
+                TerminalSettingsOverride.write()
+                TerminalThemeOverride.write(for: mode.rawValue)
+                self.configProvider.reloadConfiguration(source: "appearance.toggle")
+                TermMeshApp.syncGhosttyAppColorScheme(for: mode)
+            }
+
+            else if !changedKeys.isDisjoint(with: TermMeshUserDefaultsObserver.terminalKeys) {
+                let mode = AppearanceSettings.resolvedMode(defaults: defaults)
+                TerminalSettingsOverride.write()
+                TerminalThemeOverride.write(for: mode.rawValue)
+                self.configProvider.reloadConfiguration(source: "settings.terminal")
+            }
+            }
+        }
+    }
+
     /// Give agents on other machines a moment to be told the app is leaving.
     ///
     /// Only when there are any, and never for longer than `quitGrace` — a
@@ -1157,6 +1246,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let observer = systemAppearanceObserver {
             DistributedNotificationCenter.default.removeObserver(observer)
         }
+        if let observer = terminalSettingsDefaultsObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         if let observer = wakeRecoveryObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
@@ -1190,6 +1282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         DashboardController.shared.tabManager = tabManager
         installRemoteProjectRestoreObserver(tabManager: tabManager)
         observeSystemAppearanceChanges()
+        observeTerminalSettingsChanges()
 #if DEBUG
         setupJumpUnreadUITestIfNeeded()
         setupGotoSplitUITestIfNeeded()
