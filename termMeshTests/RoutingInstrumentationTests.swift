@@ -337,6 +337,66 @@ final class RoutingInstrumentationTests: XCTestCase {
         XCTAssertEqual(telemetry["wave_id_stated"] as? Bool, true)
     }
 
+    func testActiveTaskWaveEnrichmentPreservesTheStatedWave() throws {
+        let team = registerTeam()
+        let wave = "wave-\(UUID().uuidString)"
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "active wave", assignee: "executor", waveId: wave
+        ))
+
+        let enrichment = store.agentDataEnrichment(teamName: team, agentName: "executor")
+        XCTAssertEqual(enrichment["active_task_id"] as? String, task.id)
+        XCTAssertEqual(enrichment["active_task_wave_id"] as? String, wave)
+        XCTAssertEqual(enrichment["active_task_wave_id_stated"] as? Bool, true)
+    }
+
+    func testUnblockCorrectionReplacesDetailsBeforeTheTaskResumes() throws {
+        let team = registerTeam()
+        let blocked = try XCTUnwrap(store.createTask(
+            teamName: team, title: "corrected", details: "old instruction", assignee: "executor"
+        ))
+        _ = try XCTUnwrap(store.updateTask(
+            teamName: team, taskId: blocked.id, status: "blocked", blockedReason: "needs correction"
+        ))
+
+        let resumed = try XCTUnwrap(store.unblockTask(
+            teamName: team, taskId: blocked.id, correction: "corrected instruction"
+        ))
+        XCTAssertEqual(resumed.details, "corrected instruction")
+        XCTAssertEqual(resumed.status, "assigned")
+        XCTAssertNil(resumed.blockedReason)
+    }
+
+    func testUnblockWithoutCorrectionPreservesExistingDetails() throws {
+        let team = registerTeam()
+        let blocked = try XCTUnwrap(store.createTask(
+            teamName: team, title: "unchanged", details: "existing instruction", assignee: "executor"
+        ))
+        _ = try XCTUnwrap(store.updateTask(
+            teamName: team, taskId: blocked.id, status: "blocked", blockedReason: "temporary"
+        ))
+
+        let resumed = try XCTUnwrap(store.unblockTask(teamName: team, taskId: blocked.id))
+        XCTAssertEqual(resumed.details, "existing instruction")
+        XCTAssertEqual(resumed.status, "assigned")
+    }
+
+    func testUnblockWithBlankCorrectionPreservesExistingDetails() throws {
+        let team = registerTeam()
+        let blocked = try XCTUnwrap(store.createTask(
+            teamName: team, title: "unchanged", details: "existing instruction", assignee: "executor"
+        ))
+        _ = try XCTUnwrap(store.updateTask(
+            teamName: team, taskId: blocked.id, status: "blocked", blockedReason: "temporary"
+        ))
+
+        let resumed = try XCTUnwrap(store.unblockTask(
+            teamName: team, taskId: blocked.id, correction: "   "
+        ))
+        XCTAssertEqual(resumed.details, "existing instruction")
+        XCTAssertEqual(resumed.status, "assigned")
+    }
+
     func testBlankStringsNormalizeToNilRatherThanAnEmptyRoute() throws {
         let team = registerTeam()
 

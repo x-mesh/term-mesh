@@ -459,6 +459,35 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(decoded?.merging(coordinator: coordinator).waveID, "wave-9")
     }
 
+    func testTaskContractSurvivesParsingSanitizingAndCoordinatorMerge() throws {
+        let token = "abcdefabcdefabcdefabcdefabcdefabcdef"
+        let decoded = try XCTUnwrap(ReviewBoardTask(dictionary: [
+            "id": "task-contract",
+            "title": "Implement the task contract",
+            "team_name": "aic",
+            "status": "review_ready",
+            "description": "Read /Users/jinwoo/work/project/term-mesh/Sources/App.swift token \(token)",
+            "acceptance_criteria": [
+                "Description is visible",
+                "Token \(token) is hidden",
+                "   ",
+            ],
+        ]))
+
+        XCTAssertEqual(decoded.details, "Read …/App.swift token <token>")
+        XCTAssertEqual(
+            decoded.acceptanceCriteria,
+            ["Description is visible", "Token <token> is hidden"]
+        )
+
+        let coordinator = ReviewBoardTask(
+            id: "task-contract", teamName: "aic", title: "Placed task", status: "placed"
+        )
+        let merged = decoded.merging(coordinator: coordinator)
+        XCTAssertEqual(merged.details, decoded.details)
+        XCTAssertEqual(merged.acceptanceCriteria, decoded.acceptanceCriteria)
+    }
+
     @MainActor
     func testStatusBadgesCoverRequiredReviewStates() {
         let task = ReviewBoardTask(
@@ -581,10 +610,47 @@ final class ReviewBoardViewModelTests: XCTestCase {
             fencedZombie: false
         ))
 
+        model.setProjectScope(.allProjects)
+
         XCTAssertEqual(
             Set(model.pendingMergeQueue.map(\.taskRawID)),
             ["tsk_queued01", "tsk_running1", "tsk_failed01"]
         )
+    }
+
+    @MainActor
+    func testCurrentProjectWithoutAnActiveTeamHidesUnattributedMergeQueue() {
+        let entry = ReviewBoardMergeQueueItem(dictionary: [
+            "queue_id": "queued01",
+            "task_id": "tsk_queued01",
+            "status": "queued",
+            "approved_by": "reviewer",
+        ])!
+        let model = ReviewBoardViewModel(initialSnapshot: ReviewBoardSnapshot(
+            tasks: [], panelRuns: [], mergeQueue: [entry], coordinatorOnline: true,
+            memMeshAvailable: true, suspectHost: false, fencedZombie: false
+        ))
+
+        XCTAssertEqual(model.projectScope, .currentProject)
+        XCTAssertTrue(model.pendingMergeQueue.isEmpty)
+        model.setProjectScope(.allProjects)
+        XCTAssertEqual(model.pendingMergeQueue.map(\.id), [entry.id])
+    }
+
+    func testFailureAndReviewStatesRequireAttention() {
+        for status in [
+            "blocked", "review_ready", "failed", "quarantined", "suspect", "rejected", "cancelled",
+        ] {
+            XCTAssertTrue(ReviewBoardTask(
+                id: status, teamName: "team", title: status, status: status
+            ).requiresAttention, status)
+        }
+        XCTAssertTrue(ReviewBoardTask(
+            id: "stale", teamName: "team", title: "stale", status: "assigned", isStale: true
+        ).requiresAttention)
+        XCTAssertFalse(ReviewBoardTask(
+            id: "active", teamName: "team", title: "active", status: "in_progress"
+        ).requiresAttention)
     }
 
     /// Without a queue entry the board still has to say something, and the
@@ -654,6 +720,37 @@ final class ReviewBoardViewModelTests: XCTestCase {
         snapshot.tasks = [second]
         model.refresh()
         XCTAssertEqual(model.selectedTask?.id, "second")
+    }
+
+    @MainActor
+    func testCurrentProjectIsDefaultAndScopeFiltersTasksQueueCountsAndSelection() {
+        let current = ReviewBoardTask(id: "current", teamName: "current", title: "Current", status: "review_ready")
+        let blocked = ReviewBoardTask(id: "blocked", teamName: "current", title: "Blocked", status: "blocked")
+        let other = ReviewBoardTask(id: "other", teamName: "other", title: "Other", status: "completed")
+        let snapshot = ReviewBoardSnapshot(
+            tasks: [current, blocked, other],
+            panelRuns: [],
+            coordinatorOnline: true,
+            memMeshAvailable: true,
+            suspectHost: false,
+            fencedZombie: false
+        )
+        let model = ReviewBoardViewModel(initialSnapshot: snapshot, selectedTaskID: "other") { snapshot }
+        model.setActiveTeam("current")
+
+        XCTAssertEqual(model.projectScope, .currentProject)
+        XCTAssertEqual(Set(model.tasks.map(\.id)), ["current", "blocked"])
+        XCTAssertEqual(model.selectedTask?.id, "blocked")
+        XCTAssertEqual(model.reviewReadyCount, 1)
+        XCTAssertEqual(model.blockedCount, 1)
+        XCTAssertEqual(model.completedCount, 0)
+        XCTAssertEqual(model.workingCount, 0)
+
+        model.setProjectScope(.allProjects)
+
+        XCTAssertEqual(Set(model.tasks.map(\.id)), ["current", "blocked", "other"])
+        XCTAssertEqual(model.selectedTask?.id, "blocked")
+        XCTAssertEqual(model.completedCount, 1)
     }
 
     func testTextRedactionHidesRawPathsAndTokens() {

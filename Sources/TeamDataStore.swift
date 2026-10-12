@@ -2039,12 +2039,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     }
 
     @discardableResult
-    func unblockTask(teamName: String, taskId: String) -> TeamOrchestrator.TeamTask? {
+    func unblockTask(
+        teamName: String, taskId: String, correction: String? = nil
+    ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard var tasks = taskBoards[teamName],
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
         let now = Date()
+        if let correction = correction?.teamDataNilIfBlank {
+            tasks[idx].details = correction
+        }
         tasks[idx].blockedReason = nil
         if tasks[idx].status == "blocked" {
             if tasks[idx].startedAt != nil {
@@ -2512,6 +2517,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "active_task_id": activeTask?.id as Any? ?? NSNull(),
             "active_task_title": activeTask?.title as Any? ?? NSNull(),
             "active_task_status": activeTask?.status as Any? ?? NSNull(),
+            "active_task_wave_id": activeTask.map { $0.waveId ?? $0.id } as Any? ?? NSNull(),
+            "active_task_wave_id_stated": activeTask?.waveId != nil,
             "active_task_is_stale": isTaskStale,
             "heartbeat_age_seconds": heartbeatAge as Any? ?? NSNull(),
             "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),

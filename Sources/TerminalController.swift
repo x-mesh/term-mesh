@@ -4158,8 +4158,10 @@ class TerminalController {
                 // companion flag says so explicitly: the same key on a task
                 // object CAN carry a real wave now, and a reader that assumed
                 // one shape for both would count every agent as its own wave.
-                "wave_id": (enrichment["active_task_id"] as? String) ?? agent.instanceId,
-                "wave_id_stated": false,
+                "wave_id": (enrichment["active_task_wave_id"] as? String)
+                    ?? (enrichment["active_task_id"] as? String)
+                    ?? agent.instanceId,
+                "wave_id_stated": enrichment["active_task_wave_id_stated"] as? Bool ?? false,
                 "task_id": enrichment["active_task_id"] ?? NSNull(),
                 "agent_instance_id": agent.instanceId,
                 "host": agent.hostKey as Any? ?? NSNull(),
@@ -4524,9 +4526,20 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing task_id")
         }
         let store = TeamDataStore.shared
+        let correction: String?
+        if let rawCorrection = params["correction"] {
+            guard let value = rawCorrection as? String else {
+                return v2Error(
+                    id: id, code: "invalid_params", message: "correction must be a string"
+                )
+            }
+            correction = value.nilIfBlankTC
+        } else {
+            correction = nil
+        }
 
         guard let task = store.unblockTask(
-            teamName: teamName, taskId: taskId
+            teamName: teamName, taskId: taskId, correction: correction
         ) else {
             return v2Error(id: id, code: "not_found", message: "Task not found")
         }
@@ -4987,6 +5000,8 @@ class TerminalController {
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let context = params["context"] as? String
+        let details = params["description"] as? String
+        let acceptanceCriteria = params["acceptance_criteria"] as? [String] ?? []
         // Measurement only: recorded verbatim, never validated or acted on.
         let (route, waveId) = TerminalController.routingMeasurement(from: params)
         // The CLI has sent a stable id per delegate since d168ad61, and
@@ -5066,6 +5081,8 @@ class TerminalController {
                     taskTitle: taskTitle,
                     priority: priority,
                     context: context,
+                    details: details,
+                    acceptanceCriteria: acceptanceCriteria,
                     requestId: requestId,
                     tabManager: tabManager,
                     route: route,
@@ -7341,12 +7358,24 @@ class TerminalController {
         guard let taskId = params["task_id"] as? String else {
             return .err(code: "invalid_params", message: "Missing task_id", data: nil)
         }
+        let correction: String?
+        if let rawCorrection = params["correction"] {
+            guard let value = rawCorrection as? String else {
+                return .err(
+                    code: "invalid_params", message: "correction must be a string", data: nil
+                )
+            }
+            correction = value.nilIfBlankTC
+        } else {
+            correction = nil
+        }
 
         var result: V2CallResult = .err(code: "not_found", message: "Task not found", data: nil)
         v2MainSync {
             guard let task = TeamOrchestrator.shared.unblockTask(
                 teamName: teamName,
-                taskId: taskId
+                taskId: taskId,
+                correction: correction
             ) else { return }
             let dispatched = TeamOrchestrator.shared.dispatchTaskToAssignee(
                 teamName: teamName,

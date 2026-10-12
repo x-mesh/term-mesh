@@ -18,12 +18,10 @@ struct ReviewBoardPanelView: View {
     /// first appears. Two open windows would drift apart and never resync,
     /// with the last writer deciding what a third window sees.
     ///
-    /// The defaults differ on purpose. Delegation is what someone sets before
-    /// handing out the first task, so a Project that has never been configured
-    /// must not hide it. Auto Pilot starts folded — see its own header, which
-    /// keeps the boundary sentence visible either way.
+    /// The settings stay secondary to the operating view. Their headers retain
+    /// the current state while the controls remain available on disclosure.
     @AppStorage(ReviewBoardSettings.delegationExpandedKey)
-    private var delegationExpanded = true
+    private var delegationExpanded = false
     @AppStorage(ReviewBoardSettings.autoPilotExpandedKey)
     private var autoPilotExpanded = false
 
@@ -33,19 +31,21 @@ struct ReviewBoardPanelView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    if viewModel.tasks.isEmpty && viewModel.pendingMergeQueue.isEmpty {
+                    scopeControl
+                    statusSummary
+                    if scopedTasks.isEmpty && scopedMergeQueue.isEmpty {
                         emptyState
                     } else {
                         // Above the tasks: the queue is what gates work
                         // actually landing, so it should not need scrolling
                         // past a long task list to find.
-                        if !viewModel.pendingMergeQueue.isEmpty {
+                        if !scopedMergeQueue.isEmpty {
                             mergeQueueList
                         }
-                        if !viewModel.tasks.isEmpty {
+                        if !scopedTasks.isEmpty {
                             taskList
                         }
-                        if let task = viewModel.selectedTask {
+                        if let task = selectedScopedTask {
                             taskDetails(task)
                         }
                     }
@@ -127,8 +127,64 @@ struct ReviewBoardPanelView: View {
         .accessibilityLabel("No review tasks yet")
     }
 
+    private var scopedTasks: [ReviewBoardTask] { viewModel.tasks }
+
+    private var scopedMergeQueue: [ReviewBoardMergeQueueItem] { viewModel.pendingMergeQueue }
+
+    private var selectedScopedTask: ReviewBoardTask? {
+        if let selected = viewModel.selectedTask, scopedTasks.contains(selected) { return selected }
+        return scopedTasks.first
+    }
+
+    private var scopeControl: some View {
+        HStack(spacing: 8) {
+            Picker("Task scope", selection: Binding(
+                get: { viewModel.projectScope },
+                set: { viewModel.setProjectScope($0) }
+            )) {
+                ForEach(ReviewBoardProjectScope.allCases, id: \.self) { scope in
+                    Text(scope.title).tag(scope)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityLabel("Review Board task scope")
+            Spacer(minLength: 0)
+        }
+        .accessibilityIdentifier("reviewBoard.scope")
+    }
+
+    private var statusSummary: some View {
+        let tasks = scopedTasks
+        let working = tasks.filter { viewModel.isWorking($0) }.count
+        let blocked = tasks.filter { $0.status == "blocked" }.count
+        let reviewReady = tasks.filter { $0.status == "review_ready" }.count
+        let completed = tasks.filter { $0.finishedAt != nil }.count
+        return HStack(spacing: 10) {
+            summaryValue("Working", count: working, color: .green)
+            summaryValue("Blocked", count: blocked, color: .orange)
+            summaryValue("Review", count: reviewReady, color: .accentColor)
+            summaryValue("Completed", count: completed, color: .secondary)
+        }
+        .padding(8)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Working \(working), blocked \(blocked), review ready \(reviewReady), completed \(completed)")
+        .accessibilityIdentifier("reviewBoard.summary")
+    }
+
+    private func summaryValue(_ label: String, count: Int, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(count)").font(.system(size: 13, weight: .semibold)).monospacedDigit()
+            Text(label).font(.system(size: 9)).foregroundColor(.secondary)
+        }
+        .foregroundColor(color)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private var mergeQueueList: some View {
-        let items = viewModel.pendingMergeQueue
+        let items = scopedMergeQueue
         return VStack(alignment: .leading, spacing: 7) {
             sectionTitle("Merge Queue (\(items.count))")
             ForEach(items) { item in
@@ -203,17 +259,33 @@ struct ReviewBoardPanelView: View {
         // team's agents. Both are settled here and handed down as values.
         let selectedID = viewModel.selectedTask?.id
         let working = viewModel.workingAssignees
-        return VStack(alignment: .leading, spacing: 7) {
-            sectionTitle("Tasks")
-            ForEach(viewModel.tasks) { task in
-                ReviewBoardTaskRow(
-                    task: task,
-                    isSelected: selectedID == task.id,
-                    isWorking: task.assignee.map(working.contains) ?? false,
-                    onSelect: { viewModel.selectTask(id: task.id) },
-                    onReveal: { viewModel.revealPane(for: task) }
-                )
-                .equatable()
+        let attention = scopedTasks.filter(\.requiresAttention)
+        let active = scopedTasks.filter { task in
+            !attention.contains(task) && task.finishedAt == nil
+        }
+        let completed = scopedTasks.filter { $0.finishedAt != nil }
+        return VStack(alignment: .leading, spacing: 10) {
+            taskGroup("Attention", tasks: attention, selectedID: selectedID, working: working)
+            taskGroup("Active", tasks: active, selectedID: selectedID, working: working)
+            taskGroup("Recent Completion", tasks: Array(completed.prefix(6)), selectedID: selectedID, working: working)
+        }
+    }
+
+    @ViewBuilder
+    private func taskGroup(_ title: String, tasks: [ReviewBoardTask], selectedID: String?, working: Set<String>) -> some View {
+        if !tasks.isEmpty {
+            VStack(alignment: .leading, spacing: 7) {
+                sectionTitle("\(title) (\(tasks.count))")
+                ForEach(tasks) { task in
+                    ReviewBoardTaskRow(
+                        task: task,
+                        isSelected: selectedID == task.id,
+                        isWorking: task.assignee.map(working.contains) ?? false,
+                        onSelect: { viewModel.selectTask(id: task.id) },
+                        onReveal: { viewModel.revealPane(for: task) }
+                    )
+                    .equatable()
+                }
             }
         }
     }
@@ -327,6 +399,7 @@ extension ReviewBoardPanelView {
     private func taskDetails(_ task: ReviewBoardTask) -> some View {
         let digest = viewModel.digest(for: task)
         return VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("Task Detail")
             statusPills(viewModel.statusBadges(for: task))
 
             // The way across to where the work is actually happening. Only
@@ -397,12 +470,23 @@ extension ReviewBoardPanelView {
             // instruction IS the task for work delegated from a pane, so it is
             // shown as the agent received it.
             if !task.title.isEmpty {
-                Text(task.title)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                detailSection("Request", systemImage: "text.alignleft", text: task.title)
+            }
+            if let details = task.details, !details.isEmpty {
+                detailSection("Context", systemImage: "doc.text", text: details)
+            }
+            if !task.acceptanceCriteria.isEmpty {
+                detailSection(
+                    "Acceptance Criteria",
+                    systemImage: "checklist",
+                    text: task.acceptanceCriteria.map { "• \($0)" }.joined(separator: "\n")
+                )
+            }
+            if !task.labels.isEmpty {
+                detailSection("Labels", systemImage: "tag", text: task.labels.joined(separator: " · "))
+            }
+            if !task.dependsOn.isEmpty {
+                detailSection("Dependencies", systemImage: "arrow.triangle.branch", text: task.dependsOn.joined(separator: ", "))
             }
 
             // What the agent reported comes first and in its own words. The
@@ -419,25 +503,13 @@ extension ReviewBoardPanelView {
             if report == nil,
                let plain = task.result?.trimmingCharacters(in: .whitespacesAndNewlines),
                !plain.isEmpty {
-                Text(plain)
-                    .font(.system(size: 11))
-                    .foregroundColor(.primary)
-                    .lineLimit(6)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                detailSection("Agent Report", systemImage: "text.bubble", text: plain)
                     .accessibilityIdentifier("reviewBoard.task.report")
             }
             if let report, !report.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     if let body = report.body {
-                        Text(body)
-                            .font(.system(size: 11))
-                            .foregroundColor(.primary)
-                            .lineLimit(6)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        detailSection("Agent Report", systemImage: "text.bubble", text: body)
                     }
                     ForEach(report.presentFields, id: \.title) { field in
                         factSection(field.title, systemImage: field.systemImage, text: field.text)
@@ -503,6 +575,10 @@ extension ReviewBoardPanelView {
         .clipShape(RoundedRectangle(cornerRadius: 7))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title): \(text)")
+    }
+
+    private func detailSection(_ title: String, systemImage: String, text: String) -> some View {
+        factSection(title, systemImage: systemImage, text: text)
     }
 
     private func sectionTitle(_ title: String) -> some View {
