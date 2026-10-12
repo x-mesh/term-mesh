@@ -30,6 +30,7 @@ struct ReviewBoardActions {
 final class ReviewBoardViewModel: ObservableObject {
     @Published private(set) var snapshot: ReviewBoardSnapshot
     @Published var selectedTaskID: String?
+    @Published var projectScope: ReviewBoardProjectScope = .currentProject
 
     /// The selected task's evidence, once it has been read. Nil while nothing
     /// is selected or the read has not finished.
@@ -224,6 +225,17 @@ final class ReviewBoardViewModel: ObservableObject {
     @Published private(set) var tasks: [ReviewBoardTask] = []
     @Published private(set) var pendingMergeQueue: [ReviewBoardMergeQueueItem] = []
     @Published private(set) var workingAssignees: Set<String> = []
+    @Published private(set) var statusCounts: [String: Int] = [:]
+
+    var workingCount: Int {
+        ["in_progress", "assigned", "queued", "pending", "placed", "reassigned", "suspect"]
+            .reduce(0) { $0 + statusCounts[$1, default: 0] }
+    }
+    var blockedCount: Int { statusCounts["blocked", default: 0] + statusCounts["quarantined", default: 0] }
+    var reviewReadyCount: Int { statusCounts["review_ready", default: 0] }
+    var completedCount: Int {
+        ["completed", "merged", "approved", "done"].reduce(0) { $0 + statusCounts[$1, default: 0] }
+    }
 
     func isWorking(_ task: ReviewBoardTask) -> Bool {
         guard let assignee = task.assignee else { return false }
@@ -264,16 +276,23 @@ final class ReviewBoardViewModel: ObservableObject {
 
     /// Re-derive everything that is a pure function of `snapshot`.
     private func rebuildDerivedSnapshotState() {
-        tasks = snapshot.tasks.sorted { lhs, rhs in
+        let currentTeam = activeTeamName ?? snapshot.tasks.first?.teamName
+        let scopedTasks = snapshot.tasks.filter {
+            projectScope == .allProjects || $0.teamName == currentTeam
+        }
+        tasks = scopedTasks.sorted { lhs, rhs in
             let lhsRank = statusRank(lhs.status)
             let rhsRank = statusRank(rhs.status)
             if lhsRank != rhsRank { return lhsRank < rhsRank }
             if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
             return (lhs.updatedAt ?? "") > (rhs.updatedAt ?? "")
         }
+        let scopedRawIDs = Set(scopedTasks.map(\.rawID))
         pendingMergeQueue = snapshot.mergeQueue
+            .filter { projectScope == .allProjects || scopedRawIDs.contains($0.taskRawID) }
             .filter { $0.isPending || $0.isFailed }
             .sorted { ($0.approvedAt ?? "") > ($1.approvedAt ?? "") }
+        statusCounts = Dictionary(grouping: tasks, by: \.status).mapValues(\.count)
     }
 
     /// Agent names that are printing right now. The board's own status comes
@@ -961,7 +980,16 @@ final class ReviewBoardViewModel: ObservableObject {
         guard activeTeamName != teamName else { return }
         activeTeamName = teamName
         if !collaborationRepairInFlight { collaborationRepairOutcome = .idle }
+        rebuildDerivedSnapshotState()
+        keepSelectionValid()
         refreshDelegationPanel()
+    }
+
+    func setProjectScope(_ scope: ReviewBoardProjectScope) {
+        guard projectScope != scope else { return }
+        projectScope = scope
+        rebuildDerivedSnapshotState()
+        keepSelectionValid()
     }
 
     func workspaceSelectionDidChange() {
@@ -1508,7 +1536,7 @@ final class ReviewBoardViewModel: ObservableObject {
     }
 
     private func keepSelectionValid() {
-        let ids = Set(snapshot.tasks.map(\.id))
+        let ids = Set(tasks.map(\.id))
         if let selectedTaskID, ids.contains(selectedTaskID) { return }
         let next = tasks.first?.id
         // The other way the selection moves. A task dropping off the board

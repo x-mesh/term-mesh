@@ -69,33 +69,46 @@ final class ReviewBoardVisibilityTests: XCTestCase {
         XCTAssertEqual(ReviewBoardSettings.loadWidth(defaults: defaults), 210)
     }
 
-    /// The exact stuck state users could reach: dismissed, then switched on.
-    func testEnablingClearsAPriorDismissal() {
+    func testEnablingDoesNotChangeWindowDismissalState() {
         UserDefaults.standard.set(true, forKey: ReviewBoardSettings.enabledKey)
         UserDefaults.standard.set(true, forKey: ReviewBoardSettings.isClosedKey)
-        XCTAssertFalse(ReviewBoardSettings.isVisible, "this is the stuck state")
+        XCTAssertFalse(ReviewBoardSettings.isVisible(enabled: true, isClosed: true))
 
         ReviewBoardSettings.setVisible(true)
         XCTAssertTrue(ReviewBoardSettings.isVisible)
-        XCTAssertFalse(UserDefaults.standard.bool(forKey: ReviewBoardSettings.isClosedKey))
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: ReviewBoardSettings.isClosedKey))
     }
 
-    /// Dismissing the panel must not switch a feature off.
-    ///
-    /// `enabledKey` is the review-board half of the coordinator gate, so a
-    /// close that wrote it false turned distributed workspaces off with no
-    /// notice and no visible way back.
-    func testClosingKeepsTheCoordinatorGateUp() {
+    func testDisablingTheFeatureChangesOnlyTheGlobalPreference() {
         ReviewBoardSettings.setVisible(true)
         XCTAssertTrue(UserDefaults.standard.bool(forKey: ReviewBoardSettings.enabledKey))
 
         ReviewBoardSettings.setVisible(false)
 
         XCTAssertFalse(ReviewBoardSettings.isVisible)
-        XCTAssertTrue(
-            UserDefaults.standard.bool(forKey: ReviewBoardSettings.enabledKey),
-            "closing the panel must leave the coordinator gate alone"
-        )
+        XCTAssertFalse(UserDefaults.standard.bool(forKey: ReviewBoardSettings.enabledKey))
+        XCTAssertTrue(ReviewBoardSettings.isVisible(enabled: true, isClosed: false))
+    }
+
+    func testWindowVisibilityDoesNotChangeGlobalEnabledPreference() {
+        XCTAssertTrue(ReviewBoardSettings.isVisible(enabled: true, isClosed: false))
+        XCTAssertFalse(ReviewBoardSettings.isVisible(enabled: true, isClosed: true))
+        XCTAssertFalse(ReviewBoardSettings.isVisible(enabled: false, isClosed: false))
+        XCTAssertFalse(ReviewBoardSettings.isVisible(enabled: false, isClosed: true))
+    }
+
+    func testTitlebarShowCanRestoreTheGlobalFeatureAndWindow() {
+        var enabled = false
+        var closed = true
+
+        if enabled {
+            closed.toggle()
+        } else {
+            enabled = true
+            closed = false
+        }
+
+        XCTAssertTrue(ReviewBoardSettings.isVisible(enabled: enabled, isClosed: closed))
     }
 }
 

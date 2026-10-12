@@ -8,19 +8,13 @@ enum ReviewBoardSettings {
     static let isClosedKey = "reviewBoard.isClosed"
     static let selectedTaskIDKey = "reviewBoard.selectedTaskID"
 
-    /// Whether the board is on screen right now.
-    ///
-    /// Two keys decide it, and they mean different things: `enabled` is
-    /// "this window has a board at all", `isClosed` is "I dismissed it". The
-    /// close button only ever set the second, and nothing cleared it — so
-    /// closing the board was a one-way door. Neither the Settings toggle nor
-    /// anything else could bring it back, because flipping `enabled` leaves
-    /// `isClosed` standing.
-    ///
-    /// One place decides now, and it writes both.
+    /// Whether the review-board feature is enabled for the application.
     static var isVisible: Bool {
-        let defaults = UserDefaults.standard
-        return isEnabled(defaults: defaults) && !defaults.bool(forKey: isClosedKey)
+        isEnabled()
+    }
+
+    static func isVisible(enabled: Bool, isClosed: Bool) -> Bool {
+        enabled && !isClosed
     }
 
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
@@ -30,21 +24,11 @@ enum ReviewBoardSettings {
         return defaults.bool(forKey: enabledKey)
     }
 
-    /// Showing and hiding are deliberately not symmetric.
-    ///
-    /// `enabledKey` is also the review-board half of the coordinator gate that
-    /// `ReviewBoardCoordinatorSettings.isIntegrationEnabled` reads, so writing
-    /// it false on a dismissal turned distributed workspaces off as a side
-    /// effect of closing a panel — and nothing said so. Hiding therefore only
-    /// records the dismissal. Showing still clears a gate that a dismissal may
-    /// have left down, because a button that reports "Show Review Board" has
-    /// to actually show it.
+    /// Set the application-wide feature preference. Window dismissal is local
+    /// state owned by `ContentView`.
     static func setVisible(_ visible: Bool) {
         let defaults = UserDefaults.standard
-        if visible {
-            defaults.set(true, forKey: enabledKey)
-        }
-        defaults.set(!visible, forKey: isClosedKey)
+        defaults.set(visible, forKey: enabledKey)
     }
 
     static func toggleVisible() {
@@ -164,6 +148,18 @@ enum ReviewBoardStatus: String, CaseIterable, Equatable, Sendable {
     }
 }
 
+enum ReviewBoardProjectScope: String, CaseIterable, Equatable, Sendable {
+    case currentProject
+    case allProjects
+
+    var title: String {
+        switch self {
+        case .currentProject: return "Current Project"
+        case .allProjects: return "All Projects"
+        }
+    }
+}
+
 struct ReviewBoardSnapshot: Equatable, Sendable {
     var tasks: [ReviewBoardTask]
     var panelRuns: [ReviewBoardPanelRun]
@@ -216,10 +212,12 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let rawID: String
     let teamName: String
     let title: String
+    let details: String?
     let status: String
     let assignee: String?
     let priority: Int
     let labels: [String]
+    let acceptanceCriteria: [String]
     let dependsOn: [String]
     let blockedReason: String?
     let reviewSummary: String?
@@ -284,14 +282,24 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         Self.finishedStatuses.contains(status) ? updatedAt : nil
     }
 
+    var requiresAttention: Bool {
+        Self.attentionStatuses.contains(status) || isStale
+    }
+
+    private static let attentionStatuses: Set<String> = [
+        "blocked", "review_ready", "failed", "quarantined", "suspect", "rejected", "cancelled",
+    ]
+
     init(
         id: String,
         teamName: String,
         title: String,
+        details: String? = nil,
         status: String,
         assignee: String? = nil,
         priority: Int = 2,
         labels: [String] = [],
+        acceptanceCriteria: [String] = [],
         dependsOn: [String] = [],
         blockedReason: String? = nil,
         reviewSummary: String? = nil,
@@ -320,11 +328,17 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         self.rawID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         self.teamName = ReviewBoardText.safeLabel(teamName)
         self.title = ReviewBoardText.safeLabel(title)
+        self.details = details
+            .map { ReviewBoardText.safeBody($0) }
+            .flatMap { $0.isEmpty ? nil : $0 }
         self.rawTitle = rawTitle ?? title
         self.status = status
         self.assignee = assignee.map(ReviewBoardText.safeLabel)
         self.priority = priority
         self.labels = labels.map(ReviewBoardText.safeLabel)
+        self.acceptanceCriteria = acceptanceCriteria
+            .map { ReviewBoardText.safeBody($0) }
+            .filter { !$0.isEmpty }
         self.dependsOn = dependsOn.map(ReviewBoardText.safeIdentifier)
         self.blockedReason = blockedReason.map { ReviewBoardText.safeBody($0) }
         self.reviewSummary = reviewSummary.map { ReviewBoardText.safeBody($0) }
@@ -366,10 +380,12 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
             id: id,
             teamName: dictionary["team_name"] as? String ?? "Unknown team",
             title: title,
+            details: dictionary["description"] as? String,
             status: dictionary["status"] as? String ?? "queued",
             assignee: dictionary["assignee"] as? String,
             priority: dictionary["priority"] as? Int ?? 2,
             labels: dictionary["labels"] as? [String] ?? [],
+            acceptanceCriteria: dictionary["acceptance_criteria"] as? [String] ?? [],
             dependsOn: dictionary["depends_on"] as? [String] ?? [],
             blockedReason: dictionary["blocked_reason"] as? String,
             reviewSummary: dictionary["review_summary"] as? String,
@@ -504,12 +520,15 @@ extension ReviewBoardTask {
             id: rawID,
             teamName: teamName == "Unknown team" ? other.teamName : teamName,
             title: title.isEmpty ? other.title : title,
+            details: details ?? other.details,
             status: Self.mergedStatus(local: status, coordinator: other.status),
             // Where it runs is the coordinator's to say; who holds it is the
             // team's. Prefer the agent, because that is what a person looks for.
             assignee: assignee ?? other.assignee,
             priority: priority,
             labels: labels,
+            acceptanceCriteria: acceptanceCriteria.isEmpty
+                ? other.acceptanceCriteria : acceptanceCriteria,
             dependsOn: dependsOn.isEmpty ? other.dependsOn : dependsOn,
             blockedReason: blockedReason ?? other.blockedReason,
             reviewSummary: reviewSummary ?? other.reviewSummary,
