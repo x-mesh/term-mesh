@@ -12,6 +12,10 @@ import PeerProto
 /// formatter is safe to share while nothing mutates it.
 private let sharedISO8601 = ISO8601DateFormatter()
 
+enum TermMeshDaemonProtocol {
+    static let maxOperationEnvelopeBytes = 64 * 1024
+}
+
 /// Manages multi-agent Claude teams where a leader orchestrates N agent instances,
 /// each running in split panes within a single workspace.
 @MainActor
@@ -8826,12 +8830,198 @@ final class TeamOrchestrator: ObservableObject {
             "socket_path": SocketControlSettings.socketPath(),
             "team_count": teamData.count
         ]
-        return [
-            "teams": teamData,
-            "tasks": teamTasks,
-            "attention": teamAttention,
-            "instance": instanceMeta,
-        ]
+        return Self.budgetTeamSyncPayload(
+            teams: teamData,
+            tasks: teamTasks,
+            attention: teamAttention,
+            instance: instanceMeta
+        )
+    }
+
+    static let teamSyncFreeTextLimitBytes = 1024
+
+    nonisolated static func budgetTeamSyncPayload(
+        teams: [[String: Any]],
+        tasks: [[String: Any]],
+        attention: [[String: Any]],
+        instance: [String: Any]
+    ) -> [String: Any] {
+        let budgetedTeams = teams.map { budgetTeam($0) }
+        let budgetedTasks = tasks.map { budgetDictionary($0, keys: taskFreeTextKeys) }
+        let budgetedAttention = attention.map { budgetDictionary($0, keys: attentionFreeTextKeys) }
+        let nonTerminalTasks = budgetedTasks.filter {
+            !isTerminalTaskStatusForBudget($0.value["status"] as? String ?? "")
+        }
+        let terminalTasks = budgetedTasks
+            .filter { isTerminalTaskStatusForBudget($0.value["status"] as? String ?? "") }
+            .sorted {
+                ($0.value["updated_at"] as? String ?? "")
+                    > ($1.value["updated_at"] as? String ?? "")
+            }
+
+        var selectedTasks = nonTerminalTasks
+        var selectedAttention: [(value: [String: Any], truncated: Int)] = []
+        var selectedTerminalCount = 0
+        var omittedAttentionCount = 0
+
+        func payload(
+            tasks: [(value: [String: Any], truncated: Int)],
+            attention: [(value: [String: Any], truncated: Int)],
+            omittedTerminalCount: Int,
+            omittedAttentionCount: Int
+        ) -> [String: Any] {
+            let truncatedCount = budgetedTeams.reduce(0) { $0 + $1.truncated }
+                + tasks.reduce(0) { $0 + $1.truncated }
+                + attention.reduce(0) { $0 + $1.truncated }
+            var instance = instance
+            instance["omitted_terminal_task_count"] = omittedTerminalCount
+            instance["omitted_attention_count"] = omittedAttentionCount
+            instance["truncated_free_text_field_count"] = truncatedCount
+            return [
+                "teams": budgetedTeams.map(\.value),
+                "tasks": tasks.map(\.value),
+                "attention": attention.map(\.value),
+                "instance": instance,
+            ]
+        }
+
+        func fits(
+            tasks: [(value: [String: Any], truncated: Int)],
+            attention: [(value: [String: Any], truncated: Int)],
+            omittedTerminalCount: Int,
+            omittedAttentionCount: Int
+        ) -> Bool {
+            let candidate = payload(
+                tasks: tasks,
+                attention: attention,
+                omittedTerminalCount: omittedTerminalCount,
+                omittedAttentionCount: omittedAttentionCount
+            )
+            let request: [String: Any] = [
+                "id": 0,
+                "method": "team.sync",
+                "params": candidate,
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: request) else {
+                return false
+            }
+            return data.count + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes
+        }
+
+        let requiredPayload = payload(
+            tasks: nonTerminalTasks,
+            attention: [],
+            omittedTerminalCount: terminalTasks.count,
+            omittedAttentionCount: budgetedAttention.count
+        )
+        if !fits(
+            tasks: nonTerminalTasks,
+            attention: [],
+            omittedTerminalCount: terminalTasks.count,
+            omittedAttentionCount: budgetedAttention.count
+        ), let data = try? JSONSerialization.data(withJSONObject: requiredPayload) {
+            Logger.team.error(
+                "team.sync required state exceeds budget (bytes: \(data.count, privacy: .public))"
+            )
+        }
+
+        for terminalTask in terminalTasks {
+            let candidate = selectedTasks + [terminalTask]
+            let omittedCount = terminalTasks.count - selectedTerminalCount - 1
+            guard fits(
+                tasks: candidate,
+                attention: selectedAttention,
+                omittedTerminalCount: omittedCount,
+                omittedAttentionCount: budgetedAttention.count
+            ) else { break }
+            selectedTasks = candidate
+            selectedTerminalCount += 1
+        }
+
+        for attentionItem in budgetedAttention {
+            let candidate = selectedAttention + [attentionItem]
+            let omittedCount = budgetedAttention.count - candidate.count
+            if fits(
+                tasks: selectedTasks,
+                attention: candidate,
+                omittedTerminalCount: terminalTasks.count - selectedTerminalCount,
+                omittedAttentionCount: omittedCount
+            ) {
+                selectedAttention = candidate
+            } else {
+                omittedAttentionCount += 1
+            }
+        }
+
+        return payload(
+            tasks: selectedTasks,
+            attention: selectedAttention,
+            omittedTerminalCount: terminalTasks.count - selectedTerminalCount,
+            omittedAttentionCount: omittedAttentionCount
+        )
+    }
+
+    private static let taskFreeTextKeys: Set<String> = [
+        "title", "description", "acceptance_criteria", "labels", "blocked_reason",
+        "review_summary", "result"
+    ]
+    private static let attentionFreeTextKeys: Set<String> = [
+        "reason", "summary", "result", "review_summary", "task_title"
+    ]
+    private static let teamFreeTextKeys: Set<String> = [
+        "leader_failure", "leader_policy_failure", "last_heartbeat_summary",
+        "active_task_title"
+    ]
+
+    nonisolated private static func budgetTeam(
+        _ team: [String: Any]
+    ) -> (value: [String: Any], truncated: Int) {
+        var result = budgetDictionary(team, keys: teamFreeTextKeys)
+        var agents: [[String: Any]] = []
+        var truncated = result.truncated
+        for agent in team["agents"] as? [[String: Any]] ?? [] {
+            let budgeted = budgetDictionary(agent, keys: teamFreeTextKeys)
+            agents.append(budgeted.value)
+            truncated += budgeted.truncated
+        }
+        if team["agents"] != nil { result.value["agents"] = agents }
+        return (result.value, truncated)
+    }
+
+    nonisolated private static func budgetDictionary(
+        _ dictionary: [String: Any],
+        keys: Set<String>
+    ) -> (value: [String: Any], truncated: Int) {
+        var result = dictionary
+        var truncated = 0
+        for key in keys {
+            if let value = result[key] as? String {
+                let shortened = truncateTeamSyncText(value)
+                if shortened != value {
+                    result[key] = shortened
+                    truncated += 1
+                }
+            } else if let values = result[key] as? [String] {
+                let shortened = values.map { value in
+                    let result = truncateTeamSyncText(value)
+                    if result != value { truncated += 1 }
+                    return result
+                }
+                result[key] = shortened
+            }
+        }
+        return (result, truncated)
+    }
+
+    nonisolated static func truncateTeamSyncText(_ value: String) -> String {
+        guard value.utf8.count > teamSyncFreeTextLimitBytes else { return value }
+        var data = Data(value.utf8.prefix(teamSyncFreeTextLimitBytes))
+        while String(data: data, encoding: .utf8) == nil { data.removeLast() }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    nonisolated private static func isTerminalTaskStatusForBudget(_ status: String) -> Bool {
+        ["completed", "failed", "abandoned", "cancelled"].contains(status)
     }
 
     /// Mission Control: "waiting for input" signal — the agent pane has an

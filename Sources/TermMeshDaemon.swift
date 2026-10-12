@@ -1975,6 +1975,12 @@ final class TermMeshDaemon: ObservableObject {
               var jsonString = String(data: data, encoding: .utf8) else {
             return .failure(.rpcError("could not encode RPC request"))
         }
+        guard data.count + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes else {
+            Logger.daemon.error(
+                "RPC request rejected before send (method: \(method, privacy: .public), bytes: \(data.count, privacy: .public), limit: \(TermMeshDaemonProtocol.maxOperationEnvelopeBytes, privacy: .public))"
+            )
+            return .failure(.rpcError("RPC request exceeds daemon envelope limit"))
+        }
         jsonString += "\n"
 
         // Connect to Unix socket
