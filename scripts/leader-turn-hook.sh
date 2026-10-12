@@ -12,7 +12,9 @@
 # The two hook processes therefore correlate through one current-turn file per
 # surface. Start replaces that file with the derived ID; end consumes it, or
 # records `unknown` when no start preceded it. An unmet mandatory delegation
-# floor asks the Stop hook to continue the turn once.
+# floor asks the Stop hook to continue the turn once; that blocked Stop leaves
+# the turn on the stack (plus a `.turn-block-<id>` marker) so the continuation
+# can still state a route, and the final Stop closes it with `stop_blocked`.
 #
 # The ID is sha256(discriminator + ":" + prompt_sha256), truncated to 16
 # hex characters. The preferred discriminator is Claude's session ID from the
@@ -285,6 +287,60 @@ sys.stdout.buffer.write(prompt.encode("utf-8"))
         release_state_lock
     fi
 else
+    # A continuation Stop always carries stop_hook_active=true. Any other Stop
+    # therefore proves that a blocked turn still on the stack was abandoned
+    # (interrupted or ended before its continuation), and it must not be
+    # selected as the turn this Stop closes.
+    STOP_HOOK_ACTIVE=false
+    if command -v python3 >/dev/null 2>&1; then
+        STOP_HOOK_ACTIVE="$(printf '%s' "$PAYLOAD" | python3 -c '
+import json
+import sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    value = {}
+print("true" if isinstance(value, dict) and value.get("stop_hook_active") is True else "false", end="")
+' 2>/dev/null || printf false)"
+    fi
+    _turn_abandoned=""
+    if [ "$STOP_HOOK_ACTIVE" != true ] && acquire_state_lock && [ -f "$STATE_FILE" ]; then
+        _turn_kept=""
+        while IFS= read -r _turn_line; do
+            [ -n "$_turn_line" ] || continue
+            case "$_turn_line" in
+                *[!A-Za-z0-9._-]*) _turn_kept="$_turn_kept$_turn_line
+"; continue ;;
+            esac
+            if [ -f "$LOG_DIR/.turn-block-$_turn_line" ]; then
+                _turn_ab_nodispatch=0
+                if grep -qx 'no_dispatch' "$LOG_DIR/.turn-route-$_turn_line" 2>/dev/null; then
+                    _turn_ab_nodispatch=1
+                fi
+                _turn_ab_route=unstated
+                [ ! -f "$LOG_DIR/.turn-route-$_turn_line" ] || _turn_ab_route=stated
+                _turn_abandoned="$_turn_abandoned$_turn_line $_turn_ab_route $_turn_ab_nodispatch
+"
+                rm -f "$LOG_DIR/.turn-block-$_turn_line" "$LOG_DIR/.turn-route-$_turn_line" 2>/dev/null || true
+            else
+                _turn_kept="$_turn_kept$_turn_line
+"
+            fi
+        done < "$STATE_FILE" 2>/dev/null
+        if [ -n "$_turn_abandoned" ]; then
+            if [ -n "$_turn_kept" ]; then
+                _turn_state_tmp="$STATE_FILE.tmp.$$"
+                if { printf '%s' "$_turn_kept" > "$_turn_state_tmp"; } 2>/dev/null; then
+                    mv -f "$_turn_state_tmp" "$STATE_FILE" 2>/dev/null || true
+                else
+                    rm -f "$_turn_state_tmp" 2>/dev/null || true
+                fi
+            else
+                rm -f "$STATE_FILE" 2>/dev/null || true
+            fi
+        fi
+    fi
+    release_state_lock
     if acquire_state_lock && [ -f "$STATE_FILE" ]; then
         # Which entry does this Stop close? LIFO alone is wrong whenever the
         # harness folds a mid-turn prompt into the turn already running: that
@@ -328,42 +384,20 @@ else
             _turn_popped_index=$_turn_marked_index
         fi
         [ -n "$_turn_popped" ] && TURN_ID="$_turn_popped"
-        # Remove only the chosen entry, keeping every other line and its order.
-        # Deleting the last line unconditionally would drop a still-open turn
-        # whenever the marked entry was not the newest one.
+        # The stack is rewritten by commit_turn_pop, after the floor is decided:
+        # a blocked Stop must leave the turn open for its continuation.
+        _turn_absorbed=""
         if [ -n "$_turn_popped" ]; then
-            _turn_absorbed=""
-            rm -f "$STATE_FILE.absorbed.$$" 2>/dev/null || true
-            _turn_rest="$(
-                _turn_index=0
-                while IFS= read -r _turn_line; do
-                    [ -n "$_turn_line" ] || continue
-                    _turn_index=$((_turn_index + 1))
-                    if [ "$_turn_index" -eq "$_turn_popped_index" ]; then
-                        continue
-                    fi
-                    if [ "$_turn_index" -gt "$_turn_popped_index" ]; then
-                        printf '%s\n' "$_turn_line" >> "$STATE_FILE.absorbed.$$"
-                        continue
-                    fi
-                    printf '%s\n' "$_turn_line"
-                done < "$STATE_FILE" 2>/dev/null
-            )"
-            _turn_absorbed="$(cat "$STATE_FILE.absorbed.$$" 2>/dev/null || true)"
-            rm -f "$STATE_FILE.absorbed.$$" 2>/dev/null || true
-        else
-            _turn_absorbed=""
-            _turn_rest=""
-        fi
-        if [ -n "$_turn_rest" ]; then
-            _turn_state_tmp="$STATE_FILE.tmp.$$"
-            if { printf '%s\n' "$_turn_rest" > "$_turn_state_tmp"; } 2>/dev/null; then
-                mv -f "$_turn_state_tmp" "$STATE_FILE" 2>/dev/null || true
-            else
-                rm -f "$_turn_state_tmp" 2>/dev/null || true
-            fi
-        else
-            rm -f "$STATE_FILE" 2>/dev/null || true
+            _turn_index=0
+            while IFS= read -r _turn_line; do
+                [ -n "$_turn_line" ] || continue
+                _turn_index=$((_turn_index + 1))
+                if [ "$_turn_index" -gt "$_turn_popped_index" ]; then
+                    _turn_absorbed="$_turn_absorbed$_turn_line
+"
+                fi
+            done < "$STATE_FILE" 2>/dev/null
+            _turn_absorbed=${_turn_absorbed%?}
         fi
     fi
     release_state_lock
@@ -383,7 +417,6 @@ if [ "$MODE" = --end ]; then
         if grep -qx 'no_dispatch' "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null; then
             ROUTE_NO_DISPATCH=1
         fi
-        rm -f "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null || true
     else
         ROUTE_STATUS=unstated
     fi
@@ -596,7 +629,92 @@ TURN_HOOK_MET
         met|unmet|met_by_collection) ;;
         *) DELEGATION_FLOOR="" ;;
     esac
+fi
+
+# A justified exemption is not a violation: the leader stated a direct route
+# with a no-dispatch reason. The block rule below keys off the same condition.
+STOP_BLOCK=0
+if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ]; then
+    if [ "$ROUTE_NO_DISPATCH" = 1 ]; then
+        DELEGATION_FLOOR=waived
+    else
+        [ "$STOP_HOOK_ACTIVE" = true ] || STOP_BLOCK=1
+    fi
+fi
+
+# An abandoned turn_end keeps the facts the turn itself established; only the
+# end is synthesized, which end_reason says. Written before the block decision:
+# this Stop may itself block, and the abandoned turn's markers are already gone.
+if [ "$MODE" = --end ] && [ -n "${_turn_abandoned:-}" ]; then
+    while IFS=' ' read -r _turn_ab_id _turn_ab_route _turn_ab_nodispatch; do
+        [ -n "$_turn_ab_id" ] || continue
+        _turn_ab_floor=unmet
+        [ "$_turn_ab_nodispatch" != 1 ] || _turn_ab_floor=waived
+        _turn_ab_line="{\"event\":\"turn_end\",\"turn_id\":$(json_string "$_turn_ab_id"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$_turn_ab_route"),\"delegation_floor\":\"$_turn_ab_floor\",\"stop_blocked\":true,\"end_reason\":\"abandoned\"$IDENTITY_FIELDS}"
+        { printf '%s\n' "$_turn_ab_line" >> "$LOG_FILE"; } 2>/dev/null || true
+    done <<ABANDONED_EOF
+$_turn_abandoned
+ABANDONED_EOF
+fi
+
+BLOCK_MARKER=""
+STOP_BLOCKED_FIELD=""
+if [ "$MODE" = --end ] && [ -n "${ROUTE_KEY:-}" ]; then
+    BLOCK_MARKER="$LOG_DIR/.turn-block-$ROUTE_KEY"
+fi
+
+# Blocking must not consume the turn: tm-agent resolves the continuation's
+# turn id from the state stack, and the second Stop re-reads the baseline and
+# route marker. Leave a marker so the final turn_end can say it was blocked.
+if [ "$STOP_BLOCK" -eq 1 ]; then
+    if [ -n "$BLOCK_MARKER" ]; then
+        { printf '%s\n' "$TS" > "$BLOCK_MARKER"; } 2>/dev/null || true
+    fi
+    printf '%s\n' '{"decision":"block","reason":"Delegated mode requires at least one eligible worker dispatch before this turn can finish. Dispatch the work, or record why no eligible worker task exists with `tm-agent leader turn route --route direct --no-dispatch-reason <reason>`."}'
+    exit 0
+fi
+
+commit_turn_pop() {
+    [ -n "${_turn_popped:-}" ] || return 0
+    acquire_state_lock || return 0
+    if [ -f "$STATE_FILE" ]; then
+        _turn_drop="
+$_turn_popped
+${_turn_absorbed:-}
+"
+        _turn_kept=""
+        while IFS= read -r _turn_line; do
+            [ -n "$_turn_line" ] || continue
+            case "$_turn_drop" in
+                *"
+$_turn_line
+"*) ;;
+                *) _turn_kept="$_turn_kept$_turn_line
+" ;;
+            esac
+        done < "$STATE_FILE" 2>/dev/null
+        if [ -n "$_turn_kept" ]; then
+            _turn_state_tmp="$STATE_FILE.tmp.$$"
+            if { printf '%s' "$_turn_kept" > "$_turn_state_tmp"; } 2>/dev/null; then
+                mv -f "$_turn_state_tmp" "$STATE_FILE" 2>/dev/null || true
+            else
+                rm -f "$_turn_state_tmp" 2>/dev/null || true
+            fi
+        else
+            rm -f "$STATE_FILE" 2>/dev/null || true
+        fi
+    fi
+    release_state_lock
+}
+
+if [ "$MODE" = --end ]; then
+    commit_turn_pop
+    [ -z "${ROUTE_KEY:-}" ] || rm -f "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null || true
     rm -f "$DISPATCH_BASELINE_FILE" 2>/dev/null || true
+    if [ -n "$BLOCK_MARKER" ] && [ -f "$BLOCK_MARKER" ]; then
+        STOP_BLOCKED_FIELD=',"stop_blocked":true'
+        rm -f "$BLOCK_MARKER" 2>/dev/null || true
+    fi
 fi
 
 # Entries newer than the routed turn were prompts absorbed into that running
@@ -619,35 +737,13 @@ else
     if [ -n "$DELEGATION_FLOOR" ]; then
         FLOOR_FIELD=",\"delegation_floor\":$(json_string "$DELEGATION_FLOOR")"
     fi
-    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")$FLOOR_FIELD$IDENTITY_FIELDS}"
+    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")$FLOOR_FIELD$STOP_BLOCKED_FIELD$IDENTITY_FIELDS}"
 fi
 
 # Open the append once per invocation and emit one complete line. Do not retain
 # this FD: daemon GC rotates turns.log at startup and every six hours, and a
 # retained descriptor would keep writing to the renamed inode.
 { printf '%s\n' "$LINE" >> "$LOG_FILE"; } 2>/dev/null || true
-
-# Stop hooks continue the current turn when they receive this JSON decision.
-# `stop_hook_active` prevents the continuation from blocking itself again. A
-# direct route stated with a no-dispatch reason is the recorded alternative the
-# block offers; a bare route is not, or any route would skip the floor.
-if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ] && [ "$ROUTE_NO_DISPATCH" != 1 ]; then
-    STOP_HOOK_ACTIVE=false
-    if command -v python3 >/dev/null 2>&1; then
-        STOP_HOOK_ACTIVE="$(printf '%s' "$PAYLOAD" | python3 -c '
-import json
-import sys
-try:
-    value = json.load(sys.stdin)
-except Exception:
-    value = {}
-print("true" if value.get("stop_hook_active") is True else "false", end="")
-' 2>/dev/null || printf false)"
-    fi
-    if [ "$STOP_HOOK_ACTIVE" != true ]; then
-        printf '%s\n' '{"decision":"block","reason":"Delegated mode requires at least one eligible worker dispatch before this turn can finish. Dispatch the work, or record why no eligible worker task exists with `tm-agent leader turn route --route direct --no-dispatch-reason <reason>`."}'
-    fi
-fi
 
 # Record where the log ends before the turn runs, so Stop can tell whether this
 # turn appended any dispatch of its own. Independent of the injection below:
