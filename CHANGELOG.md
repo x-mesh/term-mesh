@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.2] - 2026-10-12
+
+### Fixed
+
+- Closing a Project's workspace with the sidebar close button now keeps its leader and agents running, the same as closing the window. "Open live project" in the Projects sidebar restores the same workspace. Before this fix, the close stopped every pane but kept the Project record, so the Project could not be restored or deleted and its name could not be used again.
+- The Projects sidebar can now delete a Project whose workspace is closed. A Project that cannot be reopened shows "Can't reopen · delete to clean up" and no longer claims that its processes are still running.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.1] - 2026-10-12
 
 ### Changed
