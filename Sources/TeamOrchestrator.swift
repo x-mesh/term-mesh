@@ -8830,15 +8830,16 @@ final class TeamOrchestrator: ObservableObject {
             "socket_path": SocketControlSettings.socketPath(),
             "team_count": teamData.count
         ]
-        return Self.budgetTeamSyncPayload(
-            teams: teamData,
-            tasks: teamTasks,
-            attention: teamAttention,
-            instance: instanceMeta
-        )
+        return [
+            "teams": teamData,
+            "tasks": teamTasks,
+            "attention": teamAttention,
+            "instance": instanceMeta,
+        ]
     }
 
     static let teamSyncFreeTextLimitBytes = 1024
+    nonisolated static let teamSyncPayloadSafetyMarginBytes = 512
 
     nonisolated static func budgetTeamSyncPayload(
         teams: [[String: Any]],
@@ -8885,80 +8886,68 @@ final class TeamOrchestrator: ObservableObject {
             ]
         }
 
-        func fits(
-            tasks: [(value: [String: Any], truncated: Int)],
-            attention: [(value: [String: Any], truncated: Int)],
-            omittedTerminalCount: Int,
-            omittedAttentionCount: Int
-        ) -> Bool {
-            let candidate = payload(
-                tasks: tasks,
-                attention: attention,
-                omittedTerminalCount: omittedTerminalCount,
-                omittedAttentionCount: omittedAttentionCount
-            )
-            let request: [String: Any] = [
-                "id": 0,
-                "method": "team.sync",
-                "params": candidate,
-            ]
-            guard let data = try? JSONSerialization.data(withJSONObject: request) else {
-                return false
-            }
-            return data.count + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes
-        }
-
         let requiredPayload = payload(
             tasks: nonTerminalTasks,
             attention: [],
             omittedTerminalCount: terminalTasks.count,
             omittedAttentionCount: budgetedAttention.count
         )
-        if !fits(
-            tasks: nonTerminalTasks,
-            attention: [],
-            omittedTerminalCount: terminalTasks.count,
-            omittedAttentionCount: budgetedAttention.count
-        ), let data = try? JSONSerialization.data(withJSONObject: requiredPayload) {
+        let requiredRequest: [String: Any] = [
+            "id": 0,
+            "method": "team.sync",
+            "params": requiredPayload,
+        ]
+        let requiredBytes = (try? JSONSerialization.data(withJSONObject: requiredRequest))?.count ?? .max
+        if requiredBytes + 1 > TermMeshDaemonProtocol.maxOperationEnvelopeBytes {
             Logger.team.error(
-                "team.sync required state exceeds budget (bytes: \(data.count, privacy: .public))"
+                "team.sync required state exceeds budget (bytes: \(requiredBytes, privacy: .public))"
             )
         }
+        var accountedBytes = requiredBytes + Self.teamSyncPayloadSafetyMarginBytes
 
-        for terminalTask in terminalTasks {
-            let candidate = selectedTasks + [terminalTask]
-            let omittedCount = terminalTasks.count - selectedTerminalCount - 1
-            guard fits(
-                tasks: candidate,
-                attention: selectedAttention,
-                omittedTerminalCount: omittedCount,
-                omittedAttentionCount: budgetedAttention.count
-            ) else { break }
-            selectedTasks = candidate
+        let terminalItems = terminalTasks.compactMap { task -> (value: [String: Any], truncated: Int, bytes: Int)? in
+            guard let data = try? JSONSerialization.data(withJSONObject: task.value) else { return nil }
+            return (task.value, task.truncated, data.count)
+        }
+        let attentionItems = budgetedAttention.compactMap { item -> (value: [String: Any], truncated: Int, bytes: Int)? in
+            guard let data = try? JSONSerialization.data(withJSONObject: item.value) else { return nil }
+            return (item.value, item.truncated, data.count)
+        }
+
+        for terminalTask in terminalItems {
+            guard accountedBytes + terminalTask.bytes + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes else { break }
+            selectedTasks.append((value: terminalTask.value, truncated: terminalTask.truncated))
             selectedTerminalCount += 1
+            accountedBytes += terminalTask.bytes + 1
         }
 
-        for attentionItem in budgetedAttention {
-            let candidate = selectedAttention + [attentionItem]
-            let omittedCount = budgetedAttention.count - candidate.count
-            if fits(
-                tasks: selectedTasks,
-                attention: candidate,
-                omittedTerminalCount: terminalTasks.count - selectedTerminalCount,
-                omittedAttentionCount: omittedCount
-            ) {
-                selectedAttention = candidate
-            } else {
+        for attentionItem in attentionItems {
+            guard accountedBytes + attentionItem.bytes + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes else {
                 omittedAttentionCount += 1
+                continue
             }
+            selectedAttention.append((value: attentionItem.value, truncated: attentionItem.truncated))
+            accountedBytes += attentionItem.bytes + 1
         }
 
-        return payload(
+        let result = payload(
             tasks: selectedTasks,
             attention: selectedAttention,
             omittedTerminalCount: terminalTasks.count - selectedTerminalCount,
             omittedAttentionCount: omittedAttentionCount
         )
+        let resultRequest: [String: Any] = [
+            "id": 0,
+            "method": "team.sync",
+            "params": result,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: resultRequest),
+           data.count + 1 > TermMeshDaemonProtocol.maxOperationEnvelopeBytes {
+            Logger.team.error(
+                "team.sync budget calculation exceeded limit (bytes: \(data.count, privacy: .public))"
+            )
+        }
+        return result
     }
 
     private static let taskFreeTextKeys: Set<String> = [
