@@ -180,6 +180,31 @@ final class TitlebarWorktreeCountCache: @unchecked Sendable {
 
 /// Installs a FileDropOverlayView on the window's theme frame for Finder file drag support.
 
+extension Notification.Name {
+    static let reviewBoardToggleRequested = Notification.Name("term-mesh.reviewBoardToggleRequested")
+}
+
+enum ReviewBoardWindowCommand {
+    struct State: Equatable {
+        var enabled: Bool
+        var isClosed: Bool
+    }
+
+    static func toggled(_ state: State) -> State {
+        guard state.enabled else { return State(enabled: true, isClosed: false) }
+        return State(enabled: true, isClosed: !state.isClosed)
+    }
+
+    static func requestToggle(in window: NSWindow? = NSApp.keyWindow ?? NSApp.mainWindow) {
+        NotificationCenter.default.post(name: .reviewBoardToggleRequested, object: window)
+    }
+}
+
+enum ReviewBoardResizerLayout {
+    static let dividerWidth: CGFloat = 1
+    static let hitTargetWidth: CGFloat = 9
+}
+
 struct ContentView: View {
     @ObservedObject var updateViewModel: UpdateViewModel
     @ObservedObject private var rainbowBanner = RainbowBannerStore.shared
@@ -209,7 +234,7 @@ struct ContentView: View {
     // the persisted value is read once here and committed on drag end.
     @State private var sidebarWidth: CGFloat = SidebarLayoutSettings.loadWidth() ?? 200
     @State private var reviewBoardWidth: CGFloat = ReviewBoardSettings.loadWidth()
-    @State private var reviewBoardDragStartWidth: CGFloat?
+    @State private var reviewBoardDragPreviousTranslation: CGFloat?
     @State private var isReviewBoardClosed = false
     @State private var lastClampedWidth: CGFloat = 0
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
@@ -692,37 +717,40 @@ struct ContentView: View {
     }
 
     private var reviewBoardResizer: some View {
-        Rectangle()
-            .fill(Color(nsColor: .separatorColor))
-            .frame(width: 1)
+        Color.clear
+            .frame(width: ReviewBoardResizerLayout.hitTargetWidth)
             .overlay {
-                Color.clear
-                    .frame(width: 9)
-                    .contentShape(Rectangle())
-                    .onHover { hovering in
-                        hovering ? Self.fixedSidebarResizeCursor.set() : NSCursor.arrow.set()
-                    }
-                    .gesture(
-                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
-                            .onChanged { value in
-                                if reviewBoardDragStartWidth == nil {
-                                    reviewBoardDragStartWidth = reviewBoardWidth
-                                }
-                                let startWidth = reviewBoardDragStartWidth ?? reviewBoardWidth
-                                withTransaction(Transaction(animation: nil)) {
-                                    reviewBoardWidth = ReviewBoardSettings.clampedWidth(startWidth - value.translation.width)
-                                }
-                                Self.fixedSidebarResizeCursor.set()
-                            }
-                            .onEnded { _ in
-                                reviewBoardDragStartWidth = nil
-                                ReviewBoardSettings.saveWidth(reviewBoardWidth)
-                                NSCursor.arrow.set()
-                            }
-                    )
-                    .accessibilityLabel("Review Board resizer")
-                    .accessibilityIdentifier("ReviewBoardResizer")
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor))
+                    .frame(width: ReviewBoardResizerLayout.dividerWidth)
+                    .allowsHitTesting(false)
             }
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                hovering ? Self.fixedSidebarResizeCursor.set() : NSCursor.arrow.set()
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { value in
+                        let previous = reviewBoardDragPreviousTranslation ?? 0
+                        reviewBoardDragPreviousTranslation = value.translation.width
+                        withTransaction(Transaction(animation: nil)) {
+                            reviewBoardWidth = ReviewBoardSettings.widthAfterDrag(
+                                current: reviewBoardWidth,
+                                previousTranslation: previous,
+                                translation: value.translation.width
+                            )
+                        }
+                        Self.fixedSidebarResizeCursor.set()
+                    }
+                    .onEnded { _ in
+                        reviewBoardDragPreviousTranslation = nil
+                        ReviewBoardSettings.saveWidth(reviewBoardWidth)
+                        NSCursor.arrow.set()
+                    }
+            )
+            .accessibilityLabel("Review Board resizer")
+            .accessibilityIdentifier("ReviewBoardResizer")
     }
 
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
@@ -1131,17 +1159,18 @@ struct ContentView: View {
             ReviewBoardTitlebarToggle(
                 isShowing: isReviewBoardShowing,
                 inactiveColor: titlebarColor(opacity: 0.5),
-                onToggle: {
-                    if isReviewBoardEnabled {
-                        isReviewBoardClosed.toggle()
-                    } else {
-                        isReviewBoardEnabled = true
-                        isReviewBoardClosed = false
-                    }
-                }
+                onToggle: toggleReviewBoard
             )
         }
         .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func toggleReviewBoard() {
+        let next = ReviewBoardWindowCommand.toggled(
+            .init(enabled: isReviewBoardEnabled, isClosed: isReviewBoardClosed)
+        )
+        isReviewBoardEnabled = next.enabled
+        isReviewBoardClosed = next.isClosed
     }
 
     /// Whether this window shows the board while the global feature is enabled.
@@ -2103,6 +2132,16 @@ struct ContentView: View {
             if isReviewBoardEnabled {
                 isReviewBoardClosed = false
             }
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardToggleRequested)) { notification in
+            guard Self.shouldHandleCommandPaletteRequest(
+                observedWindow: observedWindow,
+                requestedWindow: notification.object as? NSWindow,
+                keyWindow: NSApp.keyWindow,
+                mainWindow: NSApp.mainWindow
+            ) else { return }
+            toggleReviewBoard()
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardSnapshotDidChange)) { _ in

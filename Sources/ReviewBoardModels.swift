@@ -79,6 +79,10 @@ enum ReviewBoardSettings {
         min(max(width, minimumWidth), maximumWidth)
     }
 
+    static func widthAfterDrag(current: CGFloat, previousTranslation: CGFloat, translation: CGFloat) -> CGFloat {
+        clampedWidth(current - (translation - previousTranslation))
+    }
+
     static func loadWidth(defaults: UserDefaults = .standard) -> CGFloat {
         let stored = defaults.double(forKey: widthKey)
         guard stored > 0 else { return defaultWidth }

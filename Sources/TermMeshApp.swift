@@ -625,7 +625,7 @@ struct TermMeshApp: App {
 
             CommandMenu(LanguageSettings.localized("Remote Work")) {
                 Button {
-                    ReviewBoardSettings.toggleVisible()
+                    ReviewBoardWindowCommand.requestToggle()
                 } label: {
                     commandLabel("Toggle Review Board")
                 }
