@@ -4987,6 +4987,8 @@ class TerminalController {
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let context = params["context"] as? String
+        let details = params["description"] as? String
+        let acceptanceCriteria = params["acceptance_criteria"] as? [String] ?? []
         // Measurement only: recorded verbatim, never validated or acted on.
         let (route, waveId) = TerminalController.routingMeasurement(from: params)
         // The CLI has sent a stable id per delegate since d168ad61, and
@@ -5066,6 +5068,8 @@ class TerminalController {
                     taskTitle: taskTitle,
                     priority: priority,
                     context: context,
+                    details: details,
+                    acceptanceCriteria: acceptanceCriteria,
                     requestId: requestId,
                     tabManager: tabManager,
                     route: route,
