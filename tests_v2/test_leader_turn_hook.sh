@@ -1307,6 +1307,67 @@ if third.get("stop_blocked") is not True or third.get("delegation_floor") != "un
 BLOCKEDPY
 printf '%s\n' 'PASS: a blocked Stop keeps its turn open and the final Stop closes it once'
 
+# A blocked turn whose continuation never reaches Stop is abandoned. The next
+# turn's first Stop must close it as such rather than adopt it as the turn it
+# ends, or the new turn is misattributed and recorded as absorbed.
+for abandon_variant in idle dispatched; do
+    ABANDON_LOG_START=$(wc -l < "$BLOCK_LOG" | tr -d ' ')
+    block_hook --start '{"prompt":"abandoned turn","session_id":"ab-a"}' >/dev/null \
+        || fail "abandoned start returned nonzero"
+    abandoned_turn=$(head -n 1 "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE")
+    block_hook --end '{"session_id":"ab-a","stop_hook_active":false}' >/dev/null \
+        || fail "abandoned end returned nonzero"
+    [ -f "$BLOCK_LOGS/.turn-block-$abandoned_turn" ] || fail "abandoned turn was not blocked"
+
+    block_hook --start '{"prompt":"next turn","session_id":"ab-b"}' >/dev/null \
+        || fail "next start returned nonzero"
+    next_turn=$(tail -n 1 "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE")
+    [ "$next_turn" != "$abandoned_turn" ] || fail "next turn reused the abandoned id"
+    if [ "$abandon_variant" = dispatched ]; then
+        printf '%s\n' '{"event":"task_dispatch","turn_id":"req","ts":"2026-01-01T00:00:00Z","team":"mine","task_id":"ab1","worker":"a","delivery":"created"}' \
+            >> "$BLOCK_LOG" || exit 1
+        BLOCK_OUT=$(block_hook --end '{"session_id":"ab-b","stop_hook_active":false}') \
+            || fail "next end returned nonzero"
+        [ -z "$BLOCK_OUT" ] || fail "a dispatching next turn was blocked: $BLOCK_OUT"
+    else
+        BLOCK_OUT=$(block_hook --end '{"session_id":"ab-b","stop_hook_active":false}') \
+            || fail "next end returned nonzero"
+        case "$BLOCK_OUT" in
+            *'"decision":"block"'*) ;;
+            *) fail "an idle next turn was not blocked: $BLOCK_OUT" ;;
+        esac
+        block_hook --end '{"session_id":"ab-b","stop_hook_active":true}' >/dev/null \
+            || fail "next continuation end returned nonzero"
+    fi
+    [ ! -e "$BLOCK_LOGS/.turn-current-$BLOCK_SURFACE" ] || fail "$abandon_variant: stack not empty"
+    [ ! -e "$BLOCK_LOGS/.turn-block-$abandoned_turn" ] || fail "$abandon_variant: abandoned block marker left"
+    [ ! -e "$BLOCK_LOGS/.turn-block-$next_turn" ] || fail "$abandon_variant: next block marker left"
+
+    python3 - "$BLOCK_LOG" "$ABANDON_LOG_START" "$abandoned_turn" "$next_turn" "$abandon_variant" <<'ABANDONPY' || exit 1
+import json
+import pathlib
+import sys
+
+path, skip, abandoned, nxt, variant = sys.argv[1:6]
+lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()[int(skip):]
+ends = [json.loads(l) for l in lines if l.strip() and json.loads(l)["event"] == "turn_end"]
+if [r["turn_id"] for r in ends] != [abandoned, nxt]:
+    raise SystemExit("FAIL: %s: turn_end ids were %r" % (variant, [r["turn_id"] for r in ends]))
+first, second = ends
+if first.get("end_reason") != "abandoned" or first.get("stop_blocked") is not True \
+        or first.get("delegation_floor") != "unmet" or first.get("route_status") != "unstated":
+    raise SystemExit("FAIL: %s: abandoned turn_end was %r" % (variant, first))
+if second.get("route_status") == "absorbed" or "end_reason" in second:
+    raise SystemExit("FAIL: %s: next turn misattributed: %r" % (variant, second))
+if variant == "dispatched":
+    if second.get("delegation_floor") != "met" or "stop_blocked" in second:
+        raise SystemExit("FAIL: dispatched next turn_end was %r" % second)
+elif second.get("delegation_floor") != "unmet" or second.get("stop_blocked") is not True:
+    raise SystemExit("FAIL: idle next turn_end was %r" % second)
+ABANDONPY
+done
+printf '%s\n' 'PASS: an abandoned blocked turn is closed before the next turn is selected'
+
 printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
 printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
 printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tail'

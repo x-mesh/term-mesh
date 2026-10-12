@@ -287,6 +287,60 @@ sys.stdout.buffer.write(prompt.encode("utf-8"))
         release_state_lock
     fi
 else
+    # A continuation Stop always carries stop_hook_active=true. Any other Stop
+    # therefore proves that a blocked turn still on the stack was abandoned
+    # (interrupted or ended before its continuation), and it must not be
+    # selected as the turn this Stop closes.
+    STOP_HOOK_ACTIVE=false
+    if command -v python3 >/dev/null 2>&1; then
+        STOP_HOOK_ACTIVE="$(printf '%s' "$PAYLOAD" | python3 -c '
+import json
+import sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    value = {}
+print("true" if isinstance(value, dict) and value.get("stop_hook_active") is True else "false", end="")
+' 2>/dev/null || printf false)"
+    fi
+    _turn_abandoned=""
+    if [ "$STOP_HOOK_ACTIVE" != true ] && acquire_state_lock && [ -f "$STATE_FILE" ]; then
+        _turn_kept=""
+        while IFS= read -r _turn_line; do
+            [ -n "$_turn_line" ] || continue
+            case "$_turn_line" in
+                *[!A-Za-z0-9._-]*) _turn_kept="$_turn_kept$_turn_line
+"; continue ;;
+            esac
+            if [ -f "$LOG_DIR/.turn-block-$_turn_line" ]; then
+                _turn_ab_nodispatch=0
+                if grep -qx 'no_dispatch' "$LOG_DIR/.turn-route-$_turn_line" 2>/dev/null; then
+                    _turn_ab_nodispatch=1
+                fi
+                _turn_ab_route=unstated
+                [ ! -f "$LOG_DIR/.turn-route-$_turn_line" ] || _turn_ab_route=stated
+                _turn_abandoned="$_turn_abandoned$_turn_line $_turn_ab_route $_turn_ab_nodispatch
+"
+                rm -f "$LOG_DIR/.turn-block-$_turn_line" "$LOG_DIR/.turn-route-$_turn_line" 2>/dev/null || true
+            else
+                _turn_kept="$_turn_kept$_turn_line
+"
+            fi
+        done < "$STATE_FILE" 2>/dev/null
+        if [ -n "$_turn_abandoned" ]; then
+            if [ -n "$_turn_kept" ]; then
+                _turn_state_tmp="$STATE_FILE.tmp.$$"
+                if { printf '%s' "$_turn_kept" > "$_turn_state_tmp"; } 2>/dev/null; then
+                    mv -f "$_turn_state_tmp" "$STATE_FILE" 2>/dev/null || true
+                else
+                    rm -f "$_turn_state_tmp" 2>/dev/null || true
+                fi
+            else
+                rm -f "$STATE_FILE" 2>/dev/null || true
+            fi
+        fi
+    fi
+    release_state_lock
     if acquire_state_lock && [ -f "$STATE_FILE" ]; then
         # Which entry does this Stop close? LIFO alone is wrong whenever the
         # harness folds a mid-turn prompt into the turn already running: that
@@ -584,20 +638,23 @@ if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ]; then
     if [ "$ROUTE_NO_DISPATCH" = 1 ]; then
         DELEGATION_FLOOR=waived
     else
-        STOP_HOOK_ACTIVE=false
-        if command -v python3 >/dev/null 2>&1; then
-            STOP_HOOK_ACTIVE="$(printf '%s' "$PAYLOAD" | python3 -c '
-import json
-import sys
-try:
-    value = json.load(sys.stdin)
-except Exception:
-    value = {}
-print("true" if value.get("stop_hook_active") is True else "false", end="")
-' 2>/dev/null || printf false)"
-        fi
         [ "$STOP_HOOK_ACTIVE" = true ] || STOP_BLOCK=1
     fi
+fi
+
+# An abandoned turn_end keeps the facts the turn itself established; only the
+# end is synthesized, which end_reason says. Written before the block decision:
+# this Stop may itself block, and the abandoned turn's markers are already gone.
+if [ "$MODE" = --end ] && [ -n "${_turn_abandoned:-}" ]; then
+    while IFS=' ' read -r _turn_ab_id _turn_ab_route _turn_ab_nodispatch; do
+        [ -n "$_turn_ab_id" ] || continue
+        _turn_ab_floor=unmet
+        [ "$_turn_ab_nodispatch" != 1 ] || _turn_ab_floor=waived
+        _turn_ab_line="{\"event\":\"turn_end\",\"turn_id\":$(json_string "$_turn_ab_id"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$_turn_ab_route"),\"delegation_floor\":\"$_turn_ab_floor\",\"stop_blocked\":true,\"end_reason\":\"abandoned\"$IDENTITY_FIELDS}"
+        { printf '%s\n' "$_turn_ab_line" >> "$LOG_FILE"; } 2>/dev/null || true
+    done <<ABANDONED_EOF
+$_turn_abandoned
+ABANDONED_EOF
 fi
 
 BLOCK_MARKER=""
