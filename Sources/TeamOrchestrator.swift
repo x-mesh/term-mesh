@@ -1034,6 +1034,76 @@ final class TeamOrchestrator: ObservableObject {
         hasDeclaredProjectName || usesDedicatedRemoteWorkspaces || hasPeerLeader
     }
 
+    nonisolated static func shouldPreserveProjectPresentationOnWorkspaceClose(
+        isLastWorkspace: Bool,
+        hasProjectPresentation: Bool
+    ) -> Bool {
+        !isLastWorkspace && hasProjectPresentation
+    }
+
+    private func projectPresentationCandidate(
+        for workspaceID: UUID
+    ) -> (teamName: String, team: Team)? {
+        guard let candidate = teams.first(where: { $0.value.workspaceId == workspaceID })
+        else { return nil }
+        let hasPeerLeader: Bool
+        if case .peer = candidate.value.leaderEndpoint {
+            hasPeerLeader = true
+        } else {
+            hasPeerLeader = false
+        }
+        guard Self.shouldPreserveProjectPresentation(
+            hasDeclaredProjectName: WorkspaceProjectNames.shared
+                .projectName(for: workspaceID) != nil,
+            usesDedicatedRemoteWorkspaces: candidate.value.usesDedicatedRemoteWorkspaces,
+            hasPeerLeader: hasPeerLeader
+        ) else {
+            return nil
+        }
+        return (candidate.key, candidate.value)
+    }
+
+    @discardableResult
+    func preserveProjectPresentation(
+        for workspace: Workspace,
+        from tabManager: TabManager
+    ) -> Bool {
+        guard Self.shouldPreserveProjectPresentationOnWorkspaceClose(
+            isLastWorkspace: tabManager.tabs.count <= 1,
+            hasProjectPresentation: projectPresentationCandidate(for: workspace.id) != nil
+        ), let candidate = projectPresentationCandidate(for: workspace.id) else {
+            return false
+        }
+        return preserveProjectPresentation(
+            teamName: candidate.teamName,
+            workspace: workspace,
+            from: tabManager
+        )
+    }
+
+    @discardableResult
+    private func preserveProjectPresentation(
+        teamName: String,
+        workspace: Workspace,
+        from tabManager: TabManager
+    ) -> Bool {
+        guard let detachedWorkspace = tabManager.detachWorkspace(tabId: workspace.id) else {
+            return false
+        }
+        rememberPreservedProjectPresentation(
+            teamName: teamName,
+            workspace: detachedWorkspace
+        )
+#if DEBUG
+        dlog(
+            "project.presentation.preserved team=\(teamName) "
+                + "workspace=\(workspace.id.uuidString.prefix(8)) "
+                + "panels=\(detachedWorkspace.panels.count)"
+        )
+#endif
+        return true
+    }
+
     func preserveProjectPresentations(from tabManager: TabManager) -> [UUID] {
         // The filter used to be "this team's workspace is in the closing
         // window" with no project predicate at all, and
@@ -1045,42 +1115,25 @@ final class TeamOrchestrator: ObservableObject {
         // `closedWorkspaceIDs` the `.peerWorkspaceDidClose` signal that block
         // exists to post was skipped too, leaving attached peers holding it.
         // Only `destroyTeam` ever reclaimed such a workspace.
-        let candidates = teams.values
+        let candidates = teams
             .filter { team in
-                guard tabManager.tabs.contains(where: { $0.id == team.workspaceId })
+                guard tabManager.tabs.contains(where: { $0.id == team.value.workspaceId })
                 else { return false }
-                let hasPeerLeader: Bool
-                if case .peer = team.leaderEndpoint {
-                    hasPeerLeader = true
-                } else {
-                    hasPeerLeader = false
-                }
-                return Self.shouldPreserveProjectPresentation(
-                    hasDeclaredProjectName: WorkspaceProjectNames.shared
-                        .projectName(for: team.workspaceId) != nil,
-                    usesDedicatedRemoteWorkspaces: team.usesDedicatedRemoteWorkspaces,
-                    hasPeerLeader: hasPeerLeader
-                )
+                return projectPresentationCandidate(for: team.value.workspaceId)?.teamName == team.key
             }
-            .map { ($0.id, $0.workspaceId) }
+            .map { ($0.key, $0.value.workspaceId) }
 
         var preserved: [UUID] = []
         for (teamName, workspaceID) in candidates {
-            guard let workspace = tabManager.detachWorkspace(tabId: workspaceID) else {
+            guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceID }),
+                  preserveProjectPresentation(
+                      teamName: teamName,
+                      workspace: workspace,
+                      from: tabManager
+                  ) else {
                 continue
             }
-            rememberPreservedProjectPresentation(
-                teamName: teamName,
-                workspace: workspace
-            )
             preserved.append(workspaceID)
-#if DEBUG
-            dlog(
-                "project.presentation.preserved team=\(teamName) "
-                    + "workspace=\(workspaceID.uuidString.prefix(8)) "
-                    + "panels=\(workspace.panels.count)"
-            )
-#endif
         }
         return preserved
     }

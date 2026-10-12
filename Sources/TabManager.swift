@@ -1381,6 +1381,11 @@ class TabManager {
 
     private func closeWorkspaceIfRunningProcess(_ workspace: Workspace) async {
         let willCloseWindow = tabs.count <= 1
+        // A preserved Project workspace closes nothing, so the "close all panels" prompt would be false.
+        if TeamOrchestrator.shared.preserveProjectPresentation(for: workspace, from: self) {
+            scheduleSessionSave()
+            return
+        }
         if workspaceNeedsConfirmClose(workspace),
            !(await confirmClose(
                title: "Close workspace?",
