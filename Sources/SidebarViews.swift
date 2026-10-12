@@ -1358,6 +1358,17 @@ struct SidebarRemoteAgentTarget: Identifiable {
     var id: String { projectLabel }
 }
 
+enum SidebarDetachedProject {
+    /// Mirrors the gates in `restoreDetachedProjectPresentation`; keep in sync.
+    static func isRestorable(
+        hasPreservedPresentation: Bool,
+        agents: [TeamOrchestrator.AgentMember]
+    ) -> Bool {
+        hasPreservedPresentation
+            || agents.allSatisfy { $0.hostKey != nil && $0.remoteSurfaceID != nil }
+    }
+}
+
 private struct SidebarProjectDeletionTarget: Identifiable {
     let label: String
     let teamName: String
@@ -1979,7 +1990,11 @@ private struct SidebarPeerProjectsView: View {
         _ team: TeamOrchestrator.Team,
         showsHeader: Bool = true
     ) -> some View {
-        VStack(spacing: 4) {
+        let restorable = SidebarDetachedProject.isRestorable(
+            hasPreservedPresentation: orchestrator.hasPreservedProjectPresentation(teamName: team.id),
+            agents: team.agents
+        )
+        return VStack(spacing: 4) {
             if showsHeader {
                 HStack(spacing: 5) {
                     Text(team.id)
@@ -1999,6 +2014,15 @@ private struct SidebarPeerProjectsView: View {
             }
 
             Button {
+                guard restorable else {
+                    deletionTarget = SidebarProjectDeletionTarget(
+                        label: team.id,
+                        teamName: team.id,
+                        locations: team.remoteProjectLocations,
+                        removalScope: .stateOnly
+                    )
+                    return
+                }
                 guard !restoringTeamNames.contains(team.id) else { return }
                 restoringTeamNames.insert(team.id)
                 Task { @MainActor in
@@ -2022,9 +2046,11 @@ private struct SidebarPeerProjectsView: View {
                             .font(.system(size: 9))
                     }
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("Open live project")
+                        Text(restorable ? "Open live project" : "Project closed")
                             .font(.system(size: 11))
-                        Text("\(team.agents.count) agents · processes still running")
+                        Text(restorable
+                             ? "\(team.agents.count) agents · processes still running"
+                             : "Can't reopen · delete to clean up")
                             .font(.system(size: 9))
                     }
                     Spacer(minLength: 4)
@@ -2038,7 +2064,9 @@ private struct SidebarPeerProjectsView: View {
             .disabled(restoringTeamNames.contains(team.id))
             .padding(.horizontal, usesSeparatedPresentation ? 10 : 8)
             .accessibilityIdentifier("sidebar.projects.detached.\(team.id)")
-            .help("Attach this project's existing leader and agents to the current window")
+            .help(restorable
+                  ? "Attach this project's existing leader and agents to the current window"
+                  : "This project can't be reopened. Delete it to clean up.")
         }
         .contentShape(Rectangle())
         .contextMenu {
@@ -2174,7 +2202,8 @@ private struct SidebarPeerProjectsView: View {
         Divider()
         if let teamName = teamName(for: group),
            let team = TeamOrchestrator.shared.teams[teamName],
-           !team.ownsRemotePresentation {
+           !team.ownsRemotePresentation,
+           !isDetached(teamName) {
             Button("Detach Project") {
                 _ = TeamOrchestrator.shared.destroyTeam(
                     name: teamName,
@@ -2191,7 +2220,7 @@ private struct SidebarPeerProjectsView: View {
                     label: group.identity.label,
                     teamName: teamName,
                     locations: team.remoteProjectLocations,
-                    removalScope: .fullDelete
+                    removalScope: isDetached(teamName) ? .stateOnly : .fullDelete
                 )
             }
             .disabled(teamName(for: group) == nil)
@@ -2207,10 +2236,16 @@ private struct SidebarPeerProjectsView: View {
             guard case .local(let workspace) = item else { return nil }
             return workspace.id
         })
-        guard !workspaceIDs.isEmpty else { return nil }
-        return TeamOrchestrator.shared.teams.values
-            .first { workspaceIDs.contains($0.workspaceId) }?
-            .id
+        if let live = TeamOrchestrator.shared.teams.values
+            .first(where: { workspaceIDs.contains($0.workspaceId) }) {
+            return live.id
+        }
+        // A project closed with the sidebar "x" keeps its team but loses its workspace.
+        return detachedTeams.first { $0.id == group.identity.label }?.id
+    }
+
+    private func isDetached(_ teamName: String) -> Bool {
+        detachedTeams.contains { $0.id == teamName }
     }
 
     private func canResetLayout(for group: SidebarPeerProjectGroup) -> Bool {
