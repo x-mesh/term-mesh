@@ -4,6 +4,25 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.0] - 2026-10-12
+
+### Added
+
+- Review Board now shows project-aware dashboard summaries, attention groups, recent completion, and task details that include the request, context, acceptance criteria, dependencies, agent report, validation, changes, and risks.
+
+### Changed
+
+- Review Board windows now keep independent open and close state while the board retains Current Project and All Projects scopes.
+- Leader panes remain the primary workspace for approval, correction, and issue resolution.
+
+### Fixed
+
+- Asynchronous agent delegation now preserves task descriptions and acceptance criteria through waits and coordinator merges.
+- Task unblocking now stores a correction and delivers it once, while preserving prior correction text for blank input and rejecting invalid types.
+- Wait results now exclude unrelated historical task results, and agent status reports the actual wave identifier.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.269.0] - 2026-10-12
 
 ### Added
