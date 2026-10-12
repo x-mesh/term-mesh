@@ -210,6 +210,7 @@ struct ContentView: View {
     @State private var sidebarWidth: CGFloat = SidebarLayoutSettings.loadWidth() ?? 200
     @State private var reviewBoardWidth: CGFloat = ReviewBoardSettings.loadWidth()
     @State private var reviewBoardDragStartWidth: CGFloat?
+    @State private var isReviewBoardClosed = false
     @State private var lastClampedWidth: CGFloat = 0
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
@@ -677,17 +678,17 @@ struct ContentView: View {
         HStack(spacing: 0) {
             terminalContentWithSidebarDropOverlay
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if isReviewBoardEnabled && !isReviewBoardClosed {
+            if isReviewBoardShowing {
                 reviewBoardResizer
                 ReviewBoardPanelView(
                     viewModel: reviewBoardViewModel,
-                    onClose: { ReviewBoardSettings.setVisible(false) }
+                    onClose: { isReviewBoardClosed = true }
                 )
                 .frame(width: reviewBoardWidth)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .animation(.easeOut(duration: 0.16), value: isReviewBoardEnabled && !isReviewBoardClosed)
+        .animation(.easeOut(duration: 0.16), value: isReviewBoardShowing)
     }
 
     private var reviewBoardResizer: some View {
@@ -727,7 +728,6 @@ struct ContentView: View {
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
     @AppStorage(ReviewBoardSettings.enabledKey)
     private var isReviewBoardEnabled = ReviewBoardSettings.defaultEnabled
-    @AppStorage(ReviewBoardSettings.isClosedKey) private var isReviewBoardClosed = false
     @AppStorage("hideWelcomeScreen") private var hideWelcomeScreen: Bool = false
     @AppStorage("showStatusBar") private var showStatusBar: Bool = true
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
@@ -1130,15 +1130,21 @@ struct ContentView: View {
             titlebarInfoSeparator
             ReviewBoardTitlebarToggle(
                 isShowing: isReviewBoardShowing,
-                inactiveColor: titlebarColor(opacity: 0.5)
+                inactiveColor: titlebarColor(opacity: 0.5),
+                onToggle: {
+                    if isReviewBoardEnabled {
+                        isReviewBoardClosed.toggle()
+                    } else {
+                        isReviewBoardEnabled = true
+                        isReviewBoardClosed = false
+                    }
+                }
             )
         }
         .fixedSize(horizontal: true, vertical: false)
     }
 
-    /// Whether the board is on screen, read from the same two keys
-    /// `ReviewBoardSettings` writes, so the button's look never disagrees with
-    /// what is actually showing.
+    /// Whether this window shows the board while the global feature is enabled.
     private var isReviewBoardShowing: Bool {
         isReviewBoardEnabled && !isReviewBoardClosed
     }
@@ -1837,6 +1843,7 @@ struct ContentView: View {
                 guard let manager else { return nil }
                 return Self.reviewBoardTeamName(forWorkspace: manager.selectedTabId)
             }
+            reviewBoardViewModel.setActiveTeam(Self.reviewBoardTeamName(forWorkspace: manager.selectedTabId))
             reviewBoardViewModel.setRemoteContextProvider { [weak manager] in
                 guard let manager else { return nil }
                 return Self.reviewBoardRemoteContext(forWorkspace: manager.selectedTabId)
@@ -5235,6 +5242,7 @@ private struct SidebarOverlayWidthPreferenceKey: PreferenceKey {
 private struct ReviewBoardTitlebarToggle: View {
     let isShowing: Bool
     let inactiveColor: Color
+    let onToggle: () -> Void
 
     @StateObject private var commandKeyMonitor = SidebarCommandKeyMonitor()
     @AppStorage(ShortcutHintDebugSettings.alwaysShowHintsKey)
@@ -5250,7 +5258,7 @@ private struct ReviewBoardTitlebarToggle: View {
     }
 
     var body: some View {
-        Button(action: { ReviewBoardSettings.toggleVisible() }) {
+        Button(action: onToggle) {
             Image(systemName: isShowing ? "sidebar.right" : "sidebar.squares.right")
                 .font(.system(size: 11))
                 .foregroundColor(isShowing ? .accentColor.opacity(0.9) : inactiveColor)
