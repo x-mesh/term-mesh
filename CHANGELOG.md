@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.1] - 2026-10-12
+
+### Changed
+
+- The Toggle Review Board menu command (⌃⌘B) now opens and closes the board in the active window only. It reopens a board that was closed in that window and turns the feature back on when it is disabled.
+
+### Fixed
+
+- Review Board now switches to a compact layout at narrow widths, so the status summary, scope picker, grouped tasks, and folded sections no longer break.
+- Dragging the Review Board resizer back after passing the minimum width now widens the board immediately.
+- Review Board now groups dispatched tasks and refreshes its derived state when the active team changes without a new snapshot.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.0] - 2026-10-12
 
 ### Added
