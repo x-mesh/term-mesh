@@ -1324,9 +1324,17 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             return
         }
 
+        let conn: PeerRelayConnection
+        do {
+            conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        } catch {
+            registry.release(lease)
+            reportFailure("Peer Connection Failed", String(describing: error))
+            return
+        }
+
         let workspaces: [Termmesh_Peer_V1_Workspace]
         do {
-            let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
             // Live mirror needs the host to support workspace-lifecycle RPCs
             // and the layout-changed / WorkspaceRemoved push it subscribes to
             // (`workspace.lifecycle.v1`). An older host (e.g. a term-meshd that
