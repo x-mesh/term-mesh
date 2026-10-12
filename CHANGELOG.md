@@ -4,6 +4,24 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.269.0] - 2026-10-12
+
+### Added
+
+- Leader turn records in `~/.term-mesh/logs/turns.log` now name the leader policy in force. Each `turn_route` record carries `leader_policy_version` and `leader_policy_digest`, the same values the leader prompt received. The existing `policy_version` field is unchanged.
+
+### Changed
+
+- A leader turn that states `--route direct --no-dispatch-reason` is now recorded with `delegation_floor: "waived"` instead of `"unmet"`, so a justified exemption no longer reads as a missed delegation floor.
+- When the delegation floor stops a leader turn, the turn stays open. A reason the leader records after the stop is now joined to the same `turn_id`, and the final `turn_end` carries `"stop_blocked": true`. Before, the reason was recorded under `unstated` and the turn ended as `unknown`.
+- A stopped turn that never finishes, for example because the leader was interrupted, now ends with `"end_reason": "abandoned"` at the next turn. The next turn keeps its own `turn_id`.
+
+### Fixed
+
+- Double-clicking the title bar now zooms the window and keeps it zoomed, also when the window fills the left or right half of the screen. 0.268.4 did not fix this: macOS zooms the window on a title-bar double-click by itself, and term-mesh zoomed it a second time, which undid the first zoom. term-mesh now leaves the double-click to macOS, in the title bar and at the top of the sidebar.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.268.4] - 2026-10-11
 
 ### Fixed
