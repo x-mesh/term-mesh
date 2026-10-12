@@ -1,5 +1,13 @@
 import SwiftUI
 
+enum ReviewBoardPanelLayout {
+    static let compactWidth: CGFloat = 260
+
+    static func isCompact(width: CGFloat) -> Bool {
+        width < compactWidth
+    }
+}
+
 @MainActor
 struct ReviewBoardPanelView: View {
     @ObservedObject var viewModel: ReviewBoardViewModel
@@ -26,13 +34,26 @@ struct ReviewBoardPanelView: View {
     private var autoPilotExpanded = false
 
     var body: some View {
+        GeometryReader { proxy in
+            panel(compact: ReviewBoardPanelLayout.isCompact(width: proxy.size.width))
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .accessibilityIdentifier("reviewBoard.panel")
+        .accessibilityElement(children: .contain)
+        .onAppear {
+            viewModel.refresh()
+            viewModel.reloadAutoPilotJournals()
+        }
+    }
+
+    private func panel(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    scopeControl
-                    statusSummary
+                    scopeControl(compact: compact)
+                    statusSummary(compact: compact)
                     if scopedTasks.isEmpty && scopedMergeQueue.isEmpty {
                         emptyState
                     } else {
@@ -43,7 +64,7 @@ struct ReviewBoardPanelView: View {
                             mergeQueueList
                         }
                         if !scopedTasks.isEmpty {
-                            taskList
+                            taskList(compact: compact)
                         }
                         if let task = selectedScopedTask {
                             taskDetails(task)
@@ -59,21 +80,14 @@ struct ReviewBoardPanelView: View {
                     // whether it is happening, and separating them put the
                     // reason to change a setting on a different card from the
                     // setting.
-                    delegationSection
+                    delegationSection(compact: compact)
                     // Last: it is a setting and a log, not the work. It should
                     // be findable, not in the way of the row someone opened the
                     // board to read.
-                    autoPilotSection
+                    autoPilotSection(compact: compact)
                 }
                 .padding(12)
             }
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .accessibilityIdentifier("reviewBoard.panel")
-        .accessibilityElement(children: .contain)
-        .onAppear {
-            viewModel.refresh()
-            viewModel.reloadAutoPilotJournals()
         }
     }
 
@@ -136,35 +150,56 @@ struct ReviewBoardPanelView: View {
         return scopedTasks.first
     }
 
-    private var scopeControl: some View {
-        HStack(spacing: 8) {
-            Picker("Task scope", selection: Binding(
-                get: { viewModel.projectScope },
-                set: { viewModel.setProjectScope($0) }
-            )) {
-                ForEach(ReviewBoardProjectScope.allCases, id: \.self) { scope in
-                    Text(scope.title).tag(scope)
+    private func scopeControl(compact: Bool) -> some View {
+        let selection = Binding(
+            get: { viewModel.projectScope },
+            set: { viewModel.setProjectScope($0) }
+        )
+        return Group {
+            if compact {
+                Picker("Project", selection: selection) {
+                    ForEach(ReviewBoardProjectScope.allCases, id: \.self) { scope in
+                        Text(scope.title).tag(scope)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                HStack(spacing: 8) {
+                    Picker("Task scope", selection: selection) {
+                        ForEach(ReviewBoardProjectScope.allCases, id: \.self) { scope in
+                            Text(scope.title).tag(scope)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    Spacer(minLength: 0)
                 }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .accessibilityLabel("Review Board task scope")
-            Spacer(minLength: 0)
         }
+        .accessibilityLabel("Review Board task scope")
         .accessibilityIdentifier("reviewBoard.scope")
     }
 
-    private var statusSummary: some View {
-        let tasks = scopedTasks
-        let working = tasks.filter { viewModel.isWorking($0) }.count
-        let blocked = tasks.filter { $0.status == "blocked" }.count
-        let reviewReady = tasks.filter { $0.status == "review_ready" }.count
-        let completed = tasks.filter { $0.finishedAt != nil }.count
-        return HStack(spacing: 10) {
-            summaryValue("Working", count: working, color: .green)
-            summaryValue("Blocked", count: blocked, color: .orange)
-            summaryValue("Review", count: reviewReady, color: .accentColor)
-            summaryValue("Completed", count: completed, color: .secondary)
+    private func statusSummary(compact: Bool) -> some View {
+        let working = viewModel.workingCount
+        let blocked = viewModel.blockedCount
+        let reviewReady = viewModel.reviewReadyCount
+        let completed = viewModel.completedCount
+        return Group {
+            if compact {
+                LazyVGrid(
+                    columns: [GridItem(.flexible()), GridItem(.flexible())],
+                    alignment: .leading,
+                    spacing: 7
+                ) {
+                    summaryValues(working, blocked, reviewReady, completed)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    summaryValues(working, blocked, reviewReady, completed)
+                }
+            }
         }
         .padding(8)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -172,6 +207,14 @@ struct ReviewBoardPanelView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Working \(working), blocked \(blocked), review ready \(reviewReady), completed \(completed)")
         .accessibilityIdentifier("reviewBoard.summary")
+    }
+
+    @ViewBuilder
+    private func summaryValues(_ working: Int, _ blocked: Int, _ reviewReady: Int, _ completed: Int) -> some View {
+        summaryValue("Working", count: working, color: .green)
+        summaryValue("Blocked", count: blocked, color: .orange)
+        summaryValue("Review", count: reviewReady, color: .accentColor)
+        summaryValue("Completed", count: completed, color: .secondary)
     }
 
     private func summaryValue(_ label: String, count: Int, color: Color) -> some View {
@@ -252,43 +295,183 @@ struct ReviewBoardPanelView: View {
         .accessibilityIdentifier("reviewBoard.mergeQueue.\(item.id)")
     }
 
-    private var taskList: some View {
+    private func taskList(compact: Bool) -> some View {
         // Read once, not once per row. `selectedTask` searches the task list,
         // so asking each row whether it is the selected one made drawing the
         // list O(N²) — and every row also asked `isWorking`, which walked every
         // team's agents. Both are settled here and handed down as values.
         let selectedID = viewModel.selectedTask?.id
         let working = viewModel.workingAssignees
-        let attention = scopedTasks.filter(\.requiresAttention)
-        let active = scopedTasks.filter { task in
-            !attention.contains(task) && task.finishedAt == nil
+        let groups = ReviewBoardTask.grouped(scopedTasks)
+        let attention = groups.filter { group in
+            group.members.contains(where: \.requiresAttention)
         }
-        let completed = scopedTasks.filter { $0.finishedAt != nil }
+        let active = groups.filter { group in
+            !attention.contains(group) && group.members.contains { $0.finishedAt == nil }
+        }
+        let completed = groups.filter { group in
+            !attention.contains(group) && !active.contains(group)
+        }
         return VStack(alignment: .leading, spacing: 10) {
-            taskGroup("Attention", tasks: attention, selectedID: selectedID, working: working)
-            taskGroup("Active", tasks: active, selectedID: selectedID, working: working)
-            taskGroup("Recent Completion", tasks: Array(completed.prefix(6)), selectedID: selectedID, working: working)
+            taskGroup("Attention", groups: attention, selectedID: selectedID, working: working, compact: compact)
+            taskGroup("Active", groups: active, selectedID: selectedID, working: working, compact: compact)
+            taskGroup("Recent Completion", groups: Array(completed.prefix(6)), selectedID: selectedID, working: working, compact: compact)
         }
     }
 
     @ViewBuilder
-    private func taskGroup(_ title: String, tasks: [ReviewBoardTask], selectedID: String?, working: Set<String>) -> some View {
-        if !tasks.isEmpty {
+    private func taskGroup(_ title: String, groups: [ReviewBoardTaskGroup], selectedID: String?, working: Set<String>, compact: Bool) -> some View {
+        if !groups.isEmpty {
             VStack(alignment: .leading, spacing: 7) {
-                sectionTitle("\(title) (\(tasks.count))")
-                ForEach(tasks) { task in
-                    ReviewBoardTaskRow(
-                        task: task,
-                        isSelected: selectedID == task.id,
-                        isWorking: task.assignee.map(working.contains) ?? false,
-                        onSelect: { viewModel.selectTask(id: task.id) },
-                        onReveal: { viewModel.revealPane(for: task) }
-                    )
-                    .equatable()
+                sectionTitle("\(title) (\(groups.count))")
+                ForEach(groups) { group in
+                    if let task = group.members.first, group.isSingle {
+                        ReviewBoardTaskRow(
+                            task: task,
+                            isSelected: selectedID == task.id,
+                            isWorking: task.assignee.map(working.contains) ?? false,
+                            onSelect: { viewModel.selectTask(id: task.id) },
+                            onReveal: { viewModel.revealPane(for: task) }
+                        )
+                        .equatable()
+                    } else {
+                        ReviewBoardTaskGroupRow(
+                            group: group,
+                            selectedID: selectedID,
+                            working: working,
+                            compact: compact,
+                            onSelect: { viewModel.selectTask(id: $0.id) },
+                            onReveal: { viewModel.revealPane(for: $0) }
+                        )
+                    }
                 }
             }
         }
     }
+
+private struct ReviewBoardTaskGroupRow: View {
+    let group: ReviewBoardTaskGroup
+    let selectedID: String?
+    let working: Set<String>
+    let compact: Bool
+    let onSelect: (ReviewBoardTask) -> Void
+    let onReveal: (ReviewBoardTask) -> Void
+
+    private var statusSummary: String {
+        group.statusCounts
+            .map { "\($0.count) \($0.status.replacingOccurrences(of: "_", with: " "))" }
+            .joined(separator: " · ")
+    }
+
+    var body: some View {
+        let parts = ReviewBoardText.splitDirective(group.title)
+        VStack(alignment: .leading, spacing: 7) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    groupTitle(parts)
+                    Spacer(minLength: 4)
+                    Text("\(group.members.count) agents")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    groupTitle(parts)
+                    Text("\(group.members.count) agents")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+            }
+            if compact {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(group.isDerived ? "Derived group" : "Dispatch")
+                    Text(statusSummary).fixedSize(horizontal: false, vertical: true)
+                    Text("P\(group.priority)").monospacedDigit()
+                }
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+            } else {
+                HStack(spacing: 6) {
+                    Text(group.isDerived ? "Derived group" : "Dispatch")
+                    Text("·")
+                    Text(statusSummary).lineLimit(1)
+                    Spacer(minLength: 0)
+                    Text("P\(group.priority)").monospacedDigit()
+                }
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+            }
+
+            ForEach(group.members) { task in
+                Button {
+                    onSelect(task)
+                } label: {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 6) {
+                            memberName(task)
+                            if task.assignee != nil { Text("·") }
+                            memberStatus(task)
+                            Spacer(minLength: 0)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            memberName(task)
+                            memberStatus(task)
+                        }
+                    }
+                    .font(.system(size: 10))
+                    .foregroundColor(selectedID == task.id ? .accentColor : .secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 5)
+                    .background(selectedID == task.id ? Color.accentColor.opacity(0.12) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .simultaneousGesture(TapGesture(count: 2).onEnded { onReveal(task) })
+                .accessibilityLabel("\(task.assignee ?? task.teamName), \(task.status)")
+                .accessibilityIdentifier("reviewBoard.task.\(task.id)")
+            }
+        }
+        .padding(8)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(group.title), \(group.members.count) agents, \(statusSummary)")
+    }
+
+    @ViewBuilder
+    private func groupTitle(_ parts: (directive: String?, rest: String)) -> some View {
+        if let directive = parts.directive {
+            Text(directive)
+                .font(.system(size: 9, weight: .bold))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.16))
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .foregroundColor(.secondary)
+        }
+        Text(parts.rest)
+            .font(.system(size: 12, weight: .medium))
+            .lineLimit(compact ? 3 : 2)
+    }
+
+    private func memberName(_ task: ReviewBoardTask) -> some View {
+        Text(task.assignee ?? task.teamName)
+            .font(.system(size: 11, weight: .medium))
+            .lineLimit(1)
+    }
+
+    @ViewBuilder
+    private func memberStatus(_ task: ReviewBoardTask) -> some View {
+        Text(task.status.replacingOccurrences(of: "_", with: " "))
+        if task.assignee.map(working.contains) == true {
+            Text("working").foregroundColor(.green)
+        }
+    }
+}
 
 /// One task card, isolated behind `Equatable`.
 ///
@@ -601,11 +784,12 @@ extension ReviewBoardPanelView {
     private func foldHeader<Trailing: View>(
         _ title: String,
         isExpanded: Bool,
+        compact: Bool,
         summary: Text?,
         toggle: @escaping () -> Void,
         @ViewBuilder trailing: () -> Trailing
     ) -> some View {
-        HStack(spacing: 6) {
+        let header = HStack(spacing: 6) {
             Button(action: toggle) {
                 HStack(spacing: 6) {
                     Image(systemName: "chevron.right")
@@ -614,7 +798,7 @@ extension ReviewBoardPanelView {
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .accessibilityHidden(true)
                     sectionTitle(title)
-                    if !isExpanded, let summary {
+                    if !compact, !isExpanded, let summary {
                         summary
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
@@ -629,17 +813,28 @@ extension ReviewBoardPanelView {
             .accessibilityLabel(isExpanded ? "Collapse \(title)" : "Expand \(title)")
             trailing()
         }
+        return VStack(alignment: .leading, spacing: 4) {
+            header
+            if compact, !isExpanded, let summary {
+                summary
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     /// The switch, the boundary it works inside, and what it has done —
     /// one section, because none of the three answers anything alone.
     @ViewBuilder
-    private var delegationSection: some View {
+    private func delegationSection(compact: Bool) -> some View {
         if viewModel.delegation != nil || viewModel.collaboration != nil {
             VStack(alignment: .leading, spacing: 8) {
                 foldHeader(
                     "Delegation",
                     isExpanded: delegationExpanded,
+                    compact: compact,
                     summary: delegationSummary,
                     toggle: { delegationExpanded.toggle() }
                 ) {
@@ -909,11 +1104,12 @@ extension ReviewBoardPanelView {
     /// All three together on purpose. A toggle on its own asks someone to arm
     /// unattended merging without telling them how far it can go, and a log on
     /// its own leaves "why is this still sitting here" unanswered.
-    private var autoPilotSection: some View {
+    private func autoPilotSection(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             foldHeader(
                 "Auto Pilot",
                 isExpanded: autoPilotExpanded,
+                compact: compact,
                 // The boundary, not just the state. This section folds by
                 // default and its switch stays on the header, so wording the
                 // summary "off" would have put arming unattended merging one

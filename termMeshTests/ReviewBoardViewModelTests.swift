@@ -22,6 +22,48 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(ReviewBoardViewModel.compactDuration(0), "0s")
     }
 
+    @MainActor
+    func testProviderTeamChangeRefreshesAllScopedStateWithoutSnapshotChange() {
+        let firstTask = ReviewBoardTask(
+            id: "task-a", teamName: "team-a", title: "First task", status: "blocked",
+            assignee: "alex", updatedAt: "2026-10-12T01:00:00Z"
+        )
+        let secondTask = ReviewBoardTask(
+            id: "task-b", teamName: "team-b", title: "Second task", status: "completed",
+            assignee: "blair", updatedAt: "2026-10-12T02:00:00Z"
+        )
+        let firstQueueItem = ReviewBoardMergeQueueItem(dictionary: [
+            "queue_id": "queue-a", "task_id": firstTask.rawID,
+            "status": "queued", "approved_by": "alex"
+        ])!
+        let secondQueueItem = ReviewBoardMergeQueueItem(dictionary: [
+            "queue_id": "queue-b", "task_id": secondTask.rawID,
+            "status": "failed", "approved_by": "blair"
+        ])!
+        let snapshot = ReviewBoardSnapshot(
+            tasks: [firstTask, secondTask], panelRuns: [],
+            mergeQueue: [firstQueueItem, secondQueueItem],
+            coordinatorOnline: false, memMeshAvailable: false,
+            suspectHost: false, fencedZombie: false
+        )
+        var activeTeam = "team-a"
+        let viewModel = ReviewBoardViewModel(
+            initialSnapshot: snapshot,
+            selectedTaskID: firstTask.id,
+            snapshotProvider: { snapshot }
+        )
+        viewModel.setActiveTeamProvider { activeTeam }
+
+        activeTeam = "team-b"
+        viewModel.refresh()
+
+        XCTAssertEqual(viewModel.snapshot, snapshot)
+        XCTAssertEqual(viewModel.tasks.map { $0.rawID }, [secondTask.rawID])
+        XCTAssertEqual(viewModel.pendingMergeQueue.map { $0.taskRawID }, [secondTask.rawID])
+        XCTAssertEqual(viewModel.statusCounts, [secondTask.status: 1])
+        XCTAssertEqual(viewModel.selectedTaskID, secondTask.id)
+    }
+
     /// x-kit panel runs are part of what the board's snapshot reads, so a run
     /// arriving has to publish like every other change. Without this the board
     /// saw new runs only because its timer rebuilt the whole snapshot.

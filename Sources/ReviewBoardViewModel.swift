@@ -258,10 +258,12 @@ final class ReviewBoardViewModel: ObservableObject {
         // still revalidated — it can go stale for reasons other than a new
         // snapshot, such as the selected task leaving the list.
         let next = snapshotProvider()
-        if snapshot != next {
+        let snapshotChanged = snapshot != next
+        if snapshotChanged {
             snapshot = next
-            rebuildDerivedSnapshotState()
         }
+        let activeTeamChanged = syncActiveTeamFromProvider()
+        if snapshotChanged || activeTeamChanged { rebuildDerivedSnapshotState() }
         // The roster moves on its own beat — an agent starts printing without
         // the board changing — so this is refreshed every tick regardless, and
         // gated on inequality so an unchanged roster publishes nothing.
@@ -270,7 +272,7 @@ final class ReviewBoardViewModel: ObservableObject {
         // Same beat as the roster: the level can change from the sidebar sheet
         // or a socket call, and whether a worker is idle changes with nothing
         // published at all.
-        refreshDelegationPanel()
+        refreshDelegationPanel(rebuildDerivedState: false)
         keepSelectionValid()
     }
 
@@ -1048,12 +1050,22 @@ final class ReviewBoardViewModel: ObservableObject {
         refreshDelegationPanel()
     }
 
-    private func refreshDelegationPanel() {
+    @discardableResult
+    private func syncActiveTeamFromProvider() -> Bool {
         let resolved = activeTeamProvider() ?? activeTeamName
-        if activeTeamName != resolved {
-            activeTeamName = resolved
-            if !collaborationRepairInFlight { collaborationRepairOutcome = .idle }
+        guard activeTeamName != resolved else { return false }
+        activeTeamName = resolved
+        if !collaborationRepairInFlight { collaborationRepairOutcome = .idle }
+        return true
+    }
+
+    private func refreshDelegationPanel(rebuildDerivedState: Bool = true) {
+        let activeTeamChanged = syncActiveTeamFromProvider()
+        if activeTeamChanged && rebuildDerivedState {
+            rebuildDerivedSnapshotState()
+            keepSelectionValid()
         }
+        let resolved = activeTeamName
         let next = Self.delegationPanel(for: resolved)
             ?? remoteContextProvider().map { context in
                 DelegationPanel(
