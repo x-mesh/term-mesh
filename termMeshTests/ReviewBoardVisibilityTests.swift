@@ -59,6 +59,51 @@ final class ReviewBoardVisibilityTests: XCTestCase {
         XCTAssertLessThanOrEqual(ReviewBoardSettings.defaultWidth, 320)
     }
 
+    func testReversingAfterOvershootingMinimumExpandsImmediately() {
+        var width = ReviewBoardSettings.defaultWidth
+        var previous: CGFloat = 0
+
+        for translation: CGFloat in [100, 400, 600, 580] {
+            width = ReviewBoardSettings.widthAfterDrag(
+                current: width, previousTranslation: previous, translation: translation
+            )
+            previous = translation
+        }
+
+        XCTAssertEqual(width, ReviewBoardSettings.minimumWidth + 20)
+    }
+
+    func testDragStaysWithinBounds() {
+        var width = ReviewBoardSettings.defaultWidth
+        var previous: CGFloat = 0
+        for translation: CGFloat in [-900, -1200] {
+            width = ReviewBoardSettings.widthAfterDrag(
+                current: width, previousTranslation: previous, translation: translation
+            )
+            previous = translation
+        }
+        XCTAssertEqual(width, ReviewBoardSettings.maximumWidth)
+    }
+
+    func testResizerKeepsAThinDividerInsideAGrabbableTarget() {
+        XCTAssertEqual(ReviewBoardResizerLayout.dividerWidth, 1)
+        XCTAssertGreaterThanOrEqual(ReviewBoardResizerLayout.hitTargetWidth, 9)
+        XCTAssertGreaterThan(
+            ReviewBoardResizerLayout.hitTargetWidth,
+            ReviewBoardResizerLayout.dividerWidth
+        )
+    }
+
+    func testMinimumWidthUsesCompactPanelLayout() {
+        XCTAssertTrue(ReviewBoardPanelLayout.isCompact(width: ReviewBoardSettings.minimumWidth))
+        XCTAssertFalse(ReviewBoardPanelLayout.isCompact(width: ReviewBoardSettings.defaultWidth))
+    }
+
+    func testCompactBoundaryKeepsTheWideLayoutAtTheThreshold() {
+        XCTAssertTrue(ReviewBoardPanelLayout.isCompact(width: ReviewBoardPanelLayout.compactWidth - 1))
+        XCTAssertFalse(ReviewBoardPanelLayout.isCompact(width: ReviewBoardPanelLayout.compactWidth))
+    }
+
     /// A width saved under the old, wider floor is not forced back up.
     func testAStoredNarrowWidthSurvivesAReload() {
         let defaults = UserDefaults.standard
@@ -97,18 +142,43 @@ final class ReviewBoardVisibilityTests: XCTestCase {
         XCTAssertFalse(ReviewBoardSettings.isVisible(enabled: false, isClosed: true))
     }
 
-    func testTitlebarShowCanRestoreTheGlobalFeatureAndWindow() {
-        var enabled = false
-        var closed = true
+    func testWindowCommandReopensLocallyClosedBoardWithoutChangingGlobalEnablement() {
+        let closed = ReviewBoardWindowCommand.State(enabled: true, isClosed: true)
 
-        if enabled {
-            closed.toggle()
-        } else {
-            enabled = true
-            closed = false
+        let reopened = ReviewBoardWindowCommand.toggled(closed)
+
+        XCTAssertEqual(reopened, .init(enabled: true, isClosed: false))
+        XCTAssertEqual(ReviewBoardWindowCommand.toggled(reopened), closed)
+    }
+
+    func testWindowCommandRestoresDisabledFeatureAndWindow() {
+        let next = ReviewBoardWindowCommand.toggled(.init(enabled: false, isClosed: true))
+
+        XCTAssertTrue(ReviewBoardSettings.isVisible(enabled: next.enabled, isClosed: next.isClosed))
+    }
+
+    func testToggleRequestIsRoutedToTheActiveWindowOnly() {
+        let active = NSWindow()
+        let other = NSWindow()
+        var received: [NSWindow] = []
+        let token = NotificationCenter.default.addObserver(
+            forName: .reviewBoardToggleRequested, object: nil, queue: nil
+        ) { note in
+            for window in [active, other] where ContentView.shouldHandleCommandPaletteRequest(
+                observedWindow: window,
+                requestedWindow: note.object as? NSWindow,
+                keyWindow: nil,
+                mainWindow: nil
+            ) {
+                received.append(window)
+            }
         }
+        defer { NotificationCenter.default.removeObserver(token) }
 
-        XCTAssertTrue(ReviewBoardSettings.isVisible(enabled: enabled, isClosed: closed))
+        ReviewBoardWindowCommand.requestToggle(in: active)
+
+        XCTAssertEqual(received.count, 1)
+        XCTAssertTrue(received.first === active)
     }
 }
 
