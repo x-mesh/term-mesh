@@ -414,19 +414,21 @@ final class LeaderTurnLogTests: XCTestCase {
             supportedTurns: 4, linkedTurns: 3, statedTurns: 2, unstatedTurns: 1,
             unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 2
         )
-        LeaderTurnLog.configureHealthRefreshForTesting { _ in
+        LeaderTurnLog.configureHealthRefreshForTesting(reader: { _ in
             lock.lock()
             readCount += 1
             readOnMain = readOnMain || Thread.isMainThread
             lock.unlock()
             return measured
-        }
+        }, clock: { Date(timeIntervalSince1970: 1_800_000_000) })
         defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
 
         let start = Date(timeIntervalSince1970: 1_800_000_000)
         let first = LeaderTurnLog.cachedHealth(from: log, now: start)
-        XCTAssertEqual(first.supportedTurns, 0)
-        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(first, measured)
+        lock.lock()
+        readOnMain = false
+        lock.unlock()
         let warm = LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(1))
         lock.lock()
         let reads = readCount
@@ -450,18 +452,25 @@ final class LeaderTurnLogTests: XCTestCase {
             supportedTurns: 2, linkedTurns: 2, statedTurns: 2, unstatedTurns: 0,
             unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 1
         )
-        LeaderTurnLog.configureHealthRefreshForTesting { _ in
+        let start = Date(timeIntervalSince1970: 1_800_000_100)
+        var completionTimes = [start, start.addingTimeInterval(10)]
+        LeaderTurnLog.configureHealthRefreshForTesting(
+            reader: { _ in
             lock.lock()
             readCount += 1
             let result = readCount == 1 ? first : second
             lock.unlock()
             return result
-        }
+            },
+            clock: {
+                lock.lock()
+                defer { lock.unlock() }
+                return completionTimes.removeFirst()
+            }
+        )
         defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
 
-        let start = Date(timeIntervalSince1970: 1_800_000_100)
-        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start).supportedTurns, 0)
-        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start).supportedTurns, 1)
         XCTAssertEqual(
             LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(9)).supportedTurns,
             1
@@ -488,12 +497,20 @@ final class LeaderTurnLogTests: XCTestCase {
             team: "alpha", surfaceID: "surface-1", prompt: "one"
         )
         try LeaderTurnLog.append(startRecord, to: log)
-        LeaderTurnLog.configureHealthRefreshForTesting(reader: nil)
+        let lock = NSLock()
+        let start = Date(timeIntervalSince1970: 1_800_000_200)
+        var completionTimes = [start, start.addingTimeInterval(10)]
+        LeaderTurnLog.configureHealthRefreshForTesting(
+            reader: nil,
+            clock: {
+                lock.lock()
+                defer { lock.unlock() }
+                return completionTimes.removeFirst()
+            }
+        )
         defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
 
-        let start = Date(timeIntervalSince1970: 1_800_000_200)
-        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start).supportedTurns, 0)
-        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start).supportedTurns, 1)
         XCTAssertEqual(
             LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(1)).supportedTurns,
             1
@@ -513,6 +530,110 @@ final class LeaderTurnLogTests: XCTestCase {
             LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(10.1)).supportedTurns,
             2
         )
+    }
+
+    @MainActor
+    func testCachedHealthRecomputesSynchronouslyAfterMaximumAge() throws {
+        let log = try temporaryLog()
+        let lock = NSLock()
+        var readCount = 0
+        let first = LeaderTurnLog.Health(
+            supportedTurns: 1, linkedTurns: 1, statedTurns: 1, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 1
+        )
+        let second = LeaderTurnLog.Health(
+            supportedTurns: 2, linkedTurns: 2, statedTurns: 2, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 2
+        )
+        let start = Date(timeIntervalSince1970: 1_800_000_300)
+        var completionTimes = [start, start.addingTimeInterval(61)]
+        LeaderTurnLog.configureHealthRefreshForTesting(
+            reader: { _ in
+            lock.lock()
+            readCount += 1
+            let result = readCount == 1 ? first : second
+            lock.unlock()
+            return result
+            },
+            clock: {
+                lock.lock()
+                defer { lock.unlock() }
+                return completionTimes.removeFirst()
+            }
+        )
+        defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
+
+        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start), first)
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(61)),
+            second
+        )
+        lock.lock()
+        XCTAssertEqual(readCount, 2)
+        lock.unlock()
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(62)),
+            second
+        )
+        lock.lock()
+        XCTAssertEqual(readCount, 2)
+        lock.unlock()
+    }
+
+    @MainActor
+    func testCachedHealthUsesRefreshCompletionTime() throws {
+        let log = try temporaryLog()
+        let lock = NSLock()
+        let refreshStarted = DispatchSemaphore(value: 0)
+        let releaseRefresh = DispatchSemaphore(value: 0)
+        var readCount = 0
+        let first = LeaderTurnLog.Health(
+            supportedTurns: 1, linkedTurns: 1, statedTurns: 1, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 1
+        )
+        let second = LeaderTurnLog.Health(
+            supportedTurns: 2, linkedTurns: 2, statedTurns: 2, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 2
+        )
+        let start = Date(timeIntervalSince1970: 1_800_000_400)
+        var clockValues = [start, start.addingTimeInterval(11)]
+        LeaderTurnLog.configureHealthRefreshForTesting(
+            reader: { _ in
+                lock.lock()
+                readCount += 1
+                let result = readCount == 1 ? first : second
+                let isBackgroundRefresh = readCount == 2
+                lock.unlock()
+                if isBackgroundRefresh {
+                    refreshStarted.signal()
+                    _ = releaseRefresh.wait(timeout: .now() + 2)
+                }
+                return result
+            },
+            clock: {
+                lock.lock()
+                defer { lock.unlock() }
+                return clockValues.removeFirst()
+            }
+        )
+        defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
+
+        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start), first)
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(10)).supportedTurns,
+            1
+        )
+        XCTAssertEqual(refreshStarted.wait(timeout: .now() + 2), .success)
+        releaseRefresh.signal()
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(20)),
+            second
+        )
+        lock.lock()
+        XCTAssertEqual(readCount, 2)
+        lock.unlock()
     }
 
     @MainActor

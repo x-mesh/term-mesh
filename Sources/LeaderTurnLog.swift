@@ -821,54 +821,65 @@ enum LeaderTurnLog {
         capabilities: [MeasurementCapability] = [],
         now: Date = Date()
     ) -> Health {
-        // Fleet status accepts this bounded staleness because file reads stay off the main actor.
+        // Fleet status returns cached data for at most sixty seconds, then pays one synchronous refresh.
         let key = logFile.standardizedFileURL.path
         healthRefreshLock.lock()
         let existing = healthRefreshCache[key]
-        let value = existing?.value ?? .empty
-        let needsRefresh = existing.map {
-            now.timeIntervalSince($0.refreshedAt) >= healthRefreshInterval
-        } ?? true
-        let startRefresh = needsRefresh && !(existing?.refreshInFlight ?? false)
-        if startRefresh {
+        let value = existing?.value
+        let age = existing?.refreshedAt.map {
+            now.timeIntervalSince($0)
+        } ?? .infinity
+        let requiresSynchronousRefresh = value == nil || age >= healthRefreshMaxAge
+        let startBackgroundRefresh = !requiresSynchronousRefresh
+            && age >= healthRefreshInterval
+            && !(existing?.refreshInFlight ?? false)
+        if requiresSynchronousRefresh || startBackgroundRefresh {
             healthRefreshCache[key] = HealthRefreshEntry(
-                value: existing?.value ?? .empty,
-                refreshedAt: existing?.refreshedAt ?? .distantPast,
+                value: value,
+                refreshedAt: existing?.refreshedAt,
                 refreshInFlight: true
             )
         }
         let reader = healthRefreshReaderForTesting
+        let clock = healthRefreshClockForTesting
         healthRefreshLock.unlock()
 
-        if startRefresh {
-            let refreshAt = now
+        if requiresSynchronousRefresh {
+            let refreshed = reader?(logFile) ?? health(from: logFile)
+            let derived = FileDerivedHealth(refreshed)
+            let completedAt = clock?() ?? Date()
+            healthRefreshLock.lock()
+            healthRefreshCache[key] = HealthRefreshEntry(
+                value: derived, refreshedAt: completedAt, refreshInFlight: false
+            )
+            healthRefreshLock.unlock()
+            return health(from: derived, capabilities: capabilities)
+        }
+
+        if startBackgroundRefresh {
             healthRefreshQueue.async {
                 let refreshed = reader?(logFile) ?? health(from: logFile)
+                let completedAt = clock?() ?? Date()
                 healthRefreshLock.lock()
                 healthRefreshCache[key] = HealthRefreshEntry(
-                    value: FileDerivedHealth(
-                        supportedTurns: refreshed.supportedTurns,
-                        linkedTurns: refreshed.linkedTurns,
-                        statedTurns: refreshed.statedTurns,
-                        unstatedTurns: refreshed.unstatedTurns,
-                        malformedLines: refreshed.malformedLines,
-                        observedDays: refreshed.observedDays
-                    ),
-                    refreshedAt: refreshAt,
+                    value: FileDerivedHealth(refreshed),
+                    refreshedAt: completedAt,
                     refreshInFlight: false
                 )
                 healthRefreshLock.unlock()
             }
         }
 
-        return health(from: value, capabilities: capabilities)
+        return health(from: value ?? .empty, capabilities: capabilities)
     }
 
     static func configureHealthRefreshForTesting(
-        reader: ((URL) -> Health)?
+        reader: ((URL) -> Health)?,
+        clock: (() -> Date)? = nil
     ) {
         healthRefreshLock.lock()
         healthRefreshReaderForTesting = reader
+        healthRefreshClockForTesting = clock
         healthRefreshCache.removeAll()
         healthRefreshLock.unlock()
     }
@@ -912,6 +923,31 @@ enum LeaderTurnLog {
             malformedLines: 0,
             observedDays: 0
         )
+
+        init(
+            supportedTurns: Int,
+            linkedTurns: Int,
+            statedTurns: Int,
+            unstatedTurns: Int,
+            malformedLines: Int,
+            observedDays: Int
+        ) {
+            self.supportedTurns = supportedTurns
+            self.linkedTurns = linkedTurns
+            self.statedTurns = statedTurns
+            self.unstatedTurns = unstatedTurns
+            self.malformedLines = malformedLines
+            self.observedDays = observedDays
+        }
+
+        init(_ health: Health) {
+            supportedTurns = health.supportedTurns
+            linkedTurns = health.linkedTurns
+            statedTurns = health.statedTurns
+            unstatedTurns = health.unstatedTurns
+            malformedLines = health.malformedLines
+            observedDays = health.observedDays
+        }
     }
 
     /// Identity of the exact bytes an aggregate came from. Rotation renames the
@@ -956,17 +992,19 @@ enum LeaderTurnLog {
 
     private static let logCacheLock = NSLock()
     private static let healthRefreshInterval: TimeInterval = 10
+    private static let healthRefreshMaxAge: TimeInterval = 60
     private static let healthRefreshLock = NSLock()
     private static let healthRefreshQueue = DispatchQueue(
         label: "com.term-mesh.leader-turn-health", qos: .utility
     )
     private struct HealthRefreshEntry {
-        let value: FileDerivedHealth
-        let refreshedAt: Date
+        let value: FileDerivedHealth?
+        let refreshedAt: Date?
         let refreshInFlight: Bool
     }
     private static var healthRefreshCache: [String: HealthRefreshEntry] = [:]
     private static var healthRefreshReaderForTesting: ((URL) -> Health)?
+    private static var healthRefreshClockForTesting: (() -> Date)?
     private static var healthCache: (stamp: GenerationStamp, team: String?, value: FileDerivedHealth)?
     private static var recordCache: (stamp: LogFileStamp, records: [Record])?
     /// The rotated generation is frozen until the next rotation, and `.1` is
