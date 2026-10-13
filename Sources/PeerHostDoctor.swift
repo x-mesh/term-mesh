@@ -251,8 +251,63 @@ struct PeerAgentStackStatus: Equatable {
 enum PeerHostDoctor {
     /// Pinned to the repo's install entrypoint. Fixed constant — never
     /// built from user input.
-    static let installCommand =
-        "curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | bash"
+    static let installScriptURL =
+        "https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh"
+
+    static let installCommand = "curl -fsSL \(installScriptURL) | bash"
+
+    /// Install line with the systemd hardening choice made explicit. `env`,
+    /// not a `VAR=x` prefix: the remote login shell may be csh, where the
+    /// prefix form is a syntax error.
+    static func installCommand(harden: Bool) -> String {
+        "curl -fsSL \(installScriptURL) | env TERMMESH_INSTALL_HARDEN=\(harden ? 1 : 0) bash"
+    }
+
+    /// Whether the remote system-scope `term-meshd` unit runs with systemd
+    /// sandboxing. Hardened units make `/usr` and `/etc` read-only and block
+    /// `sudo` inside relay shells.
+    enum HardeningStatus: Equatable {
+        case unknown
+        case hardened
+        case notHardened
+    }
+
+    /// No `--value` (absent on systemd 219, CentOS 7). No single quotes in the
+    /// body (same `sh -c '…'` wrapper constraint as diagnoseCommand).
+    static let hardeningProbeCommand =
+        #"sh -c 'systemctl show -p LoadState -p ProtectSystem -p NoNewPrivileges -p PrivateTmp term-meshd 2>/dev/null; exit 0'"#
+
+    /// Pure parse of `hardeningProbeCommand` output. A missing system unit
+    /// (user scope, or not installed) is `.unknown`, never `.notHardened`.
+    /// Unknown lines are ignored.
+    static func parseHardeningStatus(_ output: String) -> HardeningStatus {
+        var values: [String: String] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            values[key] = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        }
+        guard values["LoadState"] == "loaded" else { return .unknown }
+        let protectSystem = values["ProtectSystem"] ?? ""
+        if ["yes", "true", "full", "strict"].contains(protectSystem)
+            || values["NoNewPrivileges"] == "yes" {
+            return .hardened
+        }
+        return .notHardened
+    }
+
+    /// Never throws: a failed probe is `.unknown`, which the UI omits.
+    static func hardeningStatus(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> HardeningStatus {
+        guard let out = try? await runRemote(
+            sshTarget: sshTarget, port: port, identityFile: identityFile,
+            command: hardeningProbeCommand, timeoutSeconds: 20
+        ) else { return .unknown }
+        return parseHardeningStatus(out)
+    }
 
     struct MacAppRuntimeStatus: Equatable {
         var isInstalled: Bool
@@ -1396,11 +1451,12 @@ enum PeerHostDoctor {
     static func install(
         sshTarget: String,
         port: Int?,
-        identityFile: String?
+        identityFile: String?,
+        harden: Bool
     ) async throws -> String {
         try await runRemote(
             sshTarget: sshTarget, port: port, identityFile: identityFile,
-            command: installCommand, timeoutSeconds: 180
+            command: installCommand(harden: harden), timeoutSeconds: 180
         )
     }
 
