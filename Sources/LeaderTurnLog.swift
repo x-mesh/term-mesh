@@ -832,12 +832,24 @@ enum LeaderTurnLog {
         let requiresSynchronousRefresh = value == nil || age >= healthRefreshMaxAge
         let startBackgroundRefresh = !requiresSynchronousRefresh
             && age >= healthRefreshInterval
-            && !(existing?.refreshInFlight ?? false)
+            && (existing?.inFlightGenerations.isEmpty ?? true)
+        var refreshGeneration: UInt64?
         if requiresSynchronousRefresh || startBackgroundRefresh {
+            let previous = existing ?? HealthRefreshEntry(
+                value: nil,
+                refreshedAt: nil,
+                cachedGeneration: 0,
+                latestGeneration: 0,
+                inFlightGenerations: []
+            )
+            let generation = previous.latestGeneration + 1
+            refreshGeneration = generation
             healthRefreshCache[key] = HealthRefreshEntry(
-                value: value,
-                refreshedAt: existing?.refreshedAt,
-                refreshInFlight: true
+                value: previous.value,
+                refreshedAt: previous.refreshedAt,
+                cachedGeneration: previous.cachedGeneration,
+                latestGeneration: generation,
+                inFlightGenerations: previous.inFlightGenerations.union([generation])
             )
         }
         let reader = healthRefreshReaderForTesting
@@ -848,25 +860,27 @@ enum LeaderTurnLog {
             let refreshed = reader?(logFile) ?? health(from: logFile)
             let derived = FileDerivedHealth(refreshed)
             let completedAt = clock?() ?? Date()
-            healthRefreshLock.lock()
-            healthRefreshCache[key] = HealthRefreshEntry(
-                value: derived, refreshedAt: completedAt, refreshInFlight: false
-            )
-            healthRefreshLock.unlock()
+            if let refreshGeneration {
+                completeHealthRefresh(
+                    key: key,
+                    generation: refreshGeneration,
+                    value: derived,
+                    completedAt: completedAt
+                )
+            }
             return health(from: derived, capabilities: capabilities)
         }
 
-        if startBackgroundRefresh {
+        if let refreshGeneration {
             healthRefreshQueue.async {
                 let refreshed = reader?(logFile) ?? health(from: logFile)
                 let completedAt = clock?() ?? Date()
-                healthRefreshLock.lock()
-                healthRefreshCache[key] = HealthRefreshEntry(
+                completeHealthRefresh(
+                    key: key,
+                    generation: refreshGeneration,
                     value: FileDerivedHealth(refreshed),
-                    refreshedAt: completedAt,
-                    refreshInFlight: false
+                    completedAt: completedAt
                 )
-                healthRefreshLock.unlock()
             }
         }
 
@@ -881,6 +895,31 @@ enum LeaderTurnLog {
         healthRefreshReaderForTesting = reader
         healthRefreshClockForTesting = clock
         healthRefreshCache.removeAll()
+        healthRefreshLock.unlock()
+    }
+
+    private static func completeHealthRefresh(
+        key: String,
+        generation: UInt64,
+        value: FileDerivedHealth,
+        completedAt: Date
+    ) {
+        healthRefreshLock.lock()
+        guard var entry = healthRefreshCache[key] else {
+            healthRefreshLock.unlock()
+            return
+        }
+        entry.inFlightGenerations.remove(generation)
+        if generation > entry.cachedGeneration {
+            entry = HealthRefreshEntry(
+                value: value,
+                refreshedAt: completedAt,
+                cachedGeneration: generation,
+                latestGeneration: entry.latestGeneration,
+                inFlightGenerations: entry.inFlightGenerations
+            )
+        }
+        healthRefreshCache[key] = entry
         healthRefreshLock.unlock()
     }
 
@@ -1000,7 +1039,9 @@ enum LeaderTurnLog {
     private struct HealthRefreshEntry {
         let value: FileDerivedHealth?
         let refreshedAt: Date?
-        let refreshInFlight: Bool
+        let cachedGeneration: UInt64
+        let latestGeneration: UInt64
+        var inFlightGenerations: Set<UInt64>
     }
     private static var healthRefreshCache: [String: HealthRefreshEntry] = [:]
     private static var healthRefreshReaderForTesting: ((URL) -> Health)?
