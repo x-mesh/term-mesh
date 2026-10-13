@@ -1469,7 +1469,13 @@ final class TermMeshDaemon: ObservableObject {
 
     /// Sync app-side team dashboard state with the daemon (for remote dashboard).
     func syncTeams(_ payload: [String: Any]) {
-        let _ = rpcCall(method: "team.sync", params: payload)
+        let boundedPayload = TeamOrchestrator.budgetTeamSyncPayload(
+            teams: payload["teams"] as? [[String: Any]] ?? [],
+            tasks: payload["tasks"] as? [[String: Any]] ?? [],
+            attention: payload["attention"] as? [[String: Any]] ?? [],
+            instance: payload["instance"] as? [String: Any] ?? [:]
+        )
+        let _ = rpcCall(method: "team.sync", params: boundedPayload)
     }
 
     // MARK: - Agent Sessions (F-06)
@@ -1975,6 +1981,12 @@ final class TermMeshDaemon: ObservableObject {
               var jsonString = String(data: data, encoding: .utf8) else {
             return .failure(.rpcError("could not encode RPC request"))
         }
+        guard Self.requestBodyFitsDaemonEnvelope(data) else {
+            Logger.daemon.error(
+                "RPC request rejected before send (method: \(method, privacy: .public), bytes: \(data.count, privacy: .public), limit: \(TermMeshDaemonProtocol.maxOperationEnvelopeBytes, privacy: .public))"
+            )
+            return .failure(.rpcError("RPC request exceeds daemon envelope limit"))
+        }
         jsonString += "\n"
 
         // Connect to Unix socket
@@ -2040,6 +2052,10 @@ final class TermMeshDaemon: ObservableObject {
             return .failure(.rpcError("daemon returned an empty result"))
         }
         return .success(result)
+    }
+
+    static func requestBodyFitsDaemonEnvelope(_ data: Data) -> Bool {
+        data.count <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes
     }
 
     private func daemonBinaryPath() -> String? {

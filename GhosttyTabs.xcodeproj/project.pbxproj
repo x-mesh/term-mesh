@@ -299,6 +299,8 @@
 		PC170000000000000003 /* PipeCompletionP1Regression170Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */; };
 		PT210000000000000003 /* PlacementTelemetryP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PT210000000000000006 /* PlacementTelemetryP1Tests.swift */; };
 		PP220000000000000003 /* ProjectPresentationScopeP2Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PP220000000000000006 /* ProjectPresentationScopeP2Tests.swift */; };
+		TSBP000000000000000003 /* TeamSyncPayloadBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TSBP000000000000000006 /* TeamSyncPayloadBudgetTests.swift */; };
+		TMSO00000000000000000003 /* TermMeshSettingsObserverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TMSO00000000000000000006 /* TermMeshSettingsObserverTests.swift */; };
 		DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */; };
 		DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000006 /* DelegateDedupP1Tests.swift */; };
 		DD210000000000000010 /* DelegateDiagnosisP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */; };
@@ -685,6 +687,8 @@
 		PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipeCompletionP1Regression170Tests.swift; sourceTree = "<group>"; };
 		PT210000000000000006 /* PlacementTelemetryP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlacementTelemetryP1Tests.swift; sourceTree = "<group>"; };
 		PP220000000000000006 /* ProjectPresentationScopeP2Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectPresentationScopeP2Tests.swift; sourceTree = "<group>"; };
+		TSBP000000000000000006 /* TeamSyncPayloadBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamSyncPayloadBudgetTests.swift; sourceTree = "<group>"; };
+		TMSO00000000000000000006 /* TermMeshSettingsObserverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermMeshSettingsObserverTests.swift; sourceTree = "<group>"; };
 		DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiagnosisP1Tests.swift; sourceTree = "<group>"; };
 		DD210000000000000006 /* DelegateDedupP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDedupP1Tests.swift; sourceTree = "<group>"; };
 		DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiagnosisP1Tests.swift; sourceTree = "<group>"; };
@@ -1139,6 +1143,8 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				PC170000000000000006 /* PipeCompletionP1Regression170Tests.swift */,
 				PT210000000000000006 /* PlacementTelemetryP1Tests.swift */,
 				PP220000000000000006 /* ProjectPresentationScopeP2Tests.swift */,
+				TSBP000000000000000006 /* TeamSyncPayloadBudgetTests.swift */,
+				TMSO00000000000000000006 /* TermMeshSettingsObserverTests.swift */,
 				DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */,
 				DD210000000000000006 /* DelegateDedupP1Tests.swift */,
 				DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */,
@@ -1610,6 +1616,8 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				PC170000000000000003 /* PipeCompletionP1Regression170Tests.swift in Sources */,
 				PT210000000000000003 /* PlacementTelemetryP1Tests.swift in Sources */,
 				PP220000000000000003 /* ProjectPresentationScopeP2Tests.swift in Sources */,
+				TSBP000000000000000003 /* TeamSyncPayloadBudgetTests.swift in Sources */,
+				TMSO00000000000000000003 /* TermMeshSettingsObserverTests.swift in Sources */,
 				DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */,
 				DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */,
 				DD210000000000000010 /* DelegateDiagnosisP1Tests.swift in Sources */,

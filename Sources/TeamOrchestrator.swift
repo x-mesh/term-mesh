@@ -12,6 +12,10 @@ import PeerProto
 /// formatter is safe to share while nothing mutates it.
 private let sharedISO8601 = ISO8601DateFormatter()
 
+enum TermMeshDaemonProtocol {
+    static let maxOperationEnvelopeBytes = 64 * 1024
+}
+
 /// Manages multi-agent Claude teams where a leader orchestrates N agent instances,
 /// each running in split panes within a single workspace.
 @MainActor
@@ -8832,6 +8836,232 @@ final class TeamOrchestrator: ObservableObject {
             "attention": teamAttention,
             "instance": instanceMeta,
         ]
+    }
+
+    static let teamSyncFreeTextLimitBytes = 1024
+    nonisolated static let teamSyncTaskTextLimitBytes = 256
+    nonisolated static let teamSyncResultPathLimitBytes = 512
+    nonisolated static let teamSyncPayloadSafetyMarginBytes = 512
+
+    nonisolated static func budgetTeamSyncPayload(
+        teams: [[String: Any]],
+        tasks: [[String: Any]],
+        attention: [[String: Any]],
+        instance: [String: Any]
+    ) -> [String: Any] {
+        let budgetedTeams = teams.map { budgetTeam($0) }
+        let projectedTasks = tasks.compactMap { projectTaskForTeamSync($0) }
+        let projectedAttention = attention.compactMap { projectAttentionForTeamSync($0) }
+        let reviewReady = projectedTasks.filter { $0.value["status"] as? String == "review_ready" }
+            .sorted { updatedAt($0.value) > updatedAt($1.value) }
+        let blocked = projectedTasks.filter { $0.value["status"] as? String == "blocked" }
+            .sorted { updatedAt($0.value) > updatedAt($1.value) }
+        let otherNonTerminal = projectedTasks.filter {
+            guard let status = $0.value["status"] as? String else { return true }
+            return !isTerminalTaskStatusForBudget(status) && status != "review_ready" && status != "blocked"
+        }.sorted { updatedAt($0.value) > updatedAt($1.value) }
+        let terminal = projectedTasks.filter {
+            isTerminalTaskStatusForBudget($0.value["status"] as? String ?? "")
+        }.sorted { updatedAt($0.value) > updatedAt($1.value) }
+        let orderedTasks = reviewReady + blocked + otherNonTerminal + terminal
+
+        var omittedReviewReady = reviewReady.count
+        var omittedNonTerminal = blocked.count + otherNonTerminal.count
+        var omittedTerminal = terminal.count
+        var omittedAttention = projectedAttention.count
+        var selectedTasks: [(value: [String: Any], truncated: Int)] = []
+        var selectedAttention: [(value: [String: Any], truncated: Int)] = []
+
+        func payload() -> [String: Any] {
+            let truncatedCount = budgetedTeams.reduce(0) { $0 + $1.truncated }
+                + selectedTasks.reduce(0) { $0 + $1.truncated }
+                + selectedAttention.reduce(0) { $0 + $1.truncated }
+            var payloadInstance = instance
+            payloadInstance["omitted_terminal_task_count"] = omittedTerminal
+            payloadInstance["omitted_non_terminal_task_count"] = omittedNonTerminal
+            payloadInstance["omitted_review_ready_task_count"] = omittedReviewReady
+            payloadInstance["omitted_attention_count"] = omittedAttention
+            payloadInstance["truncated_free_text_field_count"] = truncatedCount
+            return [
+                "teams": budgetedTeams.map(\.value),
+                "tasks": selectedTasks.map(\.value),
+                "attention": selectedAttention.map(\.value),
+                "instance": payloadInstance,
+            ]
+        }
+
+        let requiredPayload = payload()
+        let requiredRequest: [String: Any] = [
+            "id": 0, "method": "team.sync", "params": requiredPayload
+        ]
+        let requiredBytes = (try? JSONSerialization.data(withJSONObject: requiredRequest))?.count ?? .max
+        if requiredBytes > TermMeshDaemonProtocol.maxOperationEnvelopeBytes {
+            Logger.team.error(
+                "team.sync roster exceeds budget (bytes: \(requiredBytes, privacy: .public))"
+            )
+        }
+        var accountedBytes = requiredBytes + Self.teamSyncPayloadSafetyMarginBytes
+
+        for item in orderedTasks {
+            guard let data = try? JSONSerialization.data(withJSONObject: item.value) else { continue }
+            guard accountedBytes + data.count + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes else { continue }
+            selectedTasks.append((value: item.value, truncated: item.truncated))
+            accountedBytes += data.count + 1
+            switch item.value["status"] as? String {
+            case "review_ready": omittedReviewReady -= 1
+            case "blocked": omittedNonTerminal -= 1
+            default:
+                if isTerminalTaskStatusForBudget(item.value["status"] as? String ?? "") {
+                    omittedTerminal -= 1
+                } else {
+                    omittedNonTerminal -= 1
+                }
+            }
+        }
+
+        for item in projectedAttention {
+            guard let data = try? JSONSerialization.data(withJSONObject: item.value) else { continue }
+            guard accountedBytes + data.count + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes else { continue }
+            selectedAttention.append((value: item.value, truncated: item.truncated))
+            omittedAttention -= 1
+            accountedBytes += data.count + 1
+        }
+
+        let result = payload()
+        let resultRequest: [String: Any] = [
+            "id": 0, "method": "team.sync", "params": result
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: resultRequest),
+           data.count > TermMeshDaemonProtocol.maxOperationEnvelopeBytes {
+            Logger.team.error(
+                "team.sync budget calculation exceeded limit (bytes: \(data.count, privacy: .public))"
+            )
+        }
+        return result
+    }
+
+    private static let teamFreeTextKeys: Set<String> = [
+        "leader_failure", "leader_policy_failure", "last_heartbeat_summary",
+        "active_task_title"
+    ]
+
+    private struct TeamSyncItem {
+        let value: [String: Any]
+        let truncated: Int
+    }
+
+    nonisolated private static func projectTaskForTeamSync(_ source: [String: Any]) -> TeamSyncItem? {
+        var value: [String: Any] = [:]
+        var truncated = 0
+        let exactKeys = [
+            "id", "status", "priority", "assignee", "team_name",
+            "worktree_path", "worktree_branch", "created_at", "updated_at",
+            "last_progress_at", "is_stale", "needs_attention"
+        ]
+        for key in exactKeys where source[key] != nil && !(source[key] is NSNull) { value[key] = source[key]! }
+        guard value["id"] != nil else { return nil }
+        for key in ["title", "review_summary", "blocked_reason"] {
+            if let text = source[key] as? String {
+                let result = truncateTeamSyncText(text, limitBytes: teamSyncTaskTextLimitBytes)
+                value[key] = result.value
+                truncated += result.wasTruncated ? 1 : 0
+            }
+        }
+        for key in ["labels", "depends_on"] {
+            if let values = source[key] as? [String] {
+                value[key] = values.map { text in
+                    let result = truncateTeamSyncText(text, limitBytes: teamSyncTaskTextLimitBytes)
+                    if result.wasTruncated { truncated += 1 }
+                    return result.value
+                }
+            }
+        }
+        if let path = source["result_path"] as? String, isShortPath(path) { value["result_path"] = path }
+        return TeamSyncItem(value: value, truncated: truncated)
+    }
+
+    nonisolated private static func projectAttentionForTeamSync(_ source: [String: Any]) -> TeamSyncItem? {
+        var value: [String: Any] = [:]
+        var truncated = 0
+        for key in ["kind", "priority", "team_name", "task_id", "agent_name",
+                    "status", "age_seconds", "is_stale", "stale_seconds"] {
+            if source[key] != nil && !(source[key] is NSNull) { value[key] = source[key]! }
+        }
+        for key in ["task_title", "reason", "summary"] {
+            if let text = source[key] as? String {
+                let result = truncateTeamSyncText(text, limitBytes: teamSyncTaskTextLimitBytes)
+                value[key] = result.value
+                truncated += result.wasTruncated ? 1 : 0
+            }
+        }
+        return TeamSyncItem(value: value, truncated: truncated)
+    }
+
+    nonisolated private static func updatedAt(_ value: [String: Any]) -> String {
+        value["updated_at"] as? String ?? ""
+    }
+
+    nonisolated private static func isShortPath(_ value: String) -> Bool {
+        value.utf8.count <= teamSyncResultPathLimitBytes
+            && value.contains("/")
+            && !value.contains(where: { $0 == "\n" || $0 == "\r" })
+    }
+
+    nonisolated private static func budgetTeam(
+        _ team: [String: Any]
+    ) -> (value: [String: Any], truncated: Int) {
+        var result = budgetDictionary(team, keys: teamFreeTextKeys)
+        var agents: [[String: Any]] = []
+        var truncated = result.truncated
+        for agent in team["agents"] as? [[String: Any]] ?? [] {
+            let budgeted = budgetDictionary(agent, keys: teamFreeTextKeys)
+            agents.append(budgeted.value)
+            truncated += budgeted.truncated
+        }
+        if team["agents"] != nil { result.value["agents"] = agents }
+        return (result.value, truncated)
+    }
+
+    nonisolated private static func budgetDictionary(
+        _ dictionary: [String: Any],
+        keys: Set<String>
+    ) -> (value: [String: Any], truncated: Int) {
+        var result = dictionary
+        var truncated = 0
+        for key in keys {
+            if let value = result[key] as? String {
+                let shortened = truncateTeamSyncText(value)
+                if shortened != value {
+                    result[key] = shortened
+                    truncated += 1
+                }
+            } else if let values = result[key] as? [String] {
+                let shortened = values.map { value in
+                    let result = truncateTeamSyncText(value)
+                    if result != value { truncated += 1 }
+                    return result
+                }
+                result[key] = shortened
+            }
+        }
+        return (result, truncated)
+    }
+
+    nonisolated static func truncateTeamSyncText(_ value: String) -> String {
+        truncateTeamSyncText(value, limitBytes: teamSyncFreeTextLimitBytes).value
+    }
+
+    nonisolated private static func truncateTeamSyncText(
+        _ value: String, limitBytes: Int
+    ) -> (value: String, wasTruncated: Bool) {
+        guard value.utf8.count > limitBytes else { return (value, false) }
+        var data = Data(value.utf8.prefix(limitBytes))
+        while String(data: data, encoding: .utf8) == nil { data.removeLast() }
+        return (String(data: data, encoding: .utf8) ?? "", true)
+    }
+
+    nonisolated private static func isTerminalTaskStatusForBudget(_ status: String) -> Bool {
+        ["completed", "failed", "abandoned", "cancelled"].contains(status)
     }
 
     /// Mission Control: "waiting for input" signal — the agent pane has an

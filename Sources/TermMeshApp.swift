@@ -40,18 +40,7 @@ struct TermMeshApp: App {
     private let configProvider: any GhosttyConfigProvider = GhosttyApp.shared
     private let browserHistory: any BrowserHistoryService = BrowserHistoryStore.shared
     private let primaryWindowId = UUID()
-    @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
     @AppStorage(LanguageSettings.languageModeKey) private var languageMode = LanguageSettings.defaultMode.rawValue
-    @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
-    @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
-    @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
-    @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
-    @AppStorage(TerminalSettingsOverride.backgroundOpacityKey) private var terminalBgOpacity: Double = -1
-    @AppStorage(TerminalSettingsOverride.cursorColorKey) private var terminalCursorColor = ""
-    @AppStorage(TerminalSettingsOverride.cursorStyleKey) private var terminalCursorStyle = ""
-    @AppStorage(TerminalSettingsOverride.scrollbackLimitKey) private var terminalScrollback: Int = 0
-    @AppStorage(TerminalSettingsOverride.unfocusedSplitOpacityKey) private var terminalUnfocusedOpacity: Double = -1
-    @AppStorage(TerminalSettingsOverride.splitDividerColorKey) private var terminalDividerColor = ""
     @AppStorage("titlebarControlsStyle") private var titlebarControlsStyle = TitlebarControlsStyle.classic.rawValue
     @AppStorage(ShortcutHintDebugSettings.alwaysShowHintsKey) private var alwaysShowShortcutHints = ShortcutHintDebugSettings.defaultAlwaysShowHints
     @AppStorage(SocketControlSettings.appStorageKey) private var socketControlMode = SocketControlSettings.defaultMode.rawValue
@@ -221,7 +210,7 @@ struct TermMeshApp: App {
             // Start the Unix socket controller for programmatic access
             updateSocketController()
             appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
-            applyAppearance()
+            Self.applyAppearance(AppearanceSettings.resolvedMode())
             // Sync Ghostty app-level color scheme on startup so the
             // GUI theme picker (`theme = light:X,dark:Y`) selects the
             // right variant. Without this the user sees the light
@@ -231,7 +220,7 @@ struct TermMeshApp: App {
             // GhosttyApp keeps the default LIGHT scheme it was
             // initialized with and the next config reload picks the
             // light theme.
-            syncGhosttyAppColorScheme()
+            Self.syncGhosttyAppColorScheme(for: AppearanceSettings.resolvedMode())
             if termMeshEnv("UI_TEST_SHOW_SETTINGS") == "1" {
                 DispatchQueue.main.async {
                     showSettingsPanel()
@@ -245,28 +234,6 @@ struct TermMeshApp: App {
                 TeamOrchestrator.shared.detectRestorableFleets()
             }
         }
-        .onChange(of: appearanceMode) { _ in
-            applyAppearance()
-            // The settings file's `theme` line pins light or dark by this mode,
-            // so it has to be rewritten here too — otherwise a named theme keeps
-            // whichever half the system appearance picked when it was last saved.
-            TerminalSettingsOverride.write()
-            // Write terminal color override and reload Ghostty config
-            TerminalThemeOverride.write(for: appearanceMode)
-            configProvider.reloadConfiguration(source: "appearance.toggle")
-            // Sync Ghostty app-level color scheme so new surfaces inherit the correct theme
-            syncGhosttyAppColorScheme()
-        }
-        .onChange(of: terminalFontFamily) { _ in applyTerminalSettings() }
-        .onChange(of: terminalFontSize) { _ in applyTerminalSettings() }
-        .onChange(of: terminalThemeLight) { _ in applyTerminalSettings() }
-        .onChange(of: terminalThemeDark) { _ in applyTerminalSettings() }
-        .onChange(of: terminalBgOpacity) { _ in applyTerminalSettings() }
-        .onChange(of: terminalCursorColor) { _ in applyTerminalSettings() }
-        .onChange(of: terminalCursorStyle) { _ in applyTerminalSettings() }
-        .onChange(of: terminalScrollback) { _ in applyTerminalSettings() }
-        .onChange(of: terminalUnfocusedOpacity) { _ in applyTerminalSettings() }
-        .onChange(of: terminalDividerColor) { _ in applyTerminalSettings() }
         .onChange(of: socketControlMode) { _ in
             updateSocketController()
         }
@@ -1031,14 +998,6 @@ struct TermMeshApp: App {
         }
     }
 
-    private func applyAppearance() {
-        let mode = AppearanceSettings.mode(for: appearanceMode)
-        if appearanceMode != mode.rawValue {
-            appearanceMode = mode.rawValue
-        }
-        Self.applyAppearance(mode)
-    }
-
     /// Push the current effective appearance to the GhosttyApp-level color
     /// scheme. Surfaces and config reloads consult the app-level scheme to
     /// pick between `theme = light:X,dark:Y` variants, so this must be in
@@ -1048,12 +1007,8 @@ struct TermMeshApp: App {
     /// `.onAppear` (it initializes lazily on first reference). The retry
     /// loop covers fast paths; for slow startups (notably the brew-upgrade
     /// relaunch that this method was added to fix) the budget can run out.
-    /// `GhosttyApp.shared.app` is also re-checked on every `applyAppearance`
-    /// pass and on every `.onChange(of: appearanceMode)` — so a late init
-    /// will still receive the saved preference once any of those fire.
-    private func syncGhosttyAppColorScheme() {
-        Self.syncGhosttyAppColorScheme(for: AppearanceSettings.mode(for: appearanceMode))
-    }
+    /// `GhosttyApp.shared.app` is also re-checked on every appearance update,
+    /// so a late init will still receive the saved preference once one fires.
 
     /// Static counterpart so `init()` can call this before any SwiftUI
     /// view appears. Resolves `dark`/`light` from the explicit user
@@ -1064,7 +1019,7 @@ struct TermMeshApp: App {
     /// giving up. On a sluggish brew-upgrade relaunch that's enough time for
     /// the lazy init to finish; if it still hasn't, the next user-driven
     /// appearance change (or any later `applyAppearance` call) will pick up.
-    private static func syncGhosttyAppColorScheme(for mode: AppearanceMode, attempt: Int = 0) {
+    static func syncGhosttyAppColorScheme(for mode: AppearanceMode, attempt: Int = 0) {
         guard let app = GhosttyApp.shared.app else {
             if attempt < 5 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -1095,13 +1050,7 @@ struct TermMeshApp: App {
         ghostty_app_set_color_scheme(app, isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
     }
 
-    private func applyTerminalSettings() {
-        TerminalSettingsOverride.write()
-        TerminalThemeOverride.write(for: appearanceMode)
-        configProvider.reloadConfiguration(source: "settings.terminal")
-    }
-
-    fileprivate static func applyAppearance(_ mode: AppearanceMode) {
+    static func applyAppearance(_ mode: AppearanceMode) {
         switch mode {
         case .system:
             NSApplication.shared.appearance = nil

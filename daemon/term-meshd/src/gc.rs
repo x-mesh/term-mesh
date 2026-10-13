@@ -2071,6 +2071,32 @@ mod tests {
     }
 
     #[test]
+    fn team_member_worktree_paths_reads_budgeted_team_state() {
+        let state = serde_json::json!({
+            "teams": [{
+                "team_name": "budgeted",
+                "agents": [
+                    {"name": "agent-a", "worktree_path": "/worktrees/budgeted/a", "heartbeat_age_seconds": 4},
+                    {"name": "agent-b", "worktree_path": "/worktrees/budgeted/b", "heartbeat_is_stale": false}
+                ],
+                "tasks": [{"id": "task-1", "status": "review_ready", "title": "slim task"}]
+            }],
+            "instance": {
+                "omitted_terminal_task_count": 133,
+                "omitted_attention_count": 12
+            }
+        });
+
+        assert_eq!(
+            team_member_worktree_paths(&state),
+            HashSet::from([
+                PathBuf::from("/worktrees/budgeted/a"),
+                PathBuf::from("/worktrees/budgeted/b")
+            ])
+        );
+    }
+
+    #[test]
     fn a_synced_team_member_worktree_is_blocked_until_the_team_is_gone() {
         let temp = tempfile::tempdir().unwrap();
         let repo = init_repo(temp.path());
