@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.7] - 2026-10-13
+
+### Fixed
+
+- The daemon now stops quickly when a peer is connected but idle. Before this fix, shutdown waited for every idle peer connection until the connection drain time ran out, so a restart took longer than needed. Update the host daemon to get this fix.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.6] - 2026-10-13
 
 ### Added
