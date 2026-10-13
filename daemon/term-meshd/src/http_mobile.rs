@@ -184,8 +184,7 @@ pub type SessionResolver = Arc<dyn Fn(&str) -> Option<PaneSession> + Send + Sync
 /// `None` means the method is not one this accessor serves, which the caller
 /// turns into `method_not_found` so an optional call (`surface.read_screen_grid`)
 /// keeps its documented fallback.
-pub type SurfaceAccess =
-    Arc<dyn Fn(&str, &Value) -> Option<Result<Value, String>> + Send + Sync>;
+pub type SurfaceAccess = Arc<dyn Fn(&str, &Value) -> Option<Result<Value, String>> + Send + Sync>;
 
 pub struct MobileState {
     pub config: MobileConfig,
@@ -210,13 +209,22 @@ struct ModelLock<'a> {
 
 impl Drop for ModelLock<'_> {
     fn drop(&mut self) {
-        self.state.model_busy.lock().unwrap().remove(&self.surface_id);
+        self.state
+            .model_busy
+            .lock()
+            .unwrap()
+            .remove(&self.surface_id);
     }
 }
 
 impl MobileState {
     fn lock_model(&self, surface_id: &str) -> Result<ModelLock<'_>, ApiError> {
-        if !self.model_busy.lock().unwrap().insert(surface_id.to_string()) {
+        if !self
+            .model_busy
+            .lock()
+            .unwrap()
+            .insert(surface_id.to_string())
+        {
             return Err(model_busy_error());
         }
         Ok(ModelLock {
@@ -236,8 +244,7 @@ impl MobileState {
     /// the exposing client knew it and from the daemon's own pane correlation
     /// when it did not.
     fn resolved_session(&self, entry: &Entry) -> Option<PaneSession> {
-        if let (Some(session_id), false) =
-            (entry.session_id.as_deref(), entry.agent_cli.is_empty())
+        if let (Some(session_id), false) = (entry.session_id.as_deref(), entry.agent_cli.is_empty())
         {
             return Some(PaneSession {
                 cli: entry.agent_cli.clone(),
@@ -358,8 +365,14 @@ pub fn router(state: SharedState) -> Router {
             "/api/targets/{surface_id}/prompt",
             get(prompt_handler).post(prompt_answer_handler),
         )
-        .route("/api/targets/{surface_id}/questions", get(questions_handler))
-        .route("/api/targets/{surface_id}/questions/{question_id}/answer", post(question_answer_handler))
+        .route(
+            "/api/targets/{surface_id}/questions",
+            get(questions_handler),
+        )
+        .route(
+            "/api/targets/{surface_id}/questions/{question_id}/answer",
+            post(question_answer_handler),
+        )
         .route("/api/targets/{surface_id}/screen", get(screen_handler))
         .route("/api/targets/{surface_id}/requests", get(requests_handler))
         .route(
@@ -627,9 +640,7 @@ fn command_metadata(path: &FsPath) -> std::io::Result<HashMap<String, String>> {
         Err(error) if error.error_len().is_none() => {
             std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default()
         }
-        Err(error) => {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        }
+        Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
     };
     let mut values = HashMap::new();
     let mut lines = text.lines();
@@ -898,7 +909,11 @@ pub(crate) fn mobile_command_catalog(
                 description: description.to_string(),
                 argument_hint: String::new(),
                 selectable: !native,
-                action: if native { None } else { builtin_action(cli, invocation) },
+                action: if native {
+                    None
+                } else {
+                    builtin_action(cli, invocation)
+                },
                 reason: if native {
                     "터미널 CLI에서 사용하는 명령입니다.".to_string()
                 } else {
@@ -1260,8 +1275,10 @@ async fn prompt_handler(
     } else {
         mobile_model::screen_preview(tui, &screen)
     };
-    Ok(Json(json!({ "surface_id": entry.surface_id, "prompt": prompt, "preview": preview }))
-        .into_response())
+    Ok(
+        Json(json!({ "surface_id": entry.surface_id, "prompt": prompt, "preview": preview }))
+            .into_response(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1292,40 +1309,217 @@ async fn prompt_answer_handler(
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct QuestionOption { label: String, #[serde(default)] description: String }
-#[derive(Clone, Deserialize, Serialize)]
-struct QuestionItem { question: String, #[serde(default, rename = "multiSelect")] multi_select: bool, options: Vec<QuestionOption> }
-#[derive(Clone, Deserialize, Serialize)]
-struct StoredQuestion { id: String, fingerprint: String, surface_id: String, state: String, questions: Vec<QuestionItem> }
-#[derive(Deserialize)] struct QuestionAnswer { fingerprint: String, answers: Vec<QuestionAnswerItem> }
-#[derive(Clone, Deserialize)] struct QuestionAnswerItem { question_index: usize, selected: Vec<usize>, #[serde(default)] other: Option<String> }
-#[derive(Debug, PartialEq)] enum QuestionInputStep { Key(&'static str), Text(String) }
+struct QuestionOption {
+    label: String,
+    #[serde(default)]
+    description: String,
+}
 
-fn question_answer_steps(question: &QuestionItem, answer: &QuestionAnswerItem, screen_matches: bool) -> Vec<QuestionInputStep> {
-    if !screen_matches { return Vec::new(); }
-    if !question.multi_select {
-        let mut steps = vec![QuestionInputStep::Text(answer.selected[0].to_string())];
-        if let Some(other) = &answer.other {
-            steps.push(QuestionInputStep::Text(other.clone()));
-            steps.push(QuestionInputStep::Key("Enter"));
+#[derive(Clone, Deserialize, Serialize)]
+struct QuestionItem {
+    #[serde(default)]
+    header: String,
+    question: String,
+    #[serde(default, rename = "multiSelect")]
+    multi_select: bool,
+    options: Vec<QuestionOption>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct StoredQuestion {
+    id: String,
+    fingerprint: String,
+    surface_id: String,
+    state: String,
+    questions: Vec<QuestionItem>,
+}
+
+#[derive(Deserialize)]
+struct QuestionAnswer {
+    fingerprint: String,
+    answers: Vec<QuestionAnswerItem>,
+}
+
+#[derive(Clone, Deserialize)]
+struct QuestionAnswerItem {
+    question_index: usize,
+    selected: Vec<usize>,
+    #[serde(default)]
+    other: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AskOption {
+    index: usize,
+    label: String,
+    checked: bool,
+    has_checkbox: bool,
+    focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AskScreen {
+    Question {
+        tabs: Vec<String>,
+        question: String,
+        options: Vec<AskOption>,
+        multi: bool,
+        submit_focused: bool,
+    },
+    Review {
+        tabs: Vec<String>,
+    },
+}
+
+fn ask_tabs(line: &str) -> Vec<String> {
+    line.split(['☐', '☒'])
+        .skip(1)
+        .map(|part| {
+            part.split('✔')
+                .next()
+                .unwrap_or(part)
+                .trim()
+                .trim_matches(['←', '→', ' '])
+                .to_string()
+        })
+        .filter(|tab| !tab.is_empty())
+        .collect()
+}
+
+fn ask_option(line: &str) -> Option<AskOption> {
+    let focused = line.starts_with("❯ ");
+    let rest = if focused {
+        line.strip_prefix("❯ ")?
+    } else {
+        line.strip_prefix("  ")?
+    };
+    let (number, tail) = rest.split_once(". ")?;
+    let index = number.parse().ok()?;
+    let (checked, has_checkbox, label) = if let Some(rest) = tail.strip_prefix("[✔] ") {
+        (true, true, rest)
+    } else if let Some(rest) = tail.strip_prefix("[ ] ") {
+        (false, true, rest)
+    } else {
+        (false, false, tail)
+    };
+    (!label.trim().is_empty()).then(|| AskOption {
+        index,
+        label: label.trim().to_string(),
+        checked,
+        has_checkbox,
+        focused,
+    })
+}
+
+fn is_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|character| character == '─')
+}
+
+fn ask_screen(screen: &str) -> Option<AskScreen> {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let footer = lines.iter().rposition(|line| {
+        line.trim_start().starts_with("Enter to select") && line.contains("Esc to cancel")
+    });
+    let review = lines
+        .iter()
+        .rposition(|line| line.trim() == "Review your answers");
+    let end = footer.or(review)?;
+    let header = (0..end).rev().find(|index| {
+        let line = lines[*index];
+        (line.contains('☐') || line.contains('☒')) && !line.contains('─')
+    })?;
+    if header == 0
+        || !lines[..header]
+            .iter()
+            .rev()
+            .take(3)
+            .any(|line| is_rule(line))
+    {
+        return None;
+    }
+    let tabs = ask_tabs(lines[header]);
+    if tabs.is_empty() {
+        return None;
+    }
+    if let Some(review) = review {
+        if review > header
+            && lines[review + 1..]
+                .iter()
+                .any(|line| line.trim() == "❯ 1. Submit answers")
+        {
+            return Some(AskScreen::Review { tabs });
         }
-        return steps;
+        return None;
     }
-    let mut selected = answer.selected.clone();
-    selected.sort_unstable();
-    let mut current = 1;
-    let mut steps = Vec::new();
-    for index in selected {
-        for _ in current..index { steps.push(QuestionInputStep::Key("Down")); }
-        steps.push(QuestionInputStep::Key("Space"));
-        current = index;
+    let footer = footer?;
+    let mut first = header + 1;
+    while first < footer && lines[first].trim().is_empty() {
+        first += 1;
     }
-    steps.push(QuestionInputStep::Key("Enter"));
-    if let Some(other) = &answer.other {
-        steps.push(QuestionInputStep::Text(other.clone()));
-        steps.push(QuestionInputStep::Key("Enter"));
+    let question = lines.get(first)?.trim();
+    if question.is_empty() {
+        return None;
     }
-    steps
+    let block_end = (first + 1..footer)
+        .find(|index| is_rule(lines[*index]))
+        .unwrap_or(footer);
+    let mut options = Vec::new();
+    let mut submit_focused = false;
+    for line in &lines[first + 1..block_end] {
+        if let Some(option) = ask_option(line) {
+            options.push(option);
+        }
+        if line.trim() == "❯    Submit" {
+            submit_focused = true;
+        }
+    }
+    let multi = options.iter().any(|option| option.has_checkbox);
+    let cursor_count =
+        options.iter().filter(|option| option.focused).count() + usize::from(submit_focused);
+    (options.len() >= 2 && cursor_count == 1).then(|| AskScreen::Question {
+        tabs,
+        question: question.to_string(),
+        options,
+        multi,
+        submit_focused,
+    })
+}
+
+fn ask_matches(record: &StoredQuestion, index: usize, parsed: &AskScreen) -> bool {
+    let AskScreen::Question {
+        tabs,
+        question,
+        options,
+        multi,
+        ..
+    } = parsed
+    else {
+        return false;
+    };
+    let Some(stored) = record.questions.get(index) else {
+        return false;
+    };
+    let labels: Vec<_> = options
+        .iter()
+        .take(stored.options.len())
+        .map(|option| option.label.as_str())
+        .collect();
+    let headers = record.questions.iter().map(|item| item.header.as_str());
+    question == &stored.question
+        && options.len() == stored.options.len() + 1
+        && labels
+            == stored
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>()
+        && *multi == stored.multi_select
+        && if record.questions.len() == 1 {
+            tabs.as_slice() == [stored.header.as_str()]
+        } else {
+            tabs.iter().map(String::as_str).eq(headers)
+        }
 }
 
 fn question_root(surface: &str) -> Result<PathBuf, String> {
@@ -1344,84 +1538,583 @@ fn pending_question(surface: &str, wanted: Option<&str>) -> Option<(PathBuf, Sto
             .is_some_and(|record| record.state != "pending")
     });
     for session in fs::read_dir(root).ok()?.flatten() {
-        let Ok(files) = fs::read_dir(session.path()) else { continue };
+        let Ok(files) = fs::read_dir(session.path()) else {
+            continue;
+        };
         for file in files.flatten() {
             let path = file.path();
-            if path.extension().is_some_and(|extension| extension == "tmp") { continue; }
+            if path.extension().is_some_and(|extension| extension == "tmp") {
+                continue;
+            }
             let Ok(raw) = fs::read(&path) else { continue };
-            let Ok(record) = serde_json::from_slice::<StoredQuestion>(&raw) else { continue };
-            if record.state == "pending" && wanted.is_none_or(|id| id == record.id) { return Some((path, record)); }
+            let Ok(record) = serde_json::from_slice::<StoredQuestion>(&raw) else {
+                continue;
+            };
+            if record.state == "pending" && wanted.is_none_or(|id| id == record.id) {
+                return Some((path, record));
+            }
         }
     }
     None
 }
-async fn questions_handler(State(state): State<SharedState>, Path(surface): Path<String>) -> ApiResult {
+async fn questions_handler(
+    State(state): State<SharedState>,
+    Path(surface): Path<String>,
+) -> ApiResult {
     let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
-    if entry.app_socket.is_none() { return Err(ApiError::conflict("questions_unavailable", "relay targets are not supported yet")); }
-    Ok(Json(json!({"surface_id": entry.surface_id, "question": pending_question(&entry.surface_id, None).map(|(_, question)| question)})).into_response())
-}
-async fn question_answer_handler(State(state): State<SharedState>, Path((surface, question_id)): Path<(String, String)>, axum::Extension(caller): axum::Extension<Caller>, Json(body): Json<QuestionAnswer>) -> ApiResult {
-    let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
-    if entry.app_socket.is_none() { return Err(ApiError::conflict("questions_unavailable", "relay targets are not supported yet")); }
-    let _lock = state.lock_model(&entry.surface_id)?;
-    let Some((path, record)) = pending_question(&entry.surface_id, Some(&question_id)) else { return Err(ApiError::conflict("prompt_gone", "질문이 더 이상 대기 중이 아닙니다.")); };
-    if body.fingerprint != record.fingerprint || body.answers.len() != record.questions.len() { return Err(ApiError::conflict("prompt_gone", "질문이 바뀌었습니다.")); }
-    for (index, question) in record.questions.iter().enumerate() {
-        let Some(answer) = body.answers.iter().find(|answer| answer.question_index == index) else { return Err(ApiError::conflict("prompt_gone", "답변이 불완전합니다.")); };
-        let other = question.options.len() + 1;
-        if answer.selected.is_empty() || answer.selected.iter().any(|item| *item == 0 || *item > other) || (!question.multi_select && answer.selected.len() != 1) || answer.selected.contains(&other) != answer.other.is_some() || answer.other.as_ref().is_some_and(|text| text.is_empty() || text.len() > 2048 || text.chars().any(char::is_control)) { return Err(ApiError::conflict("prompt_gone", "답변 형식이 유효하지 않습니다.")); }
+    if entry.app_socket.is_none() {
+        return Err(ApiError::conflict(
+            "questions_unavailable",
+            "relay targets are not supported yet",
+        ));
     }
-    let driver = AppDriver::new(&state, &entry); let screen = driver.read_screen().await.map_err(|error| driver.api_error(error))?; let first = &record.questions[0];
-    if !screen.contains(&first.question) || first.options.iter().any(|option| !screen.contains(&option.label)) { return Err(ApiError::conflict("prompt_gone", "화면의 질문이 바뀌었습니다.")); }
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "question": pending_question(&entry.surface_id, None).map(|(_, question)| question),
+    }))
+    .into_response())
+}
+
+async fn question_answer_handler(
+    State(state): State<SharedState>,
+    Path((surface, question_id)): Path<(String, String)>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Json(body): Json<QuestionAnswer>,
+) -> ApiResult {
+    let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
+    if entry.app_socket.is_none() {
+        return Err(ApiError::conflict(
+            "questions_unavailable",
+            "relay targets are not supported yet",
+        ));
+    }
+    let _lock = state.lock_model(&entry.surface_id)?;
+    let Some((path, record)) = pending_question(&entry.surface_id, Some(&question_id)) else {
+        return Err(ApiError::conflict(
+            "prompt_gone",
+            "질문이 더 이상 대기 중이 아닙니다.",
+        ));
+    };
+    if body.fingerprint != record.fingerprint || body.answers.len() != record.questions.len() {
+        return Err(ApiError::conflict("prompt_gone", "질문이 바뀌었습니다."));
+    }
     for (index, question) in record.questions.iter().enumerate() {
-        let answer = body.answers.iter().find(|answer| answer.question_index == index).expect("validated answer");
-        for step in question_answer_steps(question, answer, true) {
-            match step {
-                QuestionInputStep::Key(key) => driver.send_key(key).await.map_err(|error| driver.api_error(error))?,
-                QuestionInputStep::Text(text) => driver.send_text(&text).await.map_err(|error| driver.api_error(error))?,
-            }
+        let Some(answer) = body
+            .answers
+            .iter()
+            .find(|answer| answer.question_index == index)
+        else {
+            return Err(ApiError::conflict("prompt_gone", "답변이 불완전합니다."));
+        };
+        let other = question.options.len() + 1;
+        if answer.selected.is_empty()
+            || answer
+                .selected
+                .iter()
+                .any(|item| *item == 0 || *item > other)
+            || (!question.multi_select && answer.selected.len() != 1)
+            || answer.selected.contains(&other) != answer.other.is_some()
+            || answer.other.as_ref().is_some_and(|text| {
+                text.is_empty() || text.len() > 2048 || text.chars().any(char::is_control)
+            })
+        {
+            return Err(ApiError::conflict(
+                "prompt_gone",
+                "답변 형식이 유효하지 않습니다.",
+            ));
         }
     }
+    let driver = AppDriver::new(&state, &entry);
+    for (index, question) in record.questions.iter().enumerate() {
+        let answer = body
+            .answers
+            .iter()
+            .find(|answer| answer.question_index == index)
+            .expect("validated answer");
+        wait_question(&driver, &record, index)
+            .await
+            .map_err(|error| driver.api_error(error))?;
+        let selected = normalized_selected(question, answer)
+            .ok_or_else(|| ApiError::conflict("prompt_gone", "답변 형식이 유효하지 않습니다."))?;
+        if question.multi_select {
+            let mut expected = Vec::new();
+            for option in &selected {
+                driver
+                    .send_text(&option.to_string())
+                    .await
+                    .map_err(|error| driver.api_error(error))?;
+                expected.push(*option);
+                wait_question_marks(&driver, &record, index, &expected)
+                    .await
+                    .map_err(|error| driver.api_error(error))?;
+            }
+            if let Some(other) = &answer.other {
+                let other_index = question.options.len() + 1;
+                let mut current = wait_question_marks(&driver, &record, index, &selected)
+                    .await
+                    .map_err(|error| driver.api_error(error))?;
+                while !current_options(&current)
+                    .iter()
+                    .any(|option| option.index == other_index && option.focused)
+                {
+                    driver
+                        .send_key("Down")
+                        .await
+                        .map_err(|error| driver.api_error(error))?;
+                    current = wait_question_marks(&driver, &record, index, &selected)
+                        .await
+                        .map_err(|error| driver.api_error(error))?;
+                }
+                driver
+                    .send_text(other)
+                    .await
+                    .map_err(|error| driver.api_error(error))?;
+                wait_question_marks(&driver, &record, index, &selected)
+                    .await
+                    .map_err(|error| driver.api_error(error))?;
+            }
+            let mut current = wait_question_marks(&driver, &record, index, &selected)
+                .await
+                .map_err(|error| driver.api_error(error))?;
+            while !matches!(
+                current,
+                AskScreen::Question {
+                    submit_focused: true,
+                    ..
+                }
+            ) {
+                driver
+                    .send_key("Down")
+                    .await
+                    .map_err(|error| driver.api_error(error))?;
+                current = wait_question_marks(&driver, &record, index, &selected)
+                    .await
+                    .map_err(|error| driver.api_error(error))?;
+            }
+            driver
+                .send_key("Enter")
+                .await
+                .map_err(|error| driver.api_error(error))?;
+        } else if let Some(other) = &answer.other {
+            driver
+                .send_text(&(question.options.len() + 1).to_string())
+                .await
+                .map_err(|error| driver.api_error(error))?;
+            wait_question(&driver, &record, index)
+                .await
+                .map_err(|error| driver.api_error(error))?;
+            driver
+                .send_text(other)
+                .await
+                .map_err(|error| driver.api_error(error))?;
+            wait_question(&driver, &record, index)
+                .await
+                .map_err(|error| driver.api_error(error))?;
+            driver
+                .send_key("Enter")
+                .await
+                .map_err(|error| driver.api_error(error))?;
+        } else {
+            driver
+                .send_text(&selected[0].to_string())
+                .await
+                .map_err(|error| driver.api_error(error))?;
+        }
+        if index + 1 < record.questions.len() {
+            wait_question(&driver, &record, index + 1)
+                .await
+                .map_err(|error| driver.api_error(error))?;
+        }
+    }
+    if record.questions.len() > 1
+        || record
+            .questions
+            .iter()
+            .any(|question| question.multi_select)
+    {
+        wait_review(&driver, &record)
+            .await
+            .map_err(|error| driver.api_error(error))?;
+        driver
+            .send_text("1")
+            .await
+            .map_err(|error| driver.api_error(error))?;
+    }
+    wait_question_closed(&driver)
+        .await
+        .map_err(|error| driver.api_error(error))?;
     let mut answered = record;
     answered.state = "answered".into();
-    question_store::atomic_write(&path, &serde_json::to_vec(&answered).expect("record serializes"))
-        .map_err(|_| ApiError::conflict("prompt_gone", "질문 상태를 저장할 수 없습니다."))?;
-    tracing::info!("mobile: Claude question {} by {} to {}", question_id, caller.0, entry.surface_id);
+    question_store::atomic_write(
+        &path,
+        &serde_json::to_vec(&answered).expect("record serializes"),
+    )
+    .map_err(|_| ApiError::conflict("prompt_gone", "질문 상태를 저장할 수 없습니다."))?;
+    tracing::info!(
+        "mobile: Claude question {} by {} to {}",
+        question_id,
+        caller.0,
+        entry.surface_id
+    );
     Ok(Json(json!({"surface_id": entry.surface_id, "answered": question_id})).into_response())
+}
+
+fn current_options(screen: &AskScreen) -> &[AskOption] {
+    let AskScreen::Question { options, .. } = screen else {
+        unreachable!("wait_question returns only a question screen");
+    };
+    options
+}
+
+fn normalized_selected(question: &QuestionItem, answer: &QuestionAnswerItem) -> Option<Vec<usize>> {
+    let mut selected = answer.selected.clone();
+    selected.sort_unstable();
+    selected.dedup();
+    let other = question.options.len() + 1;
+    if selected.is_empty()
+        || selected.iter().any(|item| *item == 0 || *item > other)
+        || (!question.multi_select && selected.len() != 1)
+    {
+        return None;
+    }
+    Some(selected)
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum QuestionKey {
+    Digit(usize),
+    Down,
+    Enter,
+    Text(String),
+}
+
+#[cfg(test)]
+fn question_key_plan(
+    questions: &[QuestionItem],
+    answers: &[QuestionAnswerItem],
+) -> Option<Vec<QuestionKey>> {
+    let mut keys = Vec::new();
+    for (index, question) in questions.iter().enumerate() {
+        let answer = answers
+            .iter()
+            .find(|answer| answer.question_index == index)?;
+        let selected = normalized_selected(question, answer)?;
+        let other = question.options.len() + 1;
+        if question.multi_select {
+            keys.extend(
+                selected
+                    .iter()
+                    .map(|selected| QuestionKey::Digit(*selected)),
+            );
+            if let Some(text) = &answer.other {
+                keys.extend((1..other).map(|_| QuestionKey::Down));
+                keys.push(QuestionKey::Text(text.clone()));
+            }
+            let cursor = if answer.other.is_some() {
+                question.options.len() + 1
+            } else {
+                1
+            };
+            keys.extend((cursor..=question.options.len() + 1).map(|_| QuestionKey::Down));
+            keys.push(QuestionKey::Enter);
+        } else if let Some(text) = &answer.other {
+            keys.extend([
+                QuestionKey::Digit(other),
+                QuestionKey::Text(text.clone()),
+                QuestionKey::Enter,
+            ]);
+        } else {
+            keys.push(QuestionKey::Digit(selected[0]));
+        }
+    }
+    if questions.len() > 1 || questions.iter().any(|question| question.multi_select) {
+        keys.push(QuestionKey::Digit(1));
+    }
+    Some(keys)
+}
+
+async fn wait_question(
+    driver: &AppDriver<'_>,
+    record: &StoredQuestion,
+    index: usize,
+) -> Result<AskScreen, DriveError> {
+    for _ in 0..30 {
+        let screen = driver.read_screen().await?;
+        if let Some(parsed @ AskScreen::Question { .. }) = ask_screen(&screen) {
+            if ask_matches(record, index, &parsed) {
+                return Ok(parsed);
+            }
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
+}
+
+async fn wait_question_marks(
+    driver: &AppDriver<'_>,
+    record: &StoredQuestion,
+    index: usize,
+    expected: &[usize],
+) -> Result<AskScreen, DriveError> {
+    for _ in 0..30 {
+        if let Ok(parsed) = wait_question_once(driver, record, index).await {
+            let checked: Vec<_> = current_options(&parsed)
+                .iter()
+                .filter(|option| option.checked)
+                .map(|option| option.index)
+                .collect();
+            if checked == expected {
+                return Ok(parsed);
+            }
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
+}
+
+async fn wait_question_once(
+    driver: &AppDriver<'_>,
+    record: &StoredQuestion,
+    index: usize,
+) -> Result<AskScreen, DriveError> {
+    let screen = driver.read_screen().await?;
+    let Some(parsed @ AskScreen::Question { .. }) = ask_screen(&screen) else {
+        return Err(DriveError::PromptGone);
+    };
+    ask_matches(record, index, &parsed)
+        .then_some(parsed)
+        .ok_or(DriveError::PromptGone)
+}
+
+async fn wait_review(driver: &AppDriver<'_>, record: &StoredQuestion) -> Result<(), DriveError> {
+    for _ in 0..30 {
+        let screen = driver.read_screen().await?;
+        if let Some(AskScreen::Review { tabs }) = ask_screen(&screen) {
+            let headers = record
+                .questions
+                .iter()
+                .map(|question| question.header.as_str());
+            if tabs.iter().map(String::as_str).eq(headers) {
+                return Ok(());
+            }
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
+}
+
+async fn wait_question_closed(driver: &AppDriver<'_>) -> Result<(), DriveError> {
+    for _ in 0..30 {
+        if ask_screen(&driver.read_screen().await?).is_none() {
+            return Ok(());
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
 }
 
 #[cfg(test)]
 mod question_tests {
     use super::*;
-    use std::fs;
     use std::ffi::CString;
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
 
-    fn question(multi_select: bool) -> QuestionItem {
-        QuestionItem { question: "pick".into(), multi_select, options: vec![
-            QuestionOption { label: "one".into(), description: String::new() },
-            QuestionOption { label: "two".into(), description: String::new() },
-            QuestionOption { label: "three".into(), description: String::new() },
-        ] }
+    const SINGLE: &str = include_str!("../tests/fixtures/ask_user_question/s1_single.txt");
+    const TWO: &str = include_str!("../tests/fixtures/ask_user_question/s2_two_q1.txt");
+    const REVIEW: &str = include_str!("../tests/fixtures/ask_user_question/s2_review_full.txt");
+    const ANSWERED: &str = include_str!("../tests/fixtures/ask_user_question/s2_after_submit.txt");
+    const MULTI: &str = include_str!("../tests/fixtures/ask_user_question/s3_after_toggle_D.txt");
+
+    #[test]
+    fn parses_open_question_review_and_multi_select_but_not_answered_scrollback() {
+        let AskScreen::Question {
+            question,
+            options,
+            multi,
+            ..
+        } = ask_screen(SINGLE).expect("single")
+        else {
+            panic!("question")
+        };
+        assert_eq!(question, "Pick a color");
+        assert_eq!(options[0].label, "Red");
+        assert!(!multi);
+        assert!(matches!(ask_screen(REVIEW), Some(AskScreen::Review { .. })));
+        assert!(ask_screen(ANSWERED).is_none());
+        let AskScreen::Question { multi, options, .. } = ask_screen(MULTI).expect("multi") else {
+            panic!("question")
+        };
+        assert!(multi);
+        assert!(options.iter().any(|option| option.checked));
     }
 
     #[test]
-    fn question_answer_key_sequences_cover_single_multi_other_and_stale_screen() {
-        let single = QuestionAnswerItem { question_index: 0, selected: vec![2], other: None };
-        assert_eq!(question_answer_steps(&question(false), &single, true), vec![QuestionInputStep::Text("2".into())]);
-        let next = QuestionAnswerItem { question_index: 1, selected: vec![1], other: None };
-        let ordered: Vec<_> = [single.clone(), next]
-            .iter()
-            .flat_map(|answer| question_answer_steps(&question(false), answer, true))
-            .collect();
-        assert_eq!(ordered, vec![QuestionInputStep::Text("2".into()), QuestionInputStep::Text("1".into())]);
-        let other = QuestionAnswerItem { question_index: 0, selected: vec![4], other: Some("custom".into()) };
-        assert_eq!(question_answer_steps(&question(false), &other, true), vec![QuestionInputStep::Text("4".into()), QuestionInputStep::Text("custom".into()), QuestionInputStep::Key("Enter")]);
-        let multi = QuestionAnswerItem { question_index: 1, selected: vec![3, 1], other: None };
-        assert_eq!(question_answer_steps(&question(true), &multi, true), vec![QuestionInputStep::Key("Space"), QuestionInputStep::Key("Down"), QuestionInputStep::Key("Down"), QuestionInputStep::Key("Space"), QuestionInputStep::Key("Enter")]);
-        assert!(question_answer_steps(&question(false), &single, false).is_empty());
+    fn stored_question_requires_exact_visible_question_options_and_tabs() {
+        let record = StoredQuestion {
+            id: "id".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![
+                QuestionItem {
+                    header: "Fruit".into(),
+                    question: "Pick fruit".into(),
+                    multi_select: false,
+                    options: vec![
+                        QuestionOption {
+                            label: "Apple".into(),
+                            description: String::new(),
+                        },
+                        QuestionOption {
+                            label: "Banana".into(),
+                            description: String::new(),
+                        },
+                    ],
+                },
+                QuestionItem {
+                    header: "Size".into(),
+                    question: "Pick size".into(),
+                    multi_select: false,
+                    options: vec![],
+                },
+            ],
+        };
+        assert!(ask_matches(&record, 0, &ask_screen(TWO).unwrap()));
+        let stale = format!("{}", ANSWERED);
+        assert!(ask_screen(&stale).is_none());
+    }
+
+    #[test]
+    fn normalized_answers_sort_dedupe_and_refuse_invalid_values() {
+        let question = QuestionItem {
+            header: String::new(),
+            question: "Pick".into(),
+            multi_select: true,
+            options: vec![
+                QuestionOption {
+                    label: "A".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "B".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "C".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "D".into(),
+                    description: String::new(),
+                },
+            ],
+        };
+        assert_eq!(
+            normalized_selected(
+                &question,
+                &QuestionAnswerItem {
+                    question_index: 0,
+                    selected: vec![3, 1, 3],
+                    other: None
+                }
+            ),
+            Some(vec![1, 3])
+        );
+        assert_eq!(
+            normalized_selected(
+                &question,
+                &QuestionAnswerItem {
+                    question_index: 0,
+                    selected: vec![0],
+                    other: None
+                }
+            ),
+            None
+        );
+    }
+
+    fn option(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.into(),
+            description: String::new(),
+        }
+    }
+
+    fn answer(index: usize, selected: &[usize], other: Option<&str>) -> QuestionAnswerItem {
+        QuestionAnswerItem {
+            question_index: index,
+            selected: selected.to_vec(),
+            other: other.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn key_plans_follow_the_captured_single_multi_and_other_flows() {
+        let single = QuestionItem {
+            header: "Color".into(),
+            question: "Pick".into(),
+            multi_select: false,
+            options: vec![option("Red"), option("Blue")],
+        };
+        assert_eq!(
+            question_key_plan(&[single.clone()], &[answer(0, &[2], None)]),
+            Some(vec![QuestionKey::Digit(2)])
+        );
+        assert_eq!(
+            question_key_plan(&[single.clone()], &[answer(0, &[3], Some("한글 😀"))]),
+            Some(vec![
+                QuestionKey::Digit(3),
+                QuestionKey::Text("한글 😀".into()),
+                QuestionKey::Enter,
+            ])
+        );
+
+        let size = QuestionItem {
+            header: "Size".into(),
+            question: "Pick size".into(),
+            multi_select: false,
+            options: vec![option("Small"), option("Large")],
+        };
+        assert_eq!(
+            question_key_plan(
+                &[single.clone(), size],
+                &[answer(0, &[1], None), answer(1, &[2], None)]
+            ),
+            Some(vec![
+                QuestionKey::Digit(1),
+                QuestionKey::Digit(2),
+                QuestionKey::Digit(1)
+            ])
+        );
+
+        let multi = QuestionItem {
+            header: "Letters".into(),
+            question: "Pick letters".into(),
+            multi_select: true,
+            options: vec![option("A"), option("B"), option("C"), option("D")],
+        };
+        let sorted = question_key_plan(&[multi.clone()], &[answer(0, &[2, 4], None)]).unwrap();
+        assert_eq!(
+            &sorted[..2],
+            &[QuestionKey::Digit(2), QuestionKey::Digit(4)]
+        );
+        assert_eq!(sorted.last(), Some(&QuestionKey::Digit(1)));
+        let unsorted = question_key_plan(&[multi.clone()], &[answer(0, &[3, 1], None)]).unwrap();
+        assert_eq!(
+            &unsorted[..2],
+            &[QuestionKey::Digit(1), QuestionKey::Digit(3)]
+        );
+
+        let with_other = question_key_plan(&[multi], &[answer(0, &[1, 5], Some("other"))]).unwrap();
+        assert_eq!(
+            &with_other[..2],
+            &[QuestionKey::Digit(1), QuestionKey::Digit(5)]
+        );
+        assert!(with_other.contains(&QuestionKey::Text("other".into())));
     }
 
     #[test]
@@ -1444,10 +2137,19 @@ mod question_tests {
         question_store::atomic_write(&atomic, br#"{"state":"pending"}"#).unwrap();
         assert_eq!(fs::read(&atomic).unwrap(), br#"{"state":"pending"}"#);
         set_old_mtime(&stale);
-        question_store::cleanup(&root, |path| fs::read(path).ok().is_some_and(|raw| raw.windows(8).any(|part| part == b"answered"))).unwrap();
+        question_store::cleanup(&root, |path| {
+            fs::read(path)
+                .ok()
+                .is_some_and(|raw| raw.windows(8).any(|part| part == b"answered"))
+        })
+        .unwrap();
         assert!(!session.join("answered.json").exists());
         assert!(!stale.exists());
-        assert!(fs::read_dir(&session).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(fs::read_dir(&session).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
         assert!(pending_question_from(&session).is_some());
     }
 
@@ -1463,17 +2165,37 @@ mod question_tests {
     }
 
     fn set_old_mtime(path: &FsPath) {
-        let seconds = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64 - 25 * 60 * 60;
-        let times = [libc::timespec { tv_sec: seconds, tv_nsec: 0 }, libc::timespec { tv_sec: seconds, tv_nsec: 0 }];
+        let seconds = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 25 * 60 * 60;
+        let times = [
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+        ];
         let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) }, 0);
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
     }
 
     fn pending_question_from(directory: &FsPath) -> Option<StoredQuestion> {
         fs::read_dir(directory).ok()?.flatten().find_map(|entry| {
             let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "tmp") { return None; }
-            fs::read(path).ok().and_then(|raw| serde_json::from_slice(&raw).ok())
+            if path.extension().is_some_and(|extension| extension == "tmp") {
+                return None;
+            }
+            fs::read(path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice(&raw).ok())
         })
     }
 }
@@ -2356,20 +3078,22 @@ fn entries_in_flight(entries: &[Value]) -> bool {
 /// is cancelled before it answers, so an open turn is only trusted while the
 /// log is still being written (see `CLAUDE_OPEN_TURN_STALE`).
 pub(crate) fn claude_turn_in_flight(lines: &[Value]) -> Option<bool> {
-    lines.iter().rev().find_map(|row| {
-        match row.get("type").and_then(Value::as_str) {
-            Some("system") => (row.get("subtype").and_then(Value::as_str)
-                == Some("turn_duration"))
-            .then_some(false),
+    lines
+        .iter()
+        .rev()
+        .find_map(|row| match row.get("type").and_then(Value::as_str) {
+            Some("system") => (row.get("subtype").and_then(Value::as_str) == Some("turn_duration"))
+                .then_some(false),
             Some("user") => {
                 if row.get("isMeta").and_then(Value::as_bool) == Some(true) {
                     return None;
                 }
                 let content = row.pointer("/message/content").unwrap_or(&Value::Null);
-                if content
-                    .as_array()
-                    .is_some_and(|blocks| blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")))
-                {
+                if content.as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                }) {
                     return None;
                 }
                 let text = content_text(content, &["text"]);
@@ -2383,8 +3107,7 @@ pub(crate) fn claude_turn_in_flight(lines: &[Value]) -> Option<bool> {
                 }
             }
             _ => None,
-        }
-    })
+        })
 }
 
 const CLAUDE_INTERRUPTED: &str = "[Request interrupted";
@@ -2450,7 +3173,8 @@ fn session_transcript(
     let in_flight = if agent_cli == "codex" {
         codex_turn_in_flight(&lines)
     } else {
-        claude_turn_in_flight(&lines).map(|open| open && log_is_fresh(&path, CLAUDE_OPEN_TURN_STALE))
+        claude_turn_in_flight(&lines)
+            .map(|open| open && log_is_fresh(&path, CLAUDE_OPEN_TURN_STALE))
     }
     .unwrap_or_else(|| entries_in_flight(&entries));
     Ok(json!({

@@ -1,0 +1,45 @@
+❯ Call the AskUserQuestion tool exactly once with ONE question "Pick a color" (header "Color") and exactly 3 options    
+  with labels Red, Green, Blue (multiSelect false). Do nothing else. After the answer, reply with only the chosen       
+  label.                                                                                                                
+
+⏺ User answered Claude's questions:                                                                                     
+  ⎿  · Pick a color → Green           
+
+⏺ Green                          
+
+✻ Churned for 1s · done 오후 6:04                                                                                       
+
+❯ Call AskUserQuestion exactly once with TWO questions: Q1 "Pick fruit" (header "Fruit", options Apple, Banana) and Q2  
+  "Pick size" (header "Size", options Small, Large). multiSelect false. Then reply with only the two chosen labels.     
+
+⏺ User answered Claude's questions:                                                                                     
+  ⎿  · Pick fruit → Banana     
+     · Pick size → Large
+
+⏺ Banana                          
+  Large                                                                                                                 
+                                                                                                                      
+✻ Sautéed for 1s · done 오후 6:05                                                                                       
+
+❯ Call AskUserQuestion exactly once with ONE question "Pick letters" (header "Letters") with multiSelect true and       
+  exactly 4 options labelled A, B, C, D. Then reply with only the chosen labels.                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Letters  ✔ Submit  →                                                                                               
+
+Pick letters
+
+❯ 1. [ ] A
+         Choose A                                                                                                       
+  2. [ ] B                                                                                                            
+         Choose B
+  3. [ ] C
+         Choose C
+  4. [ ] D
+         Choose D
+  5. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+

@@ -1,0 +1,45 @@
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/ask-tui/work
+
+
+❯ Call the AskUserQuestion tool exactly once with ONE question "Pick a color" (header "Color") and exactly 3 options    
+  with labels Red, Green, Blue (multiSelect false). Do nothing else. After the answer, reply with only the chosen       
+  label.                                                                                                                
+
+⏺ User answered Claude's questions:                                                                                     
+  ⎿  · Pick a color → Green           
+
+⏺ Green                          
+
+✻ Churned for 1s · done 오후 6:04                                                                                       
+
+❯ Call AskUserQuestion exactly once with TWO questions: Q1 "Pick fruit" (header "Fruit", options Apple, Banana) and Q2  
+  "Pick size" (header "Size", options Small, Large). multiSelect false. Then reply with only the two chosen labels.     
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Fruit  ☐ Size  ✔ Submit  →                                                                                         
+
+Pick fruit
+
+❯ 1. Apple
+     Choose Apple                                                                                                       
+  2. Banana                                                                                                           
+     Choose Banana
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
