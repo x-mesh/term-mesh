@@ -206,6 +206,12 @@ struct ReviewBoardSnapshot: Equatable, Sendable {
     )
 }
 
+struct IgnoredForEquality<Value: Sendable>: Equatable, Sendable {
+    let value: Value
+    init(_ value: Value) { self.value = value }
+    static func == (lhs: Self, rhs: Self) -> Bool { true }
+}
+
 struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let id: String
     /// The identifier as the producer wrote it. `id` is shortened for display,
@@ -257,7 +263,11 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     /// Same reasoning as `rawID` and `rawResult`.
     let rawTitle: String
     let isStale: Bool
-    let staleSeconds: Int?
+    private let staleSecondsBox: IgnoredForEquality<Int?>
+    /// Seconds since the last progress, read off the clock on every producer
+    /// call, so it is kept out of `==`: no view shows it, and counting it made
+    /// every refresh look like a new snapshot.
+    var staleSeconds: Int? { staleSecondsBox.value }
     let updatedAt: String?
     /// The wave this task was dispatched in, when the leader stated one.
     ///
@@ -366,7 +376,7 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         self.worktreeFinishMode = worktreeFinishMode.map(ReviewBoardText.safeLabel)
         self.worktreeRemoved = worktreeRemoved
         self.isStale = isStale
-        self.staleSeconds = staleSeconds
+        self.staleSecondsBox = IgnoredForEquality(staleSeconds)
         self.updatedAt = updatedAt
         // A wave id identifies a dispatch, so a blank one identifies nothing:
         // every task with an empty string would otherwise land in one group.
@@ -654,6 +664,15 @@ extension ReviewBoardTask {
     /// rather than claim — same Project, same instruction, finished close
     /// together — and every group it forms is marked `isDerived`, because it
     /// is a guess and the board must not present a guess as a wave.
+    static func groupedCached(
+        _ tasks: [ReviewBoardTask],
+        window: TimeInterval = derivedGroupWindow
+    ) -> [ReviewBoardTaskGroup] {
+        groupingCache.groups(for: tasks, window: window)
+    }
+
+    private static let groupingCache = ReviewBoardGroupingCache()
+
     static func grouped(
         _ tasks: [ReviewBoardTask],
         window: TimeInterval = derivedGroupWindow
@@ -1110,11 +1129,31 @@ enum ReviewBoardText {
 
     /// The instant an ISO timestamp names, for arithmetic rather than display.
     static func date(_ iso: String) -> Date? {
-        for parser in timestampParsers {
-            if let date = parser.date(from: iso) { return date }
+        dateCache.lock.lock()
+        if let hit = dateCache.entries[iso] {
+            dateCache.lock.unlock()
+            return hit
         }
-        return nil
+        dateCache.lock.unlock()
+        var parsed: Date?
+        for parser in timestampParsers {
+            if let date = parser.date(from: iso) { parsed = date; break }
+        }
+        dateCache.lock.lock()
+        if dateCache.entries.count >= dateCache.limit { dateCache.entries.removeAll(keepingCapacity: true) }
+        dateCache.entries[iso] = .some(parsed)
+        dateCache.lock.unlock()
+        return parsed
     }
+
+    /// Parsing an ISO stamp is the slow part of drawing the board, and the same
+    /// few hundred stamps are read on every pass. A miss is cached too.
+    private final class DateCache: @unchecked Sendable {
+        let lock = NSLock()
+        let limit = 4096
+        var entries: [String: Date?] = [:]
+    }
+    private static let dateCache = DateCache()
 
     /// Two copies of one instruction, compared the way a reader would.
     ///
@@ -1253,5 +1292,36 @@ enum ReviewBoardText {
         guard let regex else { return text }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return regex.stringByReplacingMatches(in: text, range: range, withTemplate: replacement)
+    }
+}
+
+/// Grouping runs on every body pass of the task list and parses a timestamp per
+/// task, while the tasks themselves change far less often than the body runs.
+final class ReviewBoardGroupingCache: @unchecked Sendable {
+    private struct Entry {
+        let tasks: [ReviewBoardTask]
+        let window: TimeInterval
+        let groups: [ReviewBoardTaskGroup]
+    }
+
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+    private let capacity = 4
+
+    func groups(for tasks: [ReviewBoardTask], window: TimeInterval) -> [ReviewBoardTaskGroup] {
+        lock.lock()
+        if let index = entries.firstIndex(where: { $0.window == window && $0.tasks == tasks }) {
+            let hit = entries.remove(at: index)
+            entries.append(hit)
+            lock.unlock()
+            return hit.groups
+        }
+        lock.unlock()
+        let groups = ReviewBoardTask.grouped(tasks, window: window)
+        lock.lock()
+        entries.append(Entry(tasks: tasks, window: window, groups: groups))
+        if entries.count > capacity { entries.removeFirst() }
+        lock.unlock()
+        return groups
     }
 }
