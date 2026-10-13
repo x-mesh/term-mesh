@@ -1021,6 +1021,35 @@ final class RemoteHostStore: ObservableObject {
     }
 
     #if DEBUG
+    func installTeamRosterPollFixture(hostID: String, sockPath: String) {
+        hosts[hostID] = HostEntry(
+            id: hostID, displayName: hostID, connectionState: .connected,
+            workspaces: [], activeSockPath: sockPath,
+            sshTarget: nil, remoteSockPath: nil
+        )
+    }
+
+    func configureTeamRosterPollingForTesting(
+        sleeper: @escaping (Duration) async throws -> Void,
+        refresh: @escaping (String, String) async -> [RemoteTeamSummary]?
+    ) {
+        teamRosterSleeperForTesting = sleeper
+        teamRosterRefreshForTesting = refresh
+    }
+
+    func startTeamRosterUpdatesForTesting(hostID: String) -> Bool {
+        guard let host = hosts[hostID], host.isConnected, !host.activeSockPath.isEmpty else { return false }
+        startTeamRosterUpdates(for: host.activeSockPath, key: hostID)
+        return true
+    }
+
+    func removeTeamRosterPollFixture(hostID: String) {
+        stopWorkspaceSubscription(for: hostID)
+        hosts[hostID] = nil
+        teamRosterSleeperForTesting = nil
+        teamRosterRefreshForTesting = nil
+    }
+
     func installConnectingHostForTesting(
         _ host: HostEntry, attemptID: UUID, task: Task<Void, Never>,
         leaseKey: PeerPaneHostKey? = nil
@@ -1176,7 +1205,11 @@ final class RemoteHostStore: ObservableObject {
     /// worker exited disappears from the sidebar instead of remaining a button
     /// that can only fail.
     private var teamRosterPollTasks: [String: Task<Void, Never>] = [:]
-    static let teamRosterPollInterval: Duration = .seconds(15)
+    static let teamRosterPollInterval: Duration = .seconds(60)
+    #if DEBUG
+    private var teamRosterSleeperForTesting: ((Duration) async throws -> Void)?
+    private var teamRosterRefreshForTesting: ((String, String) async -> [RemoteTeamSummary]?)?
+    #endif
     /// Identifies the task currently installed for each host. A cancelled
     /// task can finish after a reconnect has already installed its successor;
     /// its `defer` must not clear the successor's state.
@@ -2223,8 +2256,7 @@ final class RemoteHostStore: ObservableObject {
                 // Project discovery follows independently. An unresolved or
                 // slow session owner must not hold the serving GUI's roster
                 // hostage for the whole startup retry budget.
-                self.scheduleTeamRosterRefresh(for: path, key: key)
-                self.startTeamRosterPolling(for: path, key: key)
+                self.startTeamRosterUpdates(for: path, key: key)
                 // A connection may have recovered after the owner's initial
                 // publication attempt. Re-run publication from this concrete
                 // success event even when the team itself did not mutate.
@@ -2491,10 +2523,10 @@ final class RemoteHostStore: ObservableObject {
     private func startTeamRosterPolling(for path: String, key: String) {
         teamRosterPollTasks[key]?.cancel()
         teamRosterPollTasks[key] = Task { [weak self] in
+            guard let self else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(for: Self.teamRosterPollInterval)
+                try? await self.sleepForTeamRoster(Self.teamRosterPollInterval)
                 guard !Task.isCancelled,
-                      let self,
                       self.hosts[key]?.activeSockPath == path,
                       self.hosts[key]?.isConnected == true
                 else { return }
@@ -2550,13 +2582,13 @@ final class RemoteHostStore: ObservableObject {
             }
             while !Task.isCancelled {
                 // Coalesce a burst before opening the remote team endpoint.
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                try? await self.sleepForTeamRoster(.milliseconds(200))
                 guard !Task.isCancelled,
                       self.hosts[key]?.activeSockPath == path,
                       self.hosts[key]?.isConnected == true
                 else { return }
                 self.teamRosterRefreshDirtyKeys.remove(key)
-                let teams = await self.fetchTeamRoster(
+                let teams = await self.fetchTeamRosterForRefresh(
                     hostKey: key, servingSockPath: path
                 )
                 guard !Task.isCancelled,
@@ -2575,6 +2607,32 @@ final class RemoteHostStore: ObservableObject {
                 guard self.teamRosterRefreshDirtyKeys.contains(key) else { return }
             }
         }
+    }
+
+    private func startTeamRosterUpdates(for path: String, key: String) {
+        scheduleTeamRosterRefresh(for: path, key: key)
+        startTeamRosterPolling(for: path, key: key)
+    }
+
+    private func sleepForTeamRoster(_ duration: Duration) async throws {
+        #if DEBUG
+        if let sleeper = teamRosterSleeperForTesting {
+            try await sleeper(duration)
+            return
+        }
+        #endif
+        try await Task.sleep(for: duration)
+    }
+
+    private func fetchTeamRosterForRefresh(
+        hostKey: String, servingSockPath: String
+    ) async -> [RemoteTeamSummary]? {
+        #if DEBUG
+        if let refresh = teamRosterRefreshForTesting {
+            return await refresh(hostKey, servingSockPath)
+        }
+        #endif
+        return await fetchTeamRoster(hostKey: hostKey, servingSockPath: servingSockPath)
     }
 
     /// Delete a durable Project manifest this installation owns, without
