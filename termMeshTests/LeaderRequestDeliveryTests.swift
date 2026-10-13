@@ -146,6 +146,37 @@ final class LeaderRequestDeliveryTests: XCTestCase {
         XCTAssertEqual(recorded.lastWakeAt, next)
     }
 
+    func testLeaderReadyWakeRewakesTheOldestRequestAfterARestart() throws {
+        let team = registerTeam()
+        try enqueue(team, "a", at: 0)
+        try enqueue(team, "b", at: 5)
+        XCTAssertTrue(store.recordLeaderRequestWake(teamName: team, requestId: "a", now: t0.addingTimeInterval(1)))
+        let ready = t0.addingTimeInterval(10)
+        XCTAssertEqual(
+            store.nextLeaderRequestForWake(teamName: team, now: ready, neverWokenOnly: false)?.id, "a",
+            "the restarted leader has an empty input, so the woken-but-unprocessed request is woken again"
+        )
+        XCTAssertEqual(
+            store.nextLeaderRequestForWake(teamName: team, now: ready)?.id, "b",
+            "the wake after a completion still leaves an already-woken request alone"
+        )
+    }
+
+    func testLeaderReadyWakeStillSkipsExpiredAndClaimedRequests() throws {
+        let team = registerTeam()
+        try enqueue(team, "old", at: 0)
+        let expired = t0.addingTimeInterval(TeamDataStore.leaderRequestAutoWakeMaxAge + 1)
+        XCTAssertNil(store.nextLeaderRequestForWake(teamName: team, now: expired, neverWokenOnly: false))
+        try enqueue(team, "fresh", at: TeamDataStore.leaderRequestAutoWakeMaxAge)
+        XCTAssertEqual(
+            store.nextLeaderRequestForWake(teamName: team, now: expired, neverWokenOnly: false)?.id, "fresh"
+        )
+        guard case .succeeded = store.takeLeaderRequest(teamName: team, requestId: "fresh") else {
+            return XCTFail("fresh was not claimed")
+        }
+        XCTAssertNil(store.nextLeaderRequestForWake(teamName: team, now: expired, neverWokenOnly: false))
+    }
+
     func testCompleteThenWakeFindsNothingWhenEveryQueuedRequestWasWoken() throws {
         let team = registerTeam()
         try enqueue(team, "a", at: 0)

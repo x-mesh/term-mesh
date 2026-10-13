@@ -1078,28 +1078,33 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return includeCompleted ? requests : requests.filter { $0.status != "completed" }
     }
 
-    /// The request to wake next: the oldest live queued one whose wake was
-    /// never dispatched. One already woken sits in the leader's input, and a
-    /// second prompt would only duplicate it. A claimed request means the
-    /// leader is already working, and an expired one is never woken
-    /// automatically.
+    /// The request to wake next: the oldest live queued one. A claimed request
+    /// means the leader is already working, and an expired one is never woken
+    /// automatically. After a completion `neverWokenOnly` skips requests whose
+    /// wake already sits in the leader's input, since a second prompt would only
+    /// duplicate it; a restarted leader has an empty input, so its ready wake
+    /// passes `false` and re-wakes the oldest request.
     static func nextLeaderRequestForWake(
-        in requests: [LeaderRequest], now: Date
+        in requests: [LeaderRequest], now: Date, neverWokenOnly: Bool = true
     ) -> LeaderRequest? {
         guard !requests.contains(where: { $0.status == "claimed" }) else { return nil }
         return requests
             .filter {
                 $0.effectiveStatus(now: now) == "queued"
-                    && ($0.wakeAttempts ?? 0) == 0 && $0.lastWakeAt == nil
+                    && (!neverWokenOnly || (($0.wakeAttempts ?? 0) == 0 && $0.lastWakeAt == nil))
             }
             .min { $0.createdAt < $1.createdAt }
     }
 
-    func nextLeaderRequestForWake(teamName: String, now: Date = Date()) -> LeaderRequest? {
+    func nextLeaderRequestForWake(
+        teamName: String, now: Date = Date(), neverWokenOnly: Bool = true
+    ) -> LeaderRequest? {
         lock.lock()
         defer { lock.unlock() }
         guard teamRegistry[teamName] != nil else { return nil }
-        return Self.nextLeaderRequestForWake(in: leaderRequests[teamName] ?? [], now: now)
+        return Self.nextLeaderRequestForWake(
+            in: leaderRequests[teamName] ?? [], now: now, neverWokenOnly: neverWokenOnly
+        )
     }
 
     @discardableResult
