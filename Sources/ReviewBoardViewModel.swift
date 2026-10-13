@@ -86,6 +86,9 @@ final class ReviewBoardViewModel: ObservableObject {
     /// covers reads as well, so it cannot answer "is a decision in flight".
     private var decisionInFlight = false
     private var teamCancellable: AnyCancellable?
+    /// Whether this window's board is on screen. Every window owns a view model,
+    /// so this gates the provider calls of exactly one window.
+    private var isPresented = true
     private var activityTicker: Timer?
     private var remoteCollaborationRecords: [String: [LeaderTurnLog.Record]] = [:]
     private var remoteCollaborationFetches: [String: Task<Void, Never>] = [:]
@@ -150,7 +153,7 @@ final class ReviewBoardViewModel: ObservableObject {
         // objectWillChange fires before the change lands, so settle then read.
         .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
-            self?.refresh()
+            self?.refreshIfPresented()
         }
 
         // Whether an agent is printing changes without either store changing,
@@ -163,10 +166,28 @@ final class ReviewBoardViewModel: ObservableObject {
             // board returns, so an off-screen board can skip this work without
             // reopening with a stale snapshot.
             guard ReviewBoardSettings.isVisible else { return }
-            Task { @MainActor in self?.refreshWhileWorkIsRunning() }
+            Task { @MainActor in self?.activityTick() }
         }
         RunLoop.main.add(ticker, forMode: .common)
         activityTicker = ticker
+    }
+
+    func activityTick() {
+        guard isPresented else { return }
+        refreshWhileWorkIsRunning()
+    }
+
+    func refreshIfPresented() {
+        guard isPresented else { return }
+        refresh()
+    }
+
+    /// Reopening refreshes at once, so a board hidden for hours never shows its
+    /// last snapshot.
+    func setPresented(_ presented: Bool) {
+        guard presented != isPresented else { return }
+        isPresented = presented
+        if presented { refresh() }
     }
 
     /// Idle boards cost nothing: with no tasks there is nothing to animate.
@@ -314,7 +335,7 @@ final class ReviewBoardViewModel: ObservableObject {
 
     func setSnapshotProvider(_ provider: @escaping @MainActor () -> ReviewBoardSnapshot) {
         snapshotProvider = provider
-        refresh()
+        refreshIfPresented()
     }
 
     func setActions(_ actions: ReviewBoardActions) {
