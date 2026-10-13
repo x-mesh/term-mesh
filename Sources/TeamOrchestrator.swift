@@ -35,10 +35,7 @@ final class TeamOrchestrator: ObservableObject {
     private static let localLeaderReadinessTimeout: TimeInterval = 60
     static let localLeaderStablePromptObservations = 4
 
-    private var leaderRequestSweepTimer: DispatchSourceTimer?
-
     private init() {
-        defer { startLeaderRequestSweepTimer() }
         // Native turn state lives in the thread-safe data store rather than in
         // teams. Forward its coalesced change signal so sidebar runtime
         // snapshots are recomputed when an agent starts or finishes a turn.
@@ -6284,7 +6281,7 @@ final class TeamOrchestrator: ObservableObject {
                     current.leaderFailureDescription = nil
                     self.teams[teamName] = current
                     self.syncTeamStateToDaemon()
-                    self.wakeNextEligibleLeaderRequest(teamName: teamName, tabManager: tabManager, isRetry: false)
+                    self.wakeNextEligibleLeaderRequest(teamName: teamName, tabManager: tabManager)
                 } else {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + Self.localLeaderReadinessPollInterval
@@ -6303,59 +6300,21 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     static let nextLeaderRequestWakeDelay: TimeInterval = 2
-    private static let leaderRequestSweepInterval: TimeInterval = 30
 
-    /// Wakes at most one request: the oldest live queued one, once its cooldown
-    /// has passed and while it has attempts left. Failed dispatches are not
-    /// counted, so a leader that is not ready yet keeps its attempts.
-    ///
-    /// A retry also waits for the leader to be idle and to have seen the last
-    /// wake; `isRetry: false` is the readiness wake, which has nothing earlier
-    /// to pile up behind.
-    func wakeNextEligibleLeaderRequest(
-        teamName: String, tabManager: TabManager? = nil, isRetry: Bool = true
-    ) {
-        guard let team = teams[teamName], team.leaderReady,
+    /// Wakes exactly one request: the oldest live queued one, while no request
+    /// is claimed. Not gated on the leader being idle: the only callers run when
+    /// the leader just became ready or just completed a request, and nothing
+    /// retries a wake that is skipped. A failed dispatch is not counted.
+    func wakeNextEligibleLeaderRequest(teamName: String, tabManager: TabManager? = nil) {
+        guard teams[teamName]?.leaderReady == true,
               let manager = tabManager ?? resolveTabManager(teamName: teamName)
                 ?? AppDelegate.shared?.tabManager,
               let request = TeamDataStore.shared.nextLeaderRequestForWake(teamName: teamName)
         else { return }
-        if isRetry, !leaderMayReceiveRetryWake(team: team, teamName: teamName, request: request) {
-            return
-        }
         let wake = leaderRequestWake(teamName: teamName, requestId: request.id)
         if sendToLeader(teamName: teamName, text: wake, tabManager: manager) {
             TeamDataStore.shared.recordLeaderRequestWake(teamName: teamName, requestId: request.id)
         }
-    }
-
-    private func leaderMayReceiveRetryWake(team: Team, teamName: String, request: TeamDataStore.LeaderRequest) -> Bool {
-        let nativeThinking = nativeAgentPanel(
-            workspaceId: team.leaderWorkspaceId ?? team.workspaceId, panelId: team.leaderPanelId
-        )?.session.isThinking == true
-        let paneActive = nativeThinking || AutoReplyPoller.shared.isPaneActive(panelId: team.leaderPanelId)
-        let turn = TeamDataStore.LeaderTurnState(
-            records: LeaderTurnLog.readRecent(team: teamName), now: Date()
-        )
-        return TeamDataStore.LeaderRequestWakeGate.mayWake(
-            turn: turn, paneActive: paneActive, lastWakeAt: request.lastWakeAt
-        )
-    }
-
-    private func startLeaderRequestSweepTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(
-            deadline: .now() + Self.leaderRequestSweepInterval,
-            repeating: Self.leaderRequestSweepInterval
-        )
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            for teamName in Array(self.teams.keys) {
-                self.wakeNextEligibleLeaderRequest(teamName: teamName)
-            }
-        }
-        timer.resume()
-        leaderRequestSweepTimer = timer
     }
 
     static func leaderRequestWake(requestId: String, tmAgent: String) -> String {

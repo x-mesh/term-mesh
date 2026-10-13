@@ -242,68 +242,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// What the leader's turn hooks say about the leader right now. A retry
-    /// wake lands in the leader's input, so sending one mid-turn only stacks
-    /// copies that the leader meets all at once when the turn ends.
-    struct LeaderTurnState: Equatable {
-        static let staleTurnAge: TimeInterval = 30 * 60
-
-        let hasTelemetry: Bool
-        let inProgress: Bool
-        let lastEndAt: Date?
-
-        init(hasTelemetry: Bool, inProgress: Bool, lastEndAt: Date?) {
-            self.hasTelemetry = hasTelemetry
-            self.inProgress = inProgress
-            self.lastEndAt = lastEndAt
-        }
-
-        /// `records` are one team's leader turn records, oldest first. A start
-        /// with no end that is older than `staleTurnAge` is a lost Stop hook,
-        /// not a turn, so it must not block retries forever.
-        init(records: [LeaderTurnLog.Record], now: Date) {
-            let parser = ISO8601DateFormatter()
-            var seen = false
-            var inProgress = false
-            var startedAt: Date?
-            var endedAt: Date?
-            for record in records where record.event == .turnStart || record.event == .turnEnd {
-                guard let at = parser.date(from: record.timestamp) else { continue }
-                seen = true
-                if record.event == .turnStart {
-                    inProgress = true
-                    startedAt = at
-                } else {
-                    inProgress = false
-                    endedAt = at
-                }
-            }
-            if inProgress, let startedAt, now.timeIntervalSince(startedAt) > Self.staleTurnAge {
-                self.init(hasTelemetry: false, inProgress: false, lastEndAt: nil)
-                return
-            }
-            self.init(hasTelemetry: seen, inProgress: inProgress, lastEndAt: endedAt)
-        }
-    }
-
-    enum LeaderRequestWakeGate {
-        /// A leader printing output is busy whatever the hooks say. With turn
-        /// telemetry a resend also needs proof the previous wake was seen: a
-        /// turn that ended after it (hook timestamps are whole seconds). Without
-        /// telemetry, pane activity is the only signal there is.
-        static func mayWake(turn: LeaderTurnState, paneActive: Bool, lastWakeAt: Date?) -> Bool {
-            if paneActive { return false }
-            guard turn.hasTelemetry else { return true }
-            if turn.inProgress { return false }
-            guard let lastWakeAt else { return true }
-            guard let endedAt = turn.lastEndAt else { return false }
-            return endedAt >= Date(timeIntervalSince1970: lastWakeAt.timeIntervalSince1970.rounded(.down))
-        }
-    }
-
     static let leaderRequestAutoWakeMaxAge: TimeInterval = 30 * 60
-    static let leaderRequestWakeMinInterval: TimeInterval = 60
-    static let leaderRequestMaxWakeAttempts = 5
     static let leaderRequestPreviewLength = 80
 
     enum LeaderRequestEnqueueResult {
@@ -1139,25 +1078,16 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return includeCompleted ? requests : requests.filter { $0.status != "completed" }
     }
 
-    /// The one request worth re-waking: the oldest live queued request that
-    /// has attempts left, and only once its cooldown has passed. A claimed
-    /// request means the leader is already working, so nothing is woken.
+    /// The request to wake next: the oldest live queued one. A claimed request
+    /// means the leader is already working, and an expired one is never woken
+    /// automatically.
     static func nextLeaderRequestForWake(
         in requests: [LeaderRequest], now: Date
     ) -> LeaderRequest? {
         guard !requests.contains(where: { $0.status == "claimed" }) else { return nil }
-        let candidate = requests
-            .filter {
-                $0.effectiveStatus(now: now) == "queued"
-                    && ($0.wakeAttempts ?? 0) < leaderRequestMaxWakeAttempts
-            }
+        return requests
+            .filter { $0.effectiveStatus(now: now) == "queued" }
             .min { $0.createdAt < $1.createdAt }
-        guard let candidate else { return nil }
-        if let last = candidate.lastWakeAt,
-           now.timeIntervalSince(last) < leaderRequestWakeMinInterval {
-            return nil
-        }
-        return candidate
     }
 
     func nextLeaderRequestForWake(teamName: String, now: Date = Date()) -> LeaderRequest? {
