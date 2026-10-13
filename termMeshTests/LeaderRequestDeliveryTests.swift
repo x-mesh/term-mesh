@@ -139,4 +139,81 @@ final class LeaderRequestDeliveryTests: XCTestCase {
         else { return XCTFail("a was not completed") }
         XCTAssertEqual(store.nextLeaderRequestForWake(teamName: team, now: t0.addingTimeInterval(10))?.id, "b")
     }
+
+    // MARK: - Retry gate
+
+    private func turn(
+        inProgress: Bool = false, lastEnd: TimeInterval? = nil, telemetry: Bool = true
+    ) -> TeamDataStore.LeaderTurnState {
+        .init(hasTelemetry: telemetry, inProgress: inProgress, lastEndAt: lastEnd.map { t0.addingTimeInterval($0) })
+    }
+
+    func testNoRetryWhileALeaderTurnIsInProgress() {
+        XCTAssertFalse(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(inProgress: true, lastEnd: 100), paneActive: false, lastWakeAt: t0
+        ))
+        XCTAssertFalse(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(inProgress: true), paneActive: false, lastWakeAt: nil
+        ))
+    }
+
+    func testNoRetryUntilATurnEndedAfterTheLastWake() {
+        let wake = t0.addingTimeInterval(50.4)
+        XCTAssertFalse(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(lastEnd: 10), paneActive: false, lastWakeAt: wake
+        ), "the only turn ended before the wake, so the wake was never taken up")
+        XCTAssertFalse(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(), paneActive: false, lastWakeAt: wake
+        ))
+        XCTAssertTrue(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(lastEnd: 50), paneActive: false, lastWakeAt: wake
+        ), "hook timestamps are whole seconds, so a turn ending in the wake's second counts")
+        XCTAssertTrue(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(lastEnd: 120), paneActive: false, lastWakeAt: wake
+        ))
+    }
+
+    func testFirstWakeOfAnIdleLeaderNeedsNoEarlierTurn() {
+        XCTAssertTrue(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(), paneActive: false, lastWakeAt: nil
+        ))
+    }
+
+    func testTerminalLeaderWithoutTelemetryFallsBackToPaneActivity() {
+        let silent = turn(telemetry: false)
+        XCTAssertFalse(TeamDataStore.LeaderRequestWakeGate.mayWake(turn: silent, paneActive: true, lastWakeAt: t0))
+        XCTAssertTrue(TeamDataStore.LeaderRequestWakeGate.mayWake(turn: silent, paneActive: false, lastWakeAt: t0))
+        XCTAssertFalse(TeamDataStore.LeaderRequestWakeGate.mayWake(
+            turn: turn(lastEnd: 100), paneActive: true, lastWakeAt: t0
+        ), "a printing pane is busy whatever the hooks say")
+    }
+
+    private func record(_ event: LeaderTurnLog.Event, at offset: TimeInterval) -> LeaderTurnLog.Record {
+        let at = t0.addingTimeInterval(offset)
+        return event == .turnStart
+            ? .turnStart(team: "t", surfaceID: "s", prompt: "p", timestamp: at)
+            : .turnEnd(team: "t", surfaceID: "s", prompt: "p", timestamp: at)
+    }
+
+    func testTurnStateFollowsStartAndEndRecords() {
+        let now = t0.addingTimeInterval(1000)
+        let running = TeamDataStore.LeaderTurnState(
+            records: [record(.turnStart, at: 10), record(.turnEnd, at: 20), record(.turnStart, at: 30)], now: now
+        )
+        XCTAssertTrue(running.inProgress)
+        XCTAssertEqual(running.lastEndAt, t0.addingTimeInterval(20))
+        let idle = TeamDataStore.LeaderTurnState(
+            records: [record(.turnStart, at: 10), record(.turnEnd, at: 20)], now: now
+        )
+        XCTAssertFalse(idle.inProgress)
+        XCTAssertTrue(idle.hasTelemetry)
+        XCTAssertFalse(TeamDataStore.LeaderTurnState(records: [], now: now).hasTelemetry)
+    }
+
+    func testAnUnfinishedTurnOlderThanTheStaleAgeIsNotATurn() {
+        let now = t0.addingTimeInterval(TeamDataStore.LeaderTurnState.staleTurnAge + 100)
+        let state = TeamDataStore.LeaderTurnState(records: [record(.turnStart, at: 0)], now: now)
+        XCTAssertFalse(state.inProgress)
+        XCTAssertFalse(state.hasTelemetry)
+    }
 }

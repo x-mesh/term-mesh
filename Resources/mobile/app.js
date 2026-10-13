@@ -1160,7 +1160,7 @@
           var meta = document.createElement('span');
           meta.className = 'muted req-meta';
           var bits = [formatAge(r.created_at), String(r.id || r.request_id || '').slice(0, 8)];
-          if (r.status === 'queued' && r.wake_attempts >= 1) { bits.push('깨우기 ' + r.wake_attempts + '회'); }
+          if (r.status === 'queued' && r.wake_attempts >= 1) { bits.push('알림 ' + r.wake_attempts + '회'); }
           meta.textContent = bits.filter(Boolean).join(' · ');
           main.appendChild(preview);
           main.appendChild(meta);
