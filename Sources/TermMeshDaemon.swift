@@ -1981,7 +1981,7 @@ final class TermMeshDaemon: ObservableObject {
               var jsonString = String(data: data, encoding: .utf8) else {
             return .failure(.rpcError("could not encode RPC request"))
         }
-        guard data.count + 1 <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes else {
+        guard Self.requestBodyFitsDaemonEnvelope(data) else {
             Logger.daemon.error(
                 "RPC request rejected before send (method: \(method, privacy: .public), bytes: \(data.count, privacy: .public), limit: \(TermMeshDaemonProtocol.maxOperationEnvelopeBytes, privacy: .public))"
             )
@@ -2052,6 +2052,10 @@ final class TermMeshDaemon: ObservableObject {
             return .failure(.rpcError("daemon returned an empty result"))
         }
         return .success(result)
+    }
+
+    static func requestBodyFitsDaemonEnvelope(_ data: Data) -> Bool {
+        data.count <= TermMeshDaemonProtocol.maxOperationEnvelopeBytes
     }
 
     private func daemonBinaryPath() -> String? {
