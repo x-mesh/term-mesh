@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.6] - 2026-10-13
+
+### Added
+
+- The remote page can now answer a multiple-choice question that Claude Code asks with AskUserQuestion. The page shows each question with its options and supports single choice, several questions, multiple selection, and a typed "Other" answer. Before it sends keys, the host checks that the same question is still open in the pane, and it sends nothing if the question changed or closed. This release supports panes on the Mac that runs term-mesh. Panes on a relay host do not support it yet.
+
+### Changed
+
+- A remote native agent pane now receives only the new text of a streaming answer instead of the full answer on every update. In a test with a 20 KB answer sent in 100 updates, the data sent fell from about 1.2 MB to about 77 KB. Both the host and the viewer must run this version, and older peers keep the previous behavior.
+
+### Fixed
+
+- The peer connection no longer collects a large backlog of objects to release while a remote pane streams output, and it no longer keeps a 10-second timer for every write.
+- The leader measurement in the team status no longer shows an older value when two refreshes overlap.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.5] - 2026-10-13
 
 ### Fixed
