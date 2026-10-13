@@ -285,6 +285,15 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
         clientRows: UInt32,
         resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment?
+    /// Same as `attach`, for a provider whose output depends on what the client
+    /// advertised. The default ignores it.
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64,
+        clientCapabilities: PeerCapabilities
+    ) async -> PeerSurfaceAttachment?
     /// Layout-preserving discovery: enumerate the host's workspaces
     /// (tabs) plus their split tree. Default implementation returns an
     /// empty list, so providers that don't expose split layouts (Static,
@@ -375,6 +384,18 @@ public struct PeerTeamCallFailure: Error, Sendable, Equatable {
 }
 
 public extension PeerSurfaceProvider {
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64,
+        clientCapabilities: PeerCapabilities
+    ) async -> PeerSurfaceAttachment? {
+        await attach(
+            surfaceID: surfaceID, clientCols: clientCols,
+            clientRows: clientRows, resumeFromSeq: resumeFromSeq
+        )
+    }
     func supportsAtomicResync() async -> Bool { false }
     func supportsLivePresentation() async -> Bool { false }
     func relayTelemetrySnapshot() async -> Termmesh_Peer_V1_RelayTelemetry? { nil }
@@ -2383,7 +2404,9 @@ actor PeerServerSession {
             var advertisedCapabilities = PeerCapability.supported
             if !(await provider.supportsLivePresentation()) {
                 advertisedCapabilities.removeAll {
-                    $0 == PeerCapability.agentPresentationV1 || $0 == PeerCapability.projectPresentationLiveV1
+                    $0 == PeerCapability.agentPresentationV1
+                        || $0 == PeerCapability.agentPresentationAppendV1
+                        || $0 == PeerCapability.projectPresentationLiveV1
                 }
             }
             if !(await provider.supportsAtomicResync()) {
@@ -2833,7 +2856,8 @@ actor PeerServerSession {
                 surfaceID: req.surfaceID,
                 clientCols: req.clientCols,
                 clientRows: req.clientRows,
-                resumeFromSeq: resumeFromSeq
+                resumeFromSeq: resumeFromSeq,
+                clientCapabilities: clientCapabilities
             )
         else {
             try await sendEnvelopeWithCorrelation(correlationID) { inner in

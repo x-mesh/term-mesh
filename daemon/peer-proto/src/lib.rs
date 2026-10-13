@@ -79,6 +79,8 @@ pub mod capability {
     pub const SURFACE_AGENT_V1: &str = "surface.agent.v1";
     /// GUI-owned view support; the Rust daemon does not advertise these.
     pub const AGENT_PRESENTATION_V1: &str = "agent.presentation.v1";
+    /// The viewer applies append-only patches for a streaming agent entry.
+    pub const AGENT_PRESENTATION_APPEND_V1: &str = "agent.presentation.append.v1";
     pub const PROJECT_PRESENTATION_LIVE_V1: &str = "project.presentation.live.v1";
     /// The host reports a surface process exit after its final data frame.
     /// Advertised by the CLIENT because it opts into the new pushed payload.

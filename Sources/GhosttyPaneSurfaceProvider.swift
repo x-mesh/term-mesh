@@ -1485,6 +1485,19 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         clientRows: UInt32,
         resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? {
+        await attach(
+            surfaceID: surfaceID, clientCols: clientCols, clientRows: clientRows,
+            resumeFromSeq: resumeFromSeq, clientCapabilities: PeerCapabilities()
+        )
+    }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64,
+        clientCapabilities: PeerCapabilities
+    ) async -> PeerSurfaceAttachment? {
         for ctx in allWindowContexts() {
             for workspace in ctx.tabManager.tabs {
                 if let native = workspace.panels.values.compactMap({ $0 as? AgentPanel }).first(where: {
@@ -1492,7 +1505,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                         && workspace.remoteAgentPaneSessions[$0.id] == nil
                 }) {
                     let (id, states) = native.session.subscribeLivePresentation()
-                    let encoder = AgentLiveEncoder(states)
+                    let encoder = AgentLiveEncoder(
+                        states,
+                        supportsAppend: clientCapabilities.has(PeerCapability.agentPresentationAppendV1)
+                    )
                     let input = AgentLiveInput(native.session)
                     return PeerSurfaceAttachment(
                         byteStream: AsyncStream(unfolding: { await encoder.next() }),
