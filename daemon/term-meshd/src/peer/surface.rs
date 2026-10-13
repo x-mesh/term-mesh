@@ -57,6 +57,7 @@ const READ_BUF_SIZE: usize = 65536;
 const BROADCAST_BATCH_MAX_BYTES: usize = READ_BUF_SIZE;
 const BROADCAST_BATCH_WINDOW: Duration = Duration::from_millis(50);
 const INTERACTIVE_OUTPUT_EPOCH: Duration = Duration::from_millis(50);
+const INTERACTIVE_OUTPUT_BUDGET_BYTES: usize = 4 * 1024;
 static MONOTONIC_ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
 
 fn monotonic_now_nanos() -> u64 {
@@ -245,6 +246,8 @@ struct PtyBroadcastBatch {
     pending: Option<PtyChunk>,
     deadline: Option<tokio::time::Instant>,
     interactive_until: Option<tokio::time::Instant>,
+    interactive_immediate_bytes: usize,
+    interactive_bypass_active: bool,
 }
 
 impl PtyBroadcastBatch {
@@ -263,20 +266,43 @@ impl PtyBroadcastBatch {
             .is_some_and(|until| now < until);
         if interactive && !interactive_active {
             self.interactive_until = Some(now + INTERACTIVE_OUTPUT_EPOCH);
+            self.interactive_immediate_bytes = 0;
+            self.interactive_bypass_active = true;
         }
         if self
             .interactive_until
             .is_some_and(|until| now < until)
+            && self.interactive_bypass_active
         {
-            self.deadline = None;
-            return match self.pending.take() {
-                None => PtyBroadcastBatchOutput::One(chunk),
-                Some(mut pending) if pending.seq + pending.bytes.len() as u64 == chunk.seq => {
-                    pending.bytes.extend_from_slice(&chunk.bytes);
-                    PtyBroadcastBatchOutput::One(pending)
-                }
-                Some(pending) => PtyBroadcastBatchOutput::Two(pending, chunk),
-            };
+            let immediate_bytes = self
+                .pending
+                .as_ref()
+                .map_or(chunk.bytes.len(), |pending| {
+                    pending.bytes.len().saturating_add(chunk.bytes.len())
+                });
+            if self
+                .interactive_immediate_bytes
+                .saturating_add(immediate_bytes)
+                <= INTERACTIVE_OUTPUT_BUDGET_BYTES
+            {
+                self.interactive_immediate_bytes = self
+                    .interactive_immediate_bytes
+                    .saturating_add(immediate_bytes);
+                self.deadline = None;
+                return match self.pending.take() {
+                    None => PtyBroadcastBatchOutput::One(chunk),
+                    Some(mut pending)
+                        if pending.seq + pending.bytes.len() as u64 == chunk.seq
+                            && pending.bytes.len() + chunk.bytes.len()
+                                <= BROADCAST_BATCH_MAX_BYTES =>
+                    {
+                        pending.bytes.extend_from_slice(&chunk.bytes);
+                        PtyBroadcastBatchOutput::One(pending)
+                    }
+                    Some(pending) => PtyBroadcastBatchOutput::Two(pending, chunk),
+                };
+            }
+            self.interactive_bypass_active = false;
         }
         if self.deadline.is_none() {
             self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
@@ -326,6 +352,8 @@ impl PtyBroadcastBatch {
     fn flush_remaining(&mut self) -> PtyBroadcastBatchOutput {
         self.deadline = None;
         self.interactive_until = None;
+        self.interactive_immediate_bytes = 0;
+        self.interactive_bypass_active = false;
         self.pending
             .take()
             .map(PtyBroadcastBatchOutput::One)
@@ -3963,6 +3991,87 @@ mod tests {
         let now = tokio::time::Instant::now();
         let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
         assert!(batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false)).is_empty());
+    }
+
+    #[test]
+    fn pty_broadcast_batch_interactive_budget_falls_back_to_batching_for_flood() {
+        let mut batch = PtyBroadcastBatch::default();
+        let now = tokio::time::Instant::now();
+        let mut output = batch_output(batch.submit_at(
+            PtyChunk {
+                seq: 0,
+                bytes: b"k".to_vec(),
+            },
+            now,
+            true,
+        ));
+        let mut next_seq = 1u64;
+        let small = vec![b's'; INTERACTIVE_OUTPUT_BUDGET_BYTES / 2 - 1];
+        output.extend(batch_output(batch.submit_at(
+            PtyChunk {
+                seq: next_seq,
+                bytes: small.clone(),
+            },
+            now,
+            true,
+        )));
+        next_seq += small.len() as u64;
+        let over_budget = vec![b'o'; INTERACTIVE_OUTPUT_BUDGET_BYTES / 2];
+        output.extend(batch_output(batch.submit_at(
+            PtyChunk {
+                seq: next_seq,
+                bytes: over_budget.clone(),
+            },
+            now,
+            true,
+        )));
+        next_seq += over_budget.len() as u64;
+
+        let flood_chunk = vec![b'f'; 16 * 1024];
+        for _ in 0..8 {
+            let chunk = PtyChunk {
+                seq: next_seq,
+                bytes: flood_chunk.clone(),
+            };
+            next_seq += chunk.bytes.len() as u64;
+            output.extend(batch_output(batch.submit_at(chunk, now, true)));
+        }
+        output.extend(batch_output(batch.flush_due_at(now + BROADCAST_BATCH_WINDOW)));
+
+        assert!(output.len() <= 6, "flood produced too many frames: {}", output.len());
+        assert!(output.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
+        assert_eq!(output.iter().map(|chunk| chunk.bytes.len()).sum::<usize>(), 1 + small.len() + over_budget.len() + 8 * flood_chunk.len());
+        assert_eq!(output.first().map(|chunk| chunk.seq), Some(0));
+        assert!(output.windows(2).all(|chunks| {
+            chunks[0].seq + chunks[0].bytes.len() as u64 == chunks[1].seq
+        }));
+    }
+
+    #[test]
+    fn pty_broadcast_batch_interactive_branch_respects_max_bytes() {
+        let now = tokio::time::Instant::now();
+        let mut batch = PtyBroadcastBatch {
+            pending: Some(PtyChunk {
+                seq: 0,
+                bytes: vec![b'p'; BROADCAST_BATCH_MAX_BYTES - 1],
+            }),
+            deadline: Some(now + BROADCAST_BATCH_WINDOW),
+            interactive_until: Some(now + INTERACTIVE_OUTPUT_EPOCH),
+            interactive_immediate_bytes: 0,
+            interactive_bypass_active: true,
+        };
+        let output = batch_output(batch.submit_at(
+            PtyChunk {
+                seq: (BROADCAST_BATCH_MAX_BYTES - 1) as u64,
+                bytes: vec![b'q'; 2],
+            },
+            now,
+            true,
+        ));
+        let tail = batch_output(batch.flush_due_at(now + BROADCAST_BATCH_WINDOW));
+        assert!(output.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
+        assert!(tail.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
+        assert_eq!(output.iter().chain(tail.iter()).map(|chunk| chunk.bytes.len()).sum::<usize>(), BROADCAST_BATCH_MAX_BYTES + 1);
     }
 
     #[tokio::test]
