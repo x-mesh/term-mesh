@@ -115,6 +115,10 @@ public enum PeerCapability {
     public static let projectPresentationV1 = "project.presentation.v1"
     public static let projectPresentationLiveV1 = "project.presentation.live.v1"
     public static let agentPresentationV1 = "agent.presentation.v1"
+    /// The viewer applies append-only text patches for a streaming agent entry.
+    /// A host sends them only to a client that advertised this, so an older
+    /// viewer keeps receiving the whole entry.
+    public static let agentPresentationAppendV1 = "agent.presentation.append.v1"
     /// Operator removal of a manifest this installation does not own.
     /// Separate from `projectPresentationV1` because that endpoint is
     /// owner-authorized by design: a host may serve durable manifests and
@@ -125,7 +129,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, overflowResyncV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1, surfaceTranscriptV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, overflowResyncV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1, agentPresentationAppendV1, surfaceTranscriptV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input

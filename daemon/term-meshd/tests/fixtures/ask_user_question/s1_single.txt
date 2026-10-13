@@ -1,0 +1,45 @@
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/ask-tui/work
+
+
+❯ Call the AskUserQuestion tool exactly once with ONE question "Pick a color" (header "Color") and exactly 3 options    
+  with labels Red, Green, Blue (multiSelect false). Do nothing else. After the answer, reply with only the chosen       
+  label.                                                                                                                
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color                                                                                                                
+                                      
+Pick a color                                                                                                            
+
+❯ 1. Red                                                                                                                
+     Choose Red                                                      
+  2. Green                                                                                                            
+     Choose Green
+  3. Blue
+     Choose Blue
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

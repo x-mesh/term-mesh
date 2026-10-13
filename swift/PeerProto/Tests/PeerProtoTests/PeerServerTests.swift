@@ -37,9 +37,16 @@ private actor LivePresentationTestProvider: PeerSurfaceProvider {
         surface.attachable = true
         return [surface]
     }
+    private(set) var attachedAppendSupport: [Bool] = []
     func attach(surfaceID: Data, clientCols: UInt32, clientRows: UInt32,
                 resumeFromSeq: UInt64) async -> PeerSurfaceAttachment? {
+        await attach(surfaceID: surfaceID, clientCols: clientCols, clientRows: clientRows,
+                     resumeFromSeq: resumeFromSeq, clientCapabilities: PeerCapabilities())
+    }
+    func attach(surfaceID: Data, clientCols: UInt32, clientRows: UInt32,
+                resumeFromSeq: UInt64, clientCapabilities: PeerCapabilities) async -> PeerSurfaceAttachment? {
         guard surfaceID == self.surfaceID else { return nil }
+        attachedAppendSupport.append(clientCapabilities.has(PeerCapability.agentPresentationAppendV1))
         let pair = AsyncStream<PtyTapChunk>.makeStream()
         return PeerSurfaceAttachment(byteStream: pair.stream,
             input: { _ in await self.recordInput() }, detach: { pair.continuation.finish() })
@@ -162,6 +169,29 @@ final class PeerServerTests: XCTestCase {
             try await session.sendGoodbye(reason: "test done")
             await transport.close()
         }
+    }
+
+    func testPeerServerPassesNegotiatedPresentationCapabilitiesToProvider() async throws {
+        let provider = LivePresentationTestProvider()
+        let socket = "/tmp/tm-live-append-\(UUID().uuidString.prefix(8)).sock"
+        let server = PeerServer(socketPath: socket, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let surfaceID = await provider.surfaceID
+        for withAppend in [false, true] {
+            let transport = try await UnixSocketTransport.connect(socketPath: socket)
+            let session = PeerSession(transport: transport)
+            let capabilities = PeerCapability.supported.filter {
+                withAppend || $0 != PeerCapability.agentPresentationAppendV1
+            }
+            let info = try await session.handshake(options: PeerSessionOptions(capabilities: capabilities))
+            XCTAssertTrue(info.hostCapabilities.has(PeerCapability.agentPresentationAppendV1))
+            _ = try await session.attachSurface(id: surfaceID, mode: .readOnly, cols: 1, rows: 1)
+            try await session.sendGoodbye(reason: "append negotiation done")
+            await transport.close()
+        }
+        let seen = await provider.attachedAppendSupport
+        XCTAssertEqual(seen, [false, true])
     }
 
     func testTerminateMissingSurfaceReturnsCorrelatedIdempotentNotFound() async throws {

@@ -42,22 +42,34 @@ public actor UnixSocketTransport {
     private let queue: DispatchQueue
     private var isClosed = false
     private var readTimeoutSeconds: TimeInterval?
+    private let writeWatchdog: WriteWatchdog
 
-    private init(connection: NWConnection, queue: DispatchQueue) {
+    private init(connection: NWConnection, queue: DispatchQueue, writeTimeoutSeconds: TimeInterval) {
         self.connection = connection
         self.queue = queue
+        self.writeWatchdog = WriteWatchdog(queue: queue, timeoutSeconds: writeTimeoutSeconds)
     }
+
+    /// `.workItem` drains autoreleased objects after each handler. The default
+    /// frequency held them until the queue went idle, so a long burst of
+    /// receive and send handlers piled up and was released in one stall.
+    static func makeTransportQueue() -> DispatchQueue {
+        DispatchQueue(label: "term-mesh.peer.transport", qos: .userInitiated, autoreleaseFrequency: .workItem)
+    }
+
+    var pendingWriteTimeoutsForTesting: Int { writeWatchdog.pendingCount }
 
     /// Connect to `socketPath` and return once the Network framework
     /// reports `.ready`. Throws on connect failures with a descriptive
     /// message — the underlying `NWError` values are opaque.
     public static func connect(
         socketPath: String,
-        timeoutSeconds: TimeInterval = 5
+        timeoutSeconds: TimeInterval = 5,
+        writeTimeoutSeconds: TimeInterval = 10
     ) async throws -> UnixSocketTransport {
         let endpoint = NWEndpoint.unix(path: socketPath)
         let connection = NWConnection(to: endpoint, using: .tcp)
-        let queue = DispatchQueue(label: "term-mesh.peer.transport", qos: .userInitiated)
+        let queue = makeTransportQueue()
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             // Guard: stateUpdateHandler fires on multiple transitions; resume only once.
@@ -98,7 +110,9 @@ public actor UnixSocketTransport {
         }
 
         connection.stateUpdateHandler = nil
-        return UnixSocketTransport(connection: connection, queue: queue)
+        return UnixSocketTransport(
+            connection: connection, queue: queue, writeTimeoutSeconds: writeTimeoutSeconds
+        )
     }
 
     public func read() async throws -> Data {
@@ -153,22 +167,22 @@ public actor UnixSocketTransport {
     public func write(_ data: Data) async throws {
         if isClosed { throw UnixSocketTransportError.closed }
         let connection = self.connection
-        let queue = self.queue
-        let timeoutSeconds: TimeInterval = 10
+        let watchdog = self.writeWatchdog
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 let resumed = ResumedFlag()
-                queue.asyncAfter(deadline: .now() + timeoutSeconds) { [weak self] in
+                let token = watchdog.arm { [weak self] in
                     if resumed.setOnce() {
                         connection.cancel()
                         Task { await self?.close() }
                         cont.resume(throwing: UnixSocketTransportError.underlying(
-                            description: "write timed out after \(Int(timeoutSeconds))s"
+                            description: "write timed out after \(Int(watchdog.timeoutSeconds))s"
                         ))
                     }
                 }
                 connection.send(content: data, completion: .contentProcessed { error in
+                    watchdog.disarm(token)
                     guard resumed.setOnce() else { return }
                     if let error = error {
                         cont.resume(throwing: UnixSocketTransportError.underlying(
@@ -191,6 +205,70 @@ public actor UnixSocketTransport {
 
     public func setReadTimeoutSeconds(_ seconds: TimeInterval?) {
         readTimeoutSeconds = seconds
+    }
+}
+
+/// One timer per connection instead of one `asyncAfter` per write: a completed
+/// write must not leave a timeout closure queued behind every keystroke.
+final class WriteWatchdog: @unchecked Sendable {
+    let timeoutSeconds: TimeInterval
+    private let queue: DispatchQueue
+    private let lock = NSLock()
+    private var nextToken: UInt64 = 0
+    private var pending: [UInt64: (deadline: DispatchTime, onTimeout: () -> Void)] = [:]
+    private var timer: DispatchSourceTimer?
+
+    init(queue: DispatchQueue, timeoutSeconds: TimeInterval) {
+        self.queue = queue
+        self.timeoutSeconds = timeoutSeconds
+    }
+
+    var pendingCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.count
+    }
+
+    func arm(_ onTimeout: @escaping () -> Void) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        nextToken &+= 1
+        pending[nextToken] = (.now() + timeoutSeconds, onTimeout)
+        if timer == nil { scheduleLocked(after: timeoutSeconds) }
+        return nextToken
+    }
+
+    func disarm(_ token: UInt64) {
+        lock.lock()
+        pending.removeValue(forKey: token)
+        if pending.isEmpty {
+            timer?.cancel()
+            timer = nil
+        }
+        lock.unlock()
+    }
+
+    private func scheduleLocked(after seconds: TimeInterval) {
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now() + seconds)
+        source.setEventHandler { [weak self] in self?.fire() }
+        timer = source
+        source.resume()
+    }
+
+    private func fire() {
+        lock.lock()
+        timer?.cancel()
+        timer = nil
+        let now = DispatchTime.now()
+        let expired = pending.filter { $0.value.deadline <= now }
+        for key in expired.keys { pending.removeValue(forKey: key) }
+        if let next = pending.values.map(\.deadline).min() {
+            let remaining = Double(next.uptimeNanoseconds &- now.uptimeNanoseconds) / 1e9
+            scheduleLocked(after: max(remaining, 0.001))
+        }
+        lock.unlock()
+        for entry in expired.values { entry.onTimeout() }
     }
 }
 

@@ -14,6 +14,9 @@
 //! Replaces both tm-rpc (agent-side) and team.py (leader-side).
 //! ~1-3ms per call for all commands.
 
+mod claude_question;
+#[path = "../../question_store.rs"]
+mod question_store;
 mod orchestrator;
 mod peer;
 mod prompts;
@@ -1411,6 +1414,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    ClaudeQuestion { action: String },
     // ── Agent-side ─────────────────────────────────────────────────
     /// Submit a result report
     Report { content: Option<String> },
@@ -8528,6 +8533,10 @@ fn is_leap(y: u32) -> bool {
 
 fn main() {
     let cli = Cli::parse();
+    if let Commands::ClaudeQuestion { action } = &cli.command {
+        let _ = claude_question::run(action);
+        return;
+    }
 
     // `ls` queries the host's own peer socket, not the team control
     // socket — handle it before detect_socket() (same rationale as Peer).
@@ -9013,6 +9022,7 @@ fn main() {
     }
 
     let result = match cli.command {
+        Commands::ClaudeQuestion { .. } => unreachable!("handled before socket resolution"),
         // ── Agent-side commands ──────────────────────────────────
         Commands::Report { content } => {
             let report_content = content.as_deref().unwrap_or("done");

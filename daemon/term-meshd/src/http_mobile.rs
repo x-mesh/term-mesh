@@ -27,6 +27,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path as FsPath, PathBuf};
+#[path = "../../question_store.rs"]
+pub(crate) mod question_store;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -54,6 +56,8 @@ pub const DEDUPE_WINDOW: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_SCREEN_LINES: u32 = 200;
 pub const MIN_SCREEN_LINES: u32 = 20;
 pub const MAX_SCREEN_LINES: u32 = 1000;
+const QUESTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+static QUESTION_CLEANUP_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 /// Keys the page may send when the entry's policy is `safe`.
 pub const SAFE_KEYS: &[&str] = &[
@@ -182,8 +186,7 @@ pub type SessionResolver = Arc<dyn Fn(&str) -> Option<PaneSession> + Send + Sync
 /// `None` means the method is not one this accessor serves, which the caller
 /// turns into `method_not_found` so an optional call (`surface.read_screen_grid`)
 /// keeps its documented fallback.
-pub type SurfaceAccess =
-    Arc<dyn Fn(&str, &Value) -> Option<Result<Value, String>> + Send + Sync>;
+pub type SurfaceAccess = Arc<dyn Fn(&str, &Value) -> Option<Result<Value, String>> + Send + Sync>;
 
 pub struct MobileState {
     pub config: MobileConfig,
@@ -208,13 +211,22 @@ struct ModelLock<'a> {
 
 impl Drop for ModelLock<'_> {
     fn drop(&mut self) {
-        self.state.model_busy.lock().unwrap().remove(&self.surface_id);
+        self.state
+            .model_busy
+            .lock()
+            .unwrap()
+            .remove(&self.surface_id);
     }
 }
 
 impl MobileState {
     fn lock_model(&self, surface_id: &str) -> Result<ModelLock<'_>, ApiError> {
-        if !self.model_busy.lock().unwrap().insert(surface_id.to_string()) {
+        if !self
+            .model_busy
+            .lock()
+            .unwrap()
+            .insert(surface_id.to_string())
+        {
             return Err(model_busy_error());
         }
         Ok(ModelLock {
@@ -234,8 +246,7 @@ impl MobileState {
     /// the exposing client knew it and from the daemon's own pane correlation
     /// when it did not.
     fn resolved_session(&self, entry: &Entry) -> Option<PaneSession> {
-        if let (Some(session_id), false) =
-            (entry.session_id.as_deref(), entry.agent_cli.is_empty())
+        if let (Some(session_id), false) = (entry.session_id.as_deref(), entry.agent_cli.is_empty())
         {
             return Some(PaneSession {
                 cli: entry.agent_cli.clone(),
@@ -355,6 +366,14 @@ pub fn router(state: SharedState) -> Router {
         .route(
             "/api/targets/{surface_id}/prompt",
             get(prompt_handler).post(prompt_answer_handler),
+        )
+        .route(
+            "/api/targets/{surface_id}/questions",
+            get(questions_handler),
+        )
+        .route(
+            "/api/targets/{surface_id}/questions/{question_id}/answer",
+            post(question_answer_handler),
         )
         .route("/api/targets/{surface_id}/screen", get(screen_handler))
         .route("/api/targets/{surface_id}/requests", get(requests_handler))
@@ -623,9 +642,7 @@ fn command_metadata(path: &FsPath) -> std::io::Result<HashMap<String, String>> {
         Err(error) if error.error_len().is_none() => {
             std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default()
         }
-        Err(error) => {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        }
+        Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
     };
     let mut values = HashMap::new();
     let mut lines = text.lines();
@@ -894,7 +911,11 @@ pub(crate) fn mobile_command_catalog(
                 description: description.to_string(),
                 argument_hint: String::new(),
                 selectable: !native,
-                action: if native { None } else { builtin_action(cli, invocation) },
+                action: if native {
+                    None
+                } else {
+                    builtin_action(cli, invocation)
+                },
                 reason: if native {
                     "터미널 CLI에서 사용하는 명령입니다.".to_string()
                 } else {
@@ -1256,8 +1277,10 @@ async fn prompt_handler(
     } else {
         mobile_model::screen_preview(tui, &screen)
     };
-    Ok(Json(json!({ "surface_id": entry.surface_id, "prompt": prompt, "preview": preview }))
-        .into_response())
+    Ok(
+        Json(json!({ "surface_id": entry.surface_id, "prompt": prompt, "preview": preview }))
+            .into_response(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1285,6 +1308,989 @@ async fn prompt_answer_handler(
         .await
         .map_err(|error| driver.api_error(error))?;
     Ok(Json(json!({ "surface_id": entry.surface_id, "answered": body.index })).into_response())
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct QuestionOption {
+    label: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct QuestionItem {
+    #[serde(default)]
+    header: String,
+    question: String,
+    #[serde(default, rename = "multiSelect")]
+    multi_select: bool,
+    options: Vec<QuestionOption>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct StoredQuestion {
+    id: String,
+    fingerprint: String,
+    surface_id: String,
+    state: String,
+    questions: Vec<QuestionItem>,
+}
+
+#[derive(Deserialize)]
+struct QuestionAnswer {
+    fingerprint: String,
+    answers: Vec<QuestionAnswerItem>,
+}
+
+#[derive(Clone, Deserialize)]
+struct QuestionAnswerItem {
+    question_index: usize,
+    selected: Vec<usize>,
+    #[serde(default)]
+    other: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AskOption {
+    index: usize,
+    label: String,
+    checked: bool,
+    has_checkbox: bool,
+    focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AskScreen {
+    Question {
+        tabs: Vec<String>,
+        question: String,
+        options: Vec<AskOption>,
+        multi: bool,
+        submit_focused: bool,
+    },
+    Review {
+        tabs: Vec<String>,
+    },
+}
+
+fn ask_tabs(line: &str) -> Vec<String> {
+    line.split(['☐', '☒'])
+        .skip(1)
+        .map(|part| {
+            part.split('✔')
+                .next()
+                .unwrap_or(part)
+                .trim()
+                .trim_matches(['←', '→', ' '])
+                .to_string()
+        })
+        .filter(|tab| !tab.is_empty())
+        .collect()
+}
+
+fn ask_option(line: &str) -> Option<AskOption> {
+    let focused = line.starts_with("❯ ");
+    let rest = if focused {
+        line.strip_prefix("❯ ")?
+    } else {
+        line.strip_prefix("  ")?
+    };
+    let (number, tail) = rest.split_once(". ")?;
+    let index = number.parse().ok()?;
+    let (checked, has_checkbox, label) = if let Some(rest) = tail.strip_prefix("[✔] ") {
+        (true, true, rest)
+    } else if let Some(rest) = tail.strip_prefix("[ ] ") {
+        (false, true, rest)
+    } else {
+        (false, false, tail)
+    };
+    (!label.trim().is_empty()).then(|| AskOption {
+        index,
+        label: label.trim().to_string(),
+        checked,
+        has_checkbox,
+        focused,
+    })
+}
+
+fn is_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|character| character == '─')
+}
+
+fn ask_screen(screen: &str) -> Option<AskScreen> {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let footer = lines.iter().rposition(|line| {
+        line.trim_start().starts_with("Enter to select") && line.contains("Esc to cancel")
+    });
+    let review = lines
+        .iter()
+        .rposition(|line| line.trim() == "Review your answers");
+    let end = footer.or(review)?;
+    let header = (0..end).rev().find(|index| {
+        let line = lines[*index];
+        (line.contains('☐') || line.contains('☒')) && !line.contains('─')
+    })?;
+    if header == 0
+        || !lines[..header]
+            .iter()
+            .rev()
+            .take(3)
+            .any(|line| is_rule(line))
+    {
+        return None;
+    }
+    let tabs = ask_tabs(lines[header]);
+    if tabs.is_empty() {
+        return None;
+    }
+    if let Some(review) = review {
+        if review > header
+            && lines[review + 1..]
+                .iter()
+                .any(|line| line.trim() == "❯ 1. Submit answers")
+        {
+            return Some(AskScreen::Review { tabs });
+        }
+        return None;
+    }
+    let footer = footer?;
+    let mut first = header + 1;
+    while first < footer && lines[first].trim().is_empty() {
+        first += 1;
+    }
+    let question_end = (first + 1..footer)
+        .find(|index| ask_option(lines[*index]).is_some())
+        .unwrap_or(footer);
+    let question = lines[first..question_end]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if question.is_empty() {
+        return None;
+    }
+    let block_end = (first + 1..footer)
+        .find(|index| is_rule(lines[*index]))
+        .unwrap_or(footer);
+    let mut options = Vec::new();
+    let mut submit_focused = false;
+    for line in &lines[question_end..block_end] {
+        if let Some(option) = ask_option(line) {
+            options.push(option);
+        } else if line.starts_with("  ") && !line.starts_with("     ") {
+            if let Some(option) = options.last_mut() {
+                let continuation = line.trim();
+                if !continuation.is_empty() {
+                    option.label.push(' ');
+                    option.label.push_str(continuation);
+                }
+            }
+        }
+        if line.trim() == "❯    Submit" {
+            submit_focused = true;
+        }
+    }
+    let multi = options.iter().any(|option| option.has_checkbox);
+    let cursor_count =
+        options.iter().filter(|option| option.focused).count() + usize::from(submit_focused);
+    (options.len() >= 2 && cursor_count == 1).then(|| AskScreen::Question {
+        tabs,
+        question,
+        options,
+        multi,
+        submit_focused,
+    })
+}
+
+fn ask_matches(record: &StoredQuestion, index: usize, parsed: &AskScreen) -> bool {
+    let AskScreen::Question {
+        tabs,
+        question,
+        options,
+        multi,
+        ..
+    } = parsed
+    else {
+        return false;
+    };
+    let Some(stored) = record.questions.get(index) else {
+        return false;
+    };
+    let labels: Vec<_> = options
+        .iter()
+        .take(stored.options.len())
+        .map(|option| option.label.as_str())
+        .collect();
+    let headers = record.questions.iter().map(|item| item.header.as_str());
+    question == &stored.question
+        && options.len() == stored.options.len() + 1
+        && labels
+            == stored
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>()
+        && *multi == stored.multi_select
+        && if record.questions.len() == 1 {
+            tabs.as_slice() == [stored.header.as_str()]
+        } else {
+            tabs.iter().map(String::as_str).eq(headers)
+        }
+}
+
+fn question_root(surface: &str) -> Result<PathBuf, String> {
+    let socket = std::env::var("TERMMESH_DAEMON_UNIX_PATH")
+        .or_else(|_| std::env::var("TERMMESH_SOCKET"))
+        .unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
+    question_store::root_for_socket(&socket).map(|root| root.join(surface))
+}
+fn pending_question(surface: &str, wanted: Option<&str>) -> Option<(PathBuf, StoredQuestion)> {
+    let root = question_root(surface).ok()?;
+    if !root.exists() {
+        return None;
+    }
+    let store = root.parent()?;
+    let cleanup_at = QUESTION_CLEANUP_AT.get_or_init(|| Mutex::new(None));
+    let mut cleanup_at = cleanup_at.lock().ok()?;
+    if cleanup_at.is_none_or(|last| last.elapsed() >= QUESTION_CLEANUP_INTERVAL) {
+        let _ = question_store::cleanup(store, |path| {
+            fs::read(path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<StoredQuestion>(&raw).ok())
+                .is_some_and(|record| record.state != "pending")
+        });
+        *cleanup_at = Some(Instant::now());
+    }
+    drop(cleanup_at);
+    for session in fs::read_dir(root).ok()?.flatten() {
+        let Ok(files) = fs::read_dir(session.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_some_and(|extension| extension == "tmp") {
+                continue;
+            }
+            let Ok(raw) = fs::read(&path) else { continue };
+            let Ok(record) = serde_json::from_slice::<StoredQuestion>(&raw) else {
+                continue;
+            };
+            if record.state == "pending" && wanted.is_none_or(|id| id == record.id) {
+                return Some((path, record));
+            }
+        }
+    }
+    None
+}
+async fn questions_handler(
+    State(state): State<SharedState>,
+    Path(surface): Path<String>,
+) -> ApiResult {
+    let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
+    if entry.app_socket.is_none() {
+        return Err(ApiError::conflict(
+            "questions_unavailable",
+            "relay targets are not supported yet",
+        ));
+    }
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "question": pending_question(&entry.surface_id, None).map(|(_, question)| question),
+    }))
+    .into_response())
+}
+
+async fn question_answer_handler(
+    State(state): State<SharedState>,
+    Path((surface, question_id)): Path<(String, String)>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Json(body): Json<QuestionAnswer>,
+) -> ApiResult {
+    let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
+    if entry.app_socket.is_none() {
+        return Err(ApiError::conflict(
+            "questions_unavailable",
+            "relay targets are not supported yet",
+        ));
+    }
+    let _lock = state.lock_model(&entry.surface_id)?;
+    let Some((path, record)) = pending_question(&entry.surface_id, Some(&question_id)) else {
+        return Err(ApiError::conflict(
+            "prompt_gone",
+            "질문이 더 이상 대기 중이 아닙니다.",
+        ));
+    };
+    if body.fingerprint != record.fingerprint || body.answers.len() != record.questions.len() {
+        return Err(ApiError::conflict("prompt_gone", "질문이 바뀌었습니다."));
+    }
+    for (index, question) in record.questions.iter().enumerate() {
+        let Some(answer) = body
+            .answers
+            .iter()
+            .find(|answer| answer.question_index == index)
+        else {
+            return Err(ApiError::conflict("prompt_gone", "답변이 불완전합니다."));
+        };
+        let other = question.options.len() + 1;
+        if answer.selected.is_empty()
+            || answer
+                .selected
+                .iter()
+                .any(|item| *item == 0 || *item > other)
+            || (!question.multi_select && answer.selected.len() != 1)
+            || answer.selected.contains(&other) != answer.other.is_some()
+            || answer.other.as_ref().is_some_and(|text| {
+                text.is_empty() || text.len() > 2048 || text.chars().any(char::is_control)
+            })
+        {
+            return Err(ApiError::conflict(
+                "prompt_gone",
+                "답변 형식이 유효하지 않습니다.",
+            ));
+        }
+    }
+    let driver = AppDriver::new(&state, &entry);
+    answer_claude_question(&driver, &record, &body.answers)
+        .await
+        .map_err(|error| driver.api_error(error))?;
+    let mut answered = record;
+    answered.state = "answered".into();
+    question_store::atomic_write(
+        &path,
+        &serde_json::to_vec(&answered).expect("record serializes"),
+    )
+    .map_err(|_| ApiError::conflict("prompt_gone", "질문 상태를 저장할 수 없습니다."))?;
+    tracing::info!(
+        "mobile: Claude question {} by {} to {}",
+        question_id,
+        caller.0,
+        entry.surface_id
+    );
+    Ok(Json(json!({"surface_id": entry.surface_id, "answered": question_id})).into_response())
+}
+
+async fn answer_claude_question<D: PaneDriver>(
+    driver: &D,
+    record: &StoredQuestion,
+    answers: &[QuestionAnswerItem],
+) -> Result<(), DriveError> {
+    for (index, question) in record.questions.iter().enumerate() {
+        let answer = answers
+            .iter()
+            .find(|answer| answer.question_index == index)
+            .expect("validated answer");
+        wait_question(driver, record, index).await?;
+        let selected = normalized_selected(question, answer).ok_or(DriveError::PromptGone)?;
+        if question.multi_select {
+            let mut expected = Vec::new();
+            for option in &selected {
+                driver.send_text(&option.to_string()).await?;
+                expected.push(*option);
+                wait_question_marks(driver, record, index, &expected).await?;
+            }
+            if let Some(other) = &answer.other {
+                let other_index = question.options.len() + 1;
+                let mut current = wait_question_marks(driver, record, index, &selected).await?;
+                for _ in 0..question.options.len() + 3 {
+                    if current_options(&current)
+                        .iter()
+                        .any(|option| option.index == other_index && option.focused)
+                    {
+                        break;
+                    }
+                    driver.send_key("Down").await?;
+                    current = wait_question_marks(driver, record, index, &selected).await?;
+                }
+                if !current_options(&current)
+                    .iter()
+                    .any(|option| option.index == other_index && option.focused)
+                {
+                    return Err(DriveError::PromptGone);
+                }
+                driver.send_text(other).await?;
+                wait_question_marks(driver, record, index, &selected).await?;
+            }
+            let mut current = wait_question_marks(driver, record, index, &selected).await?;
+            for _ in 0..question.options.len() + 3 {
+                if matches!(
+                    current,
+                    AskScreen::Question {
+                        submit_focused: true,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+                driver.send_key("Down").await?;
+                current = wait_question_marks(driver, record, index, &selected).await?;
+            }
+            if !matches!(
+                current,
+                AskScreen::Question {
+                    submit_focused: true,
+                    ..
+                }
+            ) {
+                return Err(DriveError::PromptGone);
+            }
+            driver.send_key("Enter").await?;
+        } else if let Some(other) = &answer.other {
+            driver
+                .send_text(&(question.options.len() + 1).to_string())
+                .await?;
+            wait_question(driver, record, index).await?;
+            driver.send_text(other).await?;
+            wait_question(driver, record, index).await?;
+            driver.send_key("Enter").await?;
+        } else {
+            driver.send_text(&selected[0].to_string()).await?;
+        }
+        if index + 1 < record.questions.len() {
+            wait_question(driver, record, index + 1).await?;
+        }
+    }
+    if record.questions.len() > 1
+        || record
+            .questions
+            .iter()
+            .any(|question| question.multi_select)
+    {
+        wait_review(driver, record).await?;
+        driver.send_text("1").await?;
+    }
+    wait_question_closed(driver).await
+}
+
+fn current_options(screen: &AskScreen) -> &[AskOption] {
+    let AskScreen::Question { options, .. } = screen else {
+        unreachable!("wait_question returns only a question screen");
+    };
+    options
+}
+
+fn normalized_selected(question: &QuestionItem, answer: &QuestionAnswerItem) -> Option<Vec<usize>> {
+    let mut selected = answer.selected.clone();
+    selected.sort_unstable();
+    selected.dedup();
+    let other = question.options.len() + 1;
+    if selected.is_empty()
+        || selected.iter().any(|item| *item == 0 || *item > other)
+        || (!question.multi_select && selected.len() != 1)
+    {
+        return None;
+    }
+    Some(selected)
+}
+
+async fn wait_question<D: PaneDriver>(
+    driver: &D,
+    record: &StoredQuestion,
+    index: usize,
+) -> Result<AskScreen, DriveError> {
+    for _ in 0..30 {
+        let screen = driver.read_screen().await?;
+        if let Some(parsed @ AskScreen::Question { .. }) = ask_screen(&screen) {
+            if ask_matches(record, index, &parsed) {
+                return Ok(parsed);
+            }
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
+}
+
+async fn wait_question_marks<D: PaneDriver>(
+    driver: &D,
+    record: &StoredQuestion,
+    index: usize,
+    expected: &[usize],
+) -> Result<AskScreen, DriveError> {
+    for _ in 0..30 {
+        if let Ok(parsed) = wait_question_once(driver, record, index).await {
+            let checked: Vec<_> = current_options(&parsed)
+                .iter()
+                .filter(|option| option.checked)
+                .map(|option| option.index)
+                .collect();
+            if checked == expected {
+                return Ok(parsed);
+            }
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
+}
+
+async fn wait_question_once<D: PaneDriver>(
+    driver: &D,
+    record: &StoredQuestion,
+    index: usize,
+) -> Result<AskScreen, DriveError> {
+    let screen = driver.read_screen().await?;
+    let Some(parsed @ AskScreen::Question { .. }) = ask_screen(&screen) else {
+        return Err(DriveError::PromptGone);
+    };
+    ask_matches(record, index, &parsed)
+        .then_some(parsed)
+        .ok_or(DriveError::PromptGone)
+}
+
+async fn wait_review<D: PaneDriver>(driver: &D, record: &StoredQuestion) -> Result<(), DriveError> {
+    for _ in 0..30 {
+        let screen = driver.read_screen().await?;
+        if let Some(AskScreen::Review { tabs }) = ask_screen(&screen) {
+            let headers = record
+                .questions
+                .iter()
+                .map(|question| question.header.as_str());
+            if tabs.iter().map(String::as_str).eq(headers) {
+                return Ok(());
+            }
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
+}
+
+async fn wait_question_closed<D: PaneDriver>(driver: &D) -> Result<(), DriveError> {
+    let mut closed_reads = 0;
+    for _ in 0..30 {
+        let screen = driver.read_screen().await?;
+        if screen.contains("User answered Claude's questions:") {
+            return Ok(());
+        }
+        if ask_screen(&screen).is_none() {
+            closed_reads += 1;
+            if closed_reads == 3 {
+                return Ok(());
+            }
+        } else {
+            closed_reads = 0;
+        }
+        driver.pause(std::time::Duration::from_millis(80)).await;
+    }
+    Err(DriveError::PromptGone)
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::ffi::CString;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::SystemTime;
+
+    struct FixtureDriver {
+        screens: Mutex<VecDeque<String>>,
+        keys: Mutex<Vec<String>>,
+    }
+
+    impl FixtureDriver {
+        fn new(screens: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                screens: Mutex::new(screens.into_iter().map(str::to_string).collect()),
+                keys: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneDriver for FixtureDriver {
+        async fn read_screen(&self) -> Result<String, DriveError> {
+            let mut screens = self.screens.lock().unwrap();
+            Ok(screens.front().cloned().unwrap_or_default())
+        }
+        async fn send_key(&self, key: &'static str) -> Result<(), DriveError> {
+            self.keys.lock().unwrap().push(key.into());
+            self.screens.lock().unwrap().pop_front();
+            Ok(())
+        }
+        async fn send_text(&self, text: &str) -> Result<(), DriveError> {
+            self.keys.lock().unwrap().push(text.into());
+            self.screens.lock().unwrap().pop_front();
+            Ok(())
+        }
+        async fn send_turn(&self, _text: &str) -> Result<(), DriveError> {
+            Ok(())
+        }
+        async fn pause(&self, _duration: Duration) {}
+    }
+
+    const SINGLE: &str = include_str!("../tests/fixtures/ask_user_question/s1_single.txt");
+    const TWO: &str = include_str!("../tests/fixtures/ask_user_question/s2_two_q1.txt");
+    const REVIEW: &str = include_str!("../tests/fixtures/ask_user_question/s2_review_full.txt");
+    const ANSWERED: &str = include_str!("../tests/fixtures/ask_user_question/s2_after_submit.txt");
+    const MULTI: &str = include_str!("../tests/fixtures/ask_user_question/s3_after_toggle_D.txt");
+    const WRAPPED: &str = include_str!("../tests/fixtures/ask_user_question/s1_wrapped.txt");
+
+    fn option(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.into(),
+            description: String::new(),
+        }
+    }
+
+    fn answer(index: usize, selected: &[usize], other: Option<&str>) -> QuestionAnswerItem {
+        QuestionAnswerItem {
+            question_index: index,
+            selected: selected.to_vec(),
+            other: other.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn parses_open_question_review_and_multi_select_but_not_answered_scrollback() {
+        let AskScreen::Question {
+            question,
+            options,
+            multi,
+            ..
+        } = ask_screen(SINGLE).expect("single")
+        else {
+            panic!("question")
+        };
+        assert_eq!(question, "Pick a color");
+        assert_eq!(options[0].label, "Red");
+        assert!(!multi);
+        assert!(matches!(ask_screen(REVIEW), Some(AskScreen::Review { .. })));
+        assert!(ask_screen(ANSWERED).is_none());
+        let AskScreen::Question { multi, options, .. } = ask_screen(MULTI).expect("multi") else {
+            panic!("question")
+        };
+        assert!(multi);
+        assert!(options.iter().any(|option| option.checked));
+    }
+
+    #[test]
+    fn parses_wrapped_question_text_and_option_labels() {
+        let AskScreen::Question {
+            question, options, ..
+        } = ask_screen(WRAPPED).expect("wrapped")
+        else {
+            panic!("question")
+        };
+        assert_eq!(question, "Pick a very long color");
+        assert_eq!(options[0].label, "Deep Red");
+    }
+
+    #[tokio::test]
+    async fn answer_state_machine_drives_single_and_multi_question_fixtures() {
+        let single = StoredQuestion {
+            id: "single".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Color".into(),
+                question: "Pick a color".into(),
+                multi_select: false,
+                options: vec![option("Red"), option("Green"), option("Blue")],
+            }],
+        };
+        let driver = FixtureDriver::new([
+            SINGLE,
+            include_str!("../tests/fixtures/ask_user_question/s1_after_digit2.txt"),
+        ]);
+        answer_claude_question(&driver, &single, &[answer(0, &[2], None)])
+            .await
+            .unwrap();
+        assert_eq!(*driver.keys.lock().unwrap(), vec!["2"]);
+
+        let multiple = StoredQuestion {
+            id: "multiple".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![
+                QuestionItem {
+                    header: "Fruit".into(),
+                    question: "Pick fruit".into(),
+                    multi_select: false,
+                    options: vec![option("Apple"), option("Banana")],
+                },
+                QuestionItem {
+                    header: "Size".into(),
+                    question: "Pick size".into(),
+                    multi_select: false,
+                    options: vec![option("Small"), option("Large")],
+                },
+            ],
+        };
+        let driver = FixtureDriver::new([
+            TWO,
+            include_str!("../tests/fixtures/ask_user_question/s2_after_q1_enter.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s2_after_q2_digit.txt"),
+            REVIEW,
+            ANSWERED,
+        ]);
+        answer_claude_question(
+            &driver,
+            &multiple,
+            &[answer(0, &[2], None), answer(1, &[2], None)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(*driver.keys.lock().unwrap(), vec!["2", "2", "1"]);
+    }
+
+    #[tokio::test]
+    async fn answer_state_machine_refuses_stale_or_not_closed_screens_without_extra_input() {
+        let record = StoredQuestion {
+            id: "single".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Color".into(),
+                question: "Pick a color".into(),
+                multi_select: false,
+                options: vec![option("Red"), option("Green"), option("Blue")],
+            }],
+        };
+        let stale = FixtureDriver::new([ANSWERED]);
+        assert_eq!(
+            answer_claude_question(&stale, &record, &[answer(0, &[1], None)]).await,
+            Err(DriveError::PromptGone)
+        );
+        assert!(stale.keys.lock().unwrap().is_empty());
+        let not_closed = FixtureDriver::new([SINGLE, SINGLE]);
+        assert_eq!(
+            answer_claude_question(&not_closed, &record, &[answer(0, &[1], None)]).await,
+            Err(DriveError::PromptGone)
+        );
+        assert_eq!(*not_closed.keys.lock().unwrap(), vec!["1"]);
+    }
+
+    #[tokio::test]
+    async fn answer_state_machine_drives_multi_select_and_single_other_fixtures() {
+        let letters = StoredQuestion {
+            id: "letters".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Letters".into(),
+                question: "Pick letters".into(),
+                multi_select: true,
+                options: vec![option("A"), option("B"), option("C"), option("D")],
+            }],
+        };
+        let driver = FixtureDriver::new([
+            include_str!("../tests/fixtures/ask_user_question/s3_multi_initial.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s3_after_digit2.txt"),
+            MULTI,
+            include_str!("../tests/fixtures/ask_user_question/s3_cursor_on_submit.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s3_after_submit_row_enter.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s3_done.txt"),
+        ]);
+        answer_claude_question(&driver, &letters, &[answer(0, &[4, 2, 2], None)])
+            .await
+            .unwrap();
+        assert_eq!(
+            *driver.keys.lock().unwrap(),
+            vec!["2", "4", "Down", "Enter", "1"]
+        );
+
+        let number = StoredQuestion {
+            id: "number".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Num".into(),
+                question: "Pick a number".into(),
+                multi_select: false,
+                options: vec![option("One"), option("Two")],
+            }],
+        };
+        let driver = FixtureDriver::new([
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_focus.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_typed.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_typed.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_done.txt"),
+        ]);
+        answer_claude_question(
+            &driver,
+            &number,
+            &[answer(0, &[3], Some("my answer 안녕 😀"))],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *driver.keys.lock().unwrap(),
+            vec!["3", "my answer 안녕 😀", "Enter"]
+        );
+    }
+
+    #[test]
+    fn stored_question_requires_exact_visible_question_options_and_tabs() {
+        let record = StoredQuestion {
+            id: "id".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![
+                QuestionItem {
+                    header: "Fruit".into(),
+                    question: "Pick fruit".into(),
+                    multi_select: false,
+                    options: vec![
+                        QuestionOption {
+                            label: "Apple".into(),
+                            description: String::new(),
+                        },
+                        QuestionOption {
+                            label: "Banana".into(),
+                            description: String::new(),
+                        },
+                    ],
+                },
+                QuestionItem {
+                    header: "Size".into(),
+                    question: "Pick size".into(),
+                    multi_select: false,
+                    options: vec![],
+                },
+            ],
+        };
+        assert!(ask_matches(&record, 0, &ask_screen(TWO).unwrap()));
+        let stale = format!("{}", ANSWERED);
+        assert!(ask_screen(&stale).is_none());
+    }
+
+    #[test]
+    fn normalized_answers_sort_dedupe_and_refuse_invalid_values() {
+        let question = QuestionItem {
+            header: String::new(),
+            question: "Pick".into(),
+            multi_select: true,
+            options: vec![
+                QuestionOption {
+                    label: "A".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "B".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "C".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "D".into(),
+                    description: String::new(),
+                },
+            ],
+        };
+        assert_eq!(
+            normalized_selected(
+                &question,
+                &QuestionAnswerItem {
+                    question_index: 0,
+                    selected: vec![3, 1, 3],
+                    other: None
+                }
+            ),
+            Some(vec![1, 3])
+        );
+        assert_eq!(
+            normalized_selected(
+                &question,
+                &QuestionAnswerItem {
+                    question_index: 0,
+                    selected: vec![0],
+                    other: None
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn question_store_cleans_old_and_terminal_files_and_skips_corrupt_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("questions");
+        question_store::prepare_test_root(&root).unwrap();
+        let surface = root.join("surface");
+        let session = surface.join("session");
+        fs::create_dir(&surface).unwrap();
+        fs::create_dir(&session).unwrap();
+        fs::set_permissions(&surface, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(session.join("corrupt.json"), b"{").unwrap();
+        fs::write(session.join("pending.json"), br#"{"id":"pending","fingerprint":"fp","surface_id":"surface","state":"pending","questions":[]}"#).unwrap();
+        fs::write(session.join("answered.json"), br#"{"id":"answered","fingerprint":"fp","surface_id":"surface","state":"answered","questions":[]}"#).unwrap();
+        let stale = session.join("old.tmp");
+        fs::write(&stale, b"partial").unwrap();
+        let atomic = session.join("atomic.json");
+        question_store::atomic_write(&atomic, br#"{"state":"pending"}"#).unwrap();
+        assert_eq!(fs::read(&atomic).unwrap(), br#"{"state":"pending"}"#);
+        set_old_mtime(&stale);
+        question_store::cleanup(&root, |path| {
+            fs::read(path)
+                .ok()
+                .is_some_and(|raw| raw.windows(8).any(|part| part == b"answered"))
+        })
+        .unwrap();
+        assert!(!session.join("answered.json").exists());
+        assert!(!stale.exists());
+        assert!(fs::read_dir(&session).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        assert!(pending_question_from(&session).is_some());
+    }
+
+    #[test]
+    fn question_store_refuses_a_symlinked_private_component() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(question_store::verify_private_directory(&link).is_err());
+    }
+
+    fn set_old_mtime(path: &FsPath) {
+        let seconds = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 25 * 60 * 60;
+        let times = [
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+        ];
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+    }
+
+    fn pending_question_from(directory: &FsPath) -> Option<StoredQuestion> {
+        fs::read_dir(directory).ok()?.flatten().find_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_some_and(|extension| extension == "tmp") {
+                return None;
+            }
+            fs::read(path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice(&raw).ok())
+        })
+    }
 }
 
 fn model_tui(entry: &Entry) -> &'static mobile_model::Tui {
@@ -2165,20 +3171,22 @@ fn entries_in_flight(entries: &[Value]) -> bool {
 /// is cancelled before it answers, so an open turn is only trusted while the
 /// log is still being written (see `CLAUDE_OPEN_TURN_STALE`).
 pub(crate) fn claude_turn_in_flight(lines: &[Value]) -> Option<bool> {
-    lines.iter().rev().find_map(|row| {
-        match row.get("type").and_then(Value::as_str) {
-            Some("system") => (row.get("subtype").and_then(Value::as_str)
-                == Some("turn_duration"))
-            .then_some(false),
+    lines
+        .iter()
+        .rev()
+        .find_map(|row| match row.get("type").and_then(Value::as_str) {
+            Some("system") => (row.get("subtype").and_then(Value::as_str) == Some("turn_duration"))
+                .then_some(false),
             Some("user") => {
                 if row.get("isMeta").and_then(Value::as_bool) == Some(true) {
                     return None;
                 }
                 let content = row.pointer("/message/content").unwrap_or(&Value::Null);
-                if content
-                    .as_array()
-                    .is_some_and(|blocks| blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")))
-                {
+                if content.as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                }) {
                     return None;
                 }
                 let text = content_text(content, &["text"]);
@@ -2192,8 +3200,7 @@ pub(crate) fn claude_turn_in_flight(lines: &[Value]) -> Option<bool> {
                 }
             }
             _ => None,
-        }
-    })
+        })
 }
 
 const CLAUDE_INTERRUPTED: &str = "[Request interrupted";
@@ -2259,7 +3266,8 @@ fn session_transcript(
     let in_flight = if agent_cli == "codex" {
         codex_turn_in_flight(&lines)
     } else {
-        claude_turn_in_flight(&lines).map(|open| open && log_is_fresh(&path, CLAUDE_OPEN_TURN_STALE))
+        claude_turn_in_flight(&lines)
+            .map(|open| open && log_is_fresh(&path, CLAUDE_OPEN_TURN_STALE))
     }
     .unwrap_or_else(|| entries_in_flight(&entries));
     Ok(json!({
