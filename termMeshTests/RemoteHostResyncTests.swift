@@ -144,6 +144,10 @@ final class RemoteHostResyncTests: XCTestCase {
         XCTAssertEqual(idle, running, "equal entries stay equal once both are set")
     }
 
+    func testTeamRosterPollIntervalAvoidsFrequentShortLivedRelayConnections() {
+        XCTAssertEqual(RemoteHostStore.teamRosterPollInterval, .seconds(60))
+    }
+
     func testRedirectedDurableRosterLeaseReusesUntilSubscriptionStops() async {
         let store = RemoteHostStore.shared
         let registry = PeerPaneHostRegistry.shared

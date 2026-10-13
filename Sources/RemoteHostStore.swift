@@ -1176,7 +1176,7 @@ final class RemoteHostStore: ObservableObject {
     /// worker exited disappears from the sidebar instead of remaining a button
     /// that can only fail.
     private var teamRosterPollTasks: [String: Task<Void, Never>] = [:]
-    static let teamRosterPollInterval: Duration = .seconds(15)
+    static let teamRosterPollInterval: Duration = .seconds(60)
     /// Identifies the task currently installed for each host. A cancelled
     /// task can finish after a reconnect has already installed its successor;
     /// its `defer` must not clear the successor's state.
