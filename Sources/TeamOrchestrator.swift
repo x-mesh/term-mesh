@@ -10780,7 +10780,7 @@ final class TeamOrchestrator: ObservableObject {
     /// from the supported-turn denominator.
     func leaderMeasurementHealthPayload() -> [String: Any] {
         let capabilities = teams.values.map(leaderMeasurementCapability(for:))
-        let health = LeaderTurnLog.health(capabilities: capabilities)
+        let health = LeaderTurnLog.cachedHealth(capabilities: capabilities)
         let policy = LeaderTurnLog.policyReport()
         // Turn records are per-host: the hook appends to the HOME of whichever
         // machine runs the leader pane, and this aggregate can only ever read
