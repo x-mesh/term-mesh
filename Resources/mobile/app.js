@@ -72,6 +72,7 @@
     promptContext: $('prompt-context'),
     promptOptions: $('prompt-options'),
     promptStatus: $('prompt-status'),
+    questionCard: $('question-card'), questionTitle: $('question-title'), questionOptions: $('question-options'), questionSubmit: $('question-submit'), questionStatus: $('question-status'),
     buildTag: $('build-tag'),
     chatLive: $('chat-live'),
     chatJump: $('chat-jump'),
@@ -113,6 +114,7 @@
     commandLoading: false,
     commandError: null,
     commandWarning: '',
+    question: null, questionAnswers: {},
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -1024,6 +1026,77 @@
     el.promptCard.hidden = true;
     el.chatLive.hidden = true;
     state.promptFingerprint = null;
+    el.questionCard.hidden = true; state.question = null;
+  }
+
+  function refreshQuestion(t) {
+    if (!t) { return Promise.resolve(); }
+    return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/questions').then(function (data) {
+      var q = data && data.question;
+      if (!q || !isCurrentTarget(t)) { el.questionCard.hidden = true; return; }
+      if (state.question && state.question.fingerprint === q.fingerprint) { return; }
+      state.question = q;
+      state.questionAnswers = {};
+      el.questionTitle.textContent = q.questions.map(function (item) { return item.question; }).join('\n');
+      el.questionOptions.textContent = '';
+      q.questions.forEach(function (item, qi) {
+        item.options.forEach(function (option, oi) {
+          var label = document.createElement('label');
+          var input = document.createElement('input');
+          input.type = item.multi_select ? 'checkbox' : 'radio';
+          input.name = 'question-' + qi;
+          input.value = String(oi + 1);
+          input.addEventListener('change', function () {
+            state.questionAnswers[qi] = Array.prototype.map.call(
+              el.questionOptions.querySelectorAll('input[name=\"question-' + qi + '\"]:checked'),
+              function (node) { return Number(node.value); }
+            );
+          });
+          label.appendChild(input);
+          label.appendChild(document.createTextNode(' ' + option.label));
+          el.questionOptions.appendChild(label);
+        });
+        var other = document.createElement('textarea');
+        other.rows = 2;
+        other.placeholder = 'Other 답변';
+        other.setAttribute('data-question-other', String(qi));
+        el.questionOptions.appendChild(other);
+      });
+      el.questionStatus.textContent = '';
+      el.questionCard.hidden = false;
+    }).catch(function(){el.questionCard.hidden=true;});
+  }
+  function answerQuestion() {
+    var t = state.selected, q = state.question;
+    if (!t || !q) { return; }
+    var answers = q.questions.map(function (_, i) {
+      return {question_index: i, selected: state.questionAnswers[i] || []};
+    });
+    q.questions.forEach(function (item, i) {
+      var otherInput = el.questionOptions.querySelectorAll('textarea[data-question-other="' + i + '"]')[0];
+      var otherText = otherInput ? otherInput.value.trim() : '';
+      if (!otherText) { return; }
+      var otherIndex = item.options.length + 1;
+      if (item.multi_select) {
+        if (answers[i].selected.indexOf(otherIndex) < 0) { answers[i].selected.push(otherIndex); }
+      } else {
+        answers[i].selected = [otherIndex];
+      }
+      answers[i].other = otherText;
+    });
+    if (answers.some(function (answer) { return !answer.selected.length; })) {
+      el.questionStatus.textContent = '각 질문을 선택하세요.';
+      return;
+    }
+    el.questionSubmit.disabled = true;
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/questions/' + encodeURIComponent(q.id) + '/answer', {
+      fingerprint: q.fingerprint,
+      answers: answers
+    }).then(hidePrompt).catch(function (err) {
+      el.questionStatus.textContent = err.code === 'prompt_gone' ? '질문이 만료되었습니다.' : describeError(err);
+    }).then(function () {
+      el.questionSubmit.disabled = false;
+    });
   }
 
   function showPreview(lines) {
@@ -1180,7 +1253,7 @@
     state.inFlight = true;
     el.refresh.disabled = true;
     loadTargets().then(function () {
-      return Promise.all([refreshScreen(), refreshChat(), refreshRequests()]);
+      return Promise.all([refreshScreen(), refreshChat(), refreshRequests()]).then(function () { return refreshQuestion(state.selected); });
     }).catch(function (err) {
       setStatus(describeError(err), true);
     }).then(done, done);
@@ -1631,6 +1704,7 @@
   el.promptContext.addEventListener('click', function () {
     showPromptContext(state.promptContextLines || [], !state.promptContextExpanded);
   });
+  el.questionSubmit.addEventListener('click', answerQuestion);
 
   el.chatList.addEventListener('scroll', function () {
     if (isAtBottom(el.chatList)) { el.chatJump.hidden = true; }

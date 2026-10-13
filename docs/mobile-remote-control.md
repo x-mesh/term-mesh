@@ -284,6 +284,8 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 | POST | `/api/targets/{id}/model` | `{model, save_default?, custom?}` | 200 `{cli, delivered, message, session_only}` |
 | GET | `/api/targets/{id}/prompt` | Claude/Codex terminal pane | `{prompt: null\|{question, context, options: [{index, label}], fingerprint}, preview: [line]}`. 화면 맨 아래의 승인 질문, 없으면 입력창 위 마지막 몇 줄(스트리밍 중인 답) |
 | POST | `/api/targets/{id}/prompt` | `{fingerprint, index}` | 200 `{answered}`. 같은 질문(fingerprint)이 아직 떠 있을 때만 숫자 키 하나를 보냄, 아니면 409 `prompt_gone` |
+| GET | `/api/targets/{id}/questions` | Claude AskUserQuestion local pane | `{question: null|record}`. relay pane은 409 `questions_unavailable` |
+| POST | `/api/targets/{id}/questions/{question_id}/answer` | `{fingerprint, answers}` | 현재 record와 fingerprint가 일치할 때만 처리하고, 아니면 409 `prompt_gone` |
 | GET | `/api/targets/{id}/effort` | Claude terminal pane만(아니면 409 `effort_unavailable`) | `{levels, current}`. `/effort` 슬라이더를 열어 읽고 닫음 |
 | POST | `/api/targets/{id}/effort` | `{level, save_default?}` | 200 `{message, session_only}` |
 
@@ -341,6 +343,14 @@ daemon이 모델을 바꾼다(`daemon/term-meshd/src/mobile_model.rs`).
 없으면 입력창 위 마지막 줄을 미리보기로 보여 준다(Claude 답은 메시지가 끝나야 세션 기록에
 들어간다). 두 CLI 모두 숫자 키 하나로 바로 고르므로 daemon은 fingerprint가 같은지 확인한 뒤
 숫자만 보낸다. 화면 문구는 `PromptTui`(`CLAUDE_PROMPT`, `CODEX_PROMPT`)에 고정돼 있다.
+
+Claude AskUserQuestion record는 hook과 daemon이 같은 사용자 저장소를 사용한다.
+`$XDG_RUNTIME_DIR/term-mesh`를 우선 사용한다. macOS는
+`~/Library/Application Support/term-mesh`를 사용한다. 다른 Unix 시스템은
+`~/.local/share/term-mesh`를 사용한다. 각 구성요소는 현재 uid가 소유한 symlink가 아닌
+`0700` directory여야 한다. record는 `0600` temporary file을 쓴 뒤 atomic rename으로
+갱신한다. pending이 아닌 record와 24시간이 지난 record, 24시간이 지난 temporary file은
+question 조회 때 제거한다.
 
 `/api/health`는 tagged Debug 앱이면 `tag`를 함께 준다. 같은 페이지를 다른 포트로 띄우는
 DEV 앱과 설치된 앱을 페이지 머리의 배지로 구분하기 위해서다.
