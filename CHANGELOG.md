@@ -4,6 +4,19 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.4] - 2026-10-13
+
+### Fixed
+
+- Typing in a remote relay pane no longer lags behind. The host daemon sent the first output chunk after a keystroke at once, but held the next small chunks for up to 50 ms. A shell that writes the echo and a redraw separately, such as zsh with syntax highlighting, showed the redraw about 50 ms late. Output in the 50 ms after a keystroke is now sent at once, up to 4 KiB, and large output is still batched. Update the remote host daemon to get this fix.
+- A leader request sent from the remote page no longer stays queued forever when its first notification fails. When the leader completes a request, the next request that was never delivered is now sent to the leader. The remote page now shows a preview, the age, and the status of each queued request. A request that waits for more than 30 minutes shows as expired and is not sent automatically.
+
+### Changed
+
+- The client now checks the team list of a remote Project every 60 seconds instead of every 15 seconds. Connecting, reconnecting, and explicit refreshes still update the list at once.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.3] - 2026-10-13
 
 ### Fixed
