@@ -302,7 +302,7 @@ struct ReviewBoardPanelView: View {
         // team's agents. Both are settled here and handed down as values.
         let selectedID = viewModel.selectedTask?.id
         let working = viewModel.workingAssignees
-        let groups = ReviewBoardTask.grouped(scopedTasks)
+        let groups = ReviewBoardTask.groupedCached(scopedTasks)
         let attention = groups.filter { group in
             group.members.contains(where: \.requiresAttention)
         }

@@ -1855,6 +1855,7 @@ struct ContentView: View {
             reviewBoardWidth = ReviewBoardSettings.loadWidth()
             let coordinator = reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared
             coordinator.startIfNeeded()
+            reviewBoardViewModel.setPresented(isReviewBoardShowing)
             reviewBoardViewModel.setSnapshotProvider {
                 coordinator.providerSnapshot()
             }
@@ -1877,7 +1878,7 @@ struct ContentView: View {
                 guard let manager else { return nil }
                 return Self.reviewBoardRemoteContext(forWorkspace: manager.selectedTabId)
             }
-            reviewBoardViewModel.refresh()
+            reviewBoardViewModel.refreshIfPresented()
         })
 
         view = AnyView(view.onChange(of: tabManager.selectedTabId) { newValue in
@@ -2145,12 +2146,16 @@ struct ContentView: View {
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardSnapshotDidChange)) { _ in
-            reviewBoardViewModel.refresh()
+            reviewBoardViewModel.refreshIfPresented()
         })
 
         view = AnyView(view.onChange(of: isReviewBoardEnabled) { _ in
             (reviewBoardCoordinator ?? ReviewBoardCoordinatorService.shared).startIfNeeded()
-            reviewBoardViewModel.refresh()
+            reviewBoardViewModel.refreshIfPresented()
+        })
+
+        view = AnyView(view.onChange(of: isReviewBoardShowing) { showing in
+            reviewBoardViewModel.setPresented(showing)
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .worktreeWorkspaceRequested)) { notification in
@@ -2266,6 +2271,7 @@ struct ContentView: View {
 
         view = AnyView(view.onDisappear {
             removeSidebarResizerPointerMonitor()
+            reviewBoardViewModel.setPresented(false)
         })
 
         view = AnyView(view.background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity] window in
