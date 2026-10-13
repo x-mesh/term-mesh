@@ -21,13 +21,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path as FsPath, PathBuf};
+#[path = "../../question_store.rs"]
+pub(crate) mod question_store;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1327,16 +1328,29 @@ fn question_answer_steps(question: &QuestionItem, answer: &QuestionAnswerItem, s
     steps
 }
 
-fn question_root(surface: &str) -> PathBuf {
-    let socket = std::env::var("TERMMESH_DAEMON_UNIX_PATH").or_else(|_| std::env::var("TERMMESH_SOCKET")).unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
-    let mut hash = Sha256::new(); hash.update(socket.as_bytes());
-    std::env::temp_dir().join("term-mesh").join("questions-v1").join(format!("{:x}", hash.finalize())).join(surface)
+fn question_root(surface: &str) -> Result<PathBuf, String> {
+    let socket = std::env::var("TERMMESH_DAEMON_UNIX_PATH")
+        .or_else(|_| std::env::var("TERMMESH_SOCKET"))
+        .unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
+    question_store::root_for_socket(&socket).map(|root| root.join(surface))
 }
 fn pending_question(surface: &str, wanted: Option<&str>) -> Option<(PathBuf, StoredQuestion)> {
-    for session in fs::read_dir(question_root(surface)).ok()?.flatten() {
-        for file in fs::read_dir(session.path()).ok()?.flatten() {
-            let raw = fs::read(file.path()).ok()?; let record = serde_json::from_slice::<StoredQuestion>(&raw).ok()?;
-            if record.state == "pending" && wanted.is_none_or(|id| id == record.id) { return Some((file.path(), record)); }
+    let root = question_root(surface).ok()?;
+    let store = root.parent()?;
+    let _ = question_store::cleanup(store, |path| {
+        fs::read(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<StoredQuestion>(&raw).ok())
+            .is_some_and(|record| record.state != "pending")
+    });
+    for session in fs::read_dir(root).ok()?.flatten() {
+        let Ok(files) = fs::read_dir(session.path()) else { continue };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_some_and(|extension| extension == "tmp") { continue; }
+            let Ok(raw) = fs::read(&path) else { continue };
+            let Ok(record) = serde_json::from_slice::<StoredQuestion>(&raw) else { continue };
+            if record.state == "pending" && wanted.is_none_or(|id| id == record.id) { return Some((path, record)); }
         }
     }
     None
@@ -1346,7 +1360,7 @@ async fn questions_handler(State(state): State<SharedState>, Path(surface): Path
     if entry.app_socket.is_none() { return Err(ApiError::conflict("questions_unavailable", "relay targets are not supported yet")); }
     Ok(Json(json!({"surface_id": entry.surface_id, "question": pending_question(&entry.surface_id, None).map(|(_, question)| question)})).into_response())
 }
-async fn question_answer_handler(State(state): State<SharedState>, Path((surface, question_id)): Path<(String, String)>, Json(body): Json<QuestionAnswer>) -> ApiResult {
+async fn question_answer_handler(State(state): State<SharedState>, Path((surface, question_id)): Path<(String, String)>, axum::Extension(caller): axum::Extension<Caller>, Json(body): Json<QuestionAnswer>) -> ApiResult {
     let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
     if entry.app_socket.is_none() { return Err(ApiError::conflict("questions_unavailable", "relay targets are not supported yet")); }
     let _lock = state.lock_model(&entry.surface_id)?;
@@ -1368,13 +1382,22 @@ async fn question_answer_handler(State(state): State<SharedState>, Path((surface
             }
         }
     }
-    let mut answered = record; answered.state = "answered".into(); fs::write(path, serde_json::to_vec(&answered).expect("record serializes")).map_err(|_| ApiError::conflict("prompt_gone", "질문 상태를 저장할 수 없습니다."))?;
+    let mut answered = record;
+    answered.state = "answered".into();
+    question_store::atomic_write(&path, &serde_json::to_vec(&answered).expect("record serializes"))
+        .map_err(|_| ApiError::conflict("prompt_gone", "질문 상태를 저장할 수 없습니다."))?;
+    tracing::info!("mobile: Claude question {} by {} to {}", question_id, caller.0, entry.surface_id);
     Ok(Json(json!({"surface_id": entry.surface_id, "answered": question_id})).into_response())
 }
 
 #[cfg(test)]
 mod question_tests {
     use super::*;
+    use std::fs;
+    use std::ffi::CString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::SystemTime;
 
     fn question(multi_select: bool) -> QuestionItem {
         QuestionItem { question: "pick".into(), multi_select, options: vec![
@@ -1399,6 +1422,59 @@ mod question_tests {
         let multi = QuestionAnswerItem { question_index: 1, selected: vec![3, 1], other: None };
         assert_eq!(question_answer_steps(&question(true), &multi, true), vec![QuestionInputStep::Key("Space"), QuestionInputStep::Key("Down"), QuestionInputStep::Key("Down"), QuestionInputStep::Key("Space"), QuestionInputStep::Key("Enter")]);
         assert!(question_answer_steps(&question(false), &single, false).is_empty());
+    }
+
+    #[test]
+    fn question_store_cleans_old_and_terminal_files_and_skips_corrupt_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("questions");
+        question_store::prepare_test_root(&root).unwrap();
+        let surface = root.join("surface");
+        let session = surface.join("session");
+        fs::create_dir(&surface).unwrap();
+        fs::create_dir(&session).unwrap();
+        fs::set_permissions(&surface, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(session.join("corrupt.json"), b"{").unwrap();
+        fs::write(session.join("pending.json"), br#"{"id":"pending","fingerprint":"fp","surface_id":"surface","state":"pending","questions":[]}"#).unwrap();
+        fs::write(session.join("answered.json"), br#"{"id":"answered","fingerprint":"fp","surface_id":"surface","state":"answered","questions":[]}"#).unwrap();
+        let stale = session.join("old.tmp");
+        fs::write(&stale, b"partial").unwrap();
+        let atomic = session.join("atomic.json");
+        question_store::atomic_write(&atomic, br#"{"state":"pending"}"#).unwrap();
+        assert_eq!(fs::read(&atomic).unwrap(), br#"{"state":"pending"}"#);
+        set_old_mtime(&stale);
+        question_store::cleanup(&root, |path| fs::read(path).ok().is_some_and(|raw| raw.windows(8).any(|part| part == b"answered"))).unwrap();
+        assert!(!session.join("answered.json").exists());
+        assert!(!stale.exists());
+        assert!(fs::read_dir(&session).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(pending_question_from(&session).is_some());
+    }
+
+    #[test]
+    fn question_store_refuses_a_symlinked_private_component() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(question_store::verify_private_directory(&link).is_err());
+    }
+
+    fn set_old_mtime(path: &FsPath) {
+        let seconds = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64 - 25 * 60 * 60;
+        let times = [libc::timespec { tv_sec: seconds, tv_nsec: 0 }, libc::timespec { tv_sec: seconds, tv_nsec: 0 }];
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) }, 0);
+    }
+
+    fn pending_question_from(directory: &FsPath) -> Option<StoredQuestion> {
+        fs::read_dir(directory).ok()?.flatten().find_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_some_and(|extension| extension == "tmp") { return None; }
+            fs::read(path).ok().and_then(|raw| serde_json::from_slice(&raw).ok())
+        })
     }
 }
 

@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use crate::question_store;
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MAX_QUESTIONS: usize = 4;
@@ -90,15 +89,6 @@ fn parse_questions(input: &Value) -> Result<Vec<QuestionInput>, String> {
     Ok(questions)
 }
 
-pub fn root_for_socket(socket: &str) -> PathBuf {
-    let mut hash = Sha256::new();
-    hash.update(socket.as_bytes());
-    env::temp_dir()
-        .join("term-mesh")
-        .join("questions-v1")
-        .join(format!("{:x}", hash.finalize()))
-}
-
 fn record_path(root: &Path, record: &Record) -> PathBuf {
     root.join(&record.surface_id)
         .join(&record.session_id)
@@ -106,6 +96,7 @@ fn record_path(root: &Path, record: &Record) -> PathBuf {
 }
 
 fn fingerprint(surface: &str, session: &str, id: &str, questions: &[QuestionInput]) -> String {
+    use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(
         serde_json::to_vec(&json!({
@@ -125,26 +116,18 @@ fn write_record(path: &Path, record: &Record) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "invalid record path".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    for directory in parent.ancestors() {
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
-        if directory.file_name().is_some_and(|name| name == "questions-v1") {
-            break;
-        }
-    }
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|error| error.to_string())?;
-    file.write_all(&serde_json::to_vec(record).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(temporary, path).map_err(|error| error.to_string())
+    question_store::prepare_surface(
+        parent
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "invalid question root path".to_string())?,
+        parent.parent().and_then(Path::file_name).and_then(|name| name.to_str()).ok_or_else(|| "invalid question surface path".to_string())?,
+        parent.file_name().and_then(|name| name.to_str()).ok_or_else(|| "invalid question session path".to_string())?,
+    )?;
+    question_store::atomic_write(
+        path,
+        &serde_json::to_vec(record).map_err(|error| error.to_string())?,
+    )
 }
 
 fn update_state(root: &Path, surface: &str, session: &str, id: &str, state: &str) {
@@ -173,10 +156,11 @@ fn apply_hook(action: &str, raw: &str, surface: &str, socket: &str) -> Result<()
     {
         return Ok(());
     }
-    let root = root_for_socket(socket);
+    let root = question_store::root_for_socket(socket)?;
     match action {
         "capture" => {
             let questions = parse_questions(&hook.tool_input)?;
+            question_store::prepare_surface(&root, surface, &hook.session_id)?;
             let path = root.join(surface).join(&hook.session_id).join(format!("{}.json", hook.tool_use_id));
             if let Ok(raw) = fs::read(&path) {
                 if let Ok(existing) = serde_json::from_slice::<Record>(&raw) {
@@ -236,6 +220,7 @@ pub fn run(action: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::question_store;
     use std::os::unix::fs::PermissionsExt;
 
     fn payload(id: &str, questions: Value) -> String {
@@ -246,15 +231,15 @@ mod tests {
     }
 
     fn read_record(socket: &str, id: &str) -> Record {
-        let path = root_for_socket(socket).join("surface-1/session-1").join(format!("{id}.json"));
+        let path = question_store::root_for_socket(socket).unwrap().join("surface-1/session-1").join(format!("{id}.json"));
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
     #[test]
     fn socket_hash_isolates_question_stores() {
         assert_ne!(
-            root_for_socket("/tmp/a.sock"),
-            root_for_socket("/tmp/b.sock")
+            question_store::root_for_socket("/tmp/a.sock").unwrap(),
+            question_store::root_for_socket("/tmp/b.sock").unwrap()
         );
     }
 
@@ -300,7 +285,7 @@ mod tests {
         apply_hook("capture", &one, "surface-1", &socket).unwrap();
         apply_hook("capture", &two, "surface-1", &socket).unwrap();
         assert_eq!(read_record(&socket, "one").state, "cancelled");
-        let directory = root_for_socket(&socket).join("surface-1/session-1");
+        let directory = question_store::root_for_socket(&socket).unwrap().join("surface-1/session-1");
         assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(directory.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(directory.parent().unwrap().parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
@@ -322,6 +307,6 @@ mod tests {
                 "options": [{"label": "ok", "description": "x".repeat(MAX_DESCRIPTION_BYTES + 1)}]
             }]
         })).is_err());
-        assert!(!root_for_socket(&socket).exists());
+        assert!(!question_store::root_for_socket(&socket).unwrap().exists());
     }
 }

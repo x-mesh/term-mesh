@@ -1035,12 +1035,57 @@
       var q = data && data.question;
       if (!q || !isCurrentTarget(t)) { el.questionCard.hidden = true; return; }
       if (state.question && state.question.fingerprint === q.fingerprint) { return; }
-      state.question = q; state.questionAnswers = {}; el.questionTitle.textContent = q.questions.map(function (item) { return item.question; }).join('\n'); el.questionOptions.textContent = '';
-      q.questions.forEach(function (item, qi) { item.options.forEach(function (option, oi) { var label=document.createElement('label'), input=document.createElement('input'); input.type=item.multi_select?'checkbox':'radio'; input.name='question-'+qi; input.value=String(oi+1); input.addEventListener('change',function(){state.questionAnswers[qi]=Array.prototype.map.call(el.questionOptions.querySelectorAll('input[name=\"question-'+qi+'\"]:checked'),function(node){return Number(node.value);});}); label.appendChild(input);label.appendChild(document.createTextNode(' '+option.label));el.questionOptions.appendChild(label); }); });
-      el.questionStatus.textContent=''; el.questionCard.hidden=false;
+      state.question = q;
+      state.questionAnswers = {};
+      el.questionTitle.textContent = q.questions.map(function (item) { return item.question; }).join('\n');
+      el.questionOptions.textContent = '';
+      q.questions.forEach(function (item, qi) {
+        item.options.forEach(function (option, oi) {
+          var label = document.createElement('label');
+          var input = document.createElement('input');
+          input.type = item.multi_select ? 'checkbox' : 'radio';
+          input.name = 'question-' + qi;
+          input.value = String(oi + 1);
+          input.addEventListener('change', function () {
+            state.questionAnswers[qi] = Array.prototype.map.call(
+              el.questionOptions.querySelectorAll('input[name=\"question-' + qi + '\"]:checked'),
+              function (node) { return Number(node.value); }
+            );
+          });
+          label.appendChild(input);
+          label.appendChild(document.createTextNode(' ' + option.label));
+          el.questionOptions.appendChild(label);
+        });
+      });
+      el.questionStatus.textContent = '';
+      el.questionCard.hidden = false;
     }).catch(function(){el.questionCard.hidden=true;});
   }
-  function answerQuestion() { var t=state.selected,q=state.question;if(!t||!q){return;}var answers=q.questions.map(function(_,i){return {question_index:i,selected:state.questionAnswers[i]||[]};});var other=el.questionOther.value.trim();if(other){answers[0].selected=[q.questions[0].options.length+1];answers[0].other=other;}if(answers.some(function(a){return !a.selected.length;})){el.questionStatus.textContent='각 질문을 선택하세요.';return;}el.questionSubmit.disabled=true;api('POST','/api/targets/'+encodeURIComponent(t.surface_id)+'/questions/'+encodeURIComponent(q.id)+'/answer',{fingerprint:q.fingerprint,answers:answers}).then(hidePrompt).catch(function(err){el.questionStatus.textContent=err.code==='prompt_gone'?'질문이 만료되었습니다.':describeError(err);}).then(function(){el.questionSubmit.disabled=false;});}
+  function answerQuestion() {
+    var t = state.selected, q = state.question;
+    if (!t || !q) { return; }
+    var answers = q.questions.map(function (_, i) {
+      return {question_index: i, selected: state.questionAnswers[i] || []};
+    });
+    var other = el.questionOther.value.trim();
+    if (other) {
+      answers[0].selected = [q.questions[0].options.length + 1];
+      answers[0].other = other;
+    }
+    if (answers.some(function (answer) { return !answer.selected.length; })) {
+      el.questionStatus.textContent = '각 질문을 선택하세요.';
+      return;
+    }
+    el.questionSubmit.disabled = true;
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/questions/' + encodeURIComponent(q.id) + '/answer', {
+      fingerprint: q.fingerprint,
+      answers: answers
+    }).then(hidePrompt).catch(function (err) {
+      el.questionStatus.textContent = err.code === 'prompt_gone' ? '질문이 만료되었습니다.' : describeError(err);
+    }).then(function () {
+      el.questionSubmit.disabled = false;
+    });
+  }
 
   function showPreview(lines) {
     var text = (lines || []).join('\n');

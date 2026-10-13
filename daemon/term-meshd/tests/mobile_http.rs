@@ -15,7 +15,6 @@ use http_mobile::{
 };
 use remote::{EnableSpec, KeysPolicy, SharedRegistry, TargetKind};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -2326,20 +2325,15 @@ const CODEX_APPROVAL_SCREEN: &str = "• Running touch c.txt
   Press enter to confirm or esc to cancel";
 
 fn write_claude_question(surface: &str, id: &str, fingerprint: &str, state: &str) {
-    let mut hash = Sha256::new();
     let socket = std::env::var("TERMMESH_DAEMON_UNIX_PATH")
         .or_else(|_| std::env::var("TERMMESH_SOCKET"))
         .unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
-    hash.update(socket.as_bytes());
-    let directory = std::env::temp_dir()
-        .join("term-mesh/questions-v1")
-        .join(format!("{:x}", hash.finalize()))
-        .join(surface)
-        .join("session-mobile-http");
-    std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(
-        directory.join(format!("{id}.json")),
-        serde_json::to_vec(&json!({
+    let root = http_mobile::question_store::root_for_socket(&socket).unwrap();
+    let directory = http_mobile::question_store::prepare_surface(&root, surface, "session-mobile-http").unwrap();
+    let path = directory.join(format!("{id}.json"));
+    http_mobile::question_store::atomic_write(
+        &path,
+        &serde_json::to_vec(&json!({
             "id": id, "fingerprint": fingerprint, "surface_id": surface, "state": state,
             "questions": [{"question": "Choose a deploy", "options": [{"label": "Safe"}, {"label": "Fast"}]}]
         })).unwrap(),

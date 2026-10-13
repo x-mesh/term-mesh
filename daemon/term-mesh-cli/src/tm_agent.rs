@@ -15,6 +15,8 @@
 //! ~1-3ms per call for all commands.
 
 mod claude_question;
+#[path = "../../question_store.rs"]
+mod question_store;
 mod orchestrator;
 mod peer;
 mod prompts;
