@@ -404,6 +404,144 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(LeaderTurnLog.health(from: log).supportedTurns, 0)
     }
 
+    @MainActor
+    func testCachedHealthDoesNotReadOnMainAfterWarmup() throws {
+        let log = try temporaryLog()
+        let lock = NSLock()
+        var readCount = 0
+        var readOnMain = false
+        let measured = LeaderTurnLog.Health(
+            supportedTurns: 4, linkedTurns: 3, statedTurns: 2, unstatedTurns: 1,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 2
+        )
+        LeaderTurnLog.configureHealthRefreshForTesting { _ in
+            lock.lock()
+            readCount += 1
+            readOnMain = readOnMain || Thread.isMainThread
+            lock.unlock()
+            return measured
+        }
+        defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
+
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = LeaderTurnLog.cachedHealth(from: log, now: start)
+        XCTAssertEqual(first.supportedTurns, 0)
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        let warm = LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(1))
+        lock.lock()
+        let reads = readCount
+        let mainRead = readOnMain
+        lock.unlock()
+        XCTAssertEqual(reads, 1)
+        XCTAssertFalse(mainRead)
+        XCTAssertEqual(warm, measured)
+    }
+
+    @MainActor
+    func testCachedHealthRespectsRefreshInterval() throws {
+        let log = try temporaryLog()
+        let lock = NSLock()
+        var readCount = 0
+        let first = LeaderTurnLog.Health(
+            supportedTurns: 1, linkedTurns: 1, statedTurns: 1, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 1
+        )
+        let second = LeaderTurnLog.Health(
+            supportedTurns: 2, linkedTurns: 2, statedTurns: 2, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 1
+        )
+        LeaderTurnLog.configureHealthRefreshForTesting { _ in
+            lock.lock()
+            readCount += 1
+            let result = readCount == 1 ? first : second
+            lock.unlock()
+            return result
+        }
+        defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
+
+        let start = Date(timeIntervalSince1970: 1_800_000_100)
+        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start).supportedTurns, 0)
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(9)).supportedTurns,
+            1
+        )
+        lock.lock()
+        XCTAssertEqual(readCount, 1)
+        lock.unlock()
+
+        _ = LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(10))
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(10.1)).supportedTurns,
+            2
+        )
+        lock.lock()
+        XCTAssertEqual(readCount, 2)
+        lock.unlock()
+    }
+
+    @MainActor
+    func testCachedHealthPicksUpChangedLogAfterRefreshInterval() throws {
+        let log = try temporaryLog()
+        let startRecord = LeaderTurnLog.Record.turnStart(
+            team: "alpha", surfaceID: "surface-1", prompt: "one"
+        )
+        try LeaderTurnLog.append(startRecord, to: log)
+        LeaderTurnLog.configureHealthRefreshForTesting(reader: nil)
+        defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
+
+        let start = Date(timeIntervalSince1970: 1_800_000_200)
+        XCTAssertEqual(LeaderTurnLog.cachedHealth(from: log, now: start).supportedTurns, 0)
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(1)).supportedTurns,
+            1
+        )
+
+        let secondRecord = LeaderTurnLog.Record.turnStart(
+            team: "alpha", surfaceID: "surface-2", prompt: "two"
+        )
+        try LeaderTurnLog.append(secondRecord, to: log)
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(9)).supportedTurns,
+            1
+        )
+        _ = LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(10))
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, now: start.addingTimeInterval(10.1)).supportedTurns,
+            2
+        )
+    }
+
+    @MainActor
+    func testLeaderMeasurementHealthPayloadKeepsShape() {
+        let payload = TeamOrchestrator.shared.leaderMeasurementHealthPayload()
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        XCTAssertEqual(
+            Set(payload.keys),
+            [
+                "records_scope", "leaders_recording_on_other_hosts", "supported_turns",
+                "linked_start_route_end", "stated_turns", "unstated_turns", "unsupported_leaders",
+                "degraded_leaders", "malformed_lines", "observed_days", "coverage", "linkage", "policy",
+            ]
+        )
+        let policy = payload["policy"] as? [String: Any]
+        let policyKeys = Set(policy?.keys ?? Dictionary<String, Any>().keys)
+        XCTAssertEqual(
+            policyKeys,
+            [
+                "cohort_counts", "applied_turns", "suggested_turns", "route_deviations",
+                "more_parallel_than_suggested", "less_parallel_than_suggested", "shadow_turns",
+                "canary_turns", "holdout_turns", "delegated_waves", "delegated_routes", "delegated_tasks",
+                "completed_delegated_tasks", "delegation_rate", "delegation_completion_rate",
+                "unlinked_delegated_tasks", "delegation_rate_by_cohort", "delegation_measurement_status",
+                "outcome_metrics",
+            ]
+        )
+    }
+
     /// `gc.rotate_log` renames the live file to `turns.log.1` and starts an
     /// empty one, and `tm-agent` reads both. Reading only the live file made
     /// this side's count collapse at every rotation and split any turn that

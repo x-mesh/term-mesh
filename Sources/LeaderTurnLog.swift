@@ -813,6 +813,74 @@ enum LeaderTurnLog {
         capabilities: [MeasurementCapability] = []
     ) -> Health {
         let derived = fileDerivedHealth(from: logFile, team: team)
+        return health(from: derived, capabilities: capabilities)
+    }
+
+    static func cachedHealth(
+        from logFile: URL = logFile,
+        capabilities: [MeasurementCapability] = [],
+        now: Date = Date()
+    ) -> Health {
+        // Fleet status accepts this bounded staleness because file reads stay off the main actor.
+        let key = logFile.standardizedFileURL.path
+        healthRefreshLock.lock()
+        let existing = healthRefreshCache[key]
+        let value = existing?.value ?? .empty
+        let needsRefresh = existing.map {
+            now.timeIntervalSince($0.refreshedAt) >= healthRefreshInterval
+        } ?? true
+        let startRefresh = needsRefresh && !(existing?.refreshInFlight ?? false)
+        if startRefresh {
+            healthRefreshCache[key] = HealthRefreshEntry(
+                value: existing?.value ?? .empty,
+                refreshedAt: existing?.refreshedAt ?? .distantPast,
+                refreshInFlight: true
+            )
+        }
+        let reader = healthRefreshReaderForTesting
+        healthRefreshLock.unlock()
+
+        if startRefresh {
+            let refreshAt = now
+            healthRefreshQueue.async {
+                let refreshed = reader?(logFile) ?? health(from: logFile)
+                healthRefreshLock.lock()
+                healthRefreshCache[key] = HealthRefreshEntry(
+                    value: FileDerivedHealth(
+                        supportedTurns: refreshed.supportedTurns,
+                        linkedTurns: refreshed.linkedTurns,
+                        statedTurns: refreshed.statedTurns,
+                        unstatedTurns: refreshed.unstatedTurns,
+                        malformedLines: refreshed.malformedLines,
+                        observedDays: refreshed.observedDays
+                    ),
+                    refreshedAt: refreshAt,
+                    refreshInFlight: false
+                )
+                healthRefreshLock.unlock()
+            }
+        }
+
+        return health(from: value, capabilities: capabilities)
+    }
+
+    static func configureHealthRefreshForTesting(
+        reader: ((URL) -> Health)?
+    ) {
+        healthRefreshLock.lock()
+        healthRefreshReaderForTesting = reader
+        healthRefreshCache.removeAll()
+        healthRefreshLock.unlock()
+    }
+
+    static func waitForHealthRefreshForTesting() {
+        healthRefreshQueue.sync {}
+    }
+
+    private static func health(
+        from derived: FileDerivedHealth,
+        capabilities: [MeasurementCapability]
+    ) -> Health {
         return Health(
             supportedTurns: derived.supportedTurns,
             linkedTurns: derived.linkedTurns,
@@ -887,6 +955,18 @@ enum LeaderTurnLog {
     }
 
     private static let logCacheLock = NSLock()
+    private static let healthRefreshInterval: TimeInterval = 10
+    private static let healthRefreshLock = NSLock()
+    private static let healthRefreshQueue = DispatchQueue(
+        label: "com.term-mesh.leader-turn-health", qos: .utility
+    )
+    private struct HealthRefreshEntry {
+        let value: FileDerivedHealth
+        let refreshedAt: Date
+        let refreshInFlight: Bool
+    }
+    private static var healthRefreshCache: [String: HealthRefreshEntry] = [:]
+    private static var healthRefreshReaderForTesting: ((URL) -> Health)?
     private static var healthCache: (stamp: GenerationStamp, team: String?, value: FileDerivedHealth)?
     private static var recordCache: (stamp: LogFileStamp, records: [Record])?
     /// The rotated generation is frozen until the next rotation, and `.1` is
