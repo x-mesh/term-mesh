@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -356,6 +357,8 @@ pub fn router(state: SharedState) -> Router {
             "/api/targets/{surface_id}/prompt",
             get(prompt_handler).post(prompt_answer_handler),
         )
+        .route("/api/targets/{surface_id}/questions", get(questions_handler))
+        .route("/api/targets/{surface_id}/questions/{question_id}/answer", post(question_answer_handler))
         .route("/api/targets/{surface_id}/screen", get(screen_handler))
         .route("/api/targets/{surface_id}/requests", get(requests_handler))
         .route(
@@ -1285,6 +1288,56 @@ async fn prompt_answer_handler(
         .await
         .map_err(|error| driver.api_error(error))?;
     Ok(Json(json!({ "surface_id": entry.surface_id, "answered": body.index })).into_response())
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct QuestionOption { label: String, #[serde(default)] description: String }
+#[derive(Clone, Deserialize, Serialize)]
+struct QuestionItem { question: String, #[serde(default, rename = "multiSelect")] multi_select: bool, options: Vec<QuestionOption> }
+#[derive(Clone, Deserialize, Serialize)]
+struct StoredQuestion { id: String, fingerprint: String, surface_id: String, state: String, questions: Vec<QuestionItem> }
+#[derive(Deserialize)] struct QuestionAnswer { fingerprint: String, answers: Vec<QuestionAnswerItem> }
+#[derive(Deserialize)] struct QuestionAnswerItem { question_index: usize, selected: Vec<usize>, #[serde(default)] other: Option<String> }
+
+fn question_root(surface: &str) -> PathBuf {
+    let socket = std::env::var("TERMMESH_DAEMON_UNIX_PATH").or_else(|_| std::env::var("TERMMESH_SOCKET")).unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
+    let mut hash = Sha256::new(); hash.update(socket.as_bytes());
+    std::env::temp_dir().join("term-mesh").join("questions-v1").join(format!("{:x}", hash.finalize())).join(surface)
+}
+fn pending_question(surface: &str, wanted: Option<&str>) -> Option<(PathBuf, StoredQuestion)> {
+    for session in fs::read_dir(question_root(surface)).ok()?.flatten() {
+        for file in fs::read_dir(session.path()).ok()?.flatten() {
+            let raw = fs::read(file.path()).ok()?; let record = serde_json::from_slice::<StoredQuestion>(&raw).ok()?;
+            if record.state == "pending" && wanted.is_none_or(|id| id == record.id) { return Some((file.path(), record)); }
+        }
+    }
+    None
+}
+async fn questions_handler(State(state): State<SharedState>, Path(surface): Path<String>) -> ApiResult {
+    let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
+    if entry.app_socket.is_none() { return Err(ApiError::conflict("questions_unavailable", "relay targets are not supported yet")); }
+    Ok(Json(json!({"surface_id": entry.surface_id, "question": pending_question(&entry.surface_id, None).map(|(_, question)| question)})).into_response())
+}
+async fn question_answer_handler(State(state): State<SharedState>, Path((surface, question_id)): Path<(String, String)>, Json(body): Json<QuestionAnswer>) -> ApiResult {
+    let entry = cli_pane(&state, &surface, "questions_unavailable").await?;
+    if entry.app_socket.is_none() { return Err(ApiError::conflict("questions_unavailable", "relay targets are not supported yet")); }
+    let _lock = state.lock_model(&entry.surface_id)?;
+    let Some((path, record)) = pending_question(&entry.surface_id, Some(&question_id)) else { return Err(ApiError::conflict("prompt_gone", "질문이 더 이상 대기 중이 아닙니다.")); };
+    if body.fingerprint != record.fingerprint || body.answers.len() != record.questions.len() { return Err(ApiError::conflict("prompt_gone", "질문이 바뀌었습니다.")); }
+    for (index, question) in record.questions.iter().enumerate() {
+        let Some(answer) = body.answers.iter().find(|answer| answer.question_index == index) else { return Err(ApiError::conflict("prompt_gone", "답변이 불완전합니다.")); };
+        let other = question.options.len() + 1;
+        if answer.selected.is_empty() || answer.selected.iter().any(|item| *item == 0 || *item > other) || (!question.multi_select && answer.selected.len() != 1) || answer.selected.contains(&other) != answer.other.is_some() || answer.other.as_ref().is_some_and(|text| text.is_empty() || text.len() > 2048 || text.chars().any(char::is_control)) { return Err(ApiError::conflict("prompt_gone", "답변 형식이 유효하지 않습니다.")); }
+    }
+    let driver = AppDriver::new(&state, &entry); let screen = driver.read_screen().await.map_err(|error| driver.api_error(error))?; let first = &record.questions[0];
+    if !screen.contains(&first.question) || first.options.iter().any(|option| !screen.contains(&option.label)) { return Err(ApiError::conflict("prompt_gone", "화면의 질문이 바뀌었습니다.")); }
+    for (index, question) in record.questions.iter().enumerate() {
+        let answer = body.answers.iter().find(|answer| answer.question_index == index).expect("validated answer");
+        if question.multi_select { for selected in &answer.selected { for _ in 1..*selected { driver.send_key("Down").await.map_err(|error| driver.api_error(error))?; } driver.send_key("Space").await.map_err(|error| driver.api_error(error))?; } driver.send_key("Enter").await.map_err(|error| driver.api_error(error))?; } else { driver.send_text(&answer.selected[0].to_string()).await.map_err(|error| driver.api_error(error))?; }
+        if let Some(other) = &answer.other { driver.send_text(other).await.map_err(|error| driver.api_error(error))?; driver.send_key("Enter").await.map_err(|error| driver.api_error(error))?; }
+    }
+    let mut answered = record; answered.state = "answered".into(); fs::write(path, serde_json::to_vec(&answered).expect("record serializes")).map_err(|_| ApiError::conflict("prompt_gone", "질문 상태를 저장할 수 없습니다."))?;
+    Ok(Json(json!({"surface_id": entry.surface_id, "answered": question_id})).into_response())
 }
 
 fn model_tui(entry: &Entry) -> &'static mobile_model::Tui {
