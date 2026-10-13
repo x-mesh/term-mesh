@@ -6,6 +6,54 @@ import XCTest
 @testable import term_mesh
 #endif
 
+private actor TeamRosterTestClock {
+    private struct Waiter {
+        let id: UUID
+        let duration: Duration
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private var waiters: [Waiter] = []
+
+    func sleep(for duration: Duration) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                waiters.append(Waiter(id: id, duration: duration, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    func pendingCount(for duration: Duration) -> Int {
+        waiters.count { $0.duration == duration }
+    }
+
+    func advanceNext(by duration: Duration) -> Bool {
+        guard let index = waiters.firstIndex(where: { $0.duration == duration }) else { return false }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume()
+        return true
+    }
+
+    private func cancel(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+}
+
+private actor TeamRosterFetchRecorder {
+    private var entries: [(hostID: String, sockPath: String)] = []
+
+    func record(hostID: String, sockPath: String) {
+        entries.append((hostID, sockPath))
+    }
+
+    var count: Int { entries.count }
+}
+
 /// Covers the manual resync control.
 ///
 /// Project state has no push channel: `ListTeams` is request/response, and the
@@ -16,6 +64,44 @@ import XCTest
 /// which hosts it may act on, and whether the sidebar can see it working.
 @MainActor
 final class RemoteHostResyncTests: XCTestCase {
+    private func waitForPending(
+        _ duration: Duration, in clock: TeamRosterTestClock,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        for _ in 0..<100 {
+            if await clock.pendingCount(for: duration) > 0 { return }
+            await Task.yield()
+        }
+        XCTFail("timed out waiting for \(duration)", file: file, line: line)
+    }
+
+    private func waitForFetchCount(
+        _ expected: Int, in recorder: TeamRosterFetchRecorder,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        for _ in 0..<100 {
+            if await recorder.count == expected { return }
+            await Task.yield()
+        }
+        XCTFail("timed out waiting for \(expected) roster fetches", file: file, line: line)
+    }
+
+    private func configureTeamRosterPolling(
+        store: RemoteHostStore, hostID: String, sockPath: String
+    ) -> (TeamRosterTestClock, TeamRosterFetchRecorder) {
+        let clock = TeamRosterTestClock()
+        let recorder = TeamRosterFetchRecorder()
+        store.installTeamRosterPollFixture(hostID: hostID, sockPath: sockPath)
+        store.configureTeamRosterPollingForTesting(
+            sleeper: { duration in try await clock.sleep(for: duration) },
+            refresh: { refreshedHostID, refreshedSockPath in
+                await recorder.record(hostID: refreshedHostID, sockPath: refreshedSockPath)
+                return []
+            }
+        )
+        return (clock, recorder)
+    }
+
     private func makeHost(
         id: String = "ssh:root@jw-server",
         connectionState: HostConnectionState = .connected,
@@ -144,8 +230,94 @@ final class RemoteHostResyncTests: XCTestCase {
         XCTAssertEqual(idle, running, "equal entries stay equal once both are set")
     }
 
-    func testTeamRosterPollIntervalAvoidsFrequentShortLivedRelayConnections() {
-        XCTAssertEqual(RemoteHostStore.teamRosterPollInterval, .seconds(60))
+    func testTeamRosterIdlePollFetchesAtSixtySecondIntervals() async {
+        let store = RemoteHostStore.shared
+        let hostID = "roster-poll-\(UUID())"
+        let sockPath = "/tmp/rhr-poll-\(UUID()).sock"
+        let (clock, recorder) = configureTeamRosterPolling(
+            store: store, hostID: hostID, sockPath: sockPath
+        )
+        defer { store.removeTeamRosterPollFixture(hostID: hostID) }
+
+        XCTAssertTrue(store.startTeamRosterUpdatesForTesting(hostID: hostID))
+        await waitForPending(.milliseconds(200), in: clock)
+        let startedRefresh = await clock.advanceNext(by: .milliseconds(200))
+        XCTAssertTrue(startedRefresh)
+        await waitForFetchCount(1, in: recorder)
+
+        for expectedFetchCount in 2...4 {
+            await waitForPending(.seconds(60), in: clock)
+            let fifteenSecondWaits = await clock.pendingCount(for: .seconds(15))
+            XCTAssertEqual(fifteenSecondWaits, 0)
+            let advancedPoll = await clock.advanceNext(by: .seconds(60))
+            XCTAssertTrue(advancedPoll)
+            await waitForPending(.milliseconds(200), in: clock)
+            let advancedRefresh = await clock.advanceNext(by: .milliseconds(200))
+            XCTAssertTrue(advancedRefresh)
+            await waitForFetchCount(expectedFetchCount, in: recorder)
+        }
+    }
+
+    func testHostConnectedEventFetchesRosterBeforeIdlePoll() async {
+        let store = RemoteHostStore.shared
+        let hostID = "roster-connected-\(UUID())"
+        let sockPath = "/tmp/rhr-connected-\(UUID()).sock"
+        let (clock, recorder) = configureTeamRosterPolling(
+            store: store, hostID: hostID, sockPath: sockPath
+        )
+        defer { store.removeTeamRosterPollFixture(hostID: hostID) }
+
+        XCTAssertTrue(store.startTeamRosterUpdatesForTesting(hostID: hostID))
+        await waitForPending(.milliseconds(200), in: clock)
+        let idlePollWaits = await clock.pendingCount(for: .seconds(60))
+        XCTAssertEqual(idlePollWaits, 1)
+        let advancedRefresh = await clock.advanceNext(by: .milliseconds(200))
+        XCTAssertTrue(advancedRefresh)
+        await waitForFetchCount(1, in: recorder)
+    }
+
+    func testExplicitTeamRosterRefreshFetchesBeforeIdlePoll() async {
+        let store = RemoteHostStore.shared
+        let hostID = "roster-explicit-\(UUID())"
+        let sockPath = "/tmp/rhr-explicit-\(UUID()).sock"
+        let (clock, recorder) = configureTeamRosterPolling(
+            store: store, hostID: hostID, sockPath: sockPath
+        )
+        defer { store.removeTeamRosterPollFixture(hostID: hostID) }
+
+        store.refreshTeamRoster(forHostKey: hostID)
+        await waitForPending(.milliseconds(200), in: clock)
+        let idlePollWaits = await clock.pendingCount(for: .seconds(60))
+        XCTAssertEqual(idlePollWaits, 0)
+        let advancedRefresh = await clock.advanceNext(by: .milliseconds(200))
+        XCTAssertTrue(advancedRefresh)
+        await waitForFetchCount(1, in: recorder)
+    }
+
+    func testDisconnectCancelsTeamRosterPoll() async {
+        let store = RemoteHostStore.shared
+        let hostID = "roster-disconnect-\(UUID())"
+        let sockPath = "/tmp/rhr-disconnect-\(UUID()).sock"
+        let (clock, _) = configureTeamRosterPolling(
+            store: store, hostID: hostID, sockPath: sockPath
+        )
+        defer { store.removeTeamRosterPollFixture(hostID: hostID) }
+
+        XCTAssertTrue(store.startTeamRosterUpdatesForTesting(hostID: hostID))
+        await waitForPending(.seconds(60), in: clock)
+        guard let host = store.hosts[hostID] else {
+            return XCTFail("fixture host missing")
+        }
+        _ = store.disconnectSavedHost(host)
+        for _ in 0..<100 {
+            let idlePollWaits = await clock.pendingCount(for: .seconds(60))
+            let refreshWaits = await clock.pendingCount(for: .milliseconds(200))
+            if idlePollWaits == 0, refreshWaits == 0 {
+                return
+            }
+            await Task.yield()
+        }
+        XCTFail("disconnect left a team roster timer pending")
     }
 
     func testRedirectedDurableRosterLeaseReusesUntilSubscriptionStops() async {
