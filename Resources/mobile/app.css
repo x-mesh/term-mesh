@@ -627,6 +627,32 @@ body.chat-mode #send {
   white-space: nowrap;
 }
 
+.requests .req-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.requests .req-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.requests .req-meta { font-size: 11px; }
+
+.requests .req-status {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.requests .req-queued { color: var(--accent); background: var(--accent-soft); }
+.requests .req-expired { color: var(--danger); }
+
 .muted { color: var(--muted); }
 
 .composer {

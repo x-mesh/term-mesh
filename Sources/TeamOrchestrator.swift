@@ -35,7 +35,10 @@ final class TeamOrchestrator: ObservableObject {
     private static let localLeaderReadinessTimeout: TimeInterval = 60
     static let localLeaderStablePromptObservations = 4
 
+    private var leaderRequestSweepTimer: DispatchSourceTimer?
+
     private init() {
+        defer { startLeaderRequestSweepTimer() }
         // Native turn state lives in the thread-safe data store rather than in
         // teams. Forward its coalesced change signal so sidebar runtime
         // snapshots are recomputed when an agent starts or finishes a turn.
@@ -6281,7 +6284,7 @@ final class TeamOrchestrator: ObservableObject {
                     current.leaderFailureDescription = nil
                     self.teams[teamName] = current
                     self.syncTeamStateToDaemon()
-                    self.wakeFirstQueuedLeaderRequest(teamName: teamName, tabManager: tabManager)
+                    self.wakeNextEligibleLeaderRequest(teamName: teamName, tabManager: tabManager)
                 } else {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + Self.localLeaderReadinessPollInterval
@@ -6299,11 +6302,38 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
-    private func wakeFirstQueuedLeaderRequest(teamName: String, tabManager: TabManager) {
-        guard let request = TeamDataStore.shared.listLeaderRequests(teamName: teamName)?
-            .first(where: { $0.status == "queued" }) else { return }
+    static let nextLeaderRequestWakeDelay: TimeInterval = 2
+    private static let leaderRequestSweepInterval: TimeInterval = 30
+
+    /// Wakes at most one request: the oldest live queued one, once its cooldown
+    /// has passed and while it has attempts left. Failed dispatches are not
+    /// counted, so a leader that is not ready yet keeps its attempts.
+    func wakeNextEligibleLeaderRequest(teamName: String, tabManager: TabManager? = nil) {
+        guard teams[teamName]?.leaderReady == true,
+              let manager = tabManager ?? resolveTabManager(teamName: teamName)
+                ?? AppDelegate.shared?.tabManager,
+              let request = TeamDataStore.shared.nextLeaderRequestForWake(teamName: teamName)
+        else { return }
         let wake = leaderRequestWake(teamName: teamName, requestId: request.id)
-        _ = sendToLeader(teamName: teamName, text: wake, tabManager: tabManager)
+        if sendToLeader(teamName: teamName, text: wake, tabManager: manager) {
+            TeamDataStore.shared.recordLeaderRequestWake(teamName: teamName, requestId: request.id)
+        }
+    }
+
+    private func startLeaderRequestSweepTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + Self.leaderRequestSweepInterval,
+            repeating: Self.leaderRequestSweepInterval
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            for teamName in Array(self.teams.keys) {
+                self.wakeNextEligibleLeaderRequest(teamName: teamName)
+            }
+        }
+        timer.resume()
+        leaderRequestSweepTimer = timer
     }
 
     static func leaderRequestWake(requestId: String, tmAgent: String) -> String {

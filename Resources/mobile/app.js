@@ -1132,6 +1132,16 @@
       });
   }
 
+  function formatAge(iso) {
+    var ms = Date.now() - Date.parse(iso || '');
+    if (!isFinite(ms) || ms < 0) { return ''; }
+    var min = Math.floor(ms / 60000);
+    if (min < 1) { return '방금'; }
+    if (min < 60) { return min + '분 전'; }
+    var hours = Math.floor(min / 60);
+    return hours < 24 ? hours + '시간 전' : Math.floor(hours / 24) + '일 전';
+  }
+
   function refreshRequests() {
     var t = state.selected;
     if (!t || t.kind !== 'leader') { return Promise.resolve(); }
@@ -1142,13 +1152,22 @@
         el.requestsList.textContent = '';
         items.slice(-8).reverse().forEach(function (r) {
           var li = document.createElement('li');
-          var id = document.createElement('span');
-          id.className = 'id';
-          id.textContent = r.id || r.request_id || '?';
+          var main = document.createElement('div');
+          main.className = 'req-main';
+          var preview = document.createElement('span');
+          preview.className = 'req-preview';
+          preview.textContent = r.preview || String(r.id || r.request_id || '?').slice(0, 8);
+          var meta = document.createElement('span');
+          meta.className = 'muted req-meta';
+          var bits = [formatAge(r.created_at), String(r.id || r.request_id || '').slice(0, 8)];
+          if (r.status === 'queued' && r.wake_attempts >= 1) { bits.push('깨우기 ' + r.wake_attempts + '회'); }
+          meta.textContent = bits.filter(Boolean).join(' · ');
+          main.appendChild(preview);
+          main.appendChild(meta);
           var st = document.createElement('span');
-          st.className = 'muted';
+          st.className = 'req-status req-' + (r.status || 'queued');
           st.textContent = r.status || '';
-          li.appendChild(id);
+          li.appendChild(main);
           li.appendChild(st);
           el.requestsList.appendChild(li);
         });
