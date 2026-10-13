@@ -56,6 +56,8 @@ pub const DEDUPE_WINDOW: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_SCREEN_LINES: u32 = 200;
 pub const MIN_SCREEN_LINES: u32 = 20;
 pub const MAX_SCREEN_LINES: u32 = 1000;
+const QUESTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+static QUESTION_CLEANUP_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 /// Keys the page may send when the entry's policy is `safe`.
 pub const SAFE_KEYS: &[&str] = &[
@@ -1457,7 +1459,15 @@ fn ask_screen(screen: &str) -> Option<AskScreen> {
     while first < footer && lines[first].trim().is_empty() {
         first += 1;
     }
-    let question = lines.get(first)?.trim();
+    let question_end = (first + 1..footer)
+        .find(|index| ask_option(lines[*index]).is_some())
+        .unwrap_or(footer);
+    let question = lines[first..question_end]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     if question.is_empty() {
         return None;
     }
@@ -1466,9 +1476,17 @@ fn ask_screen(screen: &str) -> Option<AskScreen> {
         .unwrap_or(footer);
     let mut options = Vec::new();
     let mut submit_focused = false;
-    for line in &lines[first + 1..block_end] {
+    for line in &lines[question_end..block_end] {
         if let Some(option) = ask_option(line) {
             options.push(option);
+        } else if line.starts_with("  ") && !line.starts_with("     ") {
+            if let Some(option) = options.last_mut() {
+                let continuation = line.trim();
+                if !continuation.is_empty() {
+                    option.label.push(' ');
+                    option.label.push_str(continuation);
+                }
+            }
         }
         if line.trim() == "❯    Submit" {
             submit_focused = true;
@@ -1479,7 +1497,7 @@ fn ask_screen(screen: &str) -> Option<AskScreen> {
         options.iter().filter(|option| option.focused).count() + usize::from(submit_focused);
     (options.len() >= 2 && cursor_count == 1).then(|| AskScreen::Question {
         tabs,
-        question: question.to_string(),
+        question,
         options,
         multi,
         submit_focused,
@@ -1530,13 +1548,22 @@ fn question_root(surface: &str) -> Result<PathBuf, String> {
 }
 fn pending_question(surface: &str, wanted: Option<&str>) -> Option<(PathBuf, StoredQuestion)> {
     let root = question_root(surface).ok()?;
+    if !root.exists() {
+        return None;
+    }
     let store = root.parent()?;
-    let _ = question_store::cleanup(store, |path| {
-        fs::read(path)
-            .ok()
-            .and_then(|raw| serde_json::from_slice::<StoredQuestion>(&raw).ok())
-            .is_some_and(|record| record.state != "pending")
-    });
+    let cleanup_at = QUESTION_CLEANUP_AT.get_or_init(|| Mutex::new(None));
+    let mut cleanup_at = cleanup_at.lock().ok()?;
+    if cleanup_at.is_none_or(|last| last.elapsed() >= QUESTION_CLEANUP_INTERVAL) {
+        let _ = question_store::cleanup(store, |path| {
+            fs::read(path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<StoredQuestion>(&raw).ok())
+                .is_some_and(|record| record.state != "pending")
+        });
+        *cleanup_at = Some(Instant::now());
+    }
+    drop(cleanup_at);
     for session in fs::read_dir(root).ok()?.flatten() {
         let Ok(files) = fs::read_dir(session.path()) else {
             continue;
@@ -1625,122 +1652,7 @@ async fn question_answer_handler(
         }
     }
     let driver = AppDriver::new(&state, &entry);
-    for (index, question) in record.questions.iter().enumerate() {
-        let answer = body
-            .answers
-            .iter()
-            .find(|answer| answer.question_index == index)
-            .expect("validated answer");
-        wait_question(&driver, &record, index)
-            .await
-            .map_err(|error| driver.api_error(error))?;
-        let selected = normalized_selected(question, answer)
-            .ok_or_else(|| ApiError::conflict("prompt_gone", "답변 형식이 유효하지 않습니다."))?;
-        if question.multi_select {
-            let mut expected = Vec::new();
-            for option in &selected {
-                driver
-                    .send_text(&option.to_string())
-                    .await
-                    .map_err(|error| driver.api_error(error))?;
-                expected.push(*option);
-                wait_question_marks(&driver, &record, index, &expected)
-                    .await
-                    .map_err(|error| driver.api_error(error))?;
-            }
-            if let Some(other) = &answer.other {
-                let other_index = question.options.len() + 1;
-                let mut current = wait_question_marks(&driver, &record, index, &selected)
-                    .await
-                    .map_err(|error| driver.api_error(error))?;
-                while !current_options(&current)
-                    .iter()
-                    .any(|option| option.index == other_index && option.focused)
-                {
-                    driver
-                        .send_key("Down")
-                        .await
-                        .map_err(|error| driver.api_error(error))?;
-                    current = wait_question_marks(&driver, &record, index, &selected)
-                        .await
-                        .map_err(|error| driver.api_error(error))?;
-                }
-                driver
-                    .send_text(other)
-                    .await
-                    .map_err(|error| driver.api_error(error))?;
-                wait_question_marks(&driver, &record, index, &selected)
-                    .await
-                    .map_err(|error| driver.api_error(error))?;
-            }
-            let mut current = wait_question_marks(&driver, &record, index, &selected)
-                .await
-                .map_err(|error| driver.api_error(error))?;
-            while !matches!(
-                current,
-                AskScreen::Question {
-                    submit_focused: true,
-                    ..
-                }
-            ) {
-                driver
-                    .send_key("Down")
-                    .await
-                    .map_err(|error| driver.api_error(error))?;
-                current = wait_question_marks(&driver, &record, index, &selected)
-                    .await
-                    .map_err(|error| driver.api_error(error))?;
-            }
-            driver
-                .send_key("Enter")
-                .await
-                .map_err(|error| driver.api_error(error))?;
-        } else if let Some(other) = &answer.other {
-            driver
-                .send_text(&(question.options.len() + 1).to_string())
-                .await
-                .map_err(|error| driver.api_error(error))?;
-            wait_question(&driver, &record, index)
-                .await
-                .map_err(|error| driver.api_error(error))?;
-            driver
-                .send_text(other)
-                .await
-                .map_err(|error| driver.api_error(error))?;
-            wait_question(&driver, &record, index)
-                .await
-                .map_err(|error| driver.api_error(error))?;
-            driver
-                .send_key("Enter")
-                .await
-                .map_err(|error| driver.api_error(error))?;
-        } else {
-            driver
-                .send_text(&selected[0].to_string())
-                .await
-                .map_err(|error| driver.api_error(error))?;
-        }
-        if index + 1 < record.questions.len() {
-            wait_question(&driver, &record, index + 1)
-                .await
-                .map_err(|error| driver.api_error(error))?;
-        }
-    }
-    if record.questions.len() > 1
-        || record
-            .questions
-            .iter()
-            .any(|question| question.multi_select)
-    {
-        wait_review(&driver, &record)
-            .await
-            .map_err(|error| driver.api_error(error))?;
-        driver
-            .send_text("1")
-            .await
-            .map_err(|error| driver.api_error(error))?;
-    }
-    wait_question_closed(&driver)
+    answer_claude_question(&driver, &record, &body.answers)
         .await
         .map_err(|error| driver.api_error(error))?;
     let mut answered = record;
@@ -1757,6 +1669,98 @@ async fn question_answer_handler(
         entry.surface_id
     );
     Ok(Json(json!({"surface_id": entry.surface_id, "answered": question_id})).into_response())
+}
+
+async fn answer_claude_question<D: PaneDriver>(
+    driver: &D,
+    record: &StoredQuestion,
+    answers: &[QuestionAnswerItem],
+) -> Result<(), DriveError> {
+    for (index, question) in record.questions.iter().enumerate() {
+        let answer = answers
+            .iter()
+            .find(|answer| answer.question_index == index)
+            .expect("validated answer");
+        wait_question(driver, record, index).await?;
+        let selected = normalized_selected(question, answer).ok_or(DriveError::PromptGone)?;
+        if question.multi_select {
+            let mut expected = Vec::new();
+            for option in &selected {
+                driver.send_text(&option.to_string()).await?;
+                expected.push(*option);
+                wait_question_marks(driver, record, index, &expected).await?;
+            }
+            if let Some(other) = &answer.other {
+                let other_index = question.options.len() + 1;
+                let mut current = wait_question_marks(driver, record, index, &selected).await?;
+                for _ in 0..question.options.len() + 3 {
+                    if current_options(&current)
+                        .iter()
+                        .any(|option| option.index == other_index && option.focused)
+                    {
+                        break;
+                    }
+                    driver.send_key("Down").await?;
+                    current = wait_question_marks(driver, record, index, &selected).await?;
+                }
+                if !current_options(&current)
+                    .iter()
+                    .any(|option| option.index == other_index && option.focused)
+                {
+                    return Err(DriveError::PromptGone);
+                }
+                driver.send_text(other).await?;
+                wait_question_marks(driver, record, index, &selected).await?;
+            }
+            let mut current = wait_question_marks(driver, record, index, &selected).await?;
+            for _ in 0..question.options.len() + 3 {
+                if matches!(
+                    current,
+                    AskScreen::Question {
+                        submit_focused: true,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+                driver.send_key("Down").await?;
+                current = wait_question_marks(driver, record, index, &selected).await?;
+            }
+            if !matches!(
+                current,
+                AskScreen::Question {
+                    submit_focused: true,
+                    ..
+                }
+            ) {
+                return Err(DriveError::PromptGone);
+            }
+            driver.send_key("Enter").await?;
+        } else if let Some(other) = &answer.other {
+            driver
+                .send_text(&(question.options.len() + 1).to_string())
+                .await?;
+            wait_question(driver, record, index).await?;
+            driver.send_text(other).await?;
+            wait_question(driver, record, index).await?;
+            driver.send_key("Enter").await?;
+        } else {
+            driver.send_text(&selected[0].to_string()).await?;
+        }
+        if index + 1 < record.questions.len() {
+            wait_question(driver, record, index + 1).await?;
+        }
+    }
+    if record.questions.len() > 1
+        || record
+            .questions
+            .iter()
+            .any(|question| question.multi_select)
+    {
+        wait_review(driver, record).await?;
+        driver.send_text("1").await?;
+    }
+    wait_question_closed(driver).await
 }
 
 fn current_options(screen: &AskScreen) -> &[AskOption] {
@@ -1780,62 +1784,8 @@ fn normalized_selected(question: &QuestionItem, answer: &QuestionAnswerItem) -> 
     Some(selected)
 }
 
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-enum QuestionKey {
-    Digit(usize),
-    Down,
-    Enter,
-    Text(String),
-}
-
-#[cfg(test)]
-fn question_key_plan(
-    questions: &[QuestionItem],
-    answers: &[QuestionAnswerItem],
-) -> Option<Vec<QuestionKey>> {
-    let mut keys = Vec::new();
-    for (index, question) in questions.iter().enumerate() {
-        let answer = answers
-            .iter()
-            .find(|answer| answer.question_index == index)?;
-        let selected = normalized_selected(question, answer)?;
-        let other = question.options.len() + 1;
-        if question.multi_select {
-            keys.extend(
-                selected
-                    .iter()
-                    .map(|selected| QuestionKey::Digit(*selected)),
-            );
-            if let Some(text) = &answer.other {
-                keys.extend((1..other).map(|_| QuestionKey::Down));
-                keys.push(QuestionKey::Text(text.clone()));
-            }
-            let cursor = if answer.other.is_some() {
-                question.options.len() + 1
-            } else {
-                1
-            };
-            keys.extend((cursor..=question.options.len() + 1).map(|_| QuestionKey::Down));
-            keys.push(QuestionKey::Enter);
-        } else if let Some(text) = &answer.other {
-            keys.extend([
-                QuestionKey::Digit(other),
-                QuestionKey::Text(text.clone()),
-                QuestionKey::Enter,
-            ]);
-        } else {
-            keys.push(QuestionKey::Digit(selected[0]));
-        }
-    }
-    if questions.len() > 1 || questions.iter().any(|question| question.multi_select) {
-        keys.push(QuestionKey::Digit(1));
-    }
-    Some(keys)
-}
-
-async fn wait_question(
-    driver: &AppDriver<'_>,
+async fn wait_question<D: PaneDriver>(
+    driver: &D,
     record: &StoredQuestion,
     index: usize,
 ) -> Result<AskScreen, DriveError> {
@@ -1851,8 +1801,8 @@ async fn wait_question(
     Err(DriveError::PromptGone)
 }
 
-async fn wait_question_marks(
-    driver: &AppDriver<'_>,
+async fn wait_question_marks<D: PaneDriver>(
+    driver: &D,
     record: &StoredQuestion,
     index: usize,
     expected: &[usize],
@@ -1873,8 +1823,8 @@ async fn wait_question_marks(
     Err(DriveError::PromptGone)
 }
 
-async fn wait_question_once(
-    driver: &AppDriver<'_>,
+async fn wait_question_once<D: PaneDriver>(
+    driver: &D,
     record: &StoredQuestion,
     index: usize,
 ) -> Result<AskScreen, DriveError> {
@@ -1887,7 +1837,7 @@ async fn wait_question_once(
         .ok_or(DriveError::PromptGone)
 }
 
-async fn wait_review(driver: &AppDriver<'_>, record: &StoredQuestion) -> Result<(), DriveError> {
+async fn wait_review<D: PaneDriver>(driver: &D, record: &StoredQuestion) -> Result<(), DriveError> {
     for _ in 0..30 {
         let screen = driver.read_screen().await?;
         if let Some(AskScreen::Review { tabs }) = ask_screen(&screen) {
@@ -1904,10 +1854,20 @@ async fn wait_review(driver: &AppDriver<'_>, record: &StoredQuestion) -> Result<
     Err(DriveError::PromptGone)
 }
 
-async fn wait_question_closed(driver: &AppDriver<'_>) -> Result<(), DriveError> {
+async fn wait_question_closed<D: PaneDriver>(driver: &D) -> Result<(), DriveError> {
+    let mut closed_reads = 0;
     for _ in 0..30 {
-        if ask_screen(&driver.read_screen().await?).is_none() {
+        let screen = driver.read_screen().await?;
+        if screen.contains("User answered Claude's questions:") {
             return Ok(());
+        }
+        if ask_screen(&screen).is_none() {
+            closed_reads += 1;
+            if closed_reads == 3 {
+                return Ok(());
+            }
+        } else {
+            closed_reads = 0;
         }
         driver.pause(std::time::Duration::from_millis(80)).await;
     }
@@ -1917,17 +1877,69 @@ async fn wait_question_closed(driver: &AppDriver<'_>) -> Result<(), DriveError> 
 #[cfg(test)]
 mod question_tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::ffi::CString;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
 
+    struct FixtureDriver {
+        screens: Mutex<VecDeque<String>>,
+        keys: Mutex<Vec<String>>,
+    }
+
+    impl FixtureDriver {
+        fn new(screens: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                screens: Mutex::new(screens.into_iter().map(str::to_string).collect()),
+                keys: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneDriver for FixtureDriver {
+        async fn read_screen(&self) -> Result<String, DriveError> {
+            let mut screens = self.screens.lock().unwrap();
+            Ok(screens.front().cloned().unwrap_or_default())
+        }
+        async fn send_key(&self, key: &'static str) -> Result<(), DriveError> {
+            self.keys.lock().unwrap().push(key.into());
+            self.screens.lock().unwrap().pop_front();
+            Ok(())
+        }
+        async fn send_text(&self, text: &str) -> Result<(), DriveError> {
+            self.keys.lock().unwrap().push(text.into());
+            self.screens.lock().unwrap().pop_front();
+            Ok(())
+        }
+        async fn send_turn(&self, _text: &str) -> Result<(), DriveError> {
+            Ok(())
+        }
+        async fn pause(&self, _duration: Duration) {}
+    }
+
     const SINGLE: &str = include_str!("../tests/fixtures/ask_user_question/s1_single.txt");
     const TWO: &str = include_str!("../tests/fixtures/ask_user_question/s2_two_q1.txt");
     const REVIEW: &str = include_str!("../tests/fixtures/ask_user_question/s2_review_full.txt");
     const ANSWERED: &str = include_str!("../tests/fixtures/ask_user_question/s2_after_submit.txt");
     const MULTI: &str = include_str!("../tests/fixtures/ask_user_question/s3_after_toggle_D.txt");
+    const WRAPPED: &str = include_str!("../tests/fixtures/ask_user_question/s1_wrapped.txt");
+
+    fn option(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.into(),
+            description: String::new(),
+        }
+    }
+
+    fn answer(index: usize, selected: &[usize], other: Option<&str>) -> QuestionAnswerItem {
+        QuestionAnswerItem {
+            question_index: index,
+            selected: selected.to_vec(),
+            other: other.map(str::to_string),
+        }
+    }
 
     #[test]
     fn parses_open_question_review_and_multi_select_but_not_answered_scrollback() {
@@ -1950,6 +1962,106 @@ mod question_tests {
         };
         assert!(multi);
         assert!(options.iter().any(|option| option.checked));
+    }
+
+    #[test]
+    fn parses_wrapped_question_text_and_option_labels() {
+        let AskScreen::Question {
+            question, options, ..
+        } = ask_screen(WRAPPED).expect("wrapped")
+        else {
+            panic!("question")
+        };
+        assert_eq!(question, "Pick a very long color");
+        assert_eq!(options[0].label, "Deep Red");
+    }
+
+    #[tokio::test]
+    async fn answer_state_machine_drives_single_and_multi_question_fixtures() {
+        let single = StoredQuestion {
+            id: "single".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Color".into(),
+                question: "Pick a color".into(),
+                multi_select: false,
+                options: vec![option("Red"), option("Green"), option("Blue")],
+            }],
+        };
+        let driver = FixtureDriver::new([
+            SINGLE,
+            include_str!("../tests/fixtures/ask_user_question/s1_after_digit2.txt"),
+        ]);
+        answer_claude_question(&driver, &single, &[answer(0, &[2], None)])
+            .await
+            .unwrap();
+        assert_eq!(*driver.keys.lock().unwrap(), vec!["2"]);
+
+        let multiple = StoredQuestion {
+            id: "multiple".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![
+                QuestionItem {
+                    header: "Fruit".into(),
+                    question: "Pick fruit".into(),
+                    multi_select: false,
+                    options: vec![option("Apple"), option("Banana")],
+                },
+                QuestionItem {
+                    header: "Size".into(),
+                    question: "Pick size".into(),
+                    multi_select: false,
+                    options: vec![option("Small"), option("Large")],
+                },
+            ],
+        };
+        let driver = FixtureDriver::new([
+            TWO,
+            include_str!("../tests/fixtures/ask_user_question/s2_after_q1_enter.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s2_after_q2_digit.txt"),
+            REVIEW,
+            ANSWERED,
+        ]);
+        answer_claude_question(
+            &driver,
+            &multiple,
+            &[answer(0, &[2], None), answer(1, &[2], None)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(*driver.keys.lock().unwrap(), vec!["2", "2", "1"]);
+    }
+
+    #[tokio::test]
+    async fn answer_state_machine_refuses_stale_or_not_closed_screens_without_extra_input() {
+        let record = StoredQuestion {
+            id: "single".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Color".into(),
+                question: "Pick a color".into(),
+                multi_select: false,
+                options: vec![option("Red"), option("Green"), option("Blue")],
+            }],
+        };
+        let stale = FixtureDriver::new([ANSWERED]);
+        assert_eq!(
+            answer_claude_question(&stale, &record, &[answer(0, &[1], None)]).await,
+            Err(DriveError::PromptGone)
+        );
+        assert!(stale.keys.lock().unwrap().is_empty());
+        let not_closed = FixtureDriver::new([SINGLE, SINGLE]);
+        assert_eq!(
+            answer_claude_question(&not_closed, &record, &[answer(0, &[1], None)]).await,
+            Err(DriveError::PromptGone)
+        );
+        assert_eq!(*not_closed.keys.lock().unwrap(), vec!["1"]);
     }
 
     #[test]
@@ -2035,86 +2147,6 @@ mod question_tests {
             ),
             None
         );
-    }
-
-    fn option(label: &str) -> QuestionOption {
-        QuestionOption {
-            label: label.into(),
-            description: String::new(),
-        }
-    }
-
-    fn answer(index: usize, selected: &[usize], other: Option<&str>) -> QuestionAnswerItem {
-        QuestionAnswerItem {
-            question_index: index,
-            selected: selected.to_vec(),
-            other: other.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn key_plans_follow_the_captured_single_multi_and_other_flows() {
-        let single = QuestionItem {
-            header: "Color".into(),
-            question: "Pick".into(),
-            multi_select: false,
-            options: vec![option("Red"), option("Blue")],
-        };
-        assert_eq!(
-            question_key_plan(&[single.clone()], &[answer(0, &[2], None)]),
-            Some(vec![QuestionKey::Digit(2)])
-        );
-        assert_eq!(
-            question_key_plan(&[single.clone()], &[answer(0, &[3], Some("한글 😀"))]),
-            Some(vec![
-                QuestionKey::Digit(3),
-                QuestionKey::Text("한글 😀".into()),
-                QuestionKey::Enter,
-            ])
-        );
-
-        let size = QuestionItem {
-            header: "Size".into(),
-            question: "Pick size".into(),
-            multi_select: false,
-            options: vec![option("Small"), option("Large")],
-        };
-        assert_eq!(
-            question_key_plan(
-                &[single.clone(), size],
-                &[answer(0, &[1], None), answer(1, &[2], None)]
-            ),
-            Some(vec![
-                QuestionKey::Digit(1),
-                QuestionKey::Digit(2),
-                QuestionKey::Digit(1)
-            ])
-        );
-
-        let multi = QuestionItem {
-            header: "Letters".into(),
-            question: "Pick letters".into(),
-            multi_select: true,
-            options: vec![option("A"), option("B"), option("C"), option("D")],
-        };
-        let sorted = question_key_plan(&[multi.clone()], &[answer(0, &[2, 4], None)]).unwrap();
-        assert_eq!(
-            &sorted[..2],
-            &[QuestionKey::Digit(2), QuestionKey::Digit(4)]
-        );
-        assert_eq!(sorted.last(), Some(&QuestionKey::Digit(1)));
-        let unsorted = question_key_plan(&[multi.clone()], &[answer(0, &[3, 1], None)]).unwrap();
-        assert_eq!(
-            &unsorted[..2],
-            &[QuestionKey::Digit(1), QuestionKey::Digit(3)]
-        );
-
-        let with_other = question_key_plan(&[multi], &[answer(0, &[1, 5], Some("other"))]).unwrap();
-        assert_eq!(
-            &with_other[..2],
-            &[QuestionKey::Digit(1), QuestionKey::Digit(5)]
-        );
-        assert!(with_other.contains(&QuestionKey::Text("other".into())));
     }
 
     #[test]

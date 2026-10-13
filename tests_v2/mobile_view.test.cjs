@@ -20,12 +20,16 @@ function element() {
       toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
       contains(name) { return classes.has(name); },
     },
-    setAttribute() {},
+    attributes: {},
+    setAttribute(name, value) { this.attributes[name] = value; },
     addEventListener(name, callback) { listeners.set(name, callback); },
     dispatch(name, event = {}) { listeners.get(name)?.({ preventDefault() {}, ...event }); },
     focus() {}, scrollIntoView() {}, removeAttribute() {},
     setSelectionRange() {},
-    querySelectorAll() { return []; },
+    querySelectorAll(selector) {
+      const match = selector.match(/textarea\[data-question-other="(\d+)"\]/);
+      return match ? this.children.filter(child => child.attributes?.['data-question-other'] === match[1]) : [];
+    },
     appendChild(child) { this.children.push(child); child.parentNode = this; },
     removeChild(child) { this.children = this.children.filter(item => item !== child); },
   };
@@ -378,7 +382,7 @@ test('a captured Claude question posts structured selections and shows stale sta
   const app = page([pane(true)]);
   app.setQuestion({ id: 'question-1', fingerprint: 'question-fp', questions: [
     { question: 'Choose', options: [{ label: 'Safe' }, { label: 'Fast' }] },
-    { question: 'Extras', multiSelect: true, options: [{ label: 'Logs' }, { label: 'Tests' }] },
+    { question: 'Extras', multi_select: true, options: [{ label: 'Logs' }, { label: 'Tests' }] },
   ]});
   await settle();
   app.tick();
@@ -386,19 +390,47 @@ test('a captured Claude question posts structured selections and shows stale sta
   await settle();
   assert.equal(app.nodes.get('question-card').hidden, false);
   assert.equal(app.nodes.get('question-title').textContent, 'Choose\nExtras');
-  app.nodes.get('question-other').value = 'custom';
+  const otherFields = app.nodes.get('question-options').children.filter(node => node.placeholder === 'Other 답변');
+  otherFields[0].value = 'custom';
   app.nodes.get('question-submit').dispatch('click');
   await settle();
   assert.match(app.nodes.get('question-status').textContent, /각 질문/);
   const app2 = page([pane(true)]);
   app2.setQuestion({ id: 'question-2', fingerprint: 'question-fp-2', questions: [{ question: 'Choose', options: [{label:'Safe'}] }] });
   await settle(); app2.tick(); await settle(); await settle();
-  app2.nodes.get('question-options').querySelectorAll = () => [{value:'1', checked:true}];
+  app2.nodes.get('question-options').querySelectorAll = selector => selector.includes('input') ? [{value:'1', checked:true}] : [];
   app2.nodes.get('question-options').children[0].children[0].dispatch('change');
   app2.nodes.get('question-submit').dispatch('click');
   await settle();
   const sent = app2.bodies.find(([url]) => url.endsWith('/questions/question-2/answer'));
   assert.deepEqual(sent, ['/api/targets/pane-1/questions/question-2/answer', {fingerprint:'question-fp-2',answers:[{question_index:0,selected:[1]}]}]);
+});
+
+test('Other answers stay with their question and retain multiSelect choices', async () => {
+  const app = page([pane(true)]);
+  app.setQuestion({ id: 'question-other', fingerprint: 'question-other-fp', questions: [
+    { question: 'Extras', multi_select: true, options: [{label:'Logs'}, {label:'Tests'}] },
+    { question: 'Mode', options: [{label:'Safe'}] },
+  ]});
+  await settle(); app.tick(); await settle(); await settle();
+  const options = app.nodes.get('question-options');
+  options.querySelectorAll = selector => {
+    if (selector.includes('question-0')) return [{value:'1', checked:true}];
+    if (selector.includes('question-1')) return [{value:'1', checked:true}];
+    return options.children.filter(child => child.attributes?.['data-question-other'] === selector.match(/"(\d+)"/)?.[1]);
+  };
+  options.children[0].children[0].dispatch('change');
+  options.children[3].children[0].dispatch('change');
+  const otherFields = options.children.filter(node => node.placeholder === 'Other 답변');
+  otherFields[0].value = 'custom extras';
+  otherFields[1].value = 'custom mode';
+  app.nodes.get('question-submit').dispatch('click');
+  await settle();
+  const sent = app.bodies.find(([url]) => url.endsWith('/questions/question-other/answer'));
+  assert.deepEqual(sent[1].answers, [
+    {question_index:0,selected:[1,3],other:'custom extras'},
+    {question_index:1,selected:[2],other:'custom mode'},
+  ]);
 });
 
 test('an idle chat never asks the terminal for a prompt', async () => {

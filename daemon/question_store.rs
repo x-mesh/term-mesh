@@ -13,21 +13,20 @@ static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn private_base() -> Result<PathBuf, String> {
     #[cfg(test)]
     {
-        return Ok(env::temp_dir().join(format!("term-mesh-question-tests-{}", unsafe { libc::geteuid() })));
+        return Ok(
+            env::temp_dir().join(format!("term-mesh-question-tests-{}", unsafe {
+                libc::geteuid()
+            })),
+        );
     }
     #[cfg(not(test))]
     {
-    if let Ok(runtime) = env::var("XDG_RUNTIME_DIR") {
-        if Path::new(&runtime).is_absolute() {
-            return Ok(PathBuf::from(runtime).join("term-mesh"));
-        }
-        return Err("XDG_RUNTIME_DIR must be absolute".into());
-    }
-    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-    #[cfg(target_os = "macos")]
-    return Ok(PathBuf::from(home).join("Library/Application Support/term-mesh"));
-    #[cfg(not(target_os = "macos"))]
-    Ok(PathBuf::from(home).join(".local/share/term-mesh"))
+        // Hooks and the daemon do not always inherit the same runtime environment.
+        let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+        #[cfg(target_os = "macos")]
+        return Ok(PathBuf::from(home).join("Library/Application Support/term-mesh"));
+        #[cfg(not(target_os = "macos"))]
+        Ok(PathBuf::from(home).join(".local/share/term-mesh"))
     }
 }
 
@@ -42,13 +41,22 @@ pub(crate) fn root_for_socket(socket: &str) -> Result<PathBuf, String> {
 pub(crate) fn verify_private_directory(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("question store component is not a directory: {}", path.display()));
+        return Err(format!(
+            "question store component is not a directory: {}",
+            path.display()
+        ));
     }
     if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(format!("question store component has another owner: {}", path.display()));
+        return Err(format!(
+            "question store component has another owner: {}",
+            path.display()
+        ));
     }
     if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(format!("question store component is not private: {}", path.display()));
+        return Err(format!(
+            "question store component is not private: {}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -75,7 +83,9 @@ pub fn prepare_root(root: &Path) -> Result<(), String> {
         current.push(component);
         if !current.exists() {
             if let Err(error) = fs::create_dir(&current) {
-                if error.kind() != std::io::ErrorKind::AlreadyExists { return Err(error.to_string()); }
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.to_string());
+                }
             }
         }
         fs::set_permissions(&current, fs::Permissions::from_mode(0o700))
@@ -100,7 +110,9 @@ pub fn prepare_surface(root: &Path, surface: &str, session: &str) -> Result<Path
     for path in [&surface_dir, &session_dir] {
         if !path.exists() {
             if let Err(error) = fs::create_dir(path) {
-                if error.kind() != std::io::ErrorKind::AlreadyExists { return Err(error.to_string()); }
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.to_string());
+                }
             }
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -111,7 +123,9 @@ pub fn prepare_surface(root: &Path, surface: &str, session: &str) -> Result<Path
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| "invalid question record path".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "invalid question record path".to_string())?;
     verify_private_directory(parent)?;
     let sequence = WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
@@ -124,7 +138,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     file.write_all(bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     fs::rename(&temporary, path).map_err(|error| error.to_string())?;
-    File::open(parent).and_then(|file| file.sync_all()).map_err(|error| error.to_string())
+    File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
 }
 
 pub fn cleanup<F>(root: &Path, is_terminal: F) -> Result<(), String>
@@ -132,7 +148,9 @@ where
     F: Fn(&Path) -> bool,
 {
     #[cfg(not(test))]
-    prepare_root(root)?;
+    if !root.exists() {
+        return Ok(());
+    }
     #[cfg(test)]
     {
         if root.starts_with(private_base()?) {
@@ -142,21 +160,36 @@ where
         }
     }
     let now = SystemTime::now();
-    for surface in fs::read_dir(root).map_err(|error| error.to_string())?.flatten() {
+    for surface in fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .flatten()
+    {
         if verify_private_directory(&surface.path()).is_err() {
             continue;
         }
-        let Ok(sessions) = fs::read_dir(surface.path()) else { continue };
+        let Ok(sessions) = fs::read_dir(surface.path()) else {
+            continue;
+        };
         for session in sessions.flatten() {
             if verify_private_directory(&session.path()).is_err() {
                 continue;
             }
-            let Ok(files) = fs::read_dir(session.path()) else { continue };
+            let Ok(files) = fs::read_dir(session.path()) else {
+                continue;
+            };
             for file in files.flatten() {
                 let path = file.path();
-                let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
-                if !metadata.file_type().is_file() { continue; }
-                let old = metadata.modified().ok().and_then(|time| now.duration_since(time).ok()).is_some_and(|age| age > RECORD_TTL);
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !metadata.file_type().is_file() {
+                    continue;
+                }
+                let old = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| now.duration_since(time).ok())
+                    .is_some_and(|age| age > RECORD_TTL);
                 let temporary = path.extension().is_some_and(|extension| extension == "tmp");
                 if (temporary && old) || (!temporary && (old || is_terminal(&path))) {
                     let _ = fs::remove_file(path);

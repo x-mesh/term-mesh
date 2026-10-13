@@ -15,6 +15,17 @@ SURFACE = os.environ.get("TERMMESH_E2E_CLAUDE_QUESTION_SURFACE_ID", "")
 SOCKET = os.environ.get("TERMMESH_DAEMON_UNIX_PATH", "/tmp/term-meshd.sock")
 
 
+def private_mkdir(path):
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        current.mkdir(mode=0o700, exist_ok=True)
+        current.chmod(0o700)
+        stat = current.stat()
+        if current.is_symlink() or stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+            raise RuntimeError(f"question store is not private: {current}")
+
+
 def request(method, path, body=None):
     data = None if body is None else json.dumps(body).encode()
     headers = {} if data is None else {"Content-Type": "application/json"}
@@ -31,15 +42,18 @@ def main():
     if not ADDRESS or not SURFACE:
         print("SKIP: run through mac-sub with mobile address and Claude question surface")
         return 0
-    root = Path(os.environ.get("XDG_RUNTIME_DIR", Path.home() / "Library/Application Support"))
-    root /= "term-mesh/questions-v1" / hashlib.sha256(SOCKET.encode()).hexdigest() / SURFACE / "e2e-question"
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        root = Path.home() / "Library/Application Support/term-mesh"
+    else:
+        root = Path.home() / ".local/share/term-mesh"
+    root = root / "questions-v1" / hashlib.sha256(SOCKET.encode()).hexdigest() / SURFACE / "e2e-question"
+    private_mkdir(root)
     question = {
         "id": "e2e-question", "fingerprint": "e2e-fingerprint", "surface_id": SURFACE, "state": "pending",
         "questions": [{"question": "term-mesh mobile fixture", "options": [{"label": "Continue"}]}],
     }
     record = root / "e2e-question.json"
-    record.write_text(json.dumps(question))
+    record.write_text(json.dumps(question), encoding="utf-8")
     record.chmod(0o600)
     status, listed = request("GET", f"/api/targets/{SURFACE}/questions")
     if status != 200 or listed.get("question", {}).get("id") != question["id"]:
@@ -49,7 +63,9 @@ def main():
     })
     if status != 409 or answer.get("error", {}).get("code") != "prompt_gone":
         raise RuntimeError(f"stale POST must fail closed: {status} {answer}")
-    print("PASS: mobile Claude question GET fixture and stale POST fail closed")
+    if json.loads(record.read_text(encoding="utf-8"))["state"] != "pending":
+        raise RuntimeError("stale POST changed the pending question")
+    print("PASS: mobile Claude question GET fixture, stale POST, and pending state")
 
 
 if __name__ == "__main__":
