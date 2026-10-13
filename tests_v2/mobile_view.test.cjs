@@ -48,6 +48,7 @@ function page(initial, saved = {}, health = {}) {
   let commandError = false;
   let pendingCommands = null;
   let prompt = null;
+  let question = null;
   let preview = [];
   let transcriptError = null;
   let pendingModels = null;
@@ -116,6 +117,8 @@ function page(initial, saved = {}, health = {}) {
       if (init && init.method === 'POST') { prompt = null; return response({ answered: 1 }); }
       return response({ prompt, preview });
     }
+    if (url.endsWith('/questions')) return response({ question });
+    if (url.includes('/questions/') && url.endsWith('/answer')) return response({ answered: true });
     if (url.endsWith('/models')) return pendingModels || response(models);
     if (url.endsWith('/effort')) {
       if (init && init.method === 'POST') return response({ message: 'Set effort level to low (this session only)', session_only: true });
@@ -142,6 +145,7 @@ function page(initial, saved = {}, health = {}) {
     setCommands(next) { commands = next; },
     setTranscript(next) { transcript = next; },
     setPrompt(next) { prompt = next; },
+    setQuestion(next) { question = next; },
     setPreview(next) { preview = next; },
     failTranscript(error) { transcriptError = error; },
     failCommands() { commandError = true; },
@@ -368,6 +372,33 @@ test('a running turn waiting on approval shows the question and answers it by nu
   await settle();
   assert.deepEqual(app.bodies.at(-1), ['/api/targets/pane-1/prompt', { fingerprint: 'fp-1', index: 2 }]);
   assert.equal(app.nodes.get('prompt-card').hidden, true);
+});
+
+test('a captured Claude question posts structured selections and shows stale state', async () => {
+  const app = page([pane(true)]);
+  app.setQuestion({ id: 'question-1', fingerprint: 'question-fp', questions: [
+    { question: 'Choose', options: [{ label: 'Safe' }, { label: 'Fast' }] },
+    { question: 'Extras', multiSelect: true, options: [{ label: 'Logs' }, { label: 'Tests' }] },
+  ]});
+  await settle();
+  app.tick();
+  await settle();
+  await settle();
+  assert.equal(app.nodes.get('question-card').hidden, false);
+  assert.equal(app.nodes.get('question-title').textContent, 'Choose\nExtras');
+  app.nodes.get('question-other').value = 'custom';
+  app.nodes.get('question-submit').dispatch('click');
+  await settle();
+  assert.match(app.nodes.get('question-status').textContent, /각 질문/);
+  const app2 = page([pane(true)]);
+  app2.setQuestion({ id: 'question-2', fingerprint: 'question-fp-2', questions: [{ question: 'Choose', options: [{label:'Safe'}] }] });
+  await settle(); app2.tick(); await settle(); await settle();
+  app2.nodes.get('question-options').querySelectorAll = () => [{value:'1', checked:true}];
+  app2.nodes.get('question-options').children[0].children[0].dispatch('change');
+  app2.nodes.get('question-submit').dispatch('click');
+  await settle();
+  const sent = app2.bodies.find(([url]) => url.endsWith('/questions/question-2/answer'));
+  assert.deepEqual(sent, ['/api/targets/pane-1/questions/question-2/answer', {fingerprint:'question-fp-2',answers:[{question_index:0,selected:[1]}]}]);
 });
 
 test('an idle chat never asks the terminal for a prompt', async () => {

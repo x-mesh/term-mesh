@@ -1297,7 +1297,35 @@ struct QuestionItem { question: String, #[serde(default, rename = "multiSelect")
 #[derive(Clone, Deserialize, Serialize)]
 struct StoredQuestion { id: String, fingerprint: String, surface_id: String, state: String, questions: Vec<QuestionItem> }
 #[derive(Deserialize)] struct QuestionAnswer { fingerprint: String, answers: Vec<QuestionAnswerItem> }
-#[derive(Deserialize)] struct QuestionAnswerItem { question_index: usize, selected: Vec<usize>, #[serde(default)] other: Option<String> }
+#[derive(Clone, Deserialize)] struct QuestionAnswerItem { question_index: usize, selected: Vec<usize>, #[serde(default)] other: Option<String> }
+#[derive(Debug, PartialEq)] enum QuestionInputStep { Key(&'static str), Text(String) }
+
+fn question_answer_steps(question: &QuestionItem, answer: &QuestionAnswerItem, screen_matches: bool) -> Vec<QuestionInputStep> {
+    if !screen_matches { return Vec::new(); }
+    if !question.multi_select {
+        let mut steps = vec![QuestionInputStep::Text(answer.selected[0].to_string())];
+        if let Some(other) = &answer.other {
+            steps.push(QuestionInputStep::Text(other.clone()));
+            steps.push(QuestionInputStep::Key("Enter"));
+        }
+        return steps;
+    }
+    let mut selected = answer.selected.clone();
+    selected.sort_unstable();
+    let mut current = 1;
+    let mut steps = Vec::new();
+    for index in selected {
+        for _ in current..index { steps.push(QuestionInputStep::Key("Down")); }
+        steps.push(QuestionInputStep::Key("Space"));
+        current = index;
+    }
+    steps.push(QuestionInputStep::Key("Enter"));
+    if let Some(other) = &answer.other {
+        steps.push(QuestionInputStep::Text(other.clone()));
+        steps.push(QuestionInputStep::Key("Enter"));
+    }
+    steps
+}
 
 fn question_root(surface: &str) -> PathBuf {
     let socket = std::env::var("TERMMESH_DAEMON_UNIX_PATH").or_else(|_| std::env::var("TERMMESH_SOCKET")).unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
@@ -1333,11 +1361,45 @@ async fn question_answer_handler(State(state): State<SharedState>, Path((surface
     if !screen.contains(&first.question) || first.options.iter().any(|option| !screen.contains(&option.label)) { return Err(ApiError::conflict("prompt_gone", "화면의 질문이 바뀌었습니다.")); }
     for (index, question) in record.questions.iter().enumerate() {
         let answer = body.answers.iter().find(|answer| answer.question_index == index).expect("validated answer");
-        if question.multi_select { for selected in &answer.selected { for _ in 1..*selected { driver.send_key("Down").await.map_err(|error| driver.api_error(error))?; } driver.send_key("Space").await.map_err(|error| driver.api_error(error))?; } driver.send_key("Enter").await.map_err(|error| driver.api_error(error))?; } else { driver.send_text(&answer.selected[0].to_string()).await.map_err(|error| driver.api_error(error))?; }
-        if let Some(other) = &answer.other { driver.send_text(other).await.map_err(|error| driver.api_error(error))?; driver.send_key("Enter").await.map_err(|error| driver.api_error(error))?; }
+        for step in question_answer_steps(question, answer, true) {
+            match step {
+                QuestionInputStep::Key(key) => driver.send_key(key).await.map_err(|error| driver.api_error(error))?,
+                QuestionInputStep::Text(text) => driver.send_text(&text).await.map_err(|error| driver.api_error(error))?,
+            }
+        }
     }
     let mut answered = record; answered.state = "answered".into(); fs::write(path, serde_json::to_vec(&answered).expect("record serializes")).map_err(|_| ApiError::conflict("prompt_gone", "질문 상태를 저장할 수 없습니다."))?;
     Ok(Json(json!({"surface_id": entry.surface_id, "answered": question_id})).into_response())
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+
+    fn question(multi_select: bool) -> QuestionItem {
+        QuestionItem { question: "pick".into(), multi_select, options: vec![
+            QuestionOption { label: "one".into(), description: String::new() },
+            QuestionOption { label: "two".into(), description: String::new() },
+            QuestionOption { label: "three".into(), description: String::new() },
+        ] }
+    }
+
+    #[test]
+    fn question_answer_key_sequences_cover_single_multi_other_and_stale_screen() {
+        let single = QuestionAnswerItem { question_index: 0, selected: vec![2], other: None };
+        assert_eq!(question_answer_steps(&question(false), &single, true), vec![QuestionInputStep::Text("2".into())]);
+        let next = QuestionAnswerItem { question_index: 1, selected: vec![1], other: None };
+        let ordered: Vec<_> = [single.clone(), next]
+            .iter()
+            .flat_map(|answer| question_answer_steps(&question(false), answer, true))
+            .collect();
+        assert_eq!(ordered, vec![QuestionInputStep::Text("2".into()), QuestionInputStep::Text("1".into())]);
+        let other = QuestionAnswerItem { question_index: 0, selected: vec![4], other: Some("custom".into()) };
+        assert_eq!(question_answer_steps(&question(false), &other, true), vec![QuestionInputStep::Text("4".into()), QuestionInputStep::Text("custom".into()), QuestionInputStep::Key("Enter")]);
+        let multi = QuestionAnswerItem { question_index: 1, selected: vec![3, 1], other: None };
+        assert_eq!(question_answer_steps(&question(true), &multi, true), vec![QuestionInputStep::Key("Space"), QuestionInputStep::Key("Down"), QuestionInputStep::Key("Down"), QuestionInputStep::Key("Space"), QuestionInputStep::Key("Enter")]);
+        assert!(question_answer_steps(&question(false), &single, false).is_empty());
+    }
 }
 
 fn model_tui(entry: &Entry) -> &'static mobile_model::Tui {

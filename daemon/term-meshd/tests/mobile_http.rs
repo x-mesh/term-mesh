@@ -15,6 +15,7 @@ use http_mobile::{
 };
 use remote::{EnableSpec, KeysPolicy, SharedRegistry, TargetKind};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -2323,6 +2324,83 @@ const CODEX_APPROVAL_SCREEN: &str = "• Running touch c.txt
 › 1. Yes, proceed (y)
   2. No, and tell Codex what to do differently (esc)
   Press enter to confirm or esc to cancel";
+
+fn write_claude_question(surface: &str, id: &str, fingerprint: &str, state: &str) {
+    let mut hash = Sha256::new();
+    let socket = std::env::var("TERMMESH_DAEMON_UNIX_PATH")
+        .or_else(|_| std::env::var("TERMMESH_SOCKET"))
+        .unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
+    hash.update(socket.as_bytes());
+    let directory = std::env::temp_dir()
+        .join("term-mesh/questions-v1")
+        .join(format!("{:x}", hash.finalize()))
+        .join(surface)
+        .join("session-mobile-http");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join(format!("{id}.json")),
+        serde_json::to_vec(&json!({
+            "id": id, "fingerprint": fingerprint, "surface_id": surface, "state": state,
+            "questions": [{"question": "Choose a deploy", "options": [{"label": "Safe"}, {"label": "Fast"}]}]
+        })).unwrap(),
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn claude_questions_list_local_pending_records_and_require_normal_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    let h = start_tailscale().await;
+    expose(&h, &app, "question-local-1", TargetKind::Pane, KeysPolicy::Safe).await;
+    h.registry.lock().await.upsert(EnableSpec {
+        surface_id: "question-local-1".into(), kind: TargetKind::Pane, app_socket: Some(app.path_str()),
+        agent_cli: "claude".into(), keys: KeysPolicy::Safe, ..EnableSpec::default()
+    }, remote::now_unix()).unwrap();
+    write_claude_question("question-local-1", "question-1", "fp-local", "pending");
+    let found = get(&h, "/api/targets/question-local-1/questions").await;
+    assert_eq!(found.status, 200, "{}", found.body);
+    assert_eq!(found.json()["question"]["id"], "question-1");
+    let denied = http(h.addr, "GET", "/api/targets/question-local-1/questions", &[], None).await;
+    assert_eq!(denied.status, 403);
+    assert_eq!(denied.error_code(), "login_required");
+}
+
+#[tokio::test]
+async fn claude_question_answer_rejects_stale_screen_without_typing() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.read_text", json!({ "text": "a different prompt" }));
+    let h = start_tailscale().await;
+    h.registry.lock().await.upsert(EnableSpec {
+        surface_id: "question-stale-1".into(), kind: TargetKind::Pane, app_socket: Some(app.path_str()),
+        agent_cli: "claude".into(), keys: KeysPolicy::Safe, ..EnableSpec::default()
+    }, remote::now_unix()).unwrap();
+    write_claude_question("question-stale-1", "question-1", "fp-stale", "pending");
+    let fingerprint = post(&h, "/api/targets/question-stale-1/questions/question-1/answer", json!({
+        "fingerprint": "old-fingerprint", "answers": [{"question_index": 0, "selected": [1]}]
+    })).await;
+    assert_eq!(fingerprint.status, 409, "{}", fingerprint.body);
+    assert_eq!(fingerprint.error_code(), "prompt_gone");
+    assert!(app.calls().is_empty(), "a stale fingerprint must not read or type");
+    let reply = post(&h, "/api/targets/question-stale-1/questions/question-1/answer", json!({
+        "fingerprint": "fp-stale", "answers": [{"question_index": 0, "selected": [1]}]
+    })).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(reply.error_code(), "prompt_gone");
+    assert!(app.calls().iter().all(|(method, _)| method != "surface.send_text" && method != "surface.send_key"));
+}
+
+#[tokio::test]
+async fn claude_questions_report_relay_as_unavailable() {
+    let h = start_tailscale().await;
+    h.registry.lock().await.upsert(EnableSpec {
+        surface_id: "question-relay-1".into(), kind: TargetKind::Pane, agent_cli: "claude".into(),
+        remote_pane: true, keys: KeysPolicy::Safe, ..EnableSpec::default()
+    }, remote::now_unix()).unwrap();
+    let reply = get(&h, "/api/targets/question-relay-1/questions").await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(reply.error_code(), "questions_unavailable");
+}
 
 #[tokio::test]
 async fn an_approval_question_is_read_and_answered_only_while_it_is_the_same_one() {
