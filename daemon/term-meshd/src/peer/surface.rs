@@ -65,7 +65,8 @@ fn monotonic_now_nanos() -> u64 {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_nanos()
-        .min(u64::MAX as u128) as u64
+        .min(u64::MAX as u128 - 1) as u64
+        + 1
 }
 /// Upper bound on one AGENT-surface chunk. The PTY path is structurally
 /// bounded by `READ_BUF_SIZE`; an agent line has no such physics — a single
@@ -268,6 +269,9 @@ impl PtyBroadcastBatch {
             self.interactive_until = Some(now + INTERACTIVE_OUTPUT_EPOCH);
             self.interactive_immediate_bytes = 0;
             self.interactive_bypass_active = true;
+            if self.deadline.is_none() {
+                self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
+            }
         }
         if self
             .interactive_until
@@ -288,7 +292,6 @@ impl PtyBroadcastBatch {
                 self.interactive_immediate_bytes = self
                     .interactive_immediate_bytes
                     .saturating_add(immediate_bytes);
-                self.deadline = None;
                 return match self.pending.take() {
                     None => PtyBroadcastBatchOutput::One(chunk),
                     Some(mut pending)
@@ -3964,6 +3967,10 @@ mod tests {
         );
         let after_epoch = now + INTERACTIVE_OUTPUT_EPOCH + Duration::from_nanos(1);
         assert_eq!(
+            batch_output(batch.flush_due_at(now + INTERACTIVE_OUTPUT_EPOCH)),
+            Vec::<PtyChunk>::new()
+        );
+        assert_eq!(
             batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, after_epoch, false)),
             vec![PtyChunk { seq: 1, bytes: b"b".to_vec() }]
         );
@@ -4072,6 +4079,87 @@ mod tests {
         assert!(output.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
         assert!(tail.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
         assert_eq!(output.iter().chain(tail.iter()).map(|chunk| chunk.bytes.len()).sum::<usize>(), BROADCAST_BATCH_MAX_BYTES + 1);
+    }
+
+    #[test]
+    fn pty_broadcast_batch_budget_fallback_keeps_base_deadline() {
+        let start = tokio::time::Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        let mut interactive_batch = PtyBroadcastBatch::default();
+        let mut base_batch = PtyBroadcastBatch::default();
+
+        let first = PtyChunk {
+            seq: 0,
+            bytes: b"k".to_vec(),
+        };
+        assert_eq!(
+            interactive_batch.submit_at(first.clone(), at(0), true),
+            PtyBroadcastBatchOutput::One(first.clone())
+        );
+        assert_eq!(
+            base_batch.submit_at(first, at(0), false),
+            PtyBroadcastBatchOutput::One(PtyChunk {
+                seq: 0,
+                bytes: b"k".to_vec(),
+            })
+        );
+
+        let within_budget = PtyChunk {
+            seq: 1,
+            bytes: vec![b's'; INTERACTIVE_OUTPUT_BUDGET_BYTES / 2 - 1],
+        };
+        let within_budget_len = within_budget.bytes.len() as u64;
+        assert!(matches!(
+            interactive_batch.submit_at(within_budget.clone(), at(1), true),
+            PtyBroadcastBatchOutput::One(_)
+        ));
+        assert!(matches!(
+            base_batch.submit_at(within_budget, at(1), false),
+            PtyBroadcastBatchOutput::None
+        ));
+
+        let over_budget = PtyChunk {
+            seq: 1 + within_budget_len,
+            bytes: vec![b'o'; INTERACTIVE_OUTPUT_BUDGET_BYTES / 2 + 1],
+        };
+        assert!(matches!(
+            interactive_batch.submit_at(over_budget.clone(), at(2), true),
+            PtyBroadcastBatchOutput::None
+        ));
+        assert!(matches!(
+            base_batch.submit_at(over_budget, at(2), false),
+            PtyBroadcastBatchOutput::None
+        ));
+
+        let interactive_deadline = interactive_batch.deadline().expect("deadline");
+        let base_deadline = base_batch.deadline().expect("deadline");
+        assert!(interactive_deadline <= base_deadline);
+        assert_eq!(interactive_deadline, base_deadline);
+    }
+
+    #[test]
+    fn first_interactive_input_after_start_opens_epoch() {
+        assert_ne!(monotonic_now_nanos(), 0);
+        let now = tokio::time::Instant::now();
+        let mut batch = PtyBroadcastBatch::default();
+        let output = batch.submit_at(
+            PtyChunk {
+                seq: 0,
+                bytes: b"k".to_vec(),
+            },
+            now,
+            true,
+        );
+        assert_eq!(
+            output,
+            PtyBroadcastBatchOutput::One(PtyChunk {
+                seq: 0,
+                bytes: b"k".to_vec(),
+            })
+        );
+        assert!(batch
+            .interactive_until
+            .is_some_and(|until| until > now));
     }
 
     #[tokio::test]
