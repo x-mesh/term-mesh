@@ -932,7 +932,7 @@ async fn requests_exist_only_for_leaders() {
     let app = FakeApp::spawn(dir.path());
     app.reply(
         "team.leader.request.list",
-        json!({ "team_name": "live-team", "count": 1, "requests": [{ "id": "req-9", "status": "queued" }] }),
+        json!({ "team_name": "live-team", "count": 1, "requests": [{ "id": "req-9", "status": "queued", "preview": "reply to the review", "wake_attempts": 2 }] }),
     );
     let h = start_tailscale().await;
     expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
@@ -946,6 +946,8 @@ async fn requests_exist_only_for_leaders() {
     assert_eq!(leader.status, 200, "{}", leader.body);
     assert_eq!(leader.json()["count"], 1);
     assert_eq!(leader.json()["requests"][0]["id"], "req-9");
+    assert_eq!(leader.json()["requests"][0]["preview"], "reply to the review");
+    assert_eq!(leader.json()["requests"][0]["wake_attempts"], 2);
     assert_eq!(
         app.calls()[0].1,
         json!({ "team_name": "live-team", "leader_request_token": "tok-leader" })

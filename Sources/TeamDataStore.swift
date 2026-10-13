@@ -203,6 +203,15 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         var selectedRoute: ProjectRoutingRoute?
         var routeReasons: [String]?
         var selectedWorkerCount: Int?
+        var wakeAttempts: Int?
+        var lastWakeAt: Date?
+
+        /// `expired` is derived, never stored: the CLI keeps seeing `queued`,
+        /// and an explicit `take <id>` of an expired request still succeeds.
+        func effectiveStatus(now: Date) -> String {
+            status == "queued" && now.timeIntervalSince(createdAt) > TeamDataStore.leaderRequestAutoWakeMaxAge
+                ? "expired" : status
+        }
 
         init(
             id: String, content: String, contentSHA256: String, contentBytes: Int,
@@ -211,7 +220,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             taskShape: ProjectTaskShape? = nil,
             riskReasons: [ProjectRoutingRisk]? = nil,
             selectedRoute: ProjectRoutingRoute? = nil,
-            routeReasons: [String]? = nil, selectedWorkerCount: Int? = nil
+            routeReasons: [String]? = nil, selectedWorkerCount: Int? = nil,
+            wakeAttempts: Int? = nil, lastWakeAt: Date? = nil
         ) {
             self.id = id
             self.content = content
@@ -227,8 +237,13 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             self.selectedRoute = selectedRoute
             self.routeReasons = routeReasons
             self.selectedWorkerCount = selectedWorkerCount
+            self.wakeAttempts = wakeAttempts
+            self.lastWakeAt = lastWakeAt
         }
     }
+
+    static let leaderRequestAutoWakeMaxAge: TimeInterval = 30 * 60
+    static let leaderRequestPreviewLength = 80
 
     enum LeaderRequestEnqueueResult {
         case created(LeaderRequest, persisted: Bool)
@@ -1063,6 +1078,61 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return includeCompleted ? requests : requests.filter { $0.status != "completed" }
     }
 
+    /// The request to wake next: the oldest live queued one. A claimed request
+    /// means the leader is already working, and an expired one is never woken
+    /// automatically. After a completion `neverWokenOnly` skips requests whose
+    /// wake already sits in the leader's input, since a second prompt would only
+    /// duplicate it; a restarted leader has an empty input, so its ready wake
+    /// passes `false` and re-wakes the oldest request.
+    static func nextLeaderRequestForWake(
+        in requests: [LeaderRequest], now: Date, neverWokenOnly: Bool = true
+    ) -> LeaderRequest? {
+        guard !requests.contains(where: { $0.status == "claimed" }) else { return nil }
+        return requests
+            .filter {
+                $0.effectiveStatus(now: now) == "queued"
+                    && (!neverWokenOnly || (($0.wakeAttempts ?? 0) == 0 && $0.lastWakeAt == nil))
+            }
+            .min { $0.createdAt < $1.createdAt }
+    }
+
+    func nextLeaderRequestForWake(
+        teamName: String, now: Date = Date(), neverWokenOnly: Bool = true
+    ) -> LeaderRequest? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard teamRegistry[teamName] != nil else { return nil }
+        return Self.nextLeaderRequestForWake(
+            in: leaderRequests[teamName] ?? [], now: now, neverWokenOnly: neverWokenOnly
+        )
+    }
+
+    @discardableResult
+    func recordLeaderRequestWake(teamName: String, requestId: String, now: Date = Date()) -> Bool {
+        lock.lock()
+        guard var requests = leaderRequests[teamName],
+              let index = requests.firstIndex(where: { $0.id == requestId }),
+              requests[index].status == "queued" else {
+            lock.unlock()
+            return false
+        }
+        requests[index].wakeAttempts = (requests[index].wakeAttempts ?? 0) + 1
+        requests[index].lastWakeAt = now
+        leaderRequests[teamName] = requests
+        lock.unlock()
+        let persisted = persistLeaderRequestNow(teamName: teamName)
+        notifyChanged()
+        return persisted
+    }
+
+    static func leaderRequestPreview(_ content: String) -> String {
+        let flat = content
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return String(flat.prefix(leaderRequestPreviewLength))
+    }
+
     func takeLeaderRequest(
         teamName: String, requestId: String, now: Date = Date()
     ) -> LeaderRequestTransitionResult {
@@ -1132,10 +1202,15 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         lock.unlock()
     }
 
-    func leaderRequestDictionary(_ request: LeaderRequest, includeContent: Bool) -> [String: Any] {
+    func leaderRequestDictionary(
+        _ request: LeaderRequest, includeContent: Bool, now: Date = Date()
+    ) -> [String: Any] {
         var result: [String: Any] = [
             "request_id": request.id,
-            "status": request.status,
+            "status": request.effectiveStatus(now: now),
+            "preview": Self.leaderRequestPreview(request.content),
+            "wake_attempts": request.wakeAttempts ?? 0,
+            "last_wake_at": request.lastWakeAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
             "content_sha256": request.contentSHA256,
             "content_bytes": request.contentBytes,
             "created_at": ISO8601DateFormatter().string(from: request.createdAt),

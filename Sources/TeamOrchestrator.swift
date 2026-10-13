@@ -6281,7 +6281,9 @@ final class TeamOrchestrator: ObservableObject {
                     current.leaderFailureDescription = nil
                     self.teams[teamName] = current
                     self.syncTeamStateToDaemon()
-                    self.wakeFirstQueuedLeaderRequest(teamName: teamName, tabManager: tabManager)
+                    self.wakeNextEligibleLeaderRequest(
+                        teamName: teamName, tabManager: tabManager, neverWokenOnly: false
+                    )
                 } else {
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + Self.localLeaderReadinessPollInterval
@@ -6299,11 +6301,28 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
-    private func wakeFirstQueuedLeaderRequest(teamName: String, tabManager: TabManager) {
-        guard let request = TeamDataStore.shared.listLeaderRequests(teamName: teamName)?
-            .first(where: { $0.status == "queued" }) else { return }
+    static let nextLeaderRequestWakeDelay: TimeInterval = 2
+
+    /// Wakes exactly one request: the oldest live queued one, while no request
+    /// is claimed. Not gated on the leader being idle: the only callers run when
+    /// the leader just became ready or just completed a request, and nothing
+    /// retries a wake that is skipped. A failed dispatch is not counted, so that
+    /// request stays eligible. The default skips requests already woken (the
+    /// wake after a completion); the leader-ready wake passes `false`.
+    func wakeNextEligibleLeaderRequest(
+        teamName: String, tabManager: TabManager? = nil, neverWokenOnly: Bool = true
+    ) {
+        guard teams[teamName]?.leaderReady == true,
+              let manager = tabManager ?? resolveTabManager(teamName: teamName)
+                ?? AppDelegate.shared?.tabManager,
+              let request = TeamDataStore.shared.nextLeaderRequestForWake(
+                teamName: teamName, neverWokenOnly: neverWokenOnly
+              )
+        else { return }
         let wake = leaderRequestWake(teamName: teamName, requestId: request.id)
-        _ = sendToLeader(teamName: teamName, text: wake, tabManager: tabManager)
+        if sendToLeader(teamName: teamName, text: wake, tabManager: manager) {
+            TeamDataStore.shared.recordLeaderRequestWake(teamName: teamName, requestId: request.id)
+        }
     }
 
     static func leaderRequestWake(requestId: String, tmAgent: String) -> String {
