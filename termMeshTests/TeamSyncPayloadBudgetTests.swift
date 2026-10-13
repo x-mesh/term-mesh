@@ -94,12 +94,15 @@ final class TeamSyncPayloadBudgetTests: XCTestCase {
         let sentTasks = try XCTUnwrap(payload["tasks"] as? [[String: Any]])
         XCTAssertTrue(sentTasks.allSatisfy { $0["result"] == nil && $0["description"] == nil && $0["acceptance_criteria"] == nil })
         let statuses = sentTasks.compactMap { $0["status"] as? String }
-        if let firstAssigned = statuses.firstIndex(of: "assigned") {
-            XCTAssertFalse(statuses[..<firstAssigned].contains("assigned"))
+        let statusGroups = statuses.map { status -> Int in
+            switch status {
+            case "review_ready": return 0
+            case "blocked": return 1
+            case "completed", "failed", "abandoned", "cancelled": return 3
+            default: return 2
+            }
         }
-        if let firstBlocked = statuses.firstIndex(of: "blocked") {
-            XCTAssertFalse(statuses[..<firstBlocked].contains("assigned"))
-        }
+        XCTAssertEqual(statusGroups, statusGroups.sorted())
         let counters = try XCTUnwrap(payload["instance"] as? [String: Any])
         XCTAssertEqual(counters["omitted_review_ready_task_count"] as? Int, 0)
         XCTAssertEqual(counters["omitted_non_terminal_task_count"] as? Int, 0)
