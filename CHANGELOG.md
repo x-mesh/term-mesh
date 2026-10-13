@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.3] - 2026-10-13
+
+### Fixed
+
+- Changing the appearance or a terminal setting now applies to the terminal panes after the first window is closed. Before this fix, a window opened later changed only the sidebar, and the terminal panes and Review Board kept the previous theme.
+- The background daemon now keeps receiving team state when a team has many tasks. Before this fix, the update grew past the daemon's 64 KiB request limit and was rejected every three seconds, so the daemon's team list, worktree cleanup protection, and usage tracking stopped at the last accepted state. The update now always carries every team and agent and includes task summaries only as space permits. The dashboards still load full task details from the app.
+- A host no longer runs out of remote session slots when a viewer disconnects while a pane is still detaching. Before this fix, these sessions stayed registered, and new connections to the host failed with `unexpectedEof`. The host now records a diagnostic line when it rejects a connection at the session limit.
+- Opening a remote workspace now reports a connection failure as "Peer Connection Failed" instead of "Workspace List Failed".
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.2] - 2026-10-12
 
 ### Fixed
