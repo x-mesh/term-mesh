@@ -810,6 +810,22 @@ final class AgentSession {
         }
         guard frame.full || frame.revision > liveReceivedRevision else { return false }
         var indexed = frame.full ? [:] : Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        // Patches are checked against a copy, so a bad one leaves the model untouched.
+        if let appends = frame.appends, !appends.isEmpty {
+            guard !frame.full, AgentLiveAppendLimits.accepts(appends) else { return false }
+            for append in appends {
+                switch (append.field, indexed[append.entryID]) {
+                case (.answered, .answered(let id, let text)?):
+                    guard UInt64(text.utf8.count) == append.baseUTF8Bytes else { return false }
+                    indexed[id] = .answered(id: id, text + append.appendedText)
+                case (.thought, .thought(let id, let text?)?):
+                    guard UInt64(text.utf8.count) == append.baseUTF8Bytes else { return false }
+                    indexed[id] = .thought(id: id, text + append.appendedText)
+                default:
+                    return false
+                }
+            }
+        }
         for entry in frame.state.entries { indexed[entry.id] = entry }
         guard Set(frame.order).count == frame.order.count,
               frame.order.count <= Self.maxEntries,
@@ -3582,6 +3598,44 @@ struct AgentLiveFrame: Codable, Sendable {
     var revision: UInt64
     var order: [UUID]
     var state: AgentSession.LiveState
+    /// Present only for a viewer that advertised agent.presentation.append.v1.
+    var appends: [AgentLiveAppend]?
+}
+
+/// The text a streaming entry gained since the last frame. `baseUTF8Bytes` is the
+/// length the viewer must already hold, in bytes, so Korean and emoji agree on
+/// both sides without counting characters.
+struct AgentLiveAppend: Codable, Equatable, Sendable {
+    enum Field: String, Codable, Sendable {
+        case answered
+        case thought
+    }
+
+    let entryID: UUID
+    let field: Field
+    let baseUTF8Bytes: UInt64
+    let appendedText: String
+}
+
+enum AgentLiveAppendLimits {
+    static let maxPatchesPerFrame = 32
+    static let maxBytesPerFrame = 1 << 20
+    static let maxSuffixBytes = 256 * 1024
+    static let maxPatchesPerEntry = 256
+    static let maxBytesPerEntry = 256 * 1024
+
+    static func accepts(_ appends: [AgentLiveAppend]) -> Bool {
+        guard appends.count <= maxPatchesPerFrame else { return false }
+        var total = 0
+        for append in appends {
+            let size = append.appendedText.utf8.count
+            guard size <= maxSuffixBytes else { return false }
+            let (sum, overflow) = total.addingReportingOverflow(size)
+            guard !overflow, sum <= maxBytesPerFrame else { return false }
+            total = sum
+        }
+        return true
+    }
 }
 
 private struct AgentLivePacket: Codable {
@@ -3600,8 +3654,66 @@ final class AgentLiveEncoder: @unchecked Sendable {
     private var bytes = Data()
     private var offset = 0
     private var seq: UInt64 = 0
+    private let supportsAppend: Bool
+    /// Patches sent for an entry since its last whole-entry frame.
+    private var appended: [UUID: (patches: Int, bytes: Int)] = [:]
 
-    init(_ stream: AsyncStream<AgentSession.LiveState>) { iterator = stream.makeAsyncIterator() }
+    init(_ stream: AsyncStream<AgentSession.LiveState>, supportsAppend: Bool = false) {
+        iterator = stream.makeAsyncIterator()
+        self.supportsAppend = supportsAppend
+    }
+
+    private static func appendPatch(
+        from old: AgentSession.Entry, to new: AgentSession.Entry
+    ) -> AgentLiveAppend? {
+        let id: UUID
+        let field: AgentLiveAppend.Field
+        let before: String
+        let after: String
+        switch (old, new) {
+        case (.answered(let oldID, let oldText), .answered(let newID, let newText)) where oldID == newID:
+            (id, field, before, after) = (oldID, .answered, oldText, newText)
+        case (.thought(let oldID, let oldText?), .thought(let newID, let newText?)) where oldID == newID:
+            (id, field, before, after) = (oldID, .thought, oldText, newText)
+        default:
+            return nil
+        }
+        let base = before.utf8.count
+        guard after.utf8.count > base, after.utf8.starts(with: before.utf8) else { return nil }
+        let suffix = String(decoding: Array(after.utf8.dropFirst(base)), as: UTF8.self)
+        return AgentLiveAppend(entryID: id, field: field, baseUTF8Bytes: UInt64(base), appendedText: suffix)
+    }
+
+    /// Splits the changed entries into append patches and whole entries. Anything
+    /// that is not a pure extension of a streaming text, or that would outgrow a
+    /// budget, goes out whole, which also resets that entry's budget.
+    private func splitChanges(
+        _ changed: [AgentSession.Entry], old: [UUID: AgentSession.Entry], streaming: Set<UUID>
+    ) -> (whole: [AgentSession.Entry], appends: [AgentLiveAppend]) {
+        var whole: [AgentSession.Entry] = []
+        var appends: [AgentLiveAppend] = []
+        var frameBytes = 0
+        for entry in changed {
+            if let previousEntry = old[entry.id], streaming.contains(entry.id),
+               let patch = Self.appendPatch(from: previousEntry, to: entry) {
+                let size = patch.appendedText.utf8.count
+                let used = appended[entry.id] ?? (0, 0)
+                if appends.count < AgentLiveAppendLimits.maxPatchesPerFrame,
+                   size <= AgentLiveAppendLimits.maxSuffixBytes,
+                   frameBytes + size <= AgentLiveAppendLimits.maxBytesPerFrame,
+                   used.patches < AgentLiveAppendLimits.maxPatchesPerEntry,
+                   used.bytes + size <= AgentLiveAppendLimits.maxBytesPerEntry {
+                    appends.append(patch)
+                    frameBytes += size
+                    appended[entry.id] = (used.patches + 1, used.bytes + size)
+                    continue
+                }
+            }
+            appended[entry.id] = nil
+            whole.append(entry)
+        }
+        return (whole, appends)
+    }
 
     func next() async -> PtyTapChunk? {
         if offset >= bytes.count {
@@ -3611,9 +3723,25 @@ final class AgentLiveEncoder: @unchecked Sendable {
                 let old = full ? [:] : Dictionary(uniqueKeysWithValues: (previous?.entries ?? []).map { ($0.id, $0) })
                 var delta = state
                 delta.entries = state.entries.filter { old[$0.id] != $0 }
+                var appends: [AgentLiveAppend]?
+                if full {
+                    appended.removeAll()
+                } else if supportsAppend {
+                    let split = splitChanges(
+                        delta.entries, old: old,
+                        streaming: state.streaming.union(previous?.streaming ?? [])
+                    )
+                    delta.entries = split.whole
+                    appends = split.appends.isEmpty ? nil : split.appends
+                    if !appended.isEmpty {
+                        let live = Set(state.entries.map(\.id))
+                        appended = appended.filter { live.contains($0.key) }
+                    }
+                }
                 let frame = AgentLiveFrame(full: full, baseRevision: revision,
                                            revision: revision + 1,
-                                           order: state.entries.map(\.id), state: delta)
+                                           order: state.entries.map(\.id), state: delta,
+                                           appends: appends)
                 guard let encoded = try? JSONEncoder().encode(frame) else { return nil }
                 bytes = encoded
                 offset = 0
