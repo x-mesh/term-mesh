@@ -3704,7 +3704,7 @@ class TerminalController {
                 teamName: teamName, requestId: stored.request.id
             )
         }
-        let shouldWake = stored.request.status == "queued"
+        let shouldWake = stored.request.effectiveStatus(now: Date()) == "queued"
         // Stagger: dynamic gap based on team size to prevent GCD main-queue saturation.
         let staggerNs = await MainActor.run {
             let count = TeamOrchestrator.shared.teams[teamName]?.agents.count ?? 1
@@ -3717,7 +3717,11 @@ class TerminalController {
             await MainActor.run {
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { return false }
-                return TeamOrchestrator.shared.sendToLeader(teamName: teamName, text: wake, tabManager: tabManager)
+                let sent = TeamOrchestrator.shared.sendToLeader(teamName: teamName, text: wake, tabManager: tabManager)
+                if sent {
+                    TeamDataStore.shared.recordLeaderRequestWake(teamName: teamName, requestId: stored.request.id)
+                }
+                return sent
             }
         } else { false }
         return v2Ok(id: id, result: [
@@ -5743,6 +5747,10 @@ class TerminalController {
         }
         switch store.completeLeaderRequest(teamName: teamName, requestId: requestId) {
         case .succeeded(let request):
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(TeamOrchestrator.nextLeaderRequestWakeDelay * 1_000_000_000))
+                TeamOrchestrator.shared.wakeNextEligibleLeaderRequest(teamName: teamName)
+            }
             return v2Ok(id: id, result: store.leaderRequestDictionary(request, includeContent: false))
         case .notFound:
             return v2Error(id: id, code: "not_found", message: "Leader request not found")
@@ -6723,13 +6731,16 @@ class TerminalController {
             teamName: teamName, requestId: stored.request.id
         )
         var success = false
-        if stored.request.status == "queued" {
+        if stored.request.effectiveStatus(now: Date()) == "queued" {
             v2MainSync {
                 success = TeamOrchestrator.shared.sendToLeader(
                     teamName: teamName,
                     text: wake,
                     tabManager: tabManager
                 )
+                if success {
+                    TeamDataStore.shared.recordLeaderRequestWake(teamName: teamName, requestId: stored.request.id)
+                }
             }
         }
         return .ok([

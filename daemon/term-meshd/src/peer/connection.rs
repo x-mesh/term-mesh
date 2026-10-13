@@ -1479,6 +1479,7 @@ async fn reader_loop(
                         // agent child's stdin instead of a PTY master —
                         // that is how a viewer's turn input reaches the
                         // bridge. Mouse stays ignored for both kinds.
+                        entry.surface.note_interactive_input();
                         entry.surface.note_input(size_requester);
                         if let Err(e) = write_surface_input(entry.surface.clone(), keys).await {
                             tracing::warn!("PTY write failed: {e}");
