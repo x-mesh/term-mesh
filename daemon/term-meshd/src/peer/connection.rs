@@ -29,7 +29,7 @@ use peer_proto::{capability, PeerCapabilities};
 use sha2::{Digest, Sha256};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, mpsc, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::framing::{read_envelope, write_envelope};
@@ -253,15 +253,26 @@ fn repair_stale_project_presentation(
     }
 }
 
-pub async fn run(stream: UnixStream, host: Arc<PeerHost>) -> anyhow::Result<()> {
+pub async fn run(
+    stream: UnixStream,
+    host: Arc<PeerHost>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = stream.into_split();
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Envelope>(128);
     let seq_counter = Arc::new(AtomicU64::new(0));
 
     let writer_task = tokio::spawn(writer_loop(writer, outgoing_rx, connection_id));
-    let result = reader_loop(reader, outgoing_tx.clone(), seq_counter, host, connection_id).await;
+    let result = tokio::select! {
+        result = reader_loop(reader, outgoing_tx.clone(), seq_counter, host, connection_id) => result,
+        _ = shutdown_rx.changed() => {
+            tracing::debug!(connection_id, "peer connection cancelled for server shutdown");
+            Ok(())
+        }
+    };
     drop(outgoing_tx);
+    writer_task.abort();
     let _ = writer_task.await;
     result
 }
@@ -4889,7 +4900,8 @@ mod agent_surface_tests {
     ) -> (OwnedReadHalf, OwnedWriteHalf) {
         let (client, server) = UnixStream::pair().expect("socketpair");
         tokio::spawn(async move {
-            let _ = run(server, host).await;
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let _ = run(server, host, shutdown_rx).await;
         });
         let (mut reader, mut writer) = client.into_split();
         write_envelope(

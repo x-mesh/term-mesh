@@ -230,9 +230,10 @@ async fn serve_with_prepared_host(
                             continue;
                         };
                         let host = host.clone();
+                        let connection_shutdown_rx = shutdown_rx.clone();
                         spawn_supervised(&mut connection_tasks, async move {
                             let _permit = permit;
-                            if let Err(e) = connection::run(stream, host).await {
+                            if let Err(e) = connection::run(stream, host, connection_shutdown_rx).await {
                                 tracing::warn!("peer connection ended with error: {e}");
                             }
                         });
@@ -787,6 +788,32 @@ mod integration_tests {
             .expect("first server exits")
             .expect("join first server")
             .expect("first server clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_idle_peer_connection_without_using_the_drain_budget() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("peer.sock");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_with_manager(task_socket, shutdown_rx, cat_manager()).await
+        });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = UnixStream::connect(&socket).await.expect("idle peer connects");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("idle peer must not consume the connection drain budget")
+            .expect("server joins")
+            .expect("server exits cleanly");
+        drop(client);
     }
 
     #[tokio::test]
