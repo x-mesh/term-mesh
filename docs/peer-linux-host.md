@@ -85,6 +85,29 @@ architecture and fetches the matching release asset. Requires systemd (most
 mainstream distros) — see [Build from source](#build-from-source) for hosts
 without it.
 
+### Optional system service hardening
+
+System scope installs disable systemd hardening by default. Relay shells keep
+write access under `/usr` and `/etc` and keep access to `sudo`.
+
+Set `TERMMESH_INSTALL_HARDEN=1` to enable five systemd restrictions:
+`NoNewPrivileges`, `PrivateTmp`, an empty `CapabilityBoundingSet`,
+`ProtectSystem=full`, and `ProtectHome`.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | TERMMESH_INSTALL_HARDEN=1 bash
+```
+
+Set `TERMMESH_INSTALL_HARDEN=0` to disable the restrictions. If you omit the
+variable, the installer reads `TERMMESH_INSTALL_HARDEN` from system `peer.env`.
+The installer stores the selected value in `/etc/term-mesh/peer.env`.
+
+User scope has no systemd hardening. The installer logs and ignores
+`TERMMESH_INSTALL_HARDEN=1` for that scope.
+
+If hardening is enabled, keep `TERMMESH_DAEMON_UNIX_PATH` under `/run`.
+`PrivateTmp` hides other paths from the service.
+
 Useful commands once installed (omit `--user` for system scope):
 
 ```bash
