@@ -2064,6 +2064,67 @@ mod question_tests {
         assert_eq!(*not_closed.keys.lock().unwrap(), vec!["1"]);
     }
 
+    #[tokio::test]
+    async fn answer_state_machine_drives_multi_select_and_single_other_fixtures() {
+        let letters = StoredQuestion {
+            id: "letters".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Letters".into(),
+                question: "Pick letters".into(),
+                multi_select: true,
+                options: vec![option("A"), option("B"), option("C"), option("D")],
+            }],
+        };
+        let driver = FixtureDriver::new([
+            include_str!("../tests/fixtures/ask_user_question/s3_multi_initial.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s3_after_digit2.txt"),
+            MULTI,
+            include_str!("../tests/fixtures/ask_user_question/s3_cursor_on_submit.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s3_after_submit_row_enter.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s3_done.txt"),
+        ]);
+        answer_claude_question(&driver, &letters, &[answer(0, &[4, 2, 2], None)])
+            .await
+            .unwrap();
+        assert_eq!(
+            *driver.keys.lock().unwrap(),
+            vec!["2", "4", "Down", "Enter", "1"]
+        );
+
+        let number = StoredQuestion {
+            id: "number".into(),
+            fingerprint: "fp".into(),
+            surface_id: "surface".into(),
+            state: "pending".into(),
+            questions: vec![QuestionItem {
+                header: "Num".into(),
+                question: "Pick a number".into(),
+                multi_select: false,
+                options: vec![option("One"), option("Two")],
+            }],
+        };
+        let driver = FixtureDriver::new([
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_focus.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_typed.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_typed.txt"),
+            include_str!("../tests/fixtures/ask_user_question/s4_other_single_done.txt"),
+        ]);
+        answer_claude_question(
+            &driver,
+            &number,
+            &[answer(0, &[3], Some("my answer 안녕 😀"))],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *driver.keys.lock().unwrap(),
+            vec!["3", "my answer 안녕 😀", "Enter"]
+        );
+    }
+
     #[test]
     fn stored_question_requires_exact_visible_question_options_and_tabs() {
         let record = StoredQuestion {
