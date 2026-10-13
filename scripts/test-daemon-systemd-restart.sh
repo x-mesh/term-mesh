@@ -185,8 +185,13 @@ for ((round = 1; round <= ROUNDS; round++)); do
   }
   awk -v w="$WINDOW" -v m="$WORST" 'BEGIN { exit !(w > m) }' && WORST=$WINDOW
   ROUND_JOURNAL=$(journal_scoped -u "$UNIT" --since "$SINCE" --no-pager 2>/dev/null || true)
-  grep -E "shutdown step|shutdown budget|runtime stalled|peer surface|Killing" \
+  grep -E "shutdown step|shutdown budget|runtime stalled|peer surface|supervised task|Killing" \
     <<<"$ROUND_JOURNAL" | sed 's/^/  /' || true
+  # Repeating systemctl restart back-to-back can hit systemd's StartLimitBurst
+  # before the last requested round. Leave enough room for the common 5/10s
+  # default so every requested measurement is a daemon restart, not a unit
+  # admission failure.
+  if ((round < ROUNDS)); then sleep 3; fi
 done
 
 echo "worst window: ${WORST}s"
