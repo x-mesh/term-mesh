@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.270.5] - 2026-10-13
+
+### Fixed
+
+- The app uses less CPU when a Review Board is open or closed. The board no longer refreshes in a window where it is hidden, and it refreshes at once when it is shown again. An open board no longer redraws every two seconds when nothing changed. Before this fix, an elapsed-time value that changes on every read made each refresh look like new data.
+- The app no longer reads the leader turn log on the main thread every three seconds. The leader measurement in the team status is now computed in the background and is at most 60 seconds old.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.4] - 2026-10-13
 
 ### Fixed
