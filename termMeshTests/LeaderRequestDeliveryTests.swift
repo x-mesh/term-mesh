@@ -123,23 +123,40 @@ final class LeaderRequestDeliveryTests: XCTestCase {
         XCTAssertEqual(store.nextLeaderRequestForWake(teamName: team, now: t0.addingTimeInterval(10))?.id, "b")
     }
 
-    func testCompleteThenWakeSelectsExactlyOneUngatedRequest() throws {
+    func testCompleteThenWakeSkipsRequestsAlreadyWokenAtEnqueue() throws {
         let team = registerTeam()
         try enqueue(team, "a", at: 0)
         try enqueue(team, "b", at: 5)
         try enqueue(team, "c", at: 6)
-        guard case .succeeded = store.takeLeaderRequest(teamName: team, requestId: "a"),
-              case .succeeded = store.completeLeaderRequest(teamName: team, requestId: "a")
-        else { return XCTFail("a was not completed") }
+        guard case .succeeded = store.takeLeaderRequest(teamName: team, requestId: "a") else {
+            return XCTFail("a was not claimed")
+        }
+        XCTAssertTrue(store.recordLeaderRequestWake(teamName: team, requestId: "b", now: t0.addingTimeInterval(7)))
+        guard case .succeeded = store.completeLeaderRequest(teamName: team, requestId: "a") else {
+            return XCTFail("a was not completed")
+        }
         let next = t0.addingTimeInterval(10)
-        XCTAssertEqual(store.nextLeaderRequestForWake(teamName: team, now: next)?.id, "b")
-        XCTAssertTrue(store.recordLeaderRequestWake(teamName: team, requestId: "b", now: next))
         XCTAssertEqual(
-            store.nextLeaderRequestForWake(teamName: team, now: next)?.id, "b",
-            "there is no cooldown or turn gate on the one wake that follows a completion"
+            store.nextLeaderRequestForWake(teamName: team, now: next)?.id, "c",
+            "b already has a prompt waiting in the leader's input"
         )
-        let recorded = try XCTUnwrap(store.listLeaderRequests(teamName: team)?.first { $0.id == "b" })
+        XCTAssertTrue(store.recordLeaderRequestWake(teamName: team, requestId: "c", now: next))
+        let recorded = try XCTUnwrap(store.listLeaderRequests(teamName: team)?.first { $0.id == "c" })
         XCTAssertEqual(recorded.wakeAttempts, 1)
         XCTAssertEqual(recorded.lastWakeAt, next)
+    }
+
+    func testCompleteThenWakeFindsNothingWhenEveryQueuedRequestWasWoken() throws {
+        let team = registerTeam()
+        try enqueue(team, "a", at: 0)
+        try enqueue(team, "b", at: 5)
+        guard case .succeeded = store.takeLeaderRequest(teamName: team, requestId: "a") else {
+            return XCTFail("a was not claimed")
+        }
+        XCTAssertTrue(store.recordLeaderRequestWake(teamName: team, requestId: "b", now: t0.addingTimeInterval(6)))
+        guard case .succeeded = store.completeLeaderRequest(teamName: team, requestId: "a") else {
+            return XCTFail("a was not completed")
+        }
+        XCTAssertNil(store.nextLeaderRequestForWake(teamName: team, now: t0.addingTimeInterval(10)))
     }
 }

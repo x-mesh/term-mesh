@@ -6301,10 +6301,11 @@ final class TeamOrchestrator: ObservableObject {
 
     static let nextLeaderRequestWakeDelay: TimeInterval = 2
 
-    /// Wakes exactly one request: the oldest live queued one, while no request
-    /// is claimed. Not gated on the leader being idle: the only callers run when
-    /// the leader just became ready or just completed a request, and nothing
-    /// retries a wake that is skipped. A failed dispatch is not counted.
+    /// Wakes exactly one request: the oldest live queued one that was never
+    /// woken, while no request is claimed. Not gated on the leader being idle:
+    /// the only callers run when the leader just became ready or just completed
+    /// a request, and nothing retries a wake that is skipped. A failed dispatch
+    /// is not counted, so that request stays eligible.
     func wakeNextEligibleLeaderRequest(teamName: String, tabManager: TabManager? = nil) {
         guard teams[teamName]?.leaderReady == true,
               let manager = tabManager ?? resolveTabManager(teamName: teamName)
