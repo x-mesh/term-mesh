@@ -22,7 +22,7 @@ use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use peer_proto::v1::SurfaceInfo;
@@ -56,6 +56,16 @@ impl AsRawFd for BorrowedMasterFd {
 const READ_BUF_SIZE: usize = 65536;
 const BROADCAST_BATCH_MAX_BYTES: usize = READ_BUF_SIZE;
 const BROADCAST_BATCH_WINDOW: Duration = Duration::from_millis(50);
+const INTERACTIVE_OUTPUT_EPOCH: Duration = Duration::from_millis(50);
+static MONOTONIC_ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+
+fn monotonic_now_nanos() -> u64 {
+    MONOTONIC_ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
 /// Upper bound on one AGENT-surface chunk. The PTY path is structurally
 /// bounded by `READ_BUF_SIZE`; an agent line has no such physics — a single
 /// NDJSON event (a huge tool_result) can exceed the wire's
@@ -223,10 +233,18 @@ pub struct PtyChunk {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PtyBroadcastBatchOutput {
+    None,
+    One(PtyChunk),
+    Two(PtyChunk, PtyChunk),
+}
+
 #[derive(Default)]
 struct PtyBroadcastBatch {
     pending: Option<PtyChunk>,
     deadline: Option<tokio::time::Instant>,
+    interactive_until: Option<tokio::time::Instant>,
 }
 
 impl PtyBroadcastBatch {
@@ -234,52 +252,100 @@ impl PtyBroadcastBatch {
         self.deadline
     }
 
-    fn submit(&mut self, chunk: PtyChunk) -> Option<PtyChunk> {
-        let now = tokio::time::Instant::now();
+    fn submit_at(
+        &mut self,
+        chunk: PtyChunk,
+        now: tokio::time::Instant,
+        interactive: bool,
+    ) -> PtyBroadcastBatchOutput {
+        let interactive_active = self
+            .interactive_until
+            .is_some_and(|until| now < until);
+        if interactive && !interactive_active {
+            self.interactive_until = Some(now + INTERACTIVE_OUTPUT_EPOCH);
+        }
+        if self
+            .interactive_until
+            .is_some_and(|until| now < until)
+        {
+            self.deadline = None;
+            return match self.pending.take() {
+                None => PtyBroadcastBatchOutput::One(chunk),
+                Some(mut pending) if pending.seq + pending.bytes.len() as u64 == chunk.seq => {
+                    pending.bytes.extend_from_slice(&chunk.bytes);
+                    PtyBroadcastBatchOutput::One(pending)
+                }
+                Some(pending) => PtyBroadcastBatchOutput::Two(pending, chunk),
+            };
+        }
         if self.deadline.is_none() {
             self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
-            return Some(chunk);
+            return PtyBroadcastBatchOutput::One(chunk);
         }
 
         let Some(pending) = self.pending.as_mut() else {
             if chunk.bytes.len() >= BROADCAST_BATCH_MAX_BYTES {
                 self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
-                return Some(chunk);
+                return PtyBroadcastBatchOutput::One(chunk);
             }
             self.pending = Some(chunk);
-            return None;
+            return PtyBroadcastBatchOutput::None;
         };
 
         let pending_end = pending.seq + pending.bytes.len() as u64;
         if chunk.seq != pending_end
             || pending.bytes.len() + chunk.bytes.len() > BROADCAST_BATCH_MAX_BYTES
         {
-            let flushed = self.pending.replace(chunk);
+            let flushed = self.pending.replace(chunk).expect("pending exists");
             self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
-            return flushed;
+            return PtyBroadcastBatchOutput::One(flushed);
         }
 
         pending.bytes.extend_from_slice(&chunk.bytes);
         if pending.bytes.len() < BROADCAST_BATCH_MAX_BYTES {
-            return None;
+            return PtyBroadcastBatchOutput::None;
         }
 
         let flushed = self.pending.take();
         self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
         flushed
+            .map(PtyBroadcastBatchOutput::One)
+            .unwrap_or(PtyBroadcastBatchOutput::None)
     }
 
-    fn flush_due(&mut self) -> Option<PtyChunk> {
+    fn flush_due_at(&mut self, now: tokio::time::Instant) -> PtyBroadcastBatchOutput {
         let flushed = self.pending.take();
         self.deadline = flushed
             .as_ref()
-            .map(|_| tokio::time::Instant::now() + BROADCAST_BATCH_WINDOW);
+            .map(|_| now + BROADCAST_BATCH_WINDOW);
         flushed
+            .map(PtyBroadcastBatchOutput::One)
+            .unwrap_or(PtyBroadcastBatchOutput::None)
     }
 
-    fn flush_remaining(&mut self) -> Option<PtyChunk> {
+    fn flush_remaining(&mut self) -> PtyBroadcastBatchOutput {
         self.deadline = None;
-        self.pending.take()
+        self.interactive_until = None;
+        self.pending
+            .take()
+            .map(PtyBroadcastBatchOutput::One)
+            .unwrap_or(PtyBroadcastBatchOutput::None)
+    }
+}
+
+fn send_broadcast_batch_output(
+    tx: &broadcast::Sender<PtyChunk>,
+    output: PtyBroadcastBatchOutput,
+) {
+    match output {
+        PtyBroadcastBatchOutput::None => {}
+        PtyBroadcastBatchOutput::One(chunk) => {
+            let _ = tx.send(chunk);
+        }
+        PtyBroadcastBatchOutput::Two(first, second) => {
+            let _ = tx.send(first);
+            let _ = tx.send(second);
+        }
     }
 }
 
@@ -610,6 +676,7 @@ pub struct PtySurface {
     /// Monotonic byte offset for PTY chunks. Used only to de-duplicate replay
     /// bytes against live broadcast bytes at attach time.
     byte_seq: AtomicU64,
+    last_interactive_input_nanos: AtomicU64,
     replay: Mutex<ReplayBuffer>,
     /// Kind-specific state — see [`SurfaceIo`].
     io: SurfaceIo,
@@ -1067,6 +1134,7 @@ impl PtySurface {
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
             byte_seq: AtomicU64::new(0),
+            last_interactive_input_nanos: AtomicU64::new(0),
             replay: Mutex::new(ReplayBuffer::default()),
             io: SurfaceIo::Pty(PtyIo {
                 master_fd: child.master_fd,
@@ -1117,9 +1185,10 @@ impl PtySurface {
                 let ready = if let Some(deadline) = broadcast_batch.deadline() {
                     tokio::select! {
                         _ = tokio::time::sleep_until(deadline) => {
-                            if let Some(chunk) = broadcast_batch.flush_due() {
-                                let _ = tx.send(chunk);
-                            }
+                            send_broadcast_batch_output(
+                                &tx,
+                                broadcast_batch.flush_due_at(tokio::time::Instant::now()),
+                            );
                             continue;
                         }
                         ready = async_fd.readable() => ready,
@@ -1230,10 +1299,14 @@ impl PtySurface {
                         if let Ok(mut replay) = reader_surface.replay.lock() {
                             replay.push(chunk.clone());
                         }
-                        if let Some(chunk) = broadcast_batch.submit(chunk) {
-                            // Err only means "no subscribers", which is fine.
-                            let _ = tx.send(chunk);
-                        }
+                        send_broadcast_batch_output(
+                            &tx,
+                            broadcast_batch.submit_at(
+                                chunk,
+                                tokio::time::Instant::now(),
+                                reader_surface.has_recent_interactive_input(),
+                            ),
+                        );
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -1245,9 +1318,7 @@ impl PtySurface {
                     Err(_would_block) => continue,
                 }
             }
-            if let Some(chunk) = broadcast_batch.flush_remaining() {
-                let _ = tx.send(chunk);
-            }
+            send_broadcast_batch_output(&tx, broadcast_batch.flush_remaining());
             // Final bytes are in replay+broadcast before death becomes
             // observable. Reap off the async worker so EOF cannot leave a
             // zombie when waitpid(WNOHANG) loses the process-exit race.
@@ -1386,6 +1457,7 @@ impl PtySurface {
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
             byte_seq: AtomicU64::new(0),
+            last_interactive_input_nanos: AtomicU64::new(0),
             replay: Mutex::new(ReplayBuffer::default()),
             io: SurfaceIo::Agent(AgentIo {
                 agent_cli,
@@ -2163,6 +2235,18 @@ impl PtySurface {
         if let Err(e) = self.apply_arbitrated(effective) {
             tracing::warn!("post-input resize failed: {e}");
         }
+    }
+
+    pub fn note_interactive_input(&self) {
+        self.last_interactive_input_nanos
+            .store(monotonic_now_nanos(), Ordering::Release);
+    }
+
+    fn has_recent_interactive_input(&self) -> bool {
+        let last = self.last_interactive_input_nanos.load(Ordering::Acquire);
+        last != 0
+            && monotonic_now_nanos().saturating_sub(last)
+                <= INTERACTIVE_OUTPUT_EPOCH.as_nanos() as u64
     }
 
     /// Forget `requester`'s size request and re-arbitrate among the
@@ -3789,72 +3873,96 @@ mod tests {
 
     use super::*;
 
+    fn batch_output(output: PtyBroadcastBatchOutput) -> Vec<PtyChunk> {
+        match output {
+            PtyBroadcastBatchOutput::None => Vec::new(),
+            PtyBroadcastBatchOutput::One(chunk) => vec![chunk],
+            PtyBroadcastBatchOutput::Two(first, second) => vec![first, second],
+        }
+    }
+
     #[test]
-    fn pty_broadcast_batch_keeps_the_leading_edge_and_merges_the_burst() {
+    fn pty_broadcast_batch_keeps_idle_leading_edge_and_merges_background_burst() {
         let mut batch = PtyBroadcastBatch::default();
+        let now = tokio::time::Instant::now();
         assert_eq!(
-            batch.submit(PtyChunk {
-                seq: 0,
-                bytes: b"a".to_vec(),
-            }),
-            Some(PtyChunk {
-                seq: 0,
-                bytes: b"a".to_vec(),
-            })
+            batch_output(batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false)),
+            vec![PtyChunk { seq: 0, bytes: b"a".to_vec() }]
         );
+        assert!(batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false)).is_empty());
+        assert!(batch_output(batch.submit_at(PtyChunk { seq: 2, bytes: b"c".to_vec() }, now, false)).is_empty());
         assert_eq!(
-            batch.submit(PtyChunk {
-                seq: 1,
-                bytes: b"b".to_vec(),
-            }),
-            None
-        );
-        assert_eq!(
-            batch.submit(PtyChunk {
-                seq: 2,
-                bytes: b"c".to_vec(),
-            }),
-            None
-        );
-        assert_eq!(
-            batch.flush_due(),
-            Some(PtyChunk {
-                seq: 1,
-                bytes: b"bc".to_vec(),
-            })
+            batch_output(batch.flush_due_at(now + BROADCAST_BATCH_WINDOW)),
+            vec![PtyChunk { seq: 1, bytes: b"bc".to_vec() }]
         );
     }
 
     #[test]
-    fn pty_broadcast_batch_does_not_merge_across_a_byte_gap() {
+    fn pty_broadcast_batch_flushes_second_chunk_during_interactive_epoch() {
         let mut batch = PtyBroadcastBatch::default();
-        let _ = batch.submit(PtyChunk {
-            seq: 0,
-            bytes: b"a".to_vec(),
-        });
+        let now = tokio::time::Instant::now();
+        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
         assert!(batch
-            .submit(PtyChunk {
-                seq: 1,
-                bytes: b"b".to_vec(),
-            })
-            .is_none());
+            .submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false)
+            == PtyBroadcastBatchOutput::None);
         assert_eq!(
-            batch.submit(PtyChunk {
-                seq: 3,
-                bytes: b"d".to_vec(),
-            }),
-            Some(PtyChunk {
-                seq: 1,
-                bytes: b"b".to_vec(),
-            })
+            batch_output(batch.submit_at(PtyChunk { seq: 2, bytes: b"c".to_vec() }, now, true)),
+            vec![PtyChunk { seq: 1, bytes: b"bc".to_vec() }]
         );
+    }
+
+    #[test]
+    fn pty_broadcast_batch_preserves_order_across_gap_during_interactive_epoch() {
+        let mut batch = PtyBroadcastBatch::default();
+        let now = tokio::time::Instant::now();
+        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
+        let _ = batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false);
         assert_eq!(
-            batch.flush_remaining(),
-            Some(PtyChunk {
-                seq: 3,
-                bytes: b"d".to_vec(),
-            })
+            batch_output(batch.submit_at(PtyChunk { seq: 3, bytes: b"d".to_vec() }, now, true)),
+            vec![
+                PtyChunk { seq: 1, bytes: b"b".to_vec() },
+                PtyChunk { seq: 3, bytes: b"d".to_vec() },
+            ]
         );
+    }
+
+    #[test]
+    fn pty_broadcast_batch_returns_to_background_mode_after_epoch() {
+        let mut batch = PtyBroadcastBatch::default();
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            batch_output(batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, true)),
+            vec![PtyChunk { seq: 0, bytes: b"a".to_vec() }]
+        );
+        let after_epoch = now + INTERACTIVE_OUTPUT_EPOCH + Duration::from_nanos(1);
+        assert_eq!(
+            batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, after_epoch, false)),
+            vec![PtyChunk { seq: 1, bytes: b"b".to_vec() }]
+        );
+        assert!(batch_output(batch.submit_at(PtyChunk { seq: 2, bytes: b"c".to_vec() }, after_epoch, false)).is_empty());
+        assert_eq!(
+            batch_output(batch.flush_due_at(after_epoch + BROADCAST_BATCH_WINDOW)),
+            vec![PtyChunk { seq: 2, bytes: b"c".to_vec() }]
+        );
+    }
+
+    #[test]
+    fn pty_broadcast_batch_keeps_size_limit_during_flood() {
+        let mut batch = PtyBroadcastBatch::default();
+        let now = tokio::time::Instant::now();
+        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
+        let _ = batch.submit_at(PtyChunk { seq: 1, bytes: vec![b'b'; BROADCAST_BATCH_MAX_BYTES - 1] }, now, false);
+        let output = batch.submit_at(PtyChunk { seq: BROADCAST_BATCH_MAX_BYTES as u64, bytes: vec![b'c'; 1] }, now, false);
+        assert_eq!(batch_output(output).len(), 1);
+        assert_eq!(batch_output(batch.flush_remaining()).len(), 0);
+    }
+
+    #[test]
+    fn paste_does_not_open_interactive_output_epoch() {
+        let mut batch = PtyBroadcastBatch::default();
+        let now = tokio::time::Instant::now();
+        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
+        assert!(batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false)).is_empty());
     }
 
     #[tokio::test]
