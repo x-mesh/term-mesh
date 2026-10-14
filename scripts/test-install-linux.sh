@@ -149,6 +149,15 @@ for directive in NoNewPrivileges PrivateTmp CapabilityBoundingSet ProtectSystem 
 done
 grep -qx 'TERMMESH_INSTALL_HARDEN=0' /etc/term-mesh/peer.env
 
+echo '==> repeated installs keep one hardening record in peer.env'
+for pattern in '^TERMMESH_INSTALL_HARDEN=' '^# Added by install-linux.sh: opt-in systemd service hardening\.$'; do
+  count=$(grep -c "$pattern" /etc/term-mesh/peer.env || true)
+  if [[ "$count" != 1 ]]; then
+    echo "peer.env has ${count} lines matching ${pattern} after repeated installs" >&2
+    exit 1
+  fi
+done
+
 echo '==> an invalid hardening value fails before installation'
 if TERMMESH_INSTALL_HARDEN=2 TERMMESH_INSTALL_PREFIX=/opt/term-mesh-invalid \
   bash "$INSTALLER" >/tmp/invalid-hardening.log 2>&1; then

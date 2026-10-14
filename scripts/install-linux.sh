@@ -413,12 +413,15 @@ EOF
   fi
 fi
 if [[ "$SERVICE_SCOPE" == system ]]; then
-  sed -i '/^[[:space:]]*TERMMESH_INSTALL_HARDEN=/d' "$ENV_FILE"
-  cat >> "$ENV_FILE" <<EOF
+  if grep -q '^[[:space:]]*TERMMESH_INSTALL_HARDEN=' "$ENV_FILE"; then
+    sed -i "s/^[[:space:]]*TERMMESH_INSTALL_HARDEN=.*/TERMMESH_INSTALL_HARDEN=${INSTALL_HARDEN}/" "$ENV_FILE"
+  else
+    cat >> "$ENV_FILE" <<EOF
 
 # Added by install-linux.sh: opt-in systemd service hardening.
 TERMMESH_INSTALL_HARDEN=${INSTALL_HARDEN}
 EOF
+  fi
 fi
 if [[ "$SERVICE_SCOPE" == system ]]; then
   chown root:"$SERVICE_GROUP" "$CONFIG_DIR" "$ENV_FILE"
