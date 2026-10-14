@@ -1092,15 +1092,6 @@ class GhosttyApp {
         )
     }
 
-    private func performOnMain<T>(_ work: @MainActor () -> T) -> T {
-        if Thread.isMainThread {
-            return MainActor.assumeIsolated { work() }
-        }
-        return DispatchQueue.main.sync {
-            MainActor.assumeIsolated { work() }
-        }
-    }
-
     private func splitDirection(from direction: ghostty_action_split_direction_e) -> SplitDirection? {
         switch direction {
         case GHOSTTY_SPLIT_DIRECTION_RIGHT: return .right
@@ -1598,18 +1589,27 @@ class GhosttyApp {
                 }
                 guard let tabId = surfaceView.tabId,
                       let surfaceId = surfaceView.terminalSurface?.id else { return false }
-                return performOnMain {
-                    guard let app = AppDelegate.shared,
-                          let tabManager = app.tabManagerFor(tabId: tabId) ?? app.tabManager,
-                          let workspace = tabManager.tabs.first(where: { $0.id == tabId }) else {
-                        return false
-                    }
-                    if let targetPane = workspace.preferredBrowserTargetPane(fromPanelId: surfaceId) {
-                        return workspace.newBrowserSurface(inPane: targetPane, url: url, focus: true) != nil
-                    } else {
+                // Ghostty runs this callback while holding the clicked surface's
+                // renderer mutex. Opening the browser moves focus off that surface,
+                // and ghostty_surface_set_focus takes the same mutex, so it must run
+                // after the callback returns or the main thread deadlocks.
+                DispatchQueue.main.async {
+                    let opened: Bool = {
+                        guard let app = AppDelegate.shared,
+                              let tabManager = app.tabManagerFor(tabId: tabId) ?? app.tabManager,
+                              let workspace = tabManager.tabs.first(where: { $0.id == tabId }) else {
+                            return false
+                        }
+                        if let targetPane = workspace.preferredBrowserTargetPane(fromPanelId: surfaceId) {
+                            return workspace.newBrowserSurface(inPane: targetPane, url: url, focus: true) != nil
+                        }
                         return workspace.newBrowserSplit(from: surfaceId, orientation: .horizontal, url: url) != nil
+                    }()
+                    if !opened {
+                        _ = NSWorkspace.shared.open(url)
                     }
                 }
+                return true
             }
         default:
             return false
