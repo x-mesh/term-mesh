@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.271.1] - 2026-10-14
+
+### Fixed
+
+- Cmd-clicking a link in a terminal no longer freezes the app when the link opens in the term-mesh browser, which is the default. Before this fix, the app stopped responding and had to be force quit.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.271.0] - 2026-10-14
 
 ### Added
