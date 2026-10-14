@@ -45,6 +45,17 @@ extension TerminalController {
         guard let x = number("x"), let y = number("y") else {
             return .err(code: "invalid_params", message: "Missing x/y", data: nil)
         }
+        var modifierFlags: NSEvent.ModifierFlags = []
+        for token in (v2String(params, "modifiers") ?? "").split(separator: "+") {
+            switch token.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "cmd", "command", "super": modifierFlags.insert(.command)
+            case "ctrl", "control": modifierFlags.insert(.control)
+            case "opt", "option", "alt": modifierFlags.insert(.option)
+            case "shift": modifierFlags.insert(.shift)
+            default:
+                return .err(code: "invalid_params", message: "Unknown modifier \(token)", data: nil)
+            }
+        }
 
         var outcome: [String: Any] = [:]
         _ = v2MainExec(timeout: 5) {
@@ -56,7 +67,7 @@ extension TerminalController {
                 guard let event = NSEvent.mouseEvent(
                     with: type,
                     location: location,
-                    modifierFlags: [],
+                    modifierFlags: modifierFlags,
                     timestamp: ProcessInfo.processInfo.systemUptime,
                     windowNumber: window.windowNumber,
                     context: nil,
