@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.271.0] - 2026-10-14
+
+### Added
+
+- The Edit Peer Host window shows whether the term-meshd service on a Linux host is hardened. The status appears when you open the window, and again after Test Relay or an install. The install and update controls have a Service Hardening checkbox. When you update a hardened host, the checkbox starts selected, so clear it to remove the restrictions.
+
+### Changed
+
+- The Linux installer no longer applies systemd hardening to the system service by default. Before this change, every relay shell that the daemon opened inherited the restrictions: `/usr` and `/etc` were read-only and `sudo` did not work, also for root. To keep the restrictions, install with `TERMMESH_INSTALL_HARDEN=1`. The installer saves the choice in `/etc/term-mesh/peer.env`, and a later install without the variable keeps it. A host that you installed before this release loses the restrictions the next time you run the installer without the variable. User scope installs are not affected.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.270.7] - 2026-10-13
 
 ### Fixed
