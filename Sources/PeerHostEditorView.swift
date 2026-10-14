@@ -341,8 +341,8 @@ struct PeerHostEditorView: View {
             if showsInstallButton || showsUpdateButton || showsForceReinstallButton {
                 Toggle(isOn: $hardenInstall) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Harden term-meshd service")
-                        Text("Applies to root installs only")
+                        Text(verbatim: "Service Hardening")
+                        Text("Relay shells get read-only /usr and /etc and no sudo. Root installs only.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -399,6 +399,7 @@ struct PeerHostEditorView: View {
             bonjourBrowser.start { peers in
                 discovered = peers
             }
+            refreshHardeningOnOpen()
         }
         .onDisappear {
             bonjourBrowser.stop()
@@ -1731,6 +1732,17 @@ struct PeerHostEditorView: View {
             RemoteWorkLog.info("\(draft.sshTarget): \(warning)")
         }
         return inventory != nil
+    }
+
+    /// Not `validatedDraft()`: that surfaces a form error, which opening the
+    /// editor must not do. A field edit bumps `doctorGeneration` and drops
+    /// this result.
+    private func refreshHardeningOnOpen() {
+        var draft = profile
+        draft.sshTarget = draft.sshTarget.trimmingCharacters(in: .whitespaces)
+        guard !draft.sshTarget.isEmpty else { return }
+        let gen = doctorGeneration
+        Task { await refreshHardeningStatus(draft: draft, gen: gen) }
     }
 
     private func refreshHardeningStatus(draft: PeerHostProfile, gen: Int) async {

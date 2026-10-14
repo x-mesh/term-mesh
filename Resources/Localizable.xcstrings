@@ -461,16 +461,6 @@
         }
       }
     },
-    "Applies to root installs only": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "root 설치에만 적용"
-          }
-        }
-      }
-    },
     "Applies to terminal link clicks and intercepted `open https://...` calls. Only these hosts open in term-mesh. Others open in your default browser. One host or wildcard per line (for example: example.com, *.internal.example). Leave empty to open all hosts in term-mesh.": {
       "localizations": {
         "ko": {
@@ -1271,16 +1261,6 @@
         "ko": { "stringUnit": { "state": "translated", "value": "신중" } }
       }
     },
-    "Harden term-meshd service": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "term-meshd 서비스 하드닝"
-          }
-        }
-      }
-    },
     "How many Projects follow the leader's suggested route. It uses Leader Participation above, each Project opts in from its Review Board, and overlap ignores this percentage.": {
       "localizations": {
         "ko": {
@@ -1557,6 +1537,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "기록만"
+          }
+        }
+      }
+    },
+    "Relay shells get read-only /usr and /etc and no sudo. Root installs only.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "relay 셸에서 /usr·/etc가 읽기 전용이 되고 sudo를 쓸 수 없습니다. root 설치에만 적용됩니다."
           }
         }
       }
