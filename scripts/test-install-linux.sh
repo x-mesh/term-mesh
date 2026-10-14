@@ -87,14 +87,18 @@ TERMMESH_INSTALL_LIB_ONLY=1 source "$INSTALLER"
 [[ "$(resolve_protect_home /srv/term-mesh)" == true ]]
 unset TERMMESH_INSTALL_LIB_ONLY
 
-echo '==> system install follows the connecting account and stays hardened'
+echo '==> system install disables hardening by default'
+unset TERMMESH_INSTALL_HARDEN
 bash "$INSTALLER"
 grep -qx 'User=root' /etc/systemd/system/term-meshd.service
 grep -qx 'Group=root' /etc/systemd/system/term-meshd.service
-grep -qx 'NoNewPrivileges=true' /etc/systemd/system/term-meshd.service
-grep -qx 'CapabilityBoundingSet=' /etc/systemd/system/term-meshd.service
-grep -qx 'ProtectSystem=full' /etc/systemd/system/term-meshd.service
-grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
+for directive in NoNewPrivileges PrivateTmp CapabilityBoundingSet ProtectSystem ProtectHome; do
+  if grep -q "^${directive}=" /etc/systemd/system/term-meshd.service; then
+    echo "unexpected default hardening directive: ${directive}" >&2
+    exit 1
+  fi
+done
+grep -qx 'TERMMESH_INSTALL_HARDEN=0' /etc/term-mesh/peer.env
 grep -qx 'RuntimeDirectory=term-mesh' /etc/systemd/system/term-meshd.service
 # Without this the unit inherits the 90s default, which is how one stuck
 # teardown step cost 90 seconds of relay downtime (#403).
@@ -105,6 +109,62 @@ if grep -q '^sudo ' "$CALLS"; then
   echo 'direct root install must not invoke sudo' >&2
   exit 1
 fi
+
+echo '==> explicit hardening writes the decision and all five directives'
+TERMMESH_INSTALL_HARDEN=1 TERMMESH_INSTALL_PREFIX=/opt/term-mesh-hardened \
+  bash "$INSTALLER" > /tmp/hardened-install.log 2>&1
+for directive in \
+  'NoNewPrivileges=true' \
+  'PrivateTmp=true' \
+  'CapabilityBoundingSet=' \
+  'ProtectSystem=full' \
+  'ProtectHome=false'; do
+  grep -qx "$directive" /etc/systemd/system/term-meshd.service
+done
+grep -qx 'TERMMESH_INSTALL_HARDEN=1' /etc/term-mesh/peer.env
+grep -q 'relay shells see /usr and /etc as read-only and cannot use sudo' \
+  /tmp/hardened-install.log
+
+echo '==> the recorded hardening choice survives a reinstall without the environment variable'
+unset TERMMESH_INSTALL_HARDEN
+TERMMESH_INSTALL_PREFIX=/opt/term-mesh-recorded bash "$INSTALLER"
+for directive in \
+  'NoNewPrivileges=true' \
+  'PrivateTmp=true' \
+  'CapabilityBoundingSet=' \
+  'ProtectSystem=full' \
+  'ProtectHome=false'; do
+  grep -qx "$directive" /etc/systemd/system/term-meshd.service
+done
+grep -qx 'TERMMESH_INSTALL_HARDEN=1' /etc/term-mesh/peer.env
+
+echo '==> explicit hardening disable removes all five directives'
+TERMMESH_INSTALL_HARDEN=0 TERMMESH_INSTALL_PREFIX=/opt/term-mesh-unhardened \
+  bash "$INSTALLER"
+for directive in NoNewPrivileges PrivateTmp CapabilityBoundingSet ProtectSystem ProtectHome; do
+  if grep -q "^${directive}=" /etc/systemd/system/term-meshd.service; then
+    echo "hardening directive remained after opt-out: ${directive}" >&2
+    exit 1
+  fi
+done
+grep -qx 'TERMMESH_INSTALL_HARDEN=0' /etc/term-mesh/peer.env
+
+echo '==> repeated installs keep one hardening record in peer.env'
+for pattern in '^TERMMESH_INSTALL_HARDEN=' '^# Added by install-linux.sh: opt-in systemd service hardening\.$'; do
+  count=$(grep -c "$pattern" /etc/term-mesh/peer.env || true)
+  if [[ "$count" != 1 ]]; then
+    echo "peer.env has ${count} lines matching ${pattern} after repeated installs" >&2
+    exit 1
+  fi
+done
+
+echo '==> an invalid hardening value fails before installation'
+if TERMMESH_INSTALL_HARDEN=2 TERMMESH_INSTALL_PREFIX=/opt/term-mesh-invalid \
+  bash "$INSTALLER" >/tmp/invalid-hardening.log 2>&1; then
+  echo 'invalid TERMMESH_INSTALL_HARDEN value was accepted' >&2
+  exit 1
+fi
+grep -q 'TERMMESH_INSTALL_HARDEN must be 0 or 1' /tmp/invalid-hardening.log
 
 echo '==> an old system config gains the reachable control socket on upgrade'
 sed -i '/^TERMMESH_DAEMON_UNIX_PATH=/d' /etc/term-mesh/peer.env
@@ -123,15 +183,15 @@ grep -qx 'TERMMESH_DAEMON_UNIX_PATH=/srv/term-mesh/control.sock' /etc/term-mesh/
 
 echo '==> sudo system install follows the invoking SSH account'
 useradd --create-home tester
-SUDO_USER=tester SUDO_UID=$(id -u tester) \
+SUDO_USER=tester SUDO_UID=$(id -u tester) TERMMESH_INSTALL_HARDEN=1 \
   TERMMESH_INSTALL_PREFIX=/opt/term-mesh-sudo-user bash "$INSTALLER"
 grep -qx 'User=tester' /etc/systemd/system/term-meshd.service
 grep -qx 'Group=tester' /etc/systemd/system/term-meshd.service
 grep -qx 'Environment=HOME=/home/tester' /etc/systemd/system/term-meshd.service
 grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
 
-echo '==> a dedicated account created here lives outside /home and stays hardened'
-TERMMESH_SERVICE_USER=term-mesh TERMMESH_INSTALL_PREFIX=/opt/term-mesh-dedicated \
+echo '==> a dedicated account created here lives outside /home and stays hardened when opted in'
+TERMMESH_INSTALL_HARDEN=1 TERMMESH_SERVICE_USER=term-mesh TERMMESH_INSTALL_PREFIX=/opt/term-mesh-dedicated \
   bash "$INSTALLER"
 grep -qx 'User=term-mesh' /etc/systemd/system/term-meshd.service
 grep -qx 'Environment=HOME=/var/lib/term-mesh' /etc/systemd/system/term-meshd.service
@@ -166,6 +226,16 @@ grep -qx "TERMMESH_DAEMON_UNIX_PATH=/run/user/${tester_uid}/term-meshd.sock" \
   /home/tester/.config/term-mesh/peer.env
 grep -q 'systemctl disable --now term-meshd.service' "$CALLS"
 
+echo '==> user scope ignores hardening without recording it'
+runuser -u tester -- env HOME=/home/tester PATH="$PATH" \
+  MOCK_USER_BUS=1 TERMMESH_INSTALL_TAG=vtest TERMMESH_INSTALL_HARDEN=1 \
+  bash "$INSTALLER" >/tmp/user-hardening.log 2>&1
+grep -q 'TERMMESH_INSTALL_HARDEN=1 ignored (user scope)' /tmp/user-hardening.log
+if grep -q '^TERMMESH_INSTALL_HARDEN=' /home/tester/.config/term-mesh/peer.env; then
+  echo 'user scope recorded TERMMESH_INSTALL_HARDEN' >&2
+  exit 1
+fi
+
 echo '==> user to system switch fails closed when the user bus is unavailable'
 mkdir -p /root/.config/systemd/user
 touch /root/.config/systemd/user/term-meshd.service
@@ -184,7 +254,7 @@ grep -qx 'ExecStart=/opt/term-mesh-switch/term-meshd' \
   /etc/systemd/system/term-meshd.service
 
 echo '==> an explicit service account remains available'
-TERMMESH_SERVICE_USER=term-mesh TERMMESH_INSTALL_PREFIX=/opt/term-mesh-service \
+TERMMESH_INSTALL_HARDEN=1 TERMMESH_SERVICE_USER=term-mesh TERMMESH_INSTALL_PREFIX=/opt/term-mesh-service \
   bash "$INSTALLER"
 grep -qx 'User=term-mesh' /etc/systemd/system/term-meshd.service
 grep -qx 'Group=term-mesh' /etc/systemd/system/term-meshd.service

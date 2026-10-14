@@ -1541,6 +1541,16 @@
         }
       }
     },
+    "Relay shells get read-only /usr and /etc and no sudo. Root installs only.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "relay 셸에서 /usr·/etc가 읽기 전용이 되고 sudo를 쓸 수 없습니다. root 설치에만 적용됩니다."
+          }
+        }
+      }
+    },
     "Restart failed": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "재시작 실패" } }
@@ -2327,6 +2337,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "대시보드가 사용할 HTTP 포트입니다."
+          }
+        }
+      }
+    },
+    "Hardened: /usr and /etc are read-only in relay shells, sudo unavailable": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "하드닝됨: relay 셸에서 /usr·/etc 읽기 전용, sudo 불가"
           }
         }
       }
@@ -5490,6 +5510,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "백그라운드 서비스에서 모바일 연결 상태를 읽지 못했습니다."
+          }
+        }
+      }
+    },
+    "Not hardened": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "하드닝 없음"
           }
         }
       }

@@ -93,6 +93,12 @@ struct PeerHostEditorView: View {
     /// A relay handshake no longer paints the whole host green when its daemon
     /// control pathname has vanished.
     @State private var healthBaseline: PeerHostHealthBaseline?
+    /// Hardening of the remote system unit, measured once per Test/Install.
+    /// `.unknown` (user scope, no unit) renders nothing.
+    @State private var hardeningStatus: PeerHostDoctor.HardeningStatus = .unknown
+    /// Install/Update choice. New installs default off; a probe that finds a
+    /// hardened unit turns it on so an Update keeps the existing posture.
+    @State private var hardenInstall = false
     /// term-meshd processes this host keeps running while nothing points at
     /// them. Empty on Linux hosts by design (see `refreshDaemonSnapshot`).
     @State private var staleDaemons: [PeerHostDoctor.DaemonInstance] = []
@@ -324,12 +330,26 @@ struct PeerHostEditorView: View {
             doctorStatusLine
             relayRouteStatusLine
             healthBaselineLine
+            hardeningStatusLine
 
             agentEnvironmentStatusLine
             agentStackStatusLine
             binaryWarningLines
             staleDaemonLine
             cleanupFeedbackLines
+
+            if showsInstallButton || showsUpdateButton || showsForceReinstallButton {
+                Toggle(isOn: $hardenInstall) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(verbatim: "Service Hardening")
+                        Text("Relay shells get read-only /usr and /etc and no sudo. Root installs only.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .disabled(doctorBusy)
+            }
 
             HStack {
                 Button("Test Relay", action: runTest)
@@ -379,6 +399,7 @@ struct PeerHostEditorView: View {
             bonjourBrowser.start { peers in
                 discovered = peers
             }
+            refreshHardeningOnOpen()
         }
         .onDisappear {
             bonjourBrowser.stop()
@@ -1106,6 +1127,24 @@ struct PeerHostEditorView: View {
     }
 
     @ViewBuilder
+    private var hardeningStatusLine: some View {
+        switch hardeningStatus {
+        case .hardened:
+            Label("Hardened: /usr and /etc are read-only in relay shells, sudo unavailable",
+                  systemImage: "lock.shield")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        case .notHardened:
+            Label("Not hardened", systemImage: "lock.open")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .unknown:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
     private var healthBaselineLine: some View {
         if let health = healthBaseline {
             if health.hostKind == .app {
@@ -1437,6 +1476,8 @@ struct PeerHostEditorView: View {
         binaryWarnings = []
         binaryInventory = nil
         healthBaseline = nil
+        hardeningStatus = .unknown
+        hardenInstall = false
         daemonMissingHostKind = nil
         testedHostKind = nil
         updateAttempted = false
@@ -1471,6 +1512,7 @@ struct PeerHostEditorView: View {
         binaryWarnings = []
         binaryInventory = nil
         healthBaseline = nil
+        hardeningStatus = .unknown
         relayTestDetails = nil
         daemonMissingHostKind = nil
         testedHostKind = nil
@@ -1497,6 +1539,7 @@ struct PeerHostEditorView: View {
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
                 await refreshHealthBaseline(draft: draft, gen: gen)
+                await refreshHardeningStatus(draft: draft, gen: gen)
                 await refreshAgentStack(draft: draft, gen: gen)
                 await refreshBinaryInventory(draft: draft, gen: gen)
                 await refreshDaemonSnapshot(draft: draft, gen: gen)
@@ -1585,6 +1628,7 @@ struct PeerHostEditorView: View {
         // Test that produced `testedDraft` is still running under; see
         // `doctorGeneration`'s doc comment).
         let gen = doctorGeneration
+        let harden = hardenInstall
         doctorState = .installing
         daemonMissingVersion = nil
         binaryWarnings = []
@@ -1599,7 +1643,8 @@ struct PeerHostEditorView: View {
                 defer { installInFlight = false }
                 _ = try await PeerHostDoctor.install(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
-                    identityFile: draft.identityFile
+                    identityFile: draft.identityFile,
+                    harden: harden
                 )
             } catch {
                 guard gen == doctorGeneration else { return }
@@ -1630,6 +1675,7 @@ struct PeerHostEditorView: View {
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
                 await refreshHealthBaseline(draft: draft, gen: gen)
+                await refreshHardeningStatus(draft: draft, gen: gen)
             case .daemonMissing:
                 doctorState = .diagnosing
                 let raw = await PeerHostDoctor.diagnose(
@@ -1686,6 +1732,28 @@ struct PeerHostEditorView: View {
             RemoteWorkLog.info("\(draft.sshTarget): \(warning)")
         }
         return inventory != nil
+    }
+
+    /// Not `validatedDraft()`: that surfaces a form error, which opening the
+    /// editor must not do. A field edit bumps `doctorGeneration` and drops
+    /// this result.
+    private func refreshHardeningOnOpen() {
+        var draft = profile
+        draft.sshTarget = draft.sshTarget.trimmingCharacters(in: .whitespaces)
+        guard !draft.sshTarget.isEmpty else { return }
+        let gen = doctorGeneration
+        Task { await refreshHardeningStatus(draft: draft, gen: gen) }
+    }
+
+    private func refreshHardeningStatus(draft: PeerHostProfile, gen: Int) async {
+        guard gen == doctorGeneration else { return }
+        let measured = await PeerHostDoctor.hardeningStatus(
+            sshTarget: draft.sshTarget, port: draft.sshPort,
+            identityFile: draft.identityFile
+        )
+        guard gen == doctorGeneration else { return }
+        hardeningStatus = measured
+        if measured != .unknown { hardenInstall = measured == .hardened }
     }
 
     private func refreshHealthBaseline(draft: PeerHostProfile, gen: Int) async {

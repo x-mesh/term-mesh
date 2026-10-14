@@ -26,6 +26,7 @@
 #                           for user scope, /usr/local/bin for system scope)
 #   TERMMESH_SERVICE_USER   Account for a system service (default: the
 #                           connecting account; SUDO_USER under sudo)
+#   TERMMESH_INSTALL_HARDEN Systemd hardening for system scope (default: 0)
 #
 # What this does NOT do: pick surfaces to expose. Socket defaults are scoped
 # to systemd's runtime directories and can be overridden in peer.env.
@@ -119,6 +120,27 @@ ssh, and on older systemd (e.g. RHEL/CentOS 7). Either:
   • start a lingering login session first:
         loginctl enable-linger $(whoami)
     then reconnect and re-run, so the --user bus exists."
+fi
+
+if [[ -n "${TERMMESH_INSTALL_HARDEN+x}" ]]; then
+  case "$TERMMESH_INSTALL_HARDEN" in
+    0|1) INSTALL_HARDEN="$TERMMESH_INSTALL_HARDEN" ;;
+    *) die "TERMMESH_INSTALL_HARDEN must be 0 or 1" ;;
+  esac
+elif [[ "$SERVICE_SCOPE" == system && -f "$ENV_FILE" ]] \
+  && grep -q '^[[:space:]]*TERMMESH_INSTALL_HARDEN=' "$ENV_FILE"; then
+  existing_harden=$(sed -n 's/^[[:space:]]*TERMMESH_INSTALL_HARDEN=//p' "$ENV_FILE" \
+    | tail -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+  case "$existing_harden" in
+    0|1) INSTALL_HARDEN="$existing_harden" ;;
+    *) die "${ENV_FILE} contains an invalid TERMMESH_INSTALL_HARDEN value: ${existing_harden}" ;;
+  esac
+else
+  INSTALL_HARDEN=0
+fi
+
+if [[ "$SERVICE_SCOPE" == user && "$INSTALL_HARDEN" == 1 ]]; then
+  log "TERMMESH_INSTALL_HARDEN=1 ignored (user scope)"
 fi
 
 # Normalize uname -m to the arch suffix release-linux.yml publishes assets
@@ -348,8 +370,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # Required for the peer server to start at all (opt-in — see main.rs).
 TERMMESH_PEER_SOCKET=${PEER_SOCKET_DEFAULT}
 
-# JSON-RPC control plane used by tm-agent and host health checks. This must
-# stay outside PrivateTmp for a system-scope service.
+# JSON-RPC control plane used by tm-agent and host health checks. Keep this
+# path under /run when systemd hardening is enabled.
 TERMMESH_DAEMON_UNIX_PATH=${CONTROL_SOCKET_DEFAULT}
 
 # One "name=command" pair per line. Omit this entirely for a single
@@ -383,11 +405,22 @@ EOF
       log "         (and keep RuntimeDirectory=term-mesh in the unit), then restart."
     fi
     existing_control=$(sed -n 's/^TERMMESH_DAEMON_UNIX_PATH=//p' "$ENV_FILE" | tail -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
-    if [[ "$existing_control" == /tmp/* ]]; then
+    if [[ "$INSTALL_HARDEN" == 1 && "$existing_control" == /tmp/* ]]; then
       log "warning: ${ENV_FILE} sets TERMMESH_DAEMON_UNIX_PATH=${existing_control}, but"
       log "         PrivateTmp hides that socket from tm-agent and health probes."
       log "         Set it to ${CONTROL_SOCKET_DEFAULT}, then restart."
     fi
+  fi
+fi
+if [[ "$SERVICE_SCOPE" == system ]]; then
+  if grep -q '^[[:space:]]*TERMMESH_INSTALL_HARDEN=' "$ENV_FILE"; then
+    sed -i "s/^[[:space:]]*TERMMESH_INSTALL_HARDEN=.*/TERMMESH_INSTALL_HARDEN=${INSTALL_HARDEN}/" "$ENV_FILE"
+  else
+    cat >> "$ENV_FILE" <<EOF
+
+# Added by install-linux.sh: opt-in systemd service hardening.
+TERMMESH_INSTALL_HARDEN=${INSTALL_HARDEN}
+EOF
   fi
 fi
 if [[ "$SERVICE_SCOPE" == system ]]; then
@@ -398,7 +431,16 @@ fi
 
 mkdir -p "$UNIT_DIR"
 if [[ "$SERVICE_SCOPE" == system ]]; then
-  PROTECT_HOME=$(resolve_protect_home "$SERVICE_HOME")
+  HARDENING_DIRECTIVES=
+  if [[ "$INSTALL_HARDEN" == 1 ]]; then
+    PROTECT_HOME=$(resolve_protect_home "$SERVICE_HOME")
+    HARDENING_DIRECTIVES="NoNewPrivileges=true
+PrivateTmp=true
+CapabilityBoundingSet=
+ProtectSystem=full
+ProtectHome=${PROTECT_HOME}"
+    log "systemd hardening enabled: relay shells see /usr and /etc as read-only and cannot use sudo"
+  fi
   cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=term-mesh peer host
@@ -412,11 +454,7 @@ Group=${SERVICE_GROUP}
 Environment=HOME=${SERVICE_HOME}
 RuntimeDirectory=term-mesh
 UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-CapabilityBoundingSet=
-ProtectSystem=full
-ProtectHome=${PROTECT_HOME}
+${HARDENING_DIRECTIVES}
 Restart=always
 RestartSec=2
 # The daemon bounds its own teardown (SHUTDOWN_BUDGET in term-meshd) and exits
