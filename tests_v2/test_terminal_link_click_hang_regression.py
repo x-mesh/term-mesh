@@ -18,6 +18,7 @@ from termmesh import termmesh, termmeshError
 
 URL_PREFIX = "https://example.com/"
 URL_LINE_COUNT = 80
+DONE_MARKER = "LINKS_DONE"
 CLICK_TIMEOUT_S = 8.0
 RESPONSE_DEADLINE_S = 15.0
 
@@ -55,18 +56,29 @@ def main() -> int:
         # Build the URL from parts so the shell never sees a literal URL; zsh's
         # url-quote-magic would escape the `;` that ends the loop. send_surface
         # unescapes `\\` and `\n`, so printf's `\n` is written as `\\\\n`.
+        # The done marker prints after the loop and is split on the command line
+        # (`LINKS DONE`), so seeing `LINKS_DONE` means every link line is already
+        # on screen and the middle row the click targets holds a link.
         c.send_surface(
             terminal_id,
-            f"clear; for i in $(seq {URL_LINE_COUNT}); do printf 'https%s//example.com/%020d\\\\n' : 0; done\n",
+            f"clear; for i in $(seq {URL_LINE_COUNT}); do printf 'https%s//example.com/%020d\\\\n' : 0; done; "
+            "printf '%s_%s\\\\n' LINKS DONE\n",
         )
         expected_line = URL_PREFIX + "0" * 20
 
-        def url_lines() -> int:
-            text = c.read_terminal_text(terminal_id)
-            return sum(1 for line in text.splitlines() if line.strip() == expected_line)
+        def screen_lines() -> list:
+            return [line.strip() for line in c.read_terminal_text(terminal_id).splitlines()]
 
-        if not wait_for(lambda: url_lines() >= 10, timeout_s=15.0):
-            raise termmeshError(f"terminal did not print the link lines (count={url_lines()})")
+        def links_printed() -> bool:
+            lines = screen_lines()
+            return DONE_MARKER in lines and lines.count(expected_line) >= 10
+
+        if not wait_for(links_printed, timeout_s=15.0):
+            lines = screen_lines()
+            raise termmeshError(
+                f"terminal did not finish printing the link lines "
+                f"(links={lines.count(expected_line)}, done={DONE_MARKER in lines})"
+            )
 
         c.activate_app()
         c.focus_surface(terminal_id)
