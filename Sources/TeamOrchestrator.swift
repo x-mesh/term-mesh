@@ -5420,7 +5420,7 @@ final class TeamOrchestrator: ObservableObject {
     nonisolated static func checkoutTopologyRule(worktreeMode: String) -> String {
         switch worktreeMode {
         case "isolated":
-            return "TOPOLOGY_RULE: Isolated. Each worker writes in its own checkout, which satisfies ownership separation: owned and forbidden path lists are optional, and concurrent write tasks may touch the same paths. Give each task a goal, done criteria, and one verification command. If a task needs a shared-code change, make it there instead of duplicating code or deferring the connection to another worker. The leader integrates branches serially and resolves conflicts during integration."
+            return "TOPOLOGY_RULE: Isolated. Each worker writes in its own checkout, which satisfies ownership separation: owned and forbidden path lists are optional, and concurrent write tasks may touch the same paths. Give each task a goal, done criteria, and one verification command. If a task needs a shared-code change, make it there instead of duplicating code or deferring the connection to another worker. The leader merges each task branch serially with git merge and resolves conflicts inside that merge; never copy files out of a task branch instead of merging it."
         case "shared":
             return "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint."
         case "off":

@@ -394,6 +394,7 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("Tasks that share a checkout also name owned and forbidden paths"))
         XCTAssertTrue(policy.contains("when TEAM_CHECKOUT_MODE is isolated those lists are optional"))
         XCTAssertTrue(policy.contains("\"done\": \"observable completion criteria\""))
+        XCTAssertTrue(policy.contains("Never copy files out of a task branch instead of merging it"))
         XCTAssertTrue(policy.contains("avoid turn-by-turn ping-pong"))
         XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel|delegated\""))
         XCTAssertTrue(policy.contains("probe has exactly one read-only implementation task"))
@@ -610,6 +611,7 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(leader.contains("branch=team/t/executor/a path=/wt/a"))
         XCTAssertTrue(leader.contains("owned and forbidden path lists are optional"))
         XCTAssertTrue(leader.contains("instead of duplicating code"))
+        XCTAssertTrue(leader.contains("never copy files out of a task branch instead of merging it"))
 
         let worker = TeamOrchestrator.workerCheckoutTopologyLines(
             worktreeMode: "isolated", leaderPath: "/repo",
