@@ -7419,7 +7419,7 @@ fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
         ));
     }
     lines.push(match mode {
-        "isolated" => "TOPOLOGY_RULE: Isolated, ownership-disjoint write tasks may run concurrently. Integrate their branches serially.",
+        "isolated" => "TOPOLOGY_RULE: Isolated. Each worker writes in its own checkout, which satisfies ownership separation: owned and forbidden path lists are optional, and concurrent write tasks may touch the same paths. Give each task a goal, done criteria, and one verification command. If a task needs a shared-code change, make it there instead of duplicating code or deferring the connection to another worker. The leader merges each task branch serially with git merge and resolves conflicts inside that merge; never copy files out of a task branch instead of merging it.",
         "shared" => "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint.",
         "off" => "TOPOLOGY_RULE: No managed worktree isolation is active. Do not run concurrent writes without another verified isolation boundary.",
         _ => "TOPOLOGY_RULE: Checkout isolation is unknown. Query team.status before concurrent writes.",
@@ -7489,7 +7489,8 @@ mod checkout_contract_tests {
         ]});
         let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
-        assert!(rendered.contains("ownership-disjoint write tasks may run concurrently"));
+        assert!(rendered.contains("owned and forbidden path lists are optional"));
+        assert!(rendered.contains("never copy files out of a task branch instead of merging it"));
     }
 
     #[test]

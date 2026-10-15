@@ -438,7 +438,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertFalse(prompt.contains("TEAM_CHECKOUT_MODE: unknown"))
             XCTAssertTrue(prompt.contains("branch=agent/executor-a1b2"))
             XCTAssertFalse(prompt.contains("branch=shared-or-unknown"))
-            XCTAssertTrue(prompt.contains("ownership-disjoint write tasks may run concurrently"))
+            XCTAssertTrue(prompt.contains("owned and forbidden path lists are optional"))
         }
     }
 
