@@ -1195,6 +1195,16 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(launch.arguments.contains("--include-partial-messages"))
     }
 
+    func testNativeWorkerLaunchTurnsWorkerPluginsOff() throws {
+        let launch = AgentSession.claudeLaunch(
+            claudePath: "/usr/local/bin/claude", model: "haiku",
+            instructions: "", extraArgs: ["--extra"], workingDirectory: "/tmp")
+        let index = try XCTUnwrap(launch.arguments.firstIndex(of: "--settings"))
+        XCTAssertEqual(launch.arguments[index + 1], AgentSession.workerSettingsJSON)
+        XCTAssertLessThan(index, try XCTUnwrap(launch.arguments.firstIndex(of: "--extra")),
+                          "a profile's own arguments come last and can still override")
+    }
+
     func testNativeLaunchKeepsInjectedTeamEnvironment() {
         let environment = [
             "HOME": "/Users/test",

@@ -1789,6 +1789,14 @@ final class AgentSession {
         var interruptible = false
     }
 
+    /// Every worker session term-mesh launches turns these plugins off.
+    /// mgrep's SessionStart hook starts a detached `mgrep watch` over the
+    /// working tree for each session, so a six-agent team ran six over one
+    /// repository and each grew past 60 GB. The leader is the user's own
+    /// session and keeps its plugins. `--settings` outranks the user's
+    /// settings for `enabledPlugins`, so this holds on every host.
+    nonisolated static let workerSettingsJSON = "{\"enabledPlugins\":{\"mgrep@Mixedbread-Grep\":false}}"
+
     /// The arguments that make claude take turns on a pipe.
     ///
     /// `--print` is the non-interactive mode and `--verbose` is required
@@ -1822,6 +1830,7 @@ final class AgentSession {
         if !model.isEmpty { args += ["--model", model] }
         if !effort.isEmpty { args += ["--effort", effort] }
         if !instructions.isEmpty { args += ["--append-system-prompt", instructions] }
+        args += ["--settings", workerSettingsJSON]
         args += extraArgs
         return Launch(executable: claudePath, arguments: args,
                       workingDirectory: workingDirectory, environment: environment,

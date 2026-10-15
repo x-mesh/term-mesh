@@ -16,6 +16,8 @@ Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Lib
 
 **extraArgs 주의:** `--model`, `--resume`, `--session-id`, `--dangerously-skip-permissions`, `--print`, `--append-system-prompt`는 term-mesh가 자동으로 주입하므로 extraArgs에 넣지 말 것(경고 표시됨).
 
+**워커 플러그인:** claude 워커(터미널·native·원격·headless)는 `--settings '{"enabledPlugins":{"mgrep@Mixedbread-Grep":false}}'`로 시작한다. mgrep의 SessionStart 훅이 세션마다 작업 트리 전체를 감시하는 `mgrep watch`를 따로 띄워서, 6명 팀이 한 저장소에서 각 60GB 넘게 메모리를 썼기 때문이다. 리더는 사용자 세션이라 그대로 둔다. 목록은 `AgentSession.workerSettingsJSON`과 `daemon/term-meshd/src/headless/cli_builder.rs`의 `WORKER_SETTINGS_JSON` 두 곳에 있으니 함께 바꿀 것. extraArgs에 `--settings`를 넣으면 이 값이 덮일 수 있다.
+
 **헤드리스 모드:** `tm-agent create` / `tm-agent attach` 시에도 활성 프로파일의 extraArgs / env / modelOverride가 동일하게 적용됨.
 
 **cursor / agy:** Settings → CLI Paths에는 항상 경로 필드가 있다(`cursor-agent`, `agy`). 에이전트 role/attach CLI picker에는 **Native Agent Panes**가 켜져 있을 때만 나타난다 — 둘 다 대화형 TUI·stdin 채널이 없어 터미널 pane으로는 실행할 수 없다.

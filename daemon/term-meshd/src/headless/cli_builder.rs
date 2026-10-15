@@ -83,6 +83,13 @@ fn resolve_cli_path(cli_path: Option<&str>, env_key: &str, fallback: &str) -> St
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// Every worker session turns these plugins off. mgrep's SessionStart hook
+/// starts a detached `mgrep watch` over the working tree for each session, so
+/// a six-agent team ran six over one repository and each grew past 60 GB.
+/// `--settings` outranks the user's settings for `enabledPlugins`. Mirrors
+/// `AgentSession.workerSettingsJSON` in the app.
+pub(crate) const WORKER_SETTINGS_JSON: &str = r#"{"enabledPlugins":{"mgrep@Mixedbread-Grep":false}}"#;
+
 /// Build the CLI command for a Claude Code agent in stream-json mode.
 ///
 /// Phase 2 contract §4:
@@ -150,6 +157,9 @@ pub fn build_claude_command(
         args.push(OsString::from("--effort"));
         args.push(OsString::from(effort));
     }
+
+    args.push(OsString::from("--settings"));
+    args.push(OsString::from(WORKER_SETTINGS_JSON));
 
     // Pass agent-specific instructions as --append-system-prompt.
     // Raw bytes — no escaping. `Command::arg` does NOT pass through a shell,
@@ -648,6 +658,8 @@ mod tests {
                 "--dangerously-skip-permissions",
                 "--model",
                 "sonnet",
+                "--settings",
+                WORKER_SETTINGS_JSON,
             ]
         );
     }

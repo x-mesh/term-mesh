@@ -15,10 +15,10 @@ enum ClaudeInboxDelivery {
         defaults.bool(forKey: leaderEnabledKey)
     }
 
-    /// The `--settings` a leader launched by term-mesh starts with: `base`
+    /// The `--settings` a session launched by term-mesh starts with: `base`
     /// unchanged when the inbox is off, otherwise `base` with the inbox
     /// SessionStart hook added beside the hooks it already has.
-    static func leaderSettingsJSON(base: String?, registerInbox: Bool) -> String? {
+    static func settingsJSON(base: String?, registerInbox: Bool) -> String? {
         guard registerInbox else { return base }
         var settings: [String: Any] = [:]
         var hooks: [String: [Any]] = [:]

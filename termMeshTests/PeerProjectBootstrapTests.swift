@@ -1630,6 +1630,23 @@ final class PeerProjectBootstrapTests: XCTestCase {
         }
     }
 
+    /// A worker typed into a peer host's terminal is a Claude session like
+    /// any other, and mgrep's hook would start a watcher for it on that host.
+    @MainActor
+    func test_remote_terminal_worker_turns_worker_plugins_off_but_the_leader_keeps_them() {
+        let worker = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude", model: "sonnet", agentName: "worker",
+            teamName: "demo", workingDirectory: "/srv/demo"
+        )
+        XCTAssertTrue(worker.contains("--settings '\(AgentSession.workerSettingsJSON)'"), worker)
+
+        let leader = TeamOrchestrator.remoteLeaderCommand(
+            cli: "claude", model: "sonnet", teamName: "demo", workingDirectory: "/srv/demo",
+            grant: Termmesh_Peer_V1_TeamLeaderGrant(), leaderRequestToken: "token"
+        )
+        XCTAssertFalse(leader.contains("mgrep@Mixedbread-Grep"), leader)
+    }
+
     /// The host profile's environment reaches a typed launch as an
     /// assignment prefix on the CLI itself, values quoted, keys validated.
     @MainActor
