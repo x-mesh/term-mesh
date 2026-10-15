@@ -779,4 +779,82 @@ final class PredictedProjectPathTests: XCTestCase {
             )
         }
     }
+
+    func testExistingFolderSharesAgentsUntilItIsKnownToBeAGitWorkTree() {
+        XCTAssertTrue(NewProjectView.agentsMustShareFolder(
+            sourceKind: .existingFolder, gitURL: "", folderIsGitWorkTree: false
+        ))
+        XCTAssertFalse(NewProjectView.agentsMustShareFolder(
+            sourceKind: .existingFolder, gitURL: "", folderIsGitWorkTree: true
+        ))
+        XCTAssertFalse(NewProjectView.agentsMustShareFolder(
+            sourceKind: .existingFolder,
+            gitURL: "git@github.com:org/repo.git",
+            folderIsGitWorkTree: false
+        ))
+        for sourceKind in [ProjectSourceKind.clone, .empty] {
+            XCTAssertFalse(NewProjectView.agentsMustShareFolder(
+                sourceKind: sourceKind, gitURL: "", folderIsGitWorkTree: false
+            ))
+        }
+    }
+
+    func testGitWorkTreeLookupQuotesThePath() {
+        let script = RemoteDirectoryLookup.gitWorkTreeScript(for: "/srv/team's app")
+        XCTAssertTrue(script.contains("p='/srv/team'\\''s app'"))
+        XCTAssertTrue(script.contains("git rev-parse --is-inside-work-tree"))
+    }
+
+    func testGitWorkTreeLookupFindsRepositoriesAndLinkedWorktreesInSh() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh git lookup-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = root.appendingPathComponent("repo")
+        let nested = repository.appendingPathComponent("Sources")
+        let linkedWorktree = root.appendingPathComponent("repo-agent")
+        let plain = root.appendingPathComponent("plain")
+        for directory in [nested, plain] {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true
+            )
+        }
+        try runGit(["init", "-q"], in: repository)
+        try runGit([
+            "-c", "user.name=term-mesh", "-c", "user.email=term-mesh@local",
+            "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+            "commit", "-q", "--allow-empty", "-m", "init",
+        ], in: repository)
+        try runGit(["worktree", "add", "-q", "--detach", linkedWorktree.path], in: repository)
+
+        XCTAssertTrue(try gitWorkTreeLookup(repository.path))
+        XCTAssertTrue(try gitWorkTreeLookup(nested.path))
+        XCTAssertTrue(try gitWorkTreeLookup(linkedWorktree.path))
+        XCTAssertFalse(try gitWorkTreeLookup(plain.path))
+        XCTAssertFalse(try gitWorkTreeLookup(root.appendingPathComponent("missing").path))
+    }
+
+    private func runGit(_ arguments: [String], in directory: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory.path] + arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "git \(arguments.joined(separator: " "))")
+    }
+
+    private func gitWorkTreeLookup(_ path: String) throws -> Bool {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", RemoteDirectoryLookup.gitWorkTreeScript(for: path)]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+            && RemoteDirectoryLookup.isGitWorkTree(String(data: data, encoding: .utf8) ?? "")
+    }
 }
