@@ -55,13 +55,24 @@ extension TerminalController {
                     workspace.panels.values.contains { $0 is AgentPanel }
                 }
             }
-            window = (withAgents ?? contexts.first)?.window
-            originalFrame = window?.frame ?? .zero
+            guard let found = (withAgents ?? contexts.first)?.window else { return }
+            window = found
+            originalFrame = found.frame
             isPointerHeld = TranscriptWidthPolicy.isPointerHeld
             TranscriptWidthPolicy.isPointerHeld = { true }
         }
-        guard let window else {
+        guard let window, let isPointerHeld else {
             return .err(code: "not_found", message: "No main window", data: nil)
+        }
+        // Left held, every pane would defer its width for the rest of the
+        // process, so a restore a busy main thread cancels is queued instead.
+        defer {
+            // Only ever run on main, where every other use of `window` is.
+            nonisolated(unsafe) let restore = {
+                TranscriptWidthPolicy.isPointerHeld = isPointerHeld
+                window.setFrame(originalFrame, display: true)
+            }
+            if !v2MainExec(timeout: 10, restore) { DispatchQueue.main.async { restore() } }
         }
         Thread.sleep(forTimeInterval: 0.6)
         var samples: [Double] = []
@@ -80,9 +91,8 @@ extension TerminalController {
         }
         _ = v2MainExec(timeout: 10) {}
         let totalMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-        _ = v2MainExec(timeout: 10) {
-            if let isPointerHeld { TranscriptWidthPolicy.isPointerHeld = isPointerHeld }
-            window.setFrame(originalFrame, display: true)
+        guard !samples.isEmpty else {
+            return .err(code: "timeout", message: "Main thread ran none of the resize steps", data: nil)
         }
         let sorted = samples.sorted()
         return .ok([

@@ -3490,7 +3490,14 @@ final class AgentSessionTests: XCTestCase {
         )
         window.isReleasedWhenClosed = false
         window.contentView = host
-        defer { window.close() }
+        // The policy reads the real mouse; a button held during the run
+        // would turn every change here into a deferred one.
+        let isPointerHeld = TranscriptWidthPolicy.isPointerHeld
+        TranscriptWidthPolicy.isPointerHeld = { false }
+        defer {
+            TranscriptWidthPolicy.isPointerHeld = isPointerHeld
+            window.close()
+        }
         func settle() {
             for _ in 0..<5 {
                 host.layoutSubtreeIfNeeded()
