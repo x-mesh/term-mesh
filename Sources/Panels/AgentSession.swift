@@ -3475,6 +3475,8 @@ final class AgentSession {
         let viewportHeight: Double
         let following: Bool
         let followDrops: Int
+        let transcriptWidth: Double
+        let transcriptWidthApplies: Int
     }
 
     func noteAutoScrollForDebug() { debugAutoScrolls += 1 }
@@ -3538,8 +3540,12 @@ final class AgentSession {
     /// that width (`TranscriptWidthPolicy`), so the deferred value landing is
     /// observable only here.
     @ObservationIgnored private(set) var debugTranscriptWidth: Double = 0
+    @ObservationIgnored private(set) var debugTranscriptWidthApplies = 0
 
-    func noteTranscriptWidthForDebug(_ width: Double) { debugTranscriptWidth = width }
+    func noteTranscriptWidthForDebug(_ width: Double) {
+        debugTranscriptWidth = width
+        debugTranscriptWidthApplies += 1
+    }
 
     func renderMetricsForDebug() -> RenderMetrics {
         RenderMetrics(batches: debugAppliedBatches, lines: debugAppliedLines,
@@ -3548,7 +3554,8 @@ final class AgentSession {
                       renderedRows: rows.count, applyTotalMs: debugApplyTotalMs,
                       applyMaxMs: debugApplyMaxMs, bottomY: debugBottomY,
                       viewportHeight: debugViewportHeight, following: debugFollowing,
-                      followDrops: debugFollowDrops)
+                      followDrops: debugFollowDrops, transcriptWidth: debugTranscriptWidth,
+                      transcriptWidthApplies: debugTranscriptWidthApplies)
     }
 
     /// Feed one line of the stream, as the reader would.
