@@ -337,12 +337,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "14")
+        XCTAssertEqual(LeaderParallelPolicy.version, "15")
         XCTAssertEqual(LeaderParallelPolicy.activation, "request-boundary-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 14"))
+        XCTAssertTrue(first.contains("policy_version: 15"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: request-boundary-enforced"))
     }
@@ -391,6 +391,10 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("Direct execution is the explicit exception"))
         XCTAssertTrue(policy.contains("constraint that prevented a useful parallel split"))
         XCTAssertTrue(policy.contains("--worktree always"))
+        XCTAssertTrue(policy.contains("Tasks that share a checkout also name owned and forbidden paths"))
+        XCTAssertTrue(policy.contains("when TEAM_CHECKOUT_MODE is isolated those lists are optional"))
+        XCTAssertTrue(policy.contains("\"done\": \"observable completion criteria\""))
+        XCTAssertTrue(policy.contains("Never copy files out of a task branch instead of merging it"))
         XCTAssertTrue(policy.contains("avoid turn-by-turn ping-pong"))
         XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel|delegated\""))
         XCTAssertTrue(policy.contains("probe has exactly one read-only implementation task"))
@@ -605,7 +609,9 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(leader.contains("LEADER_CHECKOUT_PATH: /repo"))
         XCTAssertTrue(leader.contains("LEADER_CHECKOUT_ROLE: integration-owner"))
         XCTAssertTrue(leader.contains("branch=team/t/executor/a path=/wt/a"))
-        XCTAssertTrue(leader.contains("ownership-disjoint write tasks may run concurrently"))
+        XCTAssertTrue(leader.contains("owned and forbidden path lists are optional"))
+        XCTAssertTrue(leader.contains("instead of duplicating code"))
+        XCTAssertTrue(leader.contains("never copy files out of a task branch instead of merging it"))
 
         let worker = TeamOrchestrator.workerCheckoutTopologyLines(
             worktreeMode: "isolated", leaderPath: "/repo",
@@ -614,7 +620,8 @@ final class AgentSessionTests: XCTestCase {
         ).joined(separator: "\n")
         XCTAssertTrue(worker.contains("PEER_CHECKOUT: name=reviewer instance=instance-b"))
         XCTAssertFalse(worker.contains("PEER_CHECKOUT: name=executor instance=instance-a"))
-        XCTAssertTrue(worker.contains("ownership-disjoint write tasks may run concurrently"))
+        XCTAssertTrue(worker.contains("owned and forbidden path lists are optional"))
+        XCTAssertTrue(worker.contains("instead of duplicating code"))
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "shared").contains("Serialize writes"))
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "off").contains("No managed worktree isolation"))
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "unknown").contains("is unknown"))
@@ -3274,6 +3281,186 @@ final class AgentSessionTests: XCTestCase {
         let clis = ["claude", "codex", "kiro", "cursor", "agy", "gemini"]
         let drawn = Set(clis.map { AgentPanelView.mascot(for: $0).joined() })
         XCTAssertEqual(drawn.count, clis.count)
+    }
+
+    /// Issue #770: every width change during a window resize re-measured,
+    /// re-selected and redrew the whole mounted transcript. Opt-in because it
+    /// reports wall-clock cost rather than asserting a machine-dependent bound.
+    func testTranscriptResizeLayoutCostBenchmark() throws {
+        guard ProcessInfo.processInfo.environment["TERMMESH_TRANSCRIPT_RESIZE_BENCH"] == "1" else {
+            throw XCTSkip("set TERMMESH_TRANSCRIPT_RESIZE_BENCH=1 to measure transcript resize cost")
+        }
+        let paragraph = String(
+            repeating: "The transcript wraps this sentence differently at every pane width. ",
+            count: 6
+        )
+        for visible in [true, false] {
+            let panel = AgentPanel(
+                agentName: "bench", teamName: "bench", workingDirectory: "/tmp/bench",
+                cli: "claude", color: "green"
+            )
+            for index in 0..<320 {
+                panel.session.ingestForTesting(event(["type": "user", "message": ["content": [
+                    ["type": "text", "text": "question \(index)"]]]]))
+                panel.session.ingestForTesting(event(["type": "assistant", "message": ["content": [
+                    ["type": "text", "text": "\(index). \(paragraph)\n\n- `code` and **bold** \(paragraph)"]]]]))
+            }
+            let host = NSHostingView(rootView: AgentPanelView(
+                panel: panel,
+                isFocused: visible,
+                isVisibleInUI: visible,
+                appearance: PanelAppearance(
+                    dividerColor: .secondary,
+                    unfocusedOverlayNSColor: .clear,
+                    unfocusedOverlayOpacity: 0
+                ),
+                onFocus: {}
+            ))
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 800, height: 900),
+                styleMask: [.titled, .resizable], backing: .buffered, defer: false
+            )
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            // Ends short of where it started, so the deferred width that lands
+            // after the burst is a real re-wrap rather than a no-op.
+            let widths = Array(stride(from: 794, through: 500, by: -6))
+                + Array(stride(from: 506, through: 698, by: 6))
+            func elapsedMs(since start: UInt64) -> Double {
+                Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            }
+            // Spinning the run loop each step lets main-queue width updates
+            // land inside the step that caused them, as they would between
+            // frames of a real drag.
+            func step() {
+                host.layoutSubtreeIfNeeded()
+                host.displayIfNeeded()
+                RunLoop.main.run(until: Date())
+                host.layoutSubtreeIfNeeded()
+                host.displayIfNeeded()
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            step()
+            var samples: [Double] = []
+            for width in widths {
+                let start = DispatchTime.now().uptimeNanoseconds
+                window.setContentSize(NSSize(width: CGFloat(width), height: 900))
+                step()
+                samples.append(elapsedMs(since: start))
+            }
+            // A deferred width lands after the burst. Count only the time the
+            // run loop overran its 10 ms slices, which is the work it did.
+            var settleMs = 0.0
+            for _ in 0..<40 {
+                let start = DispatchTime.now().uptimeNanoseconds
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+                settleMs += max(0, elapsedMs(since: start) - 10)
+            }
+            let finalStart = DispatchTime.now().uptimeNanoseconds
+            step()
+            settleMs += elapsedMs(since: finalStart)
+            window.close()
+            let sorted = samples.sorted()
+            print(String(
+                format: "TRANSCRIPT_RESIZE_BENCH visible=%@ rows=%d widths=%d burst_total_ms=%.1f median_ms=%.2f p90_ms=%.2f max_ms=%.2f heavy_steps=%d settle_ms=%.1f applied_width=%.0f",
+                visible ? "true" : "false", panel.session.rows.count, widths.count,
+                samples.reduce(0, +), sorted[sorted.count / 2],
+                sorted[Int(Double(sorted.count) * 0.9)], sorted.last ?? 0,
+                samples.filter { $0 > 20 }.count, settleMs,
+                panel.session.debugTranscriptWidth
+            ))
+        }
+    }
+
+    /// The deferred width is the one that has to land: a burst that ended
+    /// with the transcript still wrapped at a width from mid-drag would read
+    /// as fast and be wrong.
+    func testTranscriptTakesTheLastWidthOfABurstAndAHiddenPaneWaitsUntilShown() {
+        let panel = AgentPanel(
+            agentName: "resize", teamName: "resize", workingDirectory: "/tmp/resize",
+            cli: "claude", color: "green"
+        )
+        panel.session.ingestForTesting(event(["type": "assistant", "message": ["content": [
+            ["type": "text", "text": "a short answer that wraps"]]]]))
+        func view(visible: Bool) -> AgentPanelView {
+            AgentPanelView(
+                panel: panel, isFocused: false, isVisibleInUI: visible,
+                appearance: PanelAppearance(
+                    dividerColor: .secondary,
+                    unfocusedOverlayNSColor: .clear,
+                    unfocusedOverlayOpacity: 0
+                ),
+                onFocus: {}
+            )
+        }
+        let host = NSHostingView(rootView: view(visible: true))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.close() }
+        func settle() {
+            for _ in 0..<5 {
+                host.layoutSubtreeIfNeeded()
+                RunLoop.main.run(until: Date().addingTimeInterval(TranscriptWidthPolicy.quietInterval))
+            }
+            host.layoutSubtreeIfNeeded()
+        }
+        func resize(to width: CGFloat) {
+            window.setContentSize(NSSize(width: width, height: 600))
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date())
+        }
+
+        settle()
+        let initial = panel.session.debugTranscriptWidth
+        XCTAssertGreaterThan(initial, 0)
+
+        for width in stride(from: 790, through: 600, by: -10) { resize(to: CGFloat(width)) }
+        settle()
+        XCTAssertEqual(panel.session.debugTranscriptWidth, initial - 200, accuracy: 0.5,
+                       "the width the burst ended on must be applied once it pauses")
+
+        host.rootView = view(visible: false)
+        settle()
+        resize(to: 700)
+        settle()
+        XCTAssertEqual(panel.session.debugTranscriptWidth, initial - 200, accuracy: 0.5,
+                       "a hidden pane keeps its width")
+
+        host.rootView = view(visible: true)
+        settle()
+        XCTAssertEqual(panel.session.debugTranscriptWidth, initial - 100, accuracy: 0.5,
+                       "showing the pane applies the width it was given while hidden")
+    }
+
+    func testTranscriptWidthAppliesOnceAQuietIntervalPassesAndHoldsWhileHidden() {
+        let quiet = TranscriptWidthPolicy.quietInterval
+        func decide(_ applied: CGFloat?, _ offered: CGFloat, visible: Bool = true,
+                    since: TimeInterval) -> TranscriptWidthPolicy.Decision {
+            TranscriptWidthPolicy.decide(
+                applied: applied, offered: offered, visible: visible, sinceLastChange: since
+            )
+        }
+
+        XCTAssertEqual(decide(nil, 600, visible: false, since: 0), .apply,
+                       "a pane built hidden still needs a first width")
+        XCTAssertEqual(decide(600, 590, since: quiet), .apply,
+                       "a single change after a pause is not delayed")
+        XCTAssertEqual(decide(600, 590, since: quiet / 2), .applyWhenQuiet,
+                       "a change inside a drag waits for the drag to pause")
+        XCTAssertEqual(decide(600, 590, visible: false, since: 10), .hold,
+                       "a hidden pane is not re-wrapped until it is shown")
+        XCTAssertEqual(decide(600, 600, since: 0), .hold)
+        XCTAssertEqual(decide(600, 0, since: 10), .hold,
+                       "a zero width from a view being torn down is not a layout")
+        XCTAssertEqual(TranscriptWidthPolicy.contentWidth(viewport: 600, scrollerStyle: .overlay), 600)
+        XCTAssertLessThan(TranscriptWidthPolicy.contentWidth(viewport: 600, scrollerStyle: .legacy), 600,
+                          "an always-shown scroll bar is not width the transcript can wrap into")
     }
 
     /// A peer title includes its host, and the header used to make that whole

@@ -39,6 +39,11 @@ struct AgentPanelView: View {
     /// explicit choice here opens one — a running or failed group still says
     /// so in its header, but no longer springs open on its own.
     @State private var openToolGroups: Set<UUID> = []
+    /// The width the transcript is laid out at. Re-wrapping 300 rows took
+    /// ~140 ms per width change (#770), so a resize must not pay it on every
+    /// frame.
+    @State private var transcriptWidth: CGFloat?
+    @State private var transcriptWidthTracker = TranscriptWidthTracker()
 
     private var session: AgentSession { panel.session }
 
@@ -105,6 +110,7 @@ struct AgentPanelView: View {
         // every delta of a transcript nobody has looked at yet.
         .onChange(of: isVisibleInUI, initial: true) { _, visible in
             session.isVisible = visible
+            if visible { reconcileTranscriptWidth(transcriptWidthTracker.offered) }
         }
         .onAppear {
             panel.onFocusRequested { composerFocused = true }
@@ -420,16 +426,30 @@ struct AgentPanelView: View {
                         .id(Self.bottom)
                     }
                     .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(width: transcriptWidth, alignment: .leading)
                     // Native panes are SwiftUI transcript views rather than
                     // Ghostty surfaces, so terminal selection does not apply.
                     // Enable the standard macOS text-selection environment at
                     // the transcript boundary: dragging selects across all row
                     // kinds and Cmd+C copies through the system pasteboard,
                     // while the composer remains an independent text field.
+                    // Inside the held width, so the selection layout's
+                    // container keeps its size while the pane is resized.
                     .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .coordinateSpace(name: Self.scrollSpace)
+                // From `viewport`, which does not depend on the transcript's own
+                // width: measuring anything that contains the held transcript
+                // reports the held width back and the update never arrives.
+                .onChange(of: viewport.size.width, initial: true) { _, width in
+                    reconcileTranscriptWidth(TranscriptWidthPolicy.contentWidth(viewport: width))
+                }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSScroller.preferredScrollerStyleDidChangeNotification
+                )) { _ in
+                    reconcileTranscriptWidth(TranscriptWidthPolicy.contentWidth(viewport: viewport.size.width))
+                }
                 .onPreferenceChange(TranscriptBottomPreferenceKey.self) { bottomY in
                     // Preferences are delivered during a view update. Mutating
                     // @State in that pass asks NSHostingView to lay itself out
@@ -496,6 +516,32 @@ struct AgentPanelView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func reconcileTranscriptWidth(_ offered: CGFloat) {
+        let tracker = transcriptWidthTracker
+        tracker.offered = offered
+        let now = Date()
+        let decision = TranscriptWidthPolicy.decide(
+            applied: transcriptWidth,
+            offered: offered,
+            visible: isVisibleInUI,
+            sinceLastChange: now.timeIntervalSince(tracker.lastChange)
+        )
+        guard decision != .hold else { return }
+        tracker.lastChange = now
+        tracker.generation += 1
+        let generation = tracker.generation
+        // Geometry changes arrive inside a layout pass, and setting @State
+        // there makes NSHostingView lay itself out reentrantly.
+        let delay = decision == .apply ? 0 : TranscriptWidthPolicy.quietInterval
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard tracker.generation == generation else { return }
+            transcriptWidth = tracker.offered
+            #if DEBUG
+            session.noteTranscriptWidthForDebug(tracker.offered)
+            #endif
         }
     }
 
@@ -970,6 +1016,52 @@ private struct TranscriptBottomPreferenceKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
+}
+
+/// When the transcript takes a new width. A window or divider drag offers a
+/// new width every frame; following each one re-measured, re-selected and
+/// redrew every mounted row (#770). The first change after a quiet interval
+/// applies at once, so a single change such as a sidebar toggle is not
+/// delayed; changes inside the interval wait for it to pass and then apply
+/// the latest width once. A hidden pane keeps its width until it is shown.
+enum TranscriptWidthPolicy {
+    static let quietInterval: TimeInterval = 0.15
+
+    enum Decision: Equatable {
+        case apply
+        case applyWhenQuiet
+        case hold
+    }
+
+    /// The width the scroll view offers its content. Legacy scroll bars take
+    /// their width out of the viewport; overlay scroll bars do not.
+    static func contentWidth(
+        viewport: CGFloat,
+        scrollerStyle: NSScroller.Style = NSScroller.preferredScrollerStyle
+    ) -> CGFloat {
+        guard scrollerStyle == .legacy else { return viewport }
+        return viewport - NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+    }
+
+    static func decide(
+        applied: CGFloat?,
+        offered: CGFloat,
+        visible: Bool,
+        sinceLastChange: TimeInterval
+    ) -> Decision {
+        guard offered > 0, offered != applied else { return .hold }
+        guard applied != nil else { return .apply }
+        guard visible else { return .hold }
+        return sinceLastChange >= quietInterval ? .apply : .applyWhenQuiet
+    }
+}
+
+/// Resize bookkeeping kept out of SwiftUI state: writing these on every frame
+/// must not invalidate the view the way `transcriptWidth` deliberately does.
+final class TranscriptWidthTracker {
+    var offered: CGFloat = 0
+    var lastChange = Date.distantPast
+    var generation = 0
 }
 
 /// What was asked, with the protocol it travelled in folded away.

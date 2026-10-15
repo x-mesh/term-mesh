@@ -242,7 +242,7 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "14"
+    static let version = "15"
     static let activation = "request-boundary-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -259,7 +259,7 @@ enum LeaderParallelPolicy {
         ),
         (
             "structured-routing-decision",
-            "Classify execution as direct, probe, parallel, or delegated before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Delegated serial work uses route `delegated` with one worker. Other delegated work uses route `parallel` and assigns every useful dependency-ready unit up to min(available workers, the configured limit, ten) without splitting work only to fill capacity. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
+            "Classify execution as direct, probe, parallel, or delegated before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Delegated serial work uses route `delegated` with one worker. Other delegated work uses route `parallel` and assigns every useful dependency-ready unit up to min(available workers, the configured limit, ten) without splitting work only to fill capacity. Every worker task names its worker, goal, done criteria, dependencies, verification command, mutation flag, and time estimate. Tasks that share a checkout also name owned and forbidden paths; when TEAM_CHECKOUT_MODE is isolated those lists are optional."
         ),
         (
             "turn-route-measurement",
@@ -275,7 +275,7 @@ enum LeaderParallelPolicy {
         ),
         (
             "same-checkout-isolation",
-            "Allow concurrent read-only work in one checkout. For concurrent writes, give every task explicit owned and forbidden paths and use task-scoped tm-agent delegate --worktree always --from <base> unless the writes are provably disjoint in the same checkout; if isolation is unavailable, block or run sequentially rather than silently sharing a checkout."
+            "Allow concurrent read-only work in one checkout. For concurrent writes, give every task explicit owned and forbidden paths and use task-scoped tm-agent delegate --worktree always --from <base> unless the writes are provably disjoint in the same checkout; if isolation is unavailable, block or run sequentially rather than silently sharing a checkout. When TEAM_CHECKOUT_MODE is isolated, each worker already writes in its own checkout, and that checkout satisfies the ownership-disjoint conditions of this policy for worker tasks: do not require owned or forbidden paths, let tasks touch the same paths, and resolve overlapping edits while merging each task branch serially. Never copy files out of a task branch instead of merging it; an unmerged task branch blocks worktree reclamation. Tell workers to change shared code when their task needs it instead of duplicating it or deferring the connection to another worker. Before the first parallel write wave, if the code has no merge-friendly boundary such as per-feature modules or append-only registration lists, establish one in a serial first task."
         ),
         (
             "bounded-handoff",
@@ -359,6 +359,7 @@ enum LeaderParallelPolicy {
               "id": "stable-task-id",
               "worker": "project worker name",
               "goal": "self-contained outcome",
+              "done": "observable completion criteria",
               "owned": ["path or subsystem"],
               "forbidden": ["path or subsystem"],
               "depends_on": [],
@@ -379,7 +380,7 @@ enum LeaderParallelPolicy {
           ]
         }
         ```
-        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has between two and the configured maximum of ten implementation tasks whose `depends_on` prerequisites are already satisfied; route `delegated` is serial delegated work with one worker, and other delegated work uses route `parallel` with every useful ready unit up to min(available workers, the configured limit, ten) without inventing work. Every concurrent write needs isolated ownership, zero overlap, and serial integration. The leader can mutate only in a separately declared disjoint lane. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
+        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has between two and the configured maximum of ten implementation tasks whose `depends_on` prerequisites are already satisfied; route `delegated` is serial delegated work with one worker, and other delegated work uses route `parallel` with every useful ready unit up to min(available workers, the configured limit, ten) without inventing work. Every concurrent write in a shared checkout needs isolated ownership, zero overlap, and serial integration. When TEAM_CHECKOUT_MODE is isolated, separate worker checkouts provide that isolation: `owned` and `forbidden` may be empty, and serial integration resolves overlapping edits. The leader can mutate only in a separately declared disjoint lane. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
 
         \(renderedRules)
         """
