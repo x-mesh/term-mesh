@@ -367,6 +367,7 @@ enum AgentPipeTransport {
         if !instructions.isEmpty {
             parts += ["--append-system-prompt", quoted(instructions)]
         }
+        parts += ["--settings", quoted(AgentSession.workerSettingsJSON)]
         parts += extraArgs.map(quoted)
 
         let f = quoted(fifoPath)

@@ -108,13 +108,13 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
     @MainActor
     func testLeaderLaunchSettingsAreUnchangedWhileTheLeaderOptionIsOff() {
         let turnHooks = TeamOrchestrator.leaderTurnHookSettingsJSON
-        XCTAssertEqual(ClaudeInboxDelivery.leaderSettingsJSON(base: turnHooks, registerInbox: false), turnHooks)
-        XCTAssertNil(ClaudeInboxDelivery.leaderSettingsJSON(base: nil, registerInbox: false))
+        XCTAssertEqual(ClaudeInboxDelivery.settingsJSON(base: turnHooks, registerInbox: false), turnHooks)
+        XCTAssertNil(ClaudeInboxDelivery.settingsJSON(base: nil, registerInbox: false))
     }
 
     @MainActor
     func testLeaderLaunchSettingsCarryTheInboxHookBesideTheTurnHooks() throws {
-        let json = try XCTUnwrap(ClaudeInboxDelivery.leaderSettingsJSON(
+        let json = try XCTUnwrap(ClaudeInboxDelivery.settingsJSON(
             base: TeamOrchestrator.leaderTurnHookSettingsJSON, registerInbox: true))
         XCTAssertFalse(json.contains("'"), "the settings are passed inside single quotes on the launch line")
         let hooks = try XCTUnwrap(
@@ -131,10 +131,31 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
     }
 
     func testALeaderWithoutTurnHooksGetsOnlyTheInboxHook() throws {
-        let json = try XCTUnwrap(ClaudeInboxDelivery.leaderSettingsJSON(base: nil, registerInbox: true))
+        let json = try XCTUnwrap(ClaudeInboxDelivery.settingsJSON(base: nil, registerInbox: true))
         let hooks = try XCTUnwrap(
             (try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])?["hooks"] as? [String: Any])
         XCTAssertEqual(Set(hooks.keys), ["SessionStart"])
+    }
+
+    /// A worker session must not start mgrep's watcher: one per agent over the
+    /// same repository grew past 60 GB each. Turning the inbox on adds its hook
+    /// beside the plugin switch rather than replacing it.
+    func testWorkerSettingsTurnMgrepOffWithOrWithoutTheInboxHook() throws {
+        func object(_ json: String) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        }
+        let worker = AgentSession.workerSettingsJSON
+        XCTAssertFalse(worker.contains("'"), "the settings are passed inside single quotes on the launch line")
+        let plugins = try XCTUnwrap(try object(worker)["enabledPlugins"] as? [String: Bool])
+        XCTAssertEqual(plugins["mgrep@Mixedbread-Grep"], false)
+
+        XCTAssertEqual(ClaudeInboxDelivery.settingsJSON(base: worker, registerInbox: false), worker)
+
+        let withInbox = try object(try XCTUnwrap(
+            ClaudeInboxDelivery.settingsJSON(base: worker, registerInbox: true)))
+        XCTAssertEqual((withInbox["enabledPlugins"] as? [String: Bool])?["mgrep@Mixedbread-Grep"], false,
+                       "the inbox hook must not drop the plugin switch")
+        XCTAssertNotNil((withInbox["hooks"] as? [String: Any])?["SessionStart"])
     }
 
     func testWorkerLaunchHookRegistersThroughThisAppsCLI() throws {

@@ -253,6 +253,9 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertTrue(cmd.contains("--input-format stream-json"))
         XCTAssertTrue(cmd.contains("--replay-user-messages"),
                       "the receipt is what makes delivery verifiable")
+        XCTAssertTrue(cmd.contains("--settings"))
+        XCTAssertTrue(cmd.contains("mgrep@Mixedbread-Grep"),
+                      "a terminal-pane worker turns the same plugins off as a native one")
     }
 
     /// The events file must be a new inode for every launch.
