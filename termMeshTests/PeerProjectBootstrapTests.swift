@@ -1630,8 +1630,6 @@ final class PeerProjectBootstrapTests: XCTestCase {
         }
     }
 
-    /// The host profile's environment reaches a typed launch as an
-    /// assignment prefix on the CLI itself, values quoted, keys validated.
     /// A worker typed into a peer host's terminal is a Claude session like
     /// any other, and mgrep's hook would start a watcher for it on that host.
     @MainActor
@@ -1649,6 +1647,8 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertFalse(leader.contains("mgrep@Mixedbread-Grep"), leader)
     }
 
+    /// The host profile's environment reaches a typed launch as an
+    /// assignment prefix on the CLI itself, values quoted, keys validated.
     @MainActor
     func test_remote_launch_carries_the_hosts_environment() {
         let launch = TeamOrchestrator.remoteAgentCommand(
