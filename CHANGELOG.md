@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.273.0] - 2026-10-16
+
+### Fixed
+
+- Shrinking a window that shows native agent panes is fast again. In 0.272.0 a long transcript could still make every frame of the drag wrap the whole transcript again: one wrap took longer than the 0.15 second pause the pane waited for, so the next frame looked like a pause. Now the transcript keeps its line wrapping for as long as you hold the mouse button on a window edge or a split divider, and wraps once after you release it. While you hold still with the button down, the text keeps its old width and its right edge is cut off. Each resize step also costs less, because the pane no longer rebuilds every transcript row on each frame.
+- Agent teams no longer start one `mgrep watch` process per agent when the mgrep Claude Code plugin is installed. Each agent is its own Claude session, and the plugin's session hook started a file watcher over the whole project for every one of them, so a six-agent team could use tens of gigabytes of memory. term-mesh now turns the mgrep plugin off for the agents it launches: native and terminal panes, agents on a peer host, and agents run by the daemon. The leader is your own session and keeps its plugins. Agents that a peer host's term-meshd runs get the fix once that host's term-meshd is updated.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.272.0] - 2026-10-15
 
 ### Added
