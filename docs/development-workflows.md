@@ -368,6 +368,9 @@ It moves the width of the window holding native agent panes one step per
 `median_ms`/`p90_ms`/`max_ms` and the drag's `total_ms`, then restores the
 frame. The pointer reads as held throughout, so the transcript width policy
 behaves as it does under a real drag. Pair it with `debug.agent.render_stats`:
-`transcript_width_applies` must rise by one per pane per drag, after the drag
-ends — never once per step. Numbers are Debug; compare conditions A/B/A2 in the
-same app, not against a Release build.
+each pane's `transcript_width_applies` rises by at most one per drag, and a rise
+of one per step means the policy is re-wrapping mid-drag. That one apply writes
+back the pre-drag width, because the command restores the frame before the
+deferred width lands, so it does not exercise the re-wrap at the dragged width;
+a hand drag in the tagged app does. Numbers are Debug; compare conditions
+A/B/A2 in the same app, not against a Release build.
