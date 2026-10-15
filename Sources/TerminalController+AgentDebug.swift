@@ -41,6 +41,10 @@ extension TerminalController {
     /// A window-edge drag without a pointer: the width moves a step at a
     /// time with main free in between, and the pointer reads as held so the
     /// transcript width policy behaves as it does under a real drag.
+    // Main thread only. A second drag overlapping the first would save the
+    // first one's override as the value to restore and leave it installed.
+    nonisolated(unsafe) private static var dragResizeRunning = false
+
     func v2DebugWindowDragResize(params: [String: Any]) -> V2CallResult {
         let delta = (params["delta"] as? NSNumber)?.doubleValue ?? -300
         let steps = max(2, (params["steps"] as? NSNumber)?.intValue ?? 40)
@@ -48,7 +52,12 @@ extension TerminalController {
         var window: NSWindow?
         var originalFrame = NSRect.zero
         var isPointerHeld: (() -> Bool)?
+        var busy = false
         _ = v2MainExec(timeout: 5) {
+            guard !Self.dragResizeRunning else {
+                busy = true
+                return
+            }
             let contexts = Array(AppDelegate.shared?.mainWindowContexts.values ?? [:].values)
             let withAgents = contexts.first { context in
                 context.tabManager.tabs.contains { workspace in
@@ -56,10 +65,14 @@ extension TerminalController {
                 }
             }
             guard let found = (withAgents ?? contexts.first)?.window else { return }
+            Self.dragResizeRunning = true
             window = found
             originalFrame = found.frame
             isPointerHeld = TranscriptWidthPolicy.isPointerHeld
             TranscriptWidthPolicy.isPointerHeld = { true }
+        }
+        if busy {
+            return .err(code: "busy", message: "Another drag_resize is running", data: nil)
         }
         guard let window, let isPointerHeld else {
             return .err(code: "not_found", message: "No main window", data: nil)
@@ -71,6 +84,7 @@ extension TerminalController {
             nonisolated(unsafe) let restore = {
                 TranscriptWidthPolicy.isPointerHeld = isPointerHeld
                 window.setFrame(originalFrame, display: true)
+                Self.dragResizeRunning = false
             }
             if !v2MainExec(timeout: 10, restore) { DispatchQueue.main.async { restore() } }
         }

@@ -158,6 +158,31 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
         XCTAssertNotNil((withInbox["hooks"] as? [String: Any])?["SessionStart"])
     }
 
+    /// The typed terminal worker is the launch the six-watcher incident came
+    /// through. Whatever the inbox setting, it must carry exactly one
+    /// `--settings`, or the later flag would silently replace the plugin switch.
+    @MainActor
+    func testTerminalWorkerCommandCarriesOneSettingsThatTurnsMgrepOff() throws {
+        for inbox in [false, true] {
+            let command = TeamOrchestrator.buildClaudeCommand(
+                claudePath: "/usr/local/bin/claude", agentId: "executor@demo",
+                agentName: "executor", teamName: "demo", agentColor: "blue",
+                parentSessionId: "parent", agentType: "executor", model: "sonnet",
+                inboxEnabled: inbox
+            )
+            XCTAssertEqual(command.components(separatedBy: "--settings ").count - 1, 1,
+                           "inbox \(inbox): \(command)")
+            let start = try XCTUnwrap(command.range(of: "--settings '")).upperBound
+            let end = try XCTUnwrap(command[start...].firstIndex(of: "'"))
+            let settings = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(command[start..<end].utf8)) as? [String: Any])
+            XCTAssertEqual((settings["enabledPlugins"] as? [String: Bool])?["mgrep@Mixedbread-Grep"], false,
+                           "inbox \(inbox)")
+            XCTAssertEqual((settings["hooks"] as? [String: Any])?["SessionStart"] != nil, inbox,
+                           "the inbox hook rides along only when the inbox is on")
+        }
+    }
+
     func testWorkerLaunchHookRegistersThroughThisAppsCLI() throws {
         let json = ClaudeInboxDelivery.registerHookSettingsJSON
         XCTAssertFalse(json.contains("'"), "the settings are passed inside single quotes on the launch line")
