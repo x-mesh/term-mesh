@@ -4934,8 +4934,9 @@ final class TeamOrchestrator: ObservableObject {
         A good delegation includes:
         - WHAT: clear description of the task
         - WHERE: specific file paths or directories to look at
-        - OWNERSHIP: explicit owned and forbidden paths
+        - OWNERSHIP: explicit owned and forbidden paths when workers share a checkout; optional when TEAM_CHECKOUT_MODE is isolated
         - HOW MUCH: scope boundaries and dependency assumptions
+        - DONE: observable completion criteria
         - VERIFY: one concrete verification command
         - OUTPUT: what format the result should be in
 
@@ -5419,7 +5420,7 @@ final class TeamOrchestrator: ObservableObject {
     nonisolated static func checkoutTopologyRule(worktreeMode: String) -> String {
         switch worktreeMode {
         case "isolated":
-            return "TOPOLOGY_RULE: Isolated, ownership-disjoint write tasks may run concurrently. Integrate their branches serially."
+            return "TOPOLOGY_RULE: Isolated. Each worker writes in its own checkout, which satisfies ownership separation: owned and forbidden path lists are optional, and concurrent write tasks may touch the same paths. Give each task a goal, done criteria, and one verification command. If a task needs a shared-code change, make it there instead of duplicating code or deferring the connection to another worker. The leader integrates branches serially and resolves conflicts during integration."
         case "shared":
             return "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint."
         case "off":

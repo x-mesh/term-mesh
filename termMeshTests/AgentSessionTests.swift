@@ -337,12 +337,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "14")
+        XCTAssertEqual(LeaderParallelPolicy.version, "15")
         XCTAssertEqual(LeaderParallelPolicy.activation, "request-boundary-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 14"))
+        XCTAssertTrue(first.contains("policy_version: 15"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: request-boundary-enforced"))
     }
@@ -391,6 +391,9 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("Direct execution is the explicit exception"))
         XCTAssertTrue(policy.contains("constraint that prevented a useful parallel split"))
         XCTAssertTrue(policy.contains("--worktree always"))
+        XCTAssertTrue(policy.contains("Tasks that share a checkout also name owned and forbidden paths"))
+        XCTAssertTrue(policy.contains("when TEAM_CHECKOUT_MODE is isolated those lists are optional"))
+        XCTAssertTrue(policy.contains("\"done\": \"observable completion criteria\""))
         XCTAssertTrue(policy.contains("avoid turn-by-turn ping-pong"))
         XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel|delegated\""))
         XCTAssertTrue(policy.contains("probe has exactly one read-only implementation task"))
@@ -605,7 +608,8 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(leader.contains("LEADER_CHECKOUT_PATH: /repo"))
         XCTAssertTrue(leader.contains("LEADER_CHECKOUT_ROLE: integration-owner"))
         XCTAssertTrue(leader.contains("branch=team/t/executor/a path=/wt/a"))
-        XCTAssertTrue(leader.contains("ownership-disjoint write tasks may run concurrently"))
+        XCTAssertTrue(leader.contains("owned and forbidden path lists are optional"))
+        XCTAssertTrue(leader.contains("instead of duplicating code"))
 
         let worker = TeamOrchestrator.workerCheckoutTopologyLines(
             worktreeMode: "isolated", leaderPath: "/repo",
@@ -614,7 +618,8 @@ final class AgentSessionTests: XCTestCase {
         ).joined(separator: "\n")
         XCTAssertTrue(worker.contains("PEER_CHECKOUT: name=reviewer instance=instance-b"))
         XCTAssertFalse(worker.contains("PEER_CHECKOUT: name=executor instance=instance-a"))
-        XCTAssertTrue(worker.contains("ownership-disjoint write tasks may run concurrently"))
+        XCTAssertTrue(worker.contains("owned and forbidden path lists are optional"))
+        XCTAssertTrue(worker.contains("instead of duplicating code"))
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "shared").contains("Serialize writes"))
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "off").contains("No managed worktree isolation"))
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "unknown").contains("is unknown"))
