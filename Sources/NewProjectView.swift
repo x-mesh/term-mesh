@@ -138,6 +138,9 @@ struct NewProjectView: View {
     /// dependency tree with several writers — and the collision is quiet until
     /// it is expensive.
     @State private var isolateAgents = true
+    /// The `existingFolderGitLookupID` last confirmed to be inside a Git work
+    /// tree. Keyed by host and path so a result never outlives its folder.
+    @State private var gitWorkTreeFolderID: String?
     /// Who runs the project.
     ///
     /// An agent CLI, not the manual console. A project's leader is the thing
@@ -322,6 +325,9 @@ struct NewProjectView: View {
         }
         .task(id: remoteDirectoryAutocompleteID) {
             await loadRemoteDirectorySuggestions()
+        }
+        .task(id: existingFolderGitLookupID) {
+            await detectExistingFolderGitWorkTree()
         }
         .task(id: selectedHostAgentEnvironmentID) {
             await loadSelectedHostAgentEnvironment()
@@ -1199,7 +1205,7 @@ struct NewProjectView: View {
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
                     GridRow {
                         Text("Agent checkouts")
-                        if sourceKind == .existingFolder && gitURL.isEmpty {
+                        if agentsMustShareFolder {
                             Text("Shared folder")
                                 .foregroundStyle(.secondary)
                         } else {
@@ -1518,6 +1524,11 @@ struct NewProjectView: View {
         return "\(hostKey)\u{0}\(directory)"
     }
 
+    private var existingFolderGitLookupID: String {
+        guard sourceKind == .existingFolder, !trimmedDirectory.isEmpty else { return "" }
+        return "\(runsOnHostKey ?? "")\u{0}\(trimmedDirectory)"
+    }
+
     private var selectedHostAgentEnvironmentID: String {
         guard let hostKey = runsOnHostKey,
               let host = placeableHosts.first(where: { $0.id == hostKey }),
@@ -1709,6 +1720,34 @@ struct NewProjectView: View {
             remoteDirectorySuggestionError = "Couldn’t load folders from \(host.displayName)."
         }
         isLoadingRemoteDirectorySuggestions = false
+    }
+
+    private func detectExistingFolderGitWorkTree() async {
+        let requestID = existingFolderGitLookupID
+        guard !requestID.isEmpty else { return }
+        let path = trimmedDirectory
+        let host = runsOnHostKey.flatMap { hostKey in
+            placeableHosts.first(where: { $0.id == hostKey })
+        }
+        if runsOnHostKey != nil, host == nil {
+            gitWorkTreeFolderID = nil
+            return
+        }
+
+        do {
+            try await Task.sleep(for: .milliseconds(300))
+        } catch {
+            return
+        }
+        guard existingFolderGitLookupID == requestID else { return }
+        let isGitWorkTree: Bool
+        if let host {
+            isGitWorkTree = await RemoteDirectoryLookup.isGitWorkTree(host: host, path: path)
+        } else {
+            isGitWorkTree = await Self.isLocalGitWorkTree(at: path)
+        }
+        guard !Task.isCancelled, existingFolderGitLookupID == requestID else { return }
+        gitWorkTreeFolderID = isGitWorkTree ? requestID : nil
     }
 
     private func presentRemoteDirectoryBrowser() {
@@ -2903,7 +2942,27 @@ struct NewProjectView: View {
     }
 
     private var effectiveIsolation: Bool {
-        isolateAgents && !(sourceKind == .existingFolder && gitURL.isEmpty)
+        isolateAgents && !agentsMustShareFolder
+    }
+
+    private var agentsMustShareFolder: Bool {
+        Self.agentsMustShareFolder(
+            sourceKind: sourceKind,
+            gitURL: gitURL,
+            folderIsGitWorkTree: !existingFolderGitLookupID.isEmpty
+                && gitWorkTreeFolderID == existingFolderGitLookupID
+        )
+    }
+
+    /// An existing folder gets agent worktrees only once it is known to be a
+    /// Git work tree. Until the lookup answers, agents share it: isolated team
+    /// creation refuses a folder that is not a repository.
+    static func agentsMustShareFolder(
+        sourceKind: ProjectSourceKind,
+        gitURL: String,
+        folderIsGitWorkTree: Bool
+    ) -> Bool {
+        sourceKind == .existingFolder && gitURL.isEmpty && !folderIsGitWorkTree
     }
 
     private var currentProjectSource: ProjectSource {
@@ -3746,6 +3805,15 @@ struct NewProjectView: View {
         }
     }
 
+    private static func isLocalGitWorkTree(at path: String) async -> Bool {
+        guard let output = try? await ProcessRun.capture(
+            executable: "/bin/sh",
+            arguments: ["-c", RemoteDirectoryLookup.gitWorkTreeScript(for: path)],
+            timeout: 10
+        ), !output.timedOut, output.status == 0 else { return false }
+        return RemoteDirectoryLookup.isGitWorkTree(output.stdoutText)
+    }
+
     private static func localGitOrigin(at path: String) async -> String? {
         await Task.detached(priority: .utility) {
             let process = Process()
@@ -3893,6 +3961,32 @@ enum RemoteDirectoryLookup {
             timeoutSeconds: 15
         )
         return try parse(output)
+    }
+
+    /// Prints `true` inside a Git work tree, linked worktrees included. A
+    /// plain folder, a bare repository or a missing path prints anything else.
+    static func gitWorkTreeScript(for rawPath: String) -> String {
+        let path = singleLine(rawPath).trimmingCharacters(in: .whitespacesAndNewlines)
+        return "p=\(shellQuote(path)); "
+            + "case \"$p\" in '~') p=\"$HOME\" ;; '~/'*) p=\"$HOME/${p#??}\" ;; esac; "
+            + "cd \"$p\" && git rev-parse --is-inside-work-tree"
+    }
+
+    static func isGitWorkTree(_ scriptOutput: String) -> Bool {
+        scriptOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
+    }
+
+    static func isGitWorkTree(host: HostEntry, path: String) async -> Bool {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty,
+              let output = try? await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: gitWorkTreeScript(for: path),
+                timeoutSeconds: 15
+              )
+        else { return false }
+        return isGitWorkTree(output)
     }
 
     private static func shellQuote(_ value: String) -> String {
