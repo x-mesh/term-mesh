@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.272.0] - 2026-10-15
+
+### Added
+
+- New Project can give each agent its own Git worktree when you pick an existing folder that is a Git repository. Before this change, Agent checkouts offered worktrees only when you chose the folder with Choose… and the repository had an `origin` remote. A typed path, a folder on a remote host, or a repository without `origin` always shared one folder. A folder that is not a Git repository still uses a shared folder.
+
+### Changed
+
+- In a Project where each agent has its own Git worktree, the leader no longer gives every task a list of owned and forbidden paths. Each task states its goal, its completion criteria, and one verification command, and a worker can change shared files when its task needs it. The leader merges each task branch with `git merge` and resolves conflicts in that merge. Projects whose agents share one checkout keep the strict ownership rules. A leader that is already running keeps its current instructions.
+
+### Fixed
+
+- Resizing a window that shows a native agent pane is no longer slow when the pane has a long transcript. Before this fix, every width change during the resize wrapped the whole transcript again. Now the transcript keeps its line wrapping while you drag, and it wraps again once, 0.15 seconds after you stop. A hidden agent pane wraps again when you show it.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.271.1] - 2026-10-14
 
 ### Fixed
