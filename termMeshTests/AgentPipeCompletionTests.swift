@@ -253,8 +253,9 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertTrue(cmd.contains("--input-format stream-json"))
         XCTAssertTrue(cmd.contains("--replay-user-messages"),
                       "the receipt is what makes delivery verifiable")
-        XCTAssertTrue(cmd.contains("--settings"))
-        XCTAssertTrue(cmd.contains("mgrep@Mixedbread-Grep"),
+        // The chain is itself single-quoted for `sh -c`, so the value's own
+        // quotes arrive as '\'' and the JSON stays one word after both parses.
+        XCTAssertTrue(cmd.contains("--settings '\\''\(AgentSession.workerSettingsJSON)'\\''"),
                       "a terminal-pane worker turns the same plugins off as a native one")
     }
 
