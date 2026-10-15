@@ -3374,6 +3374,94 @@ final class AgentSessionTests: XCTestCase {
         }
     }
 
+    /// A drag as the app sees it: a new width every frame, and when a frame
+    /// runs long the next one waits for it rather than being skipped. The
+    /// burst benchmark above steps with no wall-clock gaps, so it cannot see a
+    /// policy that mistakes a slow frame for the user pausing.
+    func testTranscriptRealtimeDragBenchmark() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["TERMMESH_TRANSCRIPT_RESIZE_BENCH"] == "1" else {
+            throw XCTSkip("set TERMMESH_TRANSCRIPT_RESIZE_BENCH=1 to measure transcript resize cost")
+        }
+        // A real transcript re-wraps for longer than this one; scale the text
+        // until a single re-wrap outlasts `TranscriptWidthPolicy.quietInterval`.
+        let repeats = Int(environment["TERMMESH_TRANSCRIPT_RESIZE_BENCH_REPEAT"] ?? "") ?? 6
+        let paragraph = String(
+            repeating: "The transcript wraps this sentence differently at every pane width. ",
+            count: repeats
+        )
+        let panel = AgentPanel(
+            agentName: "bench", teamName: "bench", workingDirectory: "/tmp/bench",
+            cli: "claude", color: "green"
+        )
+        for index in 0..<320 {
+            panel.session.ingestForTesting(event(["type": "user", "message": ["content": [
+                ["type": "text", "text": "question \(index)"]]]]))
+            panel.session.ingestForTesting(event(["type": "assistant", "message": ["content": [
+                ["type": "text", "text": "\(index). \(paragraph)\n\n- `code` and **bold** \(paragraph)"]]]]))
+        }
+        let host = NSHostingView(rootView: AgentPanelView(
+            panel: panel, isFocused: true, isVisibleInUI: true,
+            appearance: PanelAppearance(
+                dividerColor: .secondary,
+                unfocusedOverlayNSColor: .clear,
+                unfocusedOverlayOpacity: 0
+            ),
+            onFocus: {}
+        ))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 900),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.close() }
+        func elapsedMs(since start: UInt64) -> Double {
+            Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+        func frame() {
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+        }
+        frame()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        frame()
+        let pointerHeld = environment["TERMMESH_TRANSCRIPT_RESIZE_BENCH_POINTER"] != "0"
+        var held = pointerHeld
+        let isPointerHeld = TranscriptWidthPolicy.isPointerHeld
+        TranscriptWidthPolicy.isPointerHeld = { held }
+        defer { TranscriptWidthPolicy.isPointerHeld = isPointerHeld }
+        let appliesBefore = panel.session.debugTranscriptWidthApplies
+        let frameInterval = 1.0 / 60
+        let widths = Array(stride(from: 794, through: 500, by: -6))
+        var samples: [Double] = []
+        let dragStart = DispatchTime.now().uptimeNanoseconds
+        for width in widths {
+            let start = DispatchTime.now().uptimeNanoseconds
+            window.setContentSize(NSSize(width: CGFloat(width), height: 900))
+            frame()
+            let remaining = frameInterval - elapsedMs(since: start) / 1000
+            RunLoop.main.run(until: Date().addingTimeInterval(max(0, remaining)))
+            frame()
+            samples.append(elapsedMs(since: start))
+        }
+        let dragMs = elapsedMs(since: dragStart)
+        let appliesDuringDrag = panel.session.debugTranscriptWidthApplies - appliesBefore
+        held = false
+        for _ in 0..<5 {
+            RunLoop.main.run(until: Date().addingTimeInterval(TranscriptWidthPolicy.quietInterval))
+            frame()
+        }
+        let sorted = samples.sorted()
+        print(String(
+            format: "TRANSCRIPT_REALTIME_DRAG_BENCH pointer_held=%@ repeat=%d rows=%d frames=%d drag_ms=%.0f median_ms=%.1f p90_ms=%.1f max_ms=%.1f applies_during_drag=%d applies_total=%d final_width=%.0f",
+            pointerHeld ? "true" : "false", repeats, panel.session.rows.count, widths.count, dragMs,
+            sorted[sorted.count / 2], sorted[Int(Double(sorted.count) * 0.9)], sorted.last ?? 0,
+            appliesDuringDrag, panel.session.debugTranscriptWidthApplies - appliesBefore,
+            panel.session.debugTranscriptWidth
+        ))
+    }
+
     /// The deferred width is the one that has to land: a burst that ended
     /// with the transcript still wrapped at a width from mid-drag would read
     /// as fast and be wrong.
@@ -3438,12 +3526,74 @@ final class AgentSessionTests: XCTestCase {
                        "showing the pane applies the width it was given while hidden")
     }
 
+    /// v0.272.0 still re-wrapped every frame of a real drag: one re-wrap ran
+    /// past the quiet interval, so the frame after it looked like a pause.
+    /// Here the drag pauses for several intervals with the button still down,
+    /// which is what a slow frame looks like to the timer.
+    func testTranscriptWaitsForThePointerToBeReleasedBeforeTakingADraggedWidth() {
+        let panel = AgentPanel(
+            agentName: "drag", teamName: "drag", workingDirectory: "/tmp/drag",
+            cli: "claude", color: "green"
+        )
+        panel.session.ingestForTesting(event(["type": "assistant", "message": ["content": [
+            ["type": "text", "text": "a short answer that wraps"]]]]))
+        let host = NSHostingView(rootView: AgentPanelView(
+            panel: panel, isFocused: false, isVisibleInUI: true,
+            appearance: PanelAppearance(
+                dividerColor: .secondary,
+                unfocusedOverlayNSColor: .clear,
+                unfocusedOverlayOpacity: 0
+            ),
+            onFocus: {}
+        ))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        var held = false
+        let isPointerHeld = TranscriptWidthPolicy.isPointerHeld
+        TranscriptWidthPolicy.isPointerHeld = { held }
+        defer {
+            TranscriptWidthPolicy.isPointerHeld = isPointerHeld
+            window.close()
+        }
+        func settle() {
+            for _ in 0..<5 {
+                host.layoutSubtreeIfNeeded()
+                RunLoop.main.run(until: Date().addingTimeInterval(TranscriptWidthPolicy.quietInterval))
+            }
+            host.layoutSubtreeIfNeeded()
+        }
+
+        settle()
+        let initial = panel.session.debugTranscriptWidth
+        XCTAssertGreaterThan(initial, 0)
+
+        held = true
+        for width in stride(from: 790, through: 600, by: -10) {
+            window.setContentSize(NSSize(width: CGFloat(width), height: 600))
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date())
+        }
+        settle()
+        XCTAssertEqual(panel.session.debugTranscriptWidth, initial, accuracy: 0.5,
+                       "a stall with the button down is not the drag ending")
+
+        held = false
+        settle()
+        XCTAssertEqual(panel.session.debugTranscriptWidth, initial - 200, accuracy: 0.5,
+                       "releasing the pointer applies the width the drag ended on")
+    }
+
     func testTranscriptWidthAppliesOnceAQuietIntervalPassesAndHoldsWhileHidden() {
         let quiet = TranscriptWidthPolicy.quietInterval
         func decide(_ applied: CGFloat?, _ offered: CGFloat, visible: Bool = true,
-                    since: TimeInterval) -> TranscriptWidthPolicy.Decision {
+                    since: TimeInterval, pointerHeld: Bool = false) -> TranscriptWidthPolicy.Decision {
             TranscriptWidthPolicy.decide(
-                applied: applied, offered: offered, visible: visible, sinceLastChange: since
+                applied: applied, offered: offered, visible: visible, sinceLastChange: since,
+                pointerHeld: pointerHeld
             )
         }
 
@@ -3453,6 +3603,10 @@ final class AgentSessionTests: XCTestCase {
                        "a single change after a pause is not delayed")
         XCTAssertEqual(decide(600, 590, since: quiet / 2), .applyWhenQuiet,
                        "a change inside a drag waits for the drag to pause")
+        XCTAssertEqual(decide(600, 590, since: quiet * 4, pointerHeld: true), .applyWhenQuiet,
+                       "a frame held up by the last re-wrap is not the drag pausing")
+        XCTAssertEqual(decide(nil, 600, since: 0, pointerHeld: true), .apply,
+                       "a pane built mid-drag still needs a first width")
         XCTAssertEqual(decide(600, 590, visible: false, since: 10), .hold,
                        "a hidden pane is not re-wrapped until it is shown")
         XCTAssertEqual(decide(600, 600, since: 0), .hold)

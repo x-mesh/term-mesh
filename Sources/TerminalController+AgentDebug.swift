@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 #if DEBUG
 extension TerminalController {
@@ -28,11 +29,71 @@ extension TerminalController {
                         "viewport_height": metrics.viewportHeight,
                         "following": metrics.following,
                         "follow_drops": metrics.followDrops,
+                        "transcript_width": metrics.transcriptWidth,
+                        "transcript_width_applies": metrics.transcriptWidthApplies,
                     ])
                 }
             }
         }
         return .ok(["agents": agents, "count": agents.count])
+    }
+
+    /// A window-edge drag without a pointer: the width moves a step at a
+    /// time with main free in between, and the pointer reads as held so the
+    /// transcript width policy behaves as it does under a real drag.
+    func v2DebugWindowDragResize(params: [String: Any]) -> V2CallResult {
+        let delta = (params["delta"] as? NSNumber)?.doubleValue ?? -300
+        let steps = max(2, (params["steps"] as? NSNumber)?.intValue ?? 40)
+        let intervalMs = (params["interval_ms"] as? NSNumber)?.doubleValue ?? 16
+        var window: NSWindow?
+        var originalFrame = NSRect.zero
+        var isPointerHeld: (() -> Bool)?
+        _ = v2MainExec(timeout: 5) {
+            let contexts = Array(AppDelegate.shared?.mainWindowContexts.values ?? [:].values)
+            let withAgents = contexts.first { context in
+                context.tabManager.tabs.contains { workspace in
+                    workspace.panels.values.contains { $0 is AgentPanel }
+                }
+            }
+            window = (withAgents ?? contexts.first)?.window
+            originalFrame = window?.frame ?? .zero
+            isPointerHeld = TranscriptWidthPolicy.isPointerHeld
+            TranscriptWidthPolicy.isPointerHeld = { true }
+        }
+        guard let window else {
+            return .err(code: "not_found", message: "No main window", data: nil)
+        }
+        Thread.sleep(forTimeInterval: 0.6)
+        var samples: [Double] = []
+        let start = DispatchTime.now().uptimeNanoseconds
+        for step in 1...steps {
+            _ = v2MainExec(timeout: 10) {
+                var frame = originalFrame
+                frame.size.width = originalFrame.width + delta * Double(step) / Double(steps)
+                let stepStart = DispatchTime.now().uptimeNanoseconds
+                window.setFrame(frame, display: true)
+                window.layoutIfNeeded()
+                window.displayIfNeeded()
+                samples.append(Double(DispatchTime.now().uptimeNanoseconds - stepStart) / 1_000_000)
+            }
+            Thread.sleep(forTimeInterval: intervalMs / 1000)
+        }
+        _ = v2MainExec(timeout: 10) {}
+        let totalMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        _ = v2MainExec(timeout: 10) {
+            if let isPointerHeld { TranscriptWidthPolicy.isPointerHeld = isPointerHeld }
+            window.setFrame(originalFrame, display: true)
+        }
+        let sorted = samples.sorted()
+        return .ok([
+            "steps": steps,
+            "total_ms": totalMs,
+            "overrun_ms": totalMs - Double(steps) * intervalMs,
+            "median_ms": sorted[sorted.count / 2],
+            "p90_ms": sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.9))],
+            "max_ms": sorted.last ?? 0,
+            "sum_ms": samples.reduce(0, +),
+        ])
     }
 
     func v2DebugTerminalRendererStates() -> V2CallResult {

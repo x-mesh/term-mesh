@@ -1412,6 +1412,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugAgentTranscript(params: params))
         case "debug.agent.render_stats":
             return v2Result(id: id, self.v2DebugAgentRenderStats(params: params))
+        case "debug.window.drag_resize":
+            return v2Result(id: id, self.v2DebugWindowDragResize(params: params))
         case "debug.terminal.renderer_states":
             return v2Result(id: id, self.v2DebugTerminalRendererStates())
         case "debug.command_palette.rename_tab.open":
@@ -1774,6 +1776,7 @@ class TerminalController {
             "debug.command_palette.toggle",
             "debug.agent.transcript",
             "debug.agent.render_stats",
+            "debug.window.drag_resize",
             "debug.terminal.renderer_states",
             "debug.command_palette.rename_tab.open",
             "debug.command_palette.visible",

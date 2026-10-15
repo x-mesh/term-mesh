@@ -352,3 +352,22 @@ so they are tested against synthetic sample sets carrying the numbers above.
 ```bash
 ./scripts/test-perf-sample.sh
 ```
+
+### Window resize drags (`debug.window.drag_resize`)
+
+A hand drag cannot be repeated, and a sample of one says nothing about the
+next. A tagged Debug app can drag its own window edge:
+
+```bash
+S=/tmp/term-mesh-debug-<tag>.sock
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"debug.window.drag_resize","params":{"delta":-300,"steps":40}}' | nc -U -w 180 "$S"
+```
+
+It moves the width of the window holding native agent panes one step per
+`interval_ms` (default 16) with main free in between, reports per-step
+`median_ms`/`p90_ms`/`max_ms` and the drag's `total_ms`, then restores the
+frame. The pointer reads as held throughout, so the transcript width policy
+behaves as it does under a real drag. Pair it with `debug.agent.render_stats`:
+`transcript_width_applies` must rise by one per pane per drag, after the drag
+ends — never once per step. Numbers are Debug; compare conditions A/B/A2 in the
+same app, not against a Release build.
