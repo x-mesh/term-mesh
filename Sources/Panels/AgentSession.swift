@@ -3525,6 +3525,13 @@ final class AgentSession {
         debugFollowing = following
     }
 
+    /// The width the view last laid the transcript out at. A resize defers
+    /// that width (`TranscriptWidthPolicy`), so the deferred value landing is
+    /// observable only here.
+    @ObservationIgnored private(set) var debugTranscriptWidth: Double = 0
+
+    func noteTranscriptWidthForDebug(_ width: Double) { debugTranscriptWidth = width }
+
     func renderMetricsForDebug() -> RenderMetrics {
         RenderMetrics(batches: debugAppliedBatches, lines: debugAppliedLines,
                       bytes: debugAppliedBytes, revisions: revision,
