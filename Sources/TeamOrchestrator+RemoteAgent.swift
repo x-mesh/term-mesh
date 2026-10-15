@@ -11732,7 +11732,11 @@ extension TeamOrchestrator {
         // without a failure that calls for it is not a change to make quietly.
         needsSocketAccess: Bool = false,
         turnHookFile: String? = nil,
-        participationControlFile: String? = nil
+        participationControlFile: String? = nil,
+        // A worker's by default, so a new worker call site cannot forget it.
+        // The leader passes nil: it is the user's session and keeps its
+        // plugins. See `AgentSession.workerSettingsJSON`.
+        workerSettingsJSON: String? = AgentSession.workerSettingsJSON
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         // `mkdir -p` before `cd`, because a project on another machine has
@@ -11753,7 +11757,7 @@ extension TeamOrchestrator {
         let quotedModel = shellQuoted(model)
         switch cli {
         case "claude":
-            let settings = turnHookFile.flatMap(Self.remoteLeaderTurnHookSettingsJSON)
+            let settings = (turnHookFile.flatMap(Self.remoteLeaderTurnHookSettingsJSON) ?? workerSettingsJSON)
                 .map { " --settings \(shellQuoted($0))" } ?? ""
             // The hook must outlive this viewer (the remote Claude process can
             // keep running across an app restart), but it must not survive the
@@ -11894,7 +11898,8 @@ extension TeamOrchestrator {
             hostBinDirs: hostBinDirs,
             needsSocketAccess: true,
             turnHookFile: turnHookFile,
-            participationControlFile: participationControlFile
+            participationControlFile: participationControlFile,
+            workerSettingsJSON: nil
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup

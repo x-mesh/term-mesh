@@ -2392,7 +2392,7 @@ final class TeamOrchestrator: ObservableObject {
                 extraArgs: extraArgs
             )
         default:
-            agentCommand = buildClaudeCommand(
+            agentCommand = Self.buildClaudeCommand(
                 claudePath: cliPath,
                 agentId: agentId,
                 agentName: agentName,
@@ -3354,7 +3354,7 @@ final class TeamOrchestrator: ObservableObject {
                     let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
                     let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
                     var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
-                    if let settings = ClaudeInboxDelivery.leaderSettingsJSON(
+                    if let settings = ClaudeInboxDelivery.settingsJSON(
                         base: leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? Self.leaderTurnHookSettingsJSON : nil,
                         registerInbox: ClaudeInboxDelivery.isLeaderEnabled()
                     ) {
@@ -10368,7 +10368,7 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
-    private func buildClaudeCommand(
+    static func buildClaudeCommand(
         claudePath: String,
         agentId: String,
         agentName: String,
@@ -10379,7 +10379,8 @@ final class TeamOrchestrator: ObservableObject {
         model: String,
         effort: String = "",
         instructions: String = "",
-        extraArgs: [String] = []
+        extraArgs: [String] = [],
+        inboxEnabled: Bool = ClaudeInboxDelivery.isEnabled()
     ) -> String {
         var parts = [
             claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath,
@@ -10398,7 +10399,6 @@ final class TeamOrchestrator: ObservableObject {
 
         parts += Self.effortLaunchArgs(cli: "claude", effort: effort)
 
-        let inboxEnabled = ClaudeInboxDelivery.isEnabled()
         let systemPrompt = inboxEnabled
             ? ClaudeInboxDelivery.workerSystemPrompt(roleInstructions: instructions)
             : instructions
@@ -10408,11 +10408,13 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--append-system-prompt '\(escaped)'")
         }
 
-        if inboxEnabled {
-            parts.append("--settings '\(ClaudeInboxDelivery.registerHookSettingsJSON)'")
+        if let settings = ClaudeInboxDelivery.settingsJSON(
+            base: AgentSession.workerSettingsJSON, registerInbox: inboxEnabled
+        ) {
+            parts.append("--settings '\(settings)'")
         }
 
-        parts += extraArgs.map { shellQuote($0) }
+        parts += extraArgs.map { shellQuoted($0) }
 
         return parts.joined(separator: " ")
     }

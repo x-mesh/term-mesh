@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 #if DEBUG
 extension TerminalController {
@@ -28,11 +29,95 @@ extension TerminalController {
                         "viewport_height": metrics.viewportHeight,
                         "following": metrics.following,
                         "follow_drops": metrics.followDrops,
+                        "transcript_width": metrics.transcriptWidth,
+                        "transcript_width_applies": metrics.transcriptWidthApplies,
                     ])
                 }
             }
         }
         return .ok(["agents": agents, "count": agents.count])
+    }
+
+    /// A window-edge drag without a pointer: the width moves a step at a
+    /// time with main free in between, and the pointer reads as held so the
+    /// transcript width policy behaves as it does under a real drag.
+    // Main thread only. A second drag overlapping the first would save the
+    // first one's override as the value to restore and leave it installed.
+    nonisolated(unsafe) private static var dragResizeRunning = false
+
+    func v2DebugWindowDragResize(params: [String: Any]) -> V2CallResult {
+        let delta = (params["delta"] as? NSNumber)?.doubleValue ?? -300
+        let steps = max(2, (params["steps"] as? NSNumber)?.intValue ?? 40)
+        let intervalMs = (params["interval_ms"] as? NSNumber)?.doubleValue ?? 16
+        var window: NSWindow?
+        var originalFrame = NSRect.zero
+        var isPointerHeld: (() -> Bool)?
+        var busy = false
+        _ = v2MainExec(timeout: 5) {
+            guard !Self.dragResizeRunning else {
+                busy = true
+                return
+            }
+            let contexts = Array(AppDelegate.shared?.mainWindowContexts.values ?? [:].values)
+            let withAgents = contexts.first { context in
+                context.tabManager.tabs.contains { workspace in
+                    workspace.panels.values.contains { $0 is AgentPanel }
+                }
+            }
+            guard let found = (withAgents ?? contexts.first)?.window else { return }
+            Self.dragResizeRunning = true
+            window = found
+            originalFrame = found.frame
+            isPointerHeld = TranscriptWidthPolicy.isPointerHeld
+            TranscriptWidthPolicy.isPointerHeld = { true }
+        }
+        if busy {
+            return .err(code: "busy", message: "Another drag_resize is running", data: nil)
+        }
+        guard let window, let isPointerHeld else {
+            return .err(code: "not_found", message: "No main window", data: nil)
+        }
+        // Left held, every pane would defer its width for the rest of the
+        // process, so a restore a busy main thread cancels is queued instead.
+        defer {
+            // Only ever run on main, where every other use of `window` is.
+            nonisolated(unsafe) let restore = {
+                TranscriptWidthPolicy.isPointerHeld = isPointerHeld
+                window.setFrame(originalFrame, display: true)
+                Self.dragResizeRunning = false
+            }
+            if !v2MainExec(timeout: 10, restore) { DispatchQueue.main.async { restore() } }
+        }
+        Thread.sleep(forTimeInterval: 0.6)
+        var samples: [Double] = []
+        let start = DispatchTime.now().uptimeNanoseconds
+        for step in 1...steps {
+            _ = v2MainExec(timeout: 10) {
+                var frame = originalFrame
+                frame.size.width = originalFrame.width + delta * Double(step) / Double(steps)
+                let stepStart = DispatchTime.now().uptimeNanoseconds
+                window.setFrame(frame, display: true)
+                window.layoutIfNeeded()
+                window.displayIfNeeded()
+                samples.append(Double(DispatchTime.now().uptimeNanoseconds - stepStart) / 1_000_000)
+            }
+            Thread.sleep(forTimeInterval: intervalMs / 1000)
+        }
+        _ = v2MainExec(timeout: 10) {}
+        let totalMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        guard !samples.isEmpty else {
+            return .err(code: "timeout", message: "Main thread ran none of the resize steps", data: nil)
+        }
+        let sorted = samples.sorted()
+        return .ok([
+            "steps": steps,
+            "total_ms": totalMs,
+            "overrun_ms": totalMs - Double(steps) * intervalMs,
+            "median_ms": sorted[sorted.count / 2],
+            "p90_ms": sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.9))],
+            "max_ms": sorted.last ?? 0,
+            "sum_ms": samples.reduce(0, +),
+        ])
     }
 
     func v2DebugTerminalRendererStates() -> V2CallResult {

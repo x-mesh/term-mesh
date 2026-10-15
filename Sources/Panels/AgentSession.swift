@@ -1789,6 +1789,14 @@ final class AgentSession {
         var interruptible = false
     }
 
+    /// Every worker session term-mesh launches turns these plugins off.
+    /// mgrep's SessionStart hook starts a detached `mgrep watch` over the
+    /// working tree for each session, so a six-agent team ran six over one
+    /// repository and each grew past 60 GB. The leader is the user's own
+    /// session and keeps its plugins. `--settings` outranks the user's
+    /// settings for `enabledPlugins`, so this holds on every host.
+    nonisolated static let workerSettingsJSON = "{\"enabledPlugins\":{\"mgrep@Mixedbread-Grep\":false}}"
+
     /// The arguments that make claude take turns on a pipe.
     ///
     /// `--print` is the non-interactive mode and `--verbose` is required
@@ -1822,6 +1830,7 @@ final class AgentSession {
         if !model.isEmpty { args += ["--model", model] }
         if !effort.isEmpty { args += ["--effort", effort] }
         if !instructions.isEmpty { args += ["--append-system-prompt", instructions] }
+        args += ["--settings", workerSettingsJSON]
         args += extraArgs
         return Launch(executable: claudePath, arguments: args,
                       workingDirectory: workingDirectory, environment: environment,
@@ -3466,6 +3475,8 @@ final class AgentSession {
         let viewportHeight: Double
         let following: Bool
         let followDrops: Int
+        let transcriptWidth: Double
+        let transcriptWidthApplies: Int
     }
 
     func noteAutoScrollForDebug() { debugAutoScrolls += 1 }
@@ -3529,8 +3540,12 @@ final class AgentSession {
     /// that width (`TranscriptWidthPolicy`), so the deferred value landing is
     /// observable only here.
     @ObservationIgnored private(set) var debugTranscriptWidth: Double = 0
+    @ObservationIgnored private(set) var debugTranscriptWidthApplies = 0
 
-    func noteTranscriptWidthForDebug(_ width: Double) { debugTranscriptWidth = width }
+    func noteTranscriptWidthForDebug(_ width: Double) {
+        debugTranscriptWidth = width
+        debugTranscriptWidthApplies += 1
+    }
 
     func renderMetricsForDebug() -> RenderMetrics {
         RenderMetrics(batches: debugAppliedBatches, lines: debugAppliedLines,
@@ -3539,7 +3554,8 @@ final class AgentSession {
                       renderedRows: rows.count, applyTotalMs: debugApplyTotalMs,
                       applyMaxMs: debugApplyMaxMs, bottomY: debugBottomY,
                       viewportHeight: debugViewportHeight, following: debugFollowing,
-                      followDrops: debugFollowDrops)
+                      followDrops: debugFollowDrops, transcriptWidth: debugTranscriptWidth,
+                      transcriptWidthApplies: debugTranscriptWidthApplies)
     }
 
     /// Feed one line of the stream, as the reader would.

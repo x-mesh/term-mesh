@@ -367,153 +367,166 @@ struct AgentPanelView: View {
 
     // MARK: - Transcript
 
+    /// Measured from outside the scroll view rather than read through a
+    /// GeometryReader around it: reading the proxy in the reader's content
+    /// rebuilt the scroll view and every row on each frame of a resize, even
+    /// with the transcript's width held. The size measured here does not
+    /// depend on the transcript's own width either — measuring anything that
+    /// contains the held transcript reports the held width back and the
+    /// update never arrives.
     private var transcript: some View {
-        GeometryReader { viewport in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    // This deliberately is not lazy. Instruments caught the
-                    // main thread permanently inside
-                    // `LazyStack.place(subviews:)` while streamed rows changed
-                    // height. `AgentSession` bounds this mounted window, so a
-                    // regular stack is finite and avoids that placement path.
-                    VStack(alignment: .leading, spacing: 0) {
-                        banner
-                        if session.omittedEntryCount > 0 {
-                            Text("Showing latest \(session.rows.count) events · "
-                                 + "\(session.omittedEntryCount) earlier events hidden")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                                .padding(.top, 10)
-                                .accessibilityLabel(
-                                    "\(session.omittedEntryCount) earlier transcript events hidden"
-                                )
-                        }
-                        if session.rows.isEmpty { emptyState }
-                        ForEach(AgentSession.transcriptItems(for: session.rows)) { item in
-                            switch item {
-                            case .row(let row):
-                                TranscriptRow(
-                                    item: row,
-                                    streaming: session.streamingIds.contains(row.id),
-                                    open: openTools.contains(row.id),
-                                    root: panel.workingDirectory,
-                                    setOpen: { setToolOpen(row.id, $0) }
-                                )
-                                .equatable()
-                                .id(row.id)
-                            case .toolGroup(let group):
-                                ToolGroupRow(
-                                    group: group,
-                                    open: toolGroupIsOpen(group),
-                                    root: panel.workingDirectory,
-                                    openTools: openTools,
-                                    setOpen: { setToolGroupOpen(group, $0) },
-                                    setToolOpen: setToolOpen
-                                )
-                                .id(group.id)
-                            }
-                        }
-                        // A normal VStack mounts this marker even while it is
-                        // off screen, so visibility is measured in the scroll
-                        // coordinate space rather than inferred from onAppear.
-                        GeometryReader { marker in
-                            Color.clear.preference(
-                                key: TranscriptBottomPreferenceKey.self,
-                                value: marker.frame(in: .named(Self.scrollSpace)).maxY
+        transcriptScroll
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+                transcriptWidthTracker.viewportSize = size
+                reconcileTranscriptWidth(TranscriptWidthPolicy.contentWidth(viewport: size.width))
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: NSScroller.preferredScrollerStyleDidChangeNotification
+            )) { _ in
+                reconcileTranscriptWidth(TranscriptWidthPolicy.contentWidth(
+                    viewport: transcriptWidthTracker.viewportSize.width
+                ))
+            }
+    }
+
+    private var transcriptScroll: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                // This deliberately is not lazy. Instruments caught the
+                // main thread permanently inside
+                // `LazyStack.place(subviews:)` while streamed rows changed
+                // height. `AgentSession` bounds this mounted window, so a
+                // regular stack is finite and avoids that placement path.
+                VStack(alignment: .leading, spacing: 0) {
+                    banner
+                    if session.omittedEntryCount > 0 {
+                        Text("Showing latest \(session.rows.count) events · "
+                             + "\(session.omittedEntryCount) earlier events hidden")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                            .padding(.top, 10)
+                            .accessibilityLabel(
+                                "\(session.omittedEntryCount) earlier transcript events hidden"
                             )
-                        }
-                        .frame(height: 1)
-                        .id(Self.bottom)
                     }
-                    .padding(12)
-                    .frame(width: transcriptWidth, alignment: .leading)
-                    // Native panes are SwiftUI transcript views rather than
-                    // Ghostty surfaces, so terminal selection does not apply.
-                    // Enable the standard macOS text-selection environment at
-                    // the transcript boundary: dragging selects across all row
-                    // kinds and Cmd+C copies through the system pasteboard,
-                    // while the composer remains an independent text field.
-                    // Inside the held width, so the selection layout's
-                    // container keeps its size while the pane is resized.
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .coordinateSpace(name: Self.scrollSpace)
-                // From `viewport`, which does not depend on the transcript's own
-                // width: measuring anything that contains the held transcript
-                // reports the held width back and the update never arrives.
-                .onChange(of: viewport.size.width, initial: true) { _, width in
-                    reconcileTranscriptWidth(TranscriptWidthPolicy.contentWidth(viewport: width))
-                }
-                .onReceive(NotificationCenter.default.publisher(
-                    for: NSScroller.preferredScrollerStyleDidChangeNotification
-                )) { _ in
-                    reconcileTranscriptWidth(TranscriptWidthPolicy.contentWidth(viewport: viewport.size.width))
-                }
-                .onPreferenceChange(TranscriptBottomPreferenceKey.self) { bottomY in
-                    // Preferences are delivered during a view update. Mutating
-                    // @State in that pass asks NSHostingView to lay itself out
-                    // reentrantly, so apply the observation on the next main
-                    // run-loop turn.
-                    let viewportHeight = viewport.size.height
-                    // Stamped where the geometry was read, not where it is
-                    // judged. `bottomY` is the bottom marker as of this
-                    // preference; the hop below runs whenever main is free,
-                    // and under five streaming panes that was measured at over
-                    // 0.4s late. Reading the clock down there judged an old
-                    // coordinate against a fresh deadline: the marker had been
-                    // pushed off-screen by the transcript's own growth, the
-                    // grace window had already elapsed, and following was
-                    // dropped for a scroll the user never made — 29-34 times
-                    // per pane, with a quarter of all updates left unscrolled.
-                    // Comparing at measurement time makes a delayed hop
-                    // harmless: `grewAt` has moved on by then, the interval
-                    // goes negative, and the branch simply does not fire.
-                    let measuredAt = Date()
-                    DispatchQueue.main.async {
-                        let isAtBottom = bottomY <= viewportHeight + 2
-                        if isAtBottom {
-                            if !following { following = true }
-                        } else if following, measuredAt.timeIntervalSince(grewAt) > 0.4 {
-                            following = false
+                    if session.rows.isEmpty { emptyState }
+                    ForEach(AgentSession.transcriptItems(for: session.rows)) { item in
+                        switch item {
+                        case .row(let row):
+                            TranscriptRow(
+                                item: row,
+                                streaming: session.streamingIds.contains(row.id),
+                                open: openTools.contains(row.id),
+                                root: panel.workingDirectory,
+                                setOpen: { setToolOpen(row.id, $0) }
+                            )
+                            .equatable()
+                            .id(row.id)
+                        case .toolGroup(let group):
+                            ToolGroupRow(
+                                group: group,
+                                open: toolGroupIsOpen(group),
+                                root: panel.workingDirectory,
+                                openTools: openTools,
+                                setOpen: { setToolGroupOpen(group, $0) },
+                                setToolOpen: setToolOpen
+                            )
+                            .id(group.id)
                         }
-                        #if DEBUG
-                        session.noteFollowGeometryForDebug(
-                            bottomY: bottomY,
-                            viewportHeight: viewportHeight,
-                            following: following
+                    }
+                    // A normal VStack mounts this marker even while it is
+                    // off screen, so visibility is measured in the scroll
+                    // coordinate space rather than inferred from onAppear.
+                    GeometryReader { marker in
+                        Color.clear.preference(
+                            key: TranscriptBottomPreferenceKey.self,
+                            value: marker.frame(in: .named(Self.scrollSpace)).maxY
                         )
-                        #endif
                     }
+                    .frame(height: 1)
+                    .id(Self.bottom)
                 }
-                // Every mutation, not every append: a streamed answer grows a
-                // row that already exists, and keying on the count meant the
-                // text ran off the bottom while the view sat still.
-                .onChange(of: session.revision) { _, _ in
-                    grewAt = Date()
-                    guard following else { return }
-                    // Unanimated on purpose. A 250-delta answer animating each
-                    // step is not a smooth scroll, it is a stutter.
+                .padding(12)
+                .frame(width: transcriptWidth, alignment: .leading)
+                // Native panes are SwiftUI transcript views rather than
+                // Ghostty surfaces, so terminal selection does not apply.
+                // Enable the standard macOS text-selection environment at
+                // the transcript boundary: dragging selects across all row
+                // kinds and Cmd+C copies through the system pasteboard,
+                // while the composer remains an independent text field.
+                // Inside the held width, so the selection layout's
+                // container keeps its size while the pane is resized.
+                .textSelection(.enabled)
+                // `minWidth: 0` so a held width wider than the viewport
+                // overflows here instead of widening the scroll view, whose
+                // size is what `transcript` watches.
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            }
+            .coordinateSpace(name: Self.scrollSpace)
+            .onPreferenceChange(TranscriptBottomPreferenceKey.self) { bottomY in
+                // Preferences are delivered during a view update. Mutating
+                // @State in that pass asks NSHostingView to lay itself out
+                // reentrantly, so apply the observation on the next main
+                // run-loop turn.
+                let viewportHeight = transcriptWidthTracker.viewportSize.height
+                guard viewportHeight > 0 else { return }
+                // Stamped where the geometry was read, not where it is
+                // judged. `bottomY` is the bottom marker as of this
+                // preference; the hop below runs whenever main is free,
+                // and under five streaming panes that was measured at over
+                // 0.4s late. Reading the clock down there judged an old
+                // coordinate against a fresh deadline: the marker had been
+                // pushed off-screen by the transcript's own growth, the
+                // grace window had already elapsed, and following was
+                // dropped for a scroll the user never made — 29-34 times
+                // per pane, with a quarter of all updates left unscrolled.
+                // Comparing at measurement time makes a delayed hop
+                // harmless: `grewAt` has moved on by then, the interval
+                // goes negative, and the branch simply does not fire.
+                let measuredAt = Date()
+                DispatchQueue.main.async {
+                    let isAtBottom = bottomY <= viewportHeight + 2
+                    if isAtBottom {
+                        if !following { following = true }
+                    } else if following, measuredAt.timeIntervalSince(grewAt) > 0.4 {
+                        following = false
+                    }
                     #if DEBUG
-                    session.noteAutoScrollForDebug()
+                    session.noteFollowGeometryForDebug(
+                        bottomY: bottomY,
+                        viewportHeight: viewportHeight,
+                        following: following
+                    )
                     #endif
-                    proxy.scrollTo(Self.bottom, anchor: .bottom)
                 }
-                .overlay(alignment: .bottomTrailing) {
-                    if !following {
-                        Button {
-                            following = true
-                            withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
-                        } label: {
-                            Label("Latest", systemImage: "arrow.down")
-                                .font(.system(size: 10, weight: .medium))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(.regularMaterial, in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .padding(10)
+            }
+            // Every mutation, not every append: a streamed answer grows a
+            // row that already exists, and keying on the count meant the
+            // text ran off the bottom while the view sat still.
+            .onChange(of: session.revision) { _, _ in
+                grewAt = Date()
+                guard following else { return }
+                // Unanimated on purpose. A 250-delta answer animating each
+                // step is not a smooth scroll, it is a stutter.
+                #if DEBUG
+                session.noteAutoScrollForDebug()
+                #endif
+                proxy.scrollTo(Self.bottom, anchor: .bottom)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !following {
+                    Button {
+                        following = true
+                        withAnimation { proxy.scrollTo(Self.bottom, anchor: .bottom) }
+                    } label: {
+                        Label("Latest", systemImage: "arrow.down")
+                            .font(.system(size: 10, weight: .medium))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.regularMaterial, in: Capsule())
                     }
+                    .buttonStyle(.plain)
+                    .padding(10)
                 }
             }
         }
@@ -527,22 +540,33 @@ struct AgentPanelView: View {
             applied: transcriptWidth,
             offered: offered,
             visible: isVisibleInUI,
-            sinceLastChange: now.timeIntervalSince(tracker.lastChange)
+            sinceLastChange: now.timeIntervalSince(tracker.lastChange),
+            pointerHeld: TranscriptWidthPolicy.isPointerHeld()
         )
         guard decision != .hold else { return }
         tracker.lastChange = now
         tracker.generation += 1
         let generation = tracker.generation
-        // Geometry changes arrive inside a layout pass, and setting @State
-        // there makes NSHostingView lay itself out reentrantly.
-        let delay = decision == .apply ? 0 : TranscriptWidthPolicy.quietInterval
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        func settle() {
             guard tracker.generation == generation else { return }
+            // A frame held up past the interval — by this pane's last re-wrap
+            // or another pane's — fires the timer mid-drag just as a pause
+            // would. Re-wrapping there makes the next frame slow too.
+            if decision == .applyWhenQuiet, TranscriptWidthPolicy.isPointerHeld() {
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + TranscriptWidthPolicy.quietInterval, execute: settle
+                )
+                return
+            }
             transcriptWidth = tracker.offered
             #if DEBUG
             session.noteTranscriptWidthForDebug(tracker.offered)
             #endif
         }
+        // Geometry changes arrive inside a layout pass, and setting @State
+        // there makes NSHostingView lay itself out reentrantly.
+        let delay = decision == .apply ? 0 : TranscriptWidthPolicy.quietInterval
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: settle)
     }
 
     private func setToolOpen(_ id: UUID, _ open: Bool) {
@@ -1024,8 +1048,17 @@ private struct TranscriptBottomPreferenceKey: PreferenceKey {
 /// applies at once, so a single change such as a sidebar toggle is not
 /// delayed; changes inside the interval wait for it to pass and then apply
 /// the latest width once. A hidden pane keeps its width until it is shown.
+///
+/// The clock alone cannot tell a pause from a slow frame. Once one re-wrap
+/// outlasts the quiet interval, the next frame of the drag arrives after it
+/// and reads as quiet, so every frame re-wrapped again. While the pointer is
+/// held a change waits for the pointer to be released.
 enum TranscriptWidthPolicy {
     static let quietInterval: TimeInterval = 0.15
+
+    /// A window edge and a split divider are both dragged with a button held.
+    /// Replaceable because a benchmark has no pointer to hold.
+    static var isPointerHeld: () -> Bool = { NSEvent.pressedMouseButtons != 0 }
 
     enum Decision: Equatable {
         case apply
@@ -1047,11 +1080,13 @@ enum TranscriptWidthPolicy {
         applied: CGFloat?,
         offered: CGFloat,
         visible: Bool,
-        sinceLastChange: TimeInterval
+        sinceLastChange: TimeInterval,
+        pointerHeld: Bool
     ) -> Decision {
         guard offered > 0, offered != applied else { return .hold }
         guard applied != nil else { return .apply }
         guard visible else { return .hold }
+        guard !pointerHeld else { return .applyWhenQuiet }
         return sinceLastChange >= quietInterval ? .apply : .applyWhenQuiet
     }
 }
@@ -1060,6 +1095,7 @@ enum TranscriptWidthPolicy {
 /// must not invalidate the view the way `transcriptWidth` deliberately does.
 final class TranscriptWidthTracker {
     var offered: CGFloat = 0
+    var viewportSize: CGSize = .zero
     var lastChange = Date.distantPast
     var generation = 0
 }
