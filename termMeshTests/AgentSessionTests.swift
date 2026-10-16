@@ -3340,6 +3340,77 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(lost.first?.1, .sessionEnded(replayLossReason))
     }
 
+    /// History the stream already took in when the deadline fires is still
+    /// history: it renders, but its DONE does not reach onTurnEnd.
+    func testAReplayedResultAppliedAfterTheDeadlineDoesNotReachOnTurnEnd() async throws {
+        var lost: [String] = []
+        var ended: [String] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.onTurnEnd = { text, _, _ in ended.append(text) }
+        s.startRemote { _ in }
+        let history = Data((resultSaying(doneReport("old")) + "\n").utf8)
+        expectReplay(s, bytes: UInt64(history.count) + 512, .init(taskId: "cdcd0000", turnWasInFlight: false))
+
+        s.consume(history)
+        try XCTUnwrap(s.replayDeadlineForTesting).perform()
+        s.consume(Data((resultSaying("live") + "\n").utf8))
+
+        let reached = await waitUntil { self.turnEndedCount(s) == 2 }
+        XCTAssertTrue(reached, "both results render")
+        XCTAssertEqual(ended, ["live"])
+        XCTAssertEqual(lost, ["cdcd0000"])
+    }
+
+    func testACarryArmedWhileTheDeadlineDrainsTheQueueIsNotLost() async throws {
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        expectReplay(s, bytes: 512, .init(taskId: "dbdb0000", turnWasInFlight: false))
+
+        try XCTUnwrap(s.replayDeadlineForTesting).perform()
+        expectReplay(s, bytes: 512, .init(taskId: "dbdb1111", turnWasInFlight: false))
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(lost, ["dbdb0000"])
+        XCTAssertTrue(s.isReplayingHistoryForTesting)
+    }
+
+    func testAReplayedResultDoesNotDeliverAQueuedInstruction() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.startRemote { sink.record($0) }
+        let history = Data((assistantSaid("old") + "\n" + resultSaying("old") + "\n").utf8)
+        expectReplay(s, bytes: UInt64(history.count) + 512, .init(taskId: "cece0000", turnWasInFlight: false))
+        s.queueForTesting("TASK_ID: cece1111\nnext")
+
+        s.consume(history)
+        let replayed = await waitUntil { self.turnEndedCount(s) == 1 }
+        XCTAssertTrue(replayed)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertTrue(sink.all.isEmpty, "a replayed result ended the retired pane's turn, not this one")
+    }
+
+    func testAQueuedInstructionIsDeliveredOnceWhenTheReplayWindowCloses() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.startRemote { sink.record($0) }
+        let history = Data((assistantSaid("old") + "\n" + resultSaying("old") + "\n").utf8)
+        expectReplay(s, bytes: UInt64(history.count), .init(taskId: "cfcf0000", turnWasInFlight: false))
+        s.queueForTesting("TASK_ID: cfcf1111\nnext")
+
+        s.consume(history)
+        let delivered = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(delivered)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(sink.all.count, 1)
+        XCTAssertTrue(String(data: try XCTUnwrap(sink.all.first), encoding: .utf8)?
+            .contains("cfcf1111") == true)
+    }
+
     func testStoppingDuringReplayEndsTheWindow() throws {
         let s = AgentSession()
         s.startRemote { _ in }
@@ -3405,6 +3476,23 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(lost.count, 1)
     }
 
+    func testRedispatchingTheCarriedTaskDuringReplayKeepsItWithoutALoss() async throws {
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        let history = Data((resultSaying(doneReport("old")) + "\n").utf8)
+        expectReplay(s, bytes: UInt64(history.count), .init(taskId: "dada0000", turnWasInFlight: false))
+
+        try s.send("TASK_ID: dada0000\nbuild it again", from: .leader)
+        s.consume(history)
+        let closed = await waitUntil { !s.isReplayingHistoryForTesting }
+
+        XCTAssertTrue(closed)
+        XCTAssertTrue(lost.isEmpty)
+        XCTAssertEqual(s.pendingTaskIdForTesting, "dada0000")
+    }
+
     func testTheReplayDeadlineIsCancelledOnceTheCarryInstalls() async throws {
         var lost: [String] = []
         let s = AgentSession()
@@ -3455,6 +3543,21 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(applied)
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(s.appliedRemoteBytes, UInt64(line.count))
+    }
+
+    func testStartingRemoteAgainResetsAppliedRemoteBytes() async throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        let line = Data((assistantSaid("one") + "\n").utf8)
+        s.consume(line)
+        let applied = await waitUntil { s.appliedRemoteBytes == UInt64(line.count) }
+        XCTAssertTrue(applied)
+
+        s.stop()
+        XCTAssertEqual(s.appliedRemoteBytes, UInt64(line.count), "a rebuild reads it after the stop")
+        s.startRemote { _ in }
+
+        XCTAssertEqual(s.appliedRemoteBytes, 0)
     }
 
     /// One instruction, one turn, one result still holds when the running
