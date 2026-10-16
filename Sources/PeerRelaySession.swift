@@ -1928,6 +1928,11 @@ actor RelayLeaderSessionGate {
             healActive = true
             return true
         }
+        // A held `team.events.wait` is an active command; release it now so
+        // the heal waits for real work, not for a long-poll window.
+        if activeCommands > 0 {
+            TeamEventWakeSignal.shared.interruptAll()
+        }
         let id = UUID()
         let acquired = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in

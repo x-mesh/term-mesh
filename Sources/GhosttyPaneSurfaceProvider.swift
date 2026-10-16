@@ -1384,6 +1384,14 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         paramsJSON: String,
         teamUUID: String
     ) async -> Result<String, PeerTeamCallFailure>? {
+        // PeerServer awaits this inside its serial frame loop; a held long-poll
+        // would stall every frame on that connection, so the caller polls.
+        if method == TeamEventWakeSignal.method {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.methodNotAllowed,
+                message: "\(method) is served only on the reverse leader route"
+            ))
+        }
         let params: [String: Any]
         switch await Self.scopedLeaderParameters(
             method: method,
@@ -1421,6 +1429,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             ) {
             case .success(let resolved): params = resolved
             case .failure(let failure): return .failure(failure)
+            }
+            if method == TeamEventWakeSignal.method {
+                return await TeamEventWakeSignal.shared.respond(params: params)
             }
             let response = await TerminalController.shared.peerTeamCommandAsync(
                 method: method,

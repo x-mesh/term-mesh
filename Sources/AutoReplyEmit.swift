@@ -165,6 +165,7 @@ enum AutoReplyEmit {
         teamName: String, agentName: String, taskId: String,
         status: String, prevStatus: String
     ) {
+        TeamEventWakeSignal.shared.bump(team: teamName)
         _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
             "kind": "task_status",
             "team": teamName,

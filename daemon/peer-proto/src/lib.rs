@@ -216,6 +216,9 @@ pub mod team_leader {
     /// leader-request store, which is why it belongs here and not in the
     /// generic list: it was admitted only after its handler started demanding
     /// the same capability its siblings do.
+    ///
+    /// `team.events.wait` is a read-only wake hint bound to the grant's team
+    /// and needs no leader-request token.
     pub const SCOPED_METHODS: &[&str] = &[
         "team.add_agent",
         "team.send_key",
@@ -224,6 +227,7 @@ pub mod team_leader {
         "team.leader.request.complete",
         "team.delegation.configure",
         "team.task.metrics",
+        "team.events.wait",
     ];
 
     pub fn scoped_method_allowed(method: &str) -> bool {

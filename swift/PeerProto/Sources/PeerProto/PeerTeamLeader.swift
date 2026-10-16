@@ -33,6 +33,9 @@ public enum PeerTeamLeader {
         // Named for the task board but answers from the leader-request store,
         // and gated by the same capability, so it is scoped rather than generic.
         "team.task.metrics",
+        // A read-only wake hint bound to the grant's team; no leader request
+        // token, because it reveals only that the team's task events moved.
+        "team.events.wait",
     ]
 
     public static func isAllowed(_ method: String) -> Bool {
