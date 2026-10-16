@@ -7,53 +7,67 @@ import XCTest
 #endif
 
 final class RemoteAgentReplayBoundaryTests: XCTestCase {
+    private let cap = RemoteAgentReplayBoundary.maxReplayBytes
+
     func testEqualSeqsMeanNoHistory() {
         XCTAssertEqual(
-            RemoteAgentReplayBoundary.historyBytes(deliveredHostSeq: 4_096, newInitialSeq: 4_096),
+            RemoteAgentReplayBoundary.historyBytes(
+                appliedHostSeq: 4_096, retiredInitialSeq: 1, newInitialSeq: 4_096
+            ),
             0
         )
     }
 
-    func testTheReplayedPrefixIsTheDistanceBackToTheDeliveredSeq() {
-        XCTAssertEqual(
-            RemoteAgentReplayBoundary.historyBytes(deliveredHostSeq: 70_000, newInitialSeq: 4_464),
-            65_536
-        )
-    }
-
-    /// A fresh hub's snapshot can be longer than everything the tap emitted,
-    /// so the host reports an initial seq just below `UInt64.max`.
-    func testAWrappedInitialSeqStillMeasuresTheReplayedPrefix() {
+    func testTheReplayedPrefixIsTheDistanceBackToTheAppliedSeq() {
         XCTAssertEqual(
             RemoteAgentReplayBoundary.historyBytes(
-                deliveredHostSeq: 100,
-                newInitialSeq: UInt64.max - 99
+                appliedHostSeq: 70_000, retiredInitialSeq: 1_000, newInitialSeq: 20_000
             ),
-            200
+            50_000
         )
     }
 
-    func testAnAttachThatStartsPastTheDeliveredSeqIsAGap() {
+    func testAnAttachThatStartsPastTheAppliedSeqIsAGap() {
         XCTAssertNil(
-            RemoteAgentReplayBoundary.historyBytes(deliveredHostSeq: 1_000, newInitialSeq: 1_001)
+            RemoteAgentReplayBoundary.historyBytes(
+                appliedHostSeq: 1_000, retiredInitialSeq: 1, newInitialSeq: 1_001
+            )
         )
     }
 
-    func testAHostSeqResetIsAGap() {
+    /// A fresh tail never starts before an earlier one on the same host, so
+    /// an attach that does is a different seq space.
+    func testAnAttachThatStartsBeforeTheRetiredOneIsAHostRestart() {
         XCTAssertNil(
-            RemoteAgentReplayBoundary.historyBytes(deliveredHostSeq: 5_000_000, newInitialSeq: 0,
-                                                   maxBytes: 1_000_000)
+            RemoteAgentReplayBoundary.historyBytes(
+                appliedHostSeq: 2_000, retiredInitialSeq: 1_500, newInitialSeq: 1_499
+            )
         )
     }
 
-    func testTheRingCapacityIsTheLargestHistory() {
-        let cap = RemoteAgentReplayBoundary.maxReplayBytes
+    /// A restarted host whose surface began at the same seq as the retired
+    /// attach: only the shipped replay cap tells the two apart.
+    func testAHostSeqResetPastTheReplayCapIsAGap() {
+        XCTAssertNil(
+            RemoteAgentReplayBoundary.historyBytes(
+                appliedHostSeq: 5_000_000, retiredInitialSeq: 0, newInitialSeq: 0
+            )
+        )
+    }
+
+    /// The daemon's fresh-attach tail is the most any rebuild can replay.
+    func testTheFreshAttachTailIsTheLargestHistory() {
+        XCTAssertEqual(cap, 64 * 1024)
         XCTAssertEqual(
-            RemoteAgentReplayBoundary.historyBytes(deliveredHostSeq: cap + 10, newInitialSeq: 10),
+            RemoteAgentReplayBoundary.historyBytes(
+                appliedHostSeq: cap + 10, retiredInitialSeq: 0, newInitialSeq: 10
+            ),
             cap
         )
         XCTAssertNil(
-            RemoteAgentReplayBoundary.historyBytes(deliveredHostSeq: cap + 11, newInitialSeq: 10)
+            RemoteAgentReplayBoundary.historyBytes(
+                appliedHostSeq: cap + 11, retiredInitialSeq: 0, newInitialSeq: 10
+            )
         )
     }
 }

@@ -228,6 +228,8 @@ final class AgentStreamDecoder {
 
     private var bytes: [UInt8] = []
     private var scanOffset = 0
+    /// Stream offset of `bytes[0]`.
+    private var releasedBytes: UInt64 = 0
     private let maxLineBytes: Int
 
     init(maxLineBytes: Int) {
@@ -235,8 +237,13 @@ final class AgentStreamDecoder {
     }
 
     func consume(_ data: Data) -> [Output] {
+        consumeTracked(data).map(\.output)
+    }
+
+    /// `consume`, each output paired with the stream offset just past its line.
+    func consumeTracked(_ data: Data) -> [(output: Output, end: UInt64)] {
         bytes.append(contentsOf: data)
-        var output: [Output] = []
+        var output: [(output: Output, end: UInt64)] = []
         var lineStart = 0
         var index = scanOffset
 
@@ -249,10 +256,11 @@ final class AgentStreamDecoder {
             if end > lineStart, bytes[end - 1] == 0x0D { end -= 1 }
             if end > lineStart {
                 let lineBytes = bytes[lineStart..<end]
+                let lineEnd = releasedBytes + UInt64(index + 1)
                 if lineBytes.count > maxLineBytes {
-                    output.append(.oversized(lineBytes.count))
+                    output.append((.oversized(lineBytes.count), lineEnd))
                 } else if let line = String(bytes: lineBytes, encoding: .utf8), !line.isEmpty {
-                    output.append(.line(line))
+                    output.append((.line(line), lineEnd))
                 }
             }
             lineStart = index + 1
@@ -261,12 +269,14 @@ final class AgentStreamDecoder {
 
         if lineStart > 0 {
             bytes.removeFirst(lineStart)
+            releasedBytes += UInt64(lineStart)
             index -= lineStart
         }
         scanOffset = index
 
         if bytes.count > maxLineBytes {
-            output.append(.oversized(bytes.count))
+            releasedBytes += UInt64(bytes.count)
+            output.append((.oversized(bytes.count), releasedBytes))
             bytes.removeAll(keepingCapacity: true)
             scanOffset = 0
         }
@@ -303,6 +313,8 @@ private struct AgentParsedLine: @unchecked Sendable {
     let preparedToolIDs: Set<String>
     let sourceLineCount: Int
     let sourceBytes: Int
+    /// Remote stream offset just past this line's bytes.
+    var streamEnd: UInt64?
 
     init(_ raw: String) {
         self.raw = raw
@@ -330,13 +342,19 @@ private struct AgentParsedLine: @unchecked Sendable {
         preparedToolIDs = toolIDs
     }
 
-    private init(object: [String: Any], sourceLineCount: Int, sourceBytes: Int) {
+    private init(
+        object: [String: Any],
+        sourceLineCount: Int,
+        sourceBytes: Int,
+        streamEnd: UInt64?
+    ) {
         raw = ""
         self.object = object
         preparedChanges = [:]
         preparedToolIDs = []
         self.sourceLineCount = sourceLineCount
         self.sourceBytes = sourceBytes
+        self.streamEnd = streamEnd
     }
 
     private var deltaParts: (index: Int, field: String, text: String)? {
@@ -371,7 +389,8 @@ private struct AgentParsedLine: @unchecked Sendable {
         return AgentParsedLine(
             object: outer,
             sourceLineCount: sourceLineCount + next.sourceLineCount,
-            sourceBytes: sourceBytes + next.sourceBytes
+            sourceBytes: sourceBytes + next.sourceBytes,
+            streamEnd: next.streamEnd ?? streamEnd
         )
     }
 
@@ -1700,7 +1719,7 @@ final class AgentSession {
         /// Read and written only on `queue`.
         var closed = false
         /// Replayed bytes still to come before the stream reaches what the
-        /// retired pane never received. Read and written only on `queue`.
+        /// retired pane never applied. Read and written only on `queue`.
         var historyBytesRemaining: UInt64?
         let decoder = AgentStreamDecoder(maxLineBytes: AgentStreamDecoder.defaultMaxLineBytes)
         let batcher: AgentLineBatcher
@@ -2442,29 +2461,58 @@ final class AgentSession {
     }
 
     /// Before any byte is consumed: the first `bytes` of the stream repeat
-    /// what the retired pane already received. They render, but no turn they
-    /// end reaches `onTurnEnd`, and `carried` becomes this session's pending
-    /// task only once the stream has passed them.
-    func expectReplayHistory(bytes: UInt64, carried: CarriedTaskCorrelation?) {
+    /// what the retired pane already applied. They render, but no turn they
+    /// end settles a task or reaches `onTurnEnd`, and `carried` becomes this
+    /// session's pending task only once the stream has passed them. At
+    /// `deadline` the window closes and an uninstalled carry is lost with
+    /// `lossReason`. Returns false, taking nothing, when no remote stream is
+    /// installed to measure.
+    @discardableResult
+    func expectReplayHistory(
+        bytes: UInt64,
+        carried: CarriedTaskCorrelation,
+        lossReason: String,
+        deadline: TimeInterval
+    ) -> Bool {
+        guard let streams = remoteStreamsBox.current() else { return false }
+        abandonCarriedCorrelation(reason: uninstalledCarryLossReason)
         uninstalledCarry = carried
+        uninstalledCarryLossReason = lossReason
         guard bytes > 0 else {
             installCarriedCorrelation()
-            return
+            return true
         }
-        guard let streams = remoteStreamsBox.current() else { return }
         replayingHistory = true
         streams.queue.async { streams.historyBytesRemaining = bytes }
+        let item = DispatchWorkItem { [weak self] in
+            self?.abandonCarriedCorrelation(reason: lossReason)
+        }
+        replayDeadline = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline), execute: item)
+        return true
     }
 
-    /// Give up on a carried correlation that has not reached this session.
+    /// Close the replay window and give up on a carried correlation that has
+    /// not reached this session.
     func abandonCarriedCorrelation(reason: String) {
+        endReplayWindow()
         guard let carry = uninstalledCarry else { return }
         uninstalledCarry = nil
-        loseCarriedCorrelation(carry, reason: reason)
+        loseCarriedCorrelation(carry, .sessionEnded(reason))
+    }
+
+    private func endReplayWindow() {
+        replayDeadline?.cancel()
+        replayDeadline = nil
+        guard replayingHistory else { return }
+        replayingHistory = false
+        if let streams = remoteStreamsBox.current() {
+            streams.queue.async { streams.historyBytesRemaining = nil }
+        }
     }
 
     private func installCarriedCorrelation() {
-        replayingHistory = false
+        endReplayWindow()
         guard let carry = uninstalledCarry else { return }
         uninstalledCarry = nil
         taskCorrelationGeneration &+= 1
@@ -2481,11 +2529,11 @@ final class AgentSession {
         }
     }
 
-    private func loseCarriedCorrelation(_ carry: CarriedTaskCorrelation, reason: String) {
+    private func loseCarriedCorrelation(_ carry: CarriedTaskCorrelation, _ loss: TaskCorrelationLoss) {
         #if DEBUG
-        dlog("agent.task.correlation.lost task=\(carry.taskId) reason=\(reason)")
+        dlog("agent.task.correlation.lost task=\(carry.taskId) reason=\(loss.reason)")
         #endif
-        onTaskCorrelationLost?(carry.taskId, .sessionEnded(reason))
+        onTaskCorrelationLost?(carry.taskId, loss)
     }
 
     private func stop(lossReason: String) {
@@ -2734,11 +2782,11 @@ final class AgentSession {
             loseTaskCorrelation(task, .sessionEnded(
                 stoppedLossReason ?? "the agent exited before an explicit STATUS"))
         }
-        replayingHistory = false
+        endReplayWindow()
         if let carry = uninstalledCarry {
             uninstalledCarry = nil
-            loseCarriedCorrelation(carry, reason:
-                stoppedLossReason ?? "the agent exited before an explicit STATUS")
+            loseCarriedCorrelation(carry, .sessionEnded(
+                stoppedLossReason ?? "the agent exited before an explicit STATUS"))
         }
         if !queued.isEmpty {
             append(.notice(id: UUID(),
@@ -2880,6 +2928,12 @@ final class AgentSession {
             pendingTask = nil
             loseTaskCorrelation(previous, .superseded(by: taskId))
         }
+        if let carry = uninstalledCarry {
+            uninstalledCarry = nil
+            if carry.taskId != taskId {
+                loseCarriedCorrelation(carry, .superseded(by: taskId))
+            }
+        }
         taskCorrelationGeneration &+= 1
         pendingTask = PendingTask(taskId: taskId, generation: taskCorrelationGeneration)
         uncorrelatedStatusGeneration = nil
@@ -2970,8 +3024,12 @@ final class AgentSession {
     @ObservationIgnored private var uncorrelatedStatusGeneration: UInt64?
     /// A rebuilt pane's carried task, waiting for the replay to end.
     @ObservationIgnored private var uninstalledCarry: CarriedTaskCorrelation?
-    /// The stream is still repeating what the retired pane received.
+    @ObservationIgnored private var uninstalledCarryLossReason = ""
+    /// The stream is still repeating what the retired pane applied.
     @ObservationIgnored private var replayingHistory = false
+    @ObservationIgnored private var replayDeadline: DispatchWorkItem?
+    /// Remote stream bytes up to the end of the last applied line.
+    @ObservationIgnored private(set) var appliedRemoteBytes: UInt64 = 0
 
     /// Who opened the running turn. Only a TASK_ID dispatch and a turn the
     /// CLI started itself may answer the pending task; a person's turn or a
@@ -3143,19 +3201,25 @@ final class AgentSession {
                     // session that replaced it.
                     guard let self, self.remoteStreamsBox.current() === streams else { return }
                     self.apply(batch)
+                    if let applied = batch.last?.streamEnd {
+                        self.appliedRemoteBytes = applied
+                    }
                 }
             }
             func feed(_ bytes: Data) {
-                let parsed = streams.decoder.consume(bytes).map { output -> AgentParsedLine in
+                let parsed = streams.decoder.consumeTracked(bytes).map { output, end -> AgentParsedLine in
+                    var parsed: AgentParsedLine
                     switch output {
                     case .line(let line):
-                        return AgentParsedLine(line)
+                        parsed = AgentParsedLine(line)
                     case .oversized(let count):
                         // A raw (non-JSON) line renders as a notice in `handle`.
-                        return AgentParsedLine(
+                        parsed = AgentParsedLine(
                             "dropped an unterminated line of \(count) bytes"
                         )
                     }
+                    parsed.streamEnd = end
+                    return parsed
                 }
                 streams.batcher.enqueue(parsed, flush: flush)
             }
@@ -3168,7 +3232,7 @@ final class AgentSession {
                 feed(data)
                 return
             }
-            // A line that ends at the boundary was delivered to the retired
+            // A line that ends at the boundary was applied by the retired
             // pane; one that straddles it completes in the new bytes.
             let cut = data.startIndex + Int(remaining)
             feed(data[data.startIndex..<cut])
@@ -3514,7 +3578,9 @@ final class AgentSession {
         saidThisTurn.removeAll()
         noteTaskActivity()
         let stated = AgentPipeCompletion.explicitStatus(in: final) != nil
-        if let answered, pendingTask == answered, stated {
+        if replayingHistory {
+            // A replayed result answered the retired pane, never this one.
+        } else if let answered, pendingTask == answered, stated {
             pendingTask = nil
         } else if answered == nil, stated, let pendingTask {
             uncorrelatedStatusGeneration = pendingTask.generation
@@ -3965,6 +4031,10 @@ final class AgentSession {
     }
 
     var pendingTaskIdForTesting: String? { pendingTask?.taskId }
+
+    var isReplayingHistoryForTesting: Bool { replayingHistory }
+
+    var replayDeadlineForTesting: DispatchWorkItem? { replayDeadline }
 
     var isTurnInFlightForTesting: Bool { turnInFlight }
 

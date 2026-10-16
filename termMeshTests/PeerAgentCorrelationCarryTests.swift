@@ -26,7 +26,10 @@ final class PeerAgentCorrelationCarryTests: XCTestCase {
     }
 
     private func put(_ store: PeerAgentCorrelationCarryStore, cause: String = "stream rewound") {
-        store.store(key: key, surfaceID: surface, boundarySeq: 4_096, carry: carry, cause: cause) {
+        store.store(
+            key: key, surfaceID: surface, boundarySeq: 4_096, retiredInitialSeq: 1_024,
+            carry: carry, cause: cause
+        ) {
             [unowned self] reason in self.lost.append(reason)
         }
     }
@@ -93,6 +96,8 @@ final class PeerAgentCorrelationCarryTests: XCTestCase {
         advance(by: 20)
 
         XCTAssertEqual(lost.count, 1)
+        advance(by: PeerAgentCorrelationCarryStore.carryDeadline)
+        XCTAssertEqual(lost.count, 1, "the restored entry's second timer must not lose it again")
     }
 
     /// The rebuilt pane is dropped again after its carry was claimed: the

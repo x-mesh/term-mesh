@@ -372,6 +372,7 @@ final class PeerAgentCorrelationCarryStore {
         let key: String
         let surfaceID: Data
         let boundarySeq: UInt64
+        let retiredInitialSeq: UInt64
         let carry: AgentSession.CarriedTaskCorrelation
         let cause: String
         let deadline: Date
@@ -403,12 +404,14 @@ final class PeerAgentCorrelationCarryStore {
         key: String,
         surfaceID: Data,
         boundarySeq: UInt64,
+        retiredInitialSeq: UInt64,
         carry: AgentSession.CarriedTaskCorrelation,
         cause: String,
         lose: @escaping (String) -> Void
     ) {
         insert(Entry(
-            key: key, surfaceID: surfaceID, boundarySeq: boundarySeq, carry: carry,
+            key: key, surfaceID: surfaceID, boundarySeq: boundarySeq,
+            retiredInitialSeq: retiredInitialSeq, carry: carry,
             cause: cause, deadline: now().addingTimeInterval(Self.carryDeadline), lose: lose
         ))
     }

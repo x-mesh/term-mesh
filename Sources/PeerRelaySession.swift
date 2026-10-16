@@ -2260,23 +2260,13 @@ final class PeerRelaySession {
     /// consumer (via `onPtyData`) inside this hook: it fires strictly
     /// before any byte of the restarted stream is delivered. Terminal
     /// (relay) panes never set it — repainted bytes are harmless there.
-    ///
-    /// The argument is the host-absolute seq the restarted attach asked to
-    /// resume from — the last byte the retired consumer was handed — or nil
-    /// when the host has no replay ring and the request carried no seq.
-    var onPtyDeliveryRestart: (@MainActor (_ requestedResumeSeq: UInt64?) -> Void)?
+    var onPtyDeliveryRestart: (@MainActor () -> Void)?
 
-    /// Host-absolute seq just past the last byte handed to the consumer, or
-    /// nil when the host has no replay ring (its seqs cannot be compared).
-    func deliveredHostSeq() -> UInt64? {
-        guard hostSupportsReplayRing else { return nil }
-        return attachInitialSeq &+ (resumeTransitionGate.activeGapCapture()?.resumeWireSeq
-                                        ?? resumeTransitionGate.currentWireSeq())
-    }
-
-    /// Host-absolute seq of this attach's wire byte 0, or nil when the host
-    /// has no replay ring (its seqs cannot be compared).
-    var initialHostSeq: UInt64? { hostSupportsReplayRing ? attachInitialSeq : nil }
+    /// Host-absolute seq of the first byte this relay delivered, or nil when
+    /// the host had no replay ring (its seqs cannot be compared). A consumer
+    /// that is dropped at the first restart sees one contiguous stream from
+    /// here, so its byte count maps onto the host's seq space.
+    let originHostSeq: UInt64?
 
     func setResizeAuthorityEligible(_ eligible: Bool) {
         resizeAuthorityEligible = eligible
@@ -3098,6 +3088,7 @@ final class PeerRelaySession {
         self.onSharedDetach = onSharedDetach
         self.attachInitialSeq = attachInitialSeq
         self.hostSupportsReplayRing = hostSupportsReplayRing
+        self.originHostSeq = hostSupportsReplayRing ? attachInitialSeq : nil
         self.hostResyncsOnOverflow = hostResyncsOnOverflow
         self.ptyDelivery = ptyDelivery
         switch ptyDelivery {
@@ -4356,10 +4347,9 @@ final class PeerRelaySession {
             await newConnection.cancel()
             return
         }
-        let requestedResumeSeq: UInt64? = hostSupportsReplayRing
+        let resumeFromSeq: UInt64 = hostSupportsReplayRing
             ? (attachInitialSeq &+ transition.resumeWireSeq)
-            : nil
-        let resumeFromSeq = requestedResumeSeq ?? 0
+            : 0
 
         #if DEBUG
         dlog("peer.relay.gap.heal.resume reason=\(reason) resumeFromSeq=\(resumeFromSeq) gated=\(hostSupportsReplayRing) cols=\(size.cols) rows=\(size.rows)")
@@ -4454,7 +4444,7 @@ final class PeerRelaySession {
         // receive, so a callback owner swapping its consumer here always
         // beats the first restarted byte.
         if outcome.initialByteSeq != resumeFromSeq {
-            onPtyDeliveryRestart?(requestedResumeSeq)
+            onPtyDeliveryRestart?()
         }
 
         try? await oldSession.sendGoodbye(reason: "resume-heal reconnect")
@@ -4679,8 +4669,10 @@ final class PeerRelaySession {
         // the gap and the withheld bytes — `reset()` below then discards
         // the buffer, which is correct only because the replay covers it.
         // Without a capture this is the plain current position, unchanged.
-        let requestedResumeSeq = deliveredHostSeq()
-        let resumeFromSeq = requestedResumeSeq ?? 0
+        let resumeFromSeq = hostSupportsReplayRing
+            ? (attachInitialSeq &+ (resumeTransitionGate.activeGapCapture()?.resumeWireSeq
+                                        ?? resumeTransitionGate.currentWireSeq()))
+            : 0
         let outcome: PeerAttachOutcome
         do {
             outcome = try await connection.session.attachSurface(
@@ -4744,7 +4736,7 @@ final class PeerRelaySession {
         // replacement session only after `reconnectOwnedSession` returns,
         // so this hook always fires before the first restarted byte.
         if outcome.initialByteSeq != resumeFromSeq {
-            onPtyDeliveryRestart?(requestedResumeSeq)
+            onPtyDeliveryRestart?()
         }
         #if DEBUG
         dlog("peer.relay.reconnect.committed generation=\(newGeneration) session=\(Self.sessionTag(connection.session))")
