@@ -176,7 +176,12 @@ tag_cleanup_refusal() {
     return 1
   fi
   for path in "${TAG_TMP_ROOT}/term-mesh-${slug}" "${TAG_TMP_ROOT}/term-mesh-${raw}"; do
-    [[ "$path" == "${TAG_TMP_ROOT}/term-mesh-${slug}" || -e "$path" || -L "$path" ]] || continue
+    if [[ "$path" != "${TAG_TMP_ROOT}/term-mesh-${slug}" ]]; then
+      # Only a raw name reclaim_tag_build would act on; on a case-insensitive
+      # volume an uppercase `--tag` resolves to the slug's own directory.
+      [[ "$raw" != "$slug" && "$raw" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || continue
+      [[ -e "$path" || -L "$path" ]] || continue
+    fi
     if ! safe_managed_tag_path "$path"; then
       echo "error: refusing to reclaim ${path} — not a managed tag directory" >&2
       return 1

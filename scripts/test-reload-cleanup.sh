@@ -162,6 +162,23 @@ echo "reclaim_tag_build"
 
 (
   sandbox
+  : > "${TAG_TMP_ROOT}/term-mesh-debug-logonly.log"
+  out="$(reclaim_tag_build logonly logonly)" && rc=0 || rc=$?
+  [[ "$rc" == 0 && ! -e "${TAG_TMP_ROOT}/term-mesh-debug-logonly.log" ]] && r=yes || r=no
+  check "a tag with only its debug log left has the log reclaimed" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "${TAG_TMP_ROOT}/term-mesh-foo/Build"
+  tag_cleanup_refusal Foo foo 2>/dev/null && r=allowed || r=refused
+  check "an uppercase tag is not refused for its own slug directory" "$r" "allowed"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
   mkdir -p "$SB/outside"
   ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-linked"
   ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-dotted.1"
