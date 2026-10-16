@@ -373,7 +373,7 @@ final class AgentPipeCompletion {
     nonisolated static func headerEvent(from text: String) -> AutoReplyEvent {
         let fields = headerFields(in: text)
         return AutoReplyEvent(
-            status: fields["STATUS"] ?? "NEEDS_REVIEW",
+            status: fields["STATUS"].map { AutoReplyDetector.statedVerdict($0) ?? $0 } ?? "NEEDS_REVIEW",
             files: fields["FILES"] ?? "none",
             verify: fields["VERIFY"] ?? "n/a",
             next: fields["NEXT"] ?? "NONE",

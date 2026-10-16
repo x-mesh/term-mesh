@@ -100,7 +100,8 @@ final class AutoReplyDetectorTests: XCTestCase {
         XCTAssertEqual(AutoReplyDetector.statedVerdict("DONE CARRY-1a2b"), "DONE")
         XCTAssertEqual(AutoReplyDetector.statedVerdict("BLOCKED\twaiting on the db"), "BLOCKED")
         XCTAssertEqual(AutoReplyDetector.statedVerdict("NEEDS_REVIEW"), "NEEDS_REVIEW")
-        for value in ["done all good", " DONE", "DONE.", "DONE|BLOCKED|NEEDS_REVIEW", "DONEISH note", ""] {
+        for value in ["done all good", " DONE", "DONE.", "DONE|BLOCKED|NEEDS_REVIEW", "DONEISH note",
+                      "DONE | BLOCKED | NEEDS_REVIEW", "DONE / BLOCKED", "DONE or BLOCKED", ""] {
             XCTAssertNil(
                 AutoReplyDetector.statedVerdict(value),
                 "stated verdict unexpectedly accepted \(String(reflecting: value))"
@@ -109,6 +110,8 @@ final class AutoReplyDetectorTests: XCTestCase {
         XCTAssertNil(AutoReplyDetector.validatedStatus("DONE CARRY-1a2b"),
                      "the screen path stays exact")
         XCTAssertEqual(AgentPipeCompletion.explicitStatus(in: "STATUS: DONE CARRY-1a2b"), "DONE")
+        XCTAssertEqual(AgentPipeCompletion.headerEvent(from: "STATUS: DONE CARRY-1a2b").status, "DONE")
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: "STATUS: DONE | BLOCKED | NEEDS_REVIEW"))
     }
 
     func test_terminal_row_padding_after_status_is_accepted() {

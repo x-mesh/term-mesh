@@ -31,7 +31,24 @@ const RESULT_TRUNC_CHARS: usize = 1500;
 /// such as `DONE|BLOCKED|NEEDS_REVIEW`, a lowercase or leading-space value must
 /// not close a task (mirrors `AutoReplyDetector.statedVerdict`).
 pub fn validated_status(status: &str) -> Option<&'static str> {
-    match status.split(char::is_whitespace).next().unwrap_or("") {
+    if status.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut words = status.split_whitespace();
+    let first = words.next().unwrap_or("");
+    // A spaced choice list (`DONE | BLOCKED | NEEDS_REVIEW`) is the template.
+    let template = words.any(|word| {
+        word.starts_with('|')
+            || word.starts_with('/')
+            || matches!(
+                word.trim_matches(|c| "|/,()[]".contains(c)),
+                "DONE" | "BLOCKED" | "NEEDS_REVIEW"
+            )
+    });
+    if template {
+        return None;
+    }
+    match first {
         "DONE" => Some("completed"),
         "BLOCKED" => Some("blocked"),
         "NEEDS_REVIEW" => Some("review_ready"),
@@ -304,6 +321,9 @@ pub(crate) mod tests {
             " DONE",
             "DONE.",
             "DONEISH note",
+            "DONE | BLOCKED | NEEDS_REVIEW",
+            "DONE / BLOCKED",
+            "DONE or BLOCKED",
             "",
         ] {
             assert_eq!(validated_status(rejected), None, "{rejected:?}");

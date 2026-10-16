@@ -80,7 +80,7 @@ enum AutoReplyEmit {
         // Fail closed before formatting, task lookup, result persistence, or
         // message emission. Every producer shares the detector's exact enum
         // validation, including turn-end paths that bypass scrollback parsing.
-        guard let status = AutoReplyDetector.statedVerdict(event.status) else {
+        guard let status = AutoReplyDetector.validatedStatus(event.status) else {
             return false
         }
         let taskStatus: String

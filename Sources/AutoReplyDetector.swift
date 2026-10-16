@@ -69,7 +69,17 @@ final class AutoReplyDetector {
     /// (`STATUS: DONE all tests pass`). Not for screen scraping, where an echoed
     /// instruction can carry a line shaped like that.
     static func statedVerdict(_ value: String) -> String? {
-        validatedStatus(String(value.prefix { !$0.isWhitespace }))
+        let words = value.split(whereSeparator: \.isWhitespace)
+        guard let first = words.first, let verdict = validatedStatus(String(first)),
+              value.first?.isWhitespace == false else { return nil }
+        // A spaced choice list (`DONE | BLOCKED | NEEDS_REVIEW`) is the template,
+        // not a verdict.
+        for word in words.dropFirst() {
+            if word.hasPrefix("|") || word.hasPrefix("/") { return nil }
+            let bare = word.trimmingCharacters(in: CharacterSet(charactersIn: "|/,()[]"))
+            if validatedStatus(bare) != nil { return nil }
+        }
+        return verdict
     }
 
     /// Accept only protocol verdicts, exactly as written. Deliberately does no
