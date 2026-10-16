@@ -38,6 +38,7 @@ REBUILD_LOSS_MARKER = "the pane was rebuilt (host reconnected)"
 CORRELATION_LOST = "agent.task.correlation.lost"
 TERMINAL_STATUSES = {"completed", "blocked", "failed", "cancelled", "review_ready"}
 WORKER_SLEEP_S = 120
+OPEN_STATUSES = ("assigned", "in_progress")
 # The rebuild must land inside the worker's `sleep`, after the turn is
 # visibly running; well short of WORKER_SLEEP_S leaves room for model latency.
 REBUILD_AFTER_IN_PROGRESS_S = 12
@@ -184,17 +185,17 @@ def main() -> int:
                 raise termmeshError(f"delegate returned no task id: {delegated!r}")
             evidence["task_id"] = task_id
 
-            # in_progress can be set at dispatch, before a cold worker starts
-            # its turn; agent_state "running" is the turn actually in flight.
+            # A native worker's task stays `assigned` until a verdict settles it;
+            # agent_state "running" is the turn actually in flight.
             def running():
                 task = task_by_id(c, team, task_id)
                 if task.get("status") in TERMINAL_STATUSES:
                     raise _TerminalTestFailure(f"task settled before the rebuild could land: {task!r}")
                 state = agent_row(c, team, instance_id).get("agent_state")
-                return task if task.get("status") == "in_progress" and state == "running" else None
+                return task if task.get("status") in OPEN_STATUSES and state == "running" else None
 
             # A cold remote worker can take minutes to start its first turn.
-            if _wait(running, timeout_s=480, interval_s=1) is None:
+            if _wait(running, timeout_s=480, interval_s=0.5) is None:
                 raise termmeshError(f"worker never started task {task_id}: {task_by_id(c, team, task_id)!r}")
 
             # The carried case: the worker handed its job to the background and
@@ -204,14 +205,14 @@ def main() -> int:
                 if task.get("status") in TERMINAL_STATUSES:
                     raise _TerminalTestFailure(f"task settled before the rebuild could land: {task!r}")
                 state = agent_row(c, team, instance_id).get("agent_state")
-                return task if task.get("status") == "in_progress" and state != "running" else None
+                return task if task.get("status") in OPEN_STATUSES and state != "running" else None
 
             if _wait(idle_with_pending_task, timeout_s=180, interval_s=1) is None:
                 raise termmeshError(f"worker never ended its first turn: {task_by_id(c, team, task_id)!r}")
             time.sleep(REBUILD_AFTER_IN_PROGRESS_S)
             before = task_by_id(c, team, task_id)
             agent_state = agent_row(c, team, instance_id).get("agent_state")
-            if before.get("status") != "in_progress":
+            if before.get("status") not in OPEN_STATUSES:
                 raise termmeshError(f"task settled before the rebuild: {before!r}")
             evidence["agent_state_at_rebuild"] = agent_state
 
