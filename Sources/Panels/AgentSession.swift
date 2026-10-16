@@ -2478,7 +2478,7 @@ final class AgentSession {
         guard let streams = remoteStreamsBox.current() else { return false }
         // Not `abandonCarriedCorrelation`: a window about to reopen must not
         // deliver a queued instruction into it.
-        endReplayWindow()
+        let closedOpenWindow = endReplayWindow()
         if let displaced = uninstalledCarry {
             uninstalledCarry = nil
             loseCarriedCorrelation(displaced.carry, .sessionEnded(displaced.lossReason))
@@ -2486,6 +2486,7 @@ final class AgentSession {
         uninstalledCarry = UninstalledCarry(carry: carried, lossReason: lossReason)
         guard bytes > 0 else {
             installCarriedCorrelation()
+            if closedOpenWindow { deliverQueuedInstructionAfterReplay() }
             return true
         }
         replayingHistory = true

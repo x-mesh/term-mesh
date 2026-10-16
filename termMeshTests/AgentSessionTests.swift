@@ -3411,6 +3411,21 @@ final class AgentSessionTests: XCTestCase {
             .contains("cfcf1111") == true)
     }
 
+    func testAZeroByteRebuildOverAnOpenWindowDeliversTheDeferredInstruction() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.startRemote { sink.record($0) }
+        expectReplay(s, bytes: 512, .init(taskId: "d0d00000", turnWasInFlight: false))
+        s.queueForTesting("TASK_ID: d0d01111\nnext")
+        XCTAssertTrue(sink.all.isEmpty)
+
+        expectReplay(s, bytes: 0, .init(taskId: "d0d00000", turnWasInFlight: false))
+        let delivered = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(delivered)
+        XCTAssertTrue(String(data: try XCTUnwrap(sink.all.first), encoding: .utf8)?
+            .contains("d0d01111") == true)
+    }
+
     func testStoppingDuringReplayEndsTheWindow() throws {
         let s = AgentSession()
         s.startRemote { _ in }
