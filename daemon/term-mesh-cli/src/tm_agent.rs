@@ -5151,7 +5151,7 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(6);
-    rpc_call_with_timeout_secs(sock, method, params, timeout)
+    rpc_call_timeout(sock, method, params, timeout)
 }
 
 /// The durable request body crosses a file/RPC boundary before it reaches the
@@ -5390,39 +5390,33 @@ mod durable_leader_request_tests {
     }
 }
 
-fn rpc_call_with_timeout_secs(
+fn rpc_call_timeout(
     sock: &PathBuf,
     method: &str,
     params: Value,
     timeout_secs: u64,
 ) -> Result<Value, String> {
     match remote_leader_rpc_policy(remote_leader_route().is_some(), method) {
-        RemoteLeaderRpcPolicy::Proxy => {
-            return remote_leader_rpc_call(
-                sock,
-                method,
-                params,
-                remote_leader_timeout(method, Duration::from_secs(timeout_secs)).as_secs(),
-            );
-        }
+        RemoteLeaderRpcPolicy::Proxy => remote_leader_rpc_call(
+            sock,
+            method,
+            params,
+            remote_leader_timeout(method, Duration::from_secs(timeout_secs)).as_secs(),
+        ),
         // A remote leader's TERMMESH_SOCKET points at the peer host's local
         // app. Falling through for a disallowed team method therefore acts on
         // that app, not on the GUI team that owns the leader. In particular,
         // `tm-agent create` used to create a second same-name team after a
         // window restore. Team methods must fail closed; non-team utilities
         // may still use the local socket deliberately.
-        RemoteLeaderRpcPolicy::RejectTeam => {
-            return Err(format!(
-                "{method} is not allowed from a scoped remote leader; \
-                 use the owning project window to change team lifecycle"
-            ));
+        RemoteLeaderRpcPolicy::RejectTeam => Err(remote_leader_team_rejection(method)),
+        RemoteLeaderRpcPolicy::Local => {
+            local_rpc_call_timeout_duration(sock, method, params, Duration::from_secs(timeout_secs))
         }
-        RemoteLeaderRpcPolicy::Local => {}
     }
-    rpc_call_timeout(sock, method, params, timeout_secs)
 }
 
-fn rpc_call_with_timeout_duration(
+fn rpc_call_timeout_duration(
     sock: &PathBuf,
     method: &str,
     params: Value,
@@ -5432,11 +5426,29 @@ fn rpc_call_with_timeout_duration(
         RemoteLeaderRpcPolicy::Proxy => {
             remote_leader_rpc_call_duration(sock, method, params, timeout)
         }
-        RemoteLeaderRpcPolicy::RejectTeam => Err(format!(
-            "{method} is not allowed from a scoped remote leader; use the owning project window to change team lifecycle"
-        )),
-        RemoteLeaderRpcPolicy::Local => rpc_call_timeout_duration(sock, method, params, timeout),
+        RemoteLeaderRpcPolicy::RejectTeam => Err(remote_leader_team_rejection(method)),
+        RemoteLeaderRpcPolicy::Local => {
+            local_rpc_call_timeout_duration(sock, method, params, timeout)
+        }
     }
+}
+
+fn remote_leader_lifecycle_rejection(has_route: bool, command: &Commands) -> Option<String> {
+    if !has_route {
+        return None;
+    }
+    match command {
+        Commands::Create { .. } => Some(remote_leader_team_rejection("team.create")),
+        Commands::Destroy => Some(remote_leader_team_rejection("team.destroy")),
+        _ => None,
+    }
+}
+
+fn remote_leader_team_rejection(method: &str) -> String {
+    format!(
+        "{method} is not allowed from a scoped remote leader; \
+         use the owning project window to change team lifecycle"
+    )
 }
 
 const REMOTE_LEADER_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
@@ -5882,6 +5894,120 @@ mod remote_leader_route_file_tests {
         );
     }
 
+    fn answer_one_local_rpc(listener: &std::os::unix::net::UnixListener) -> String {
+        let (stream, _) = listener.accept().expect("accept local rpc");
+        let mut line = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("read local rpc");
+        let method = serde_json::from_str::<Value>(&line).expect("request json")["method"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let result = if method == "peer.leader.call" {
+            json!({"ok": true, "result": {}, "cached": false})
+        } else {
+            json!({})
+        };
+        (&stream)
+            .write_all(format!("{}\n", json!({"id": 1, "result": result})).as_bytes())
+            .expect("write local rpc response");
+        method
+    }
+
+    #[test]
+    fn remote_leader_timeout_helpers_route_every_call_through_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+
+        for result in [
+            rpc_call_timeout(&sock, "team.create", json!({}), 2),
+            rpc_call_timeout_duration(&sock, "team.destroy", json!({}), Duration::from_secs(2)),
+        ] {
+            let error = result.expect_err("team lifecycle must be rejected");
+            assert!(
+                error.contains("is not allowed from a scoped remote leader"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            listener.accept().map_err(|error| error.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "a rejected team method must not reach the peer host's local app"
+        );
+
+        listener.set_nonblocking(false).expect("blocking");
+        let server = std::thread::spawn(move || {
+            [
+                answer_one_local_rpc(&listener),
+                answer_one_local_rpc(&listener),
+            ]
+        });
+        let local = rpc_call_timeout(&sock, "headless.list", json!({}), 2).expect("local call");
+        assert_eq!(local["result"], json!({}));
+        let proxied = rpc_call_timeout(&sock, "team.inbox", json!({}), 2).expect("proxied call");
+        assert_eq!(proxied["remote_leader_proxy"], json!(true));
+        assert_eq!(
+            server.join().expect("server thread"),
+            ["headless.list", "peer.leader.call"]
+        );
+    }
+
+    #[test]
+    fn remote_leader_never_resolves_team_members_on_the_local_daemon() {
+        let local = || Some(PathBuf::from("/tmp/local-daemon.sock"));
+        assert_eq!(
+            headless_daemon_socket_for_route(false, local),
+            Some(PathBuf::from("/tmp/local-daemon.sock"))
+        );
+        assert_eq!(
+            headless_daemon_socket_for_route(true, || panic!("must not probe the local daemon")),
+            None
+        );
+
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+        assert_eq!(team_headless_daemon_socket(), None);
+    }
+
+    #[test]
+    fn remote_leader_lifecycle_commands_are_rejected_only_under_a_route() {
+        // Parsing the full `Cli` overflows the default 2 MiB test-thread stack
+        // in debug builds.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(lifecycle_rejection_cases)
+            .expect("spawn")
+            .join()
+            .expect("lifecycle rejection cases");
+    }
+
+    fn lifecycle_rejection_cases() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        for args in [
+            &["tm-agent", "create", "2"][..],
+            &["tm-agent", "create", "2", "--headless"],
+            &["tm-agent", "create", "0", "--adopt"],
+            &["tm-agent", "destroy"],
+        ] {
+            let command = parse(args);
+            let rejection = remote_leader_lifecycle_rejection(true, &command)
+                .unwrap_or_else(|| panic!("{args:?} must be rejected under a route"));
+            assert!(
+                rejection.contains("is not allowed from a scoped remote leader"),
+                "{rejection}"
+            );
+            assert_eq!(remote_leader_lifecycle_rejection(false, &command), None);
+        }
+        for args in [&["tm-agent", "status"][..], &["tm-agent", "wait"]] {
+            assert_eq!(remote_leader_lifecycle_rejection(true, &parse(args)), None);
+        }
+    }
+
     #[test]
     fn staged_route_wins_over_the_spawn_time_environment() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6126,7 +6252,7 @@ fn remote_leader_rpc_call(
     // A dropped local daemon response may be retried, but the opaque request
     // id stays fixed so the viewer returns its cached outcome and never
     // inserts text or presses Return twice.
-    let first = rpc_call_timeout_duration(
+    let first = local_rpc_call_timeout_duration(
         sock,
         "peer.leader.call",
         proxy_params.clone(),
@@ -6140,7 +6266,8 @@ fn remote_leader_rpc_call(
                 append_remote_leader_route_failure(&route, method, &request_id_hex);
                 return Err(first_error);
             }
-            match rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining) {
+            match local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining)
+            {
                 Ok(value) => value,
                 Err(error) => {
                     append_remote_leader_route_failure(&route, method, &request_id_hex);
@@ -6171,7 +6298,8 @@ fn remote_leader_rpc_call_duration(
     let proxy_params =
         remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex)?;
     let deadline = Instant::now() + timeout;
-    let first = rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
+    let first =
+        local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
     let mut outer = match first {
         Ok(value) => value,
         Err(first_error) => {
@@ -6180,7 +6308,8 @@ fn remote_leader_rpc_call_duration(
                 append_remote_leader_route_failure(&route, method, &request_id_hex);
                 return Err(first_error);
             }
-            match rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining) {
+            match local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining)
+            {
                 Ok(value) => value,
                 Err(error) => {
                     append_remote_leader_route_failure(&route, method, &request_id_hex);
@@ -6249,7 +6378,7 @@ fn retry_remote_leader_after_viewer_error(
         .expect("viewer unavailability is retryable");
         let refreshed =
             remote_leader_proxy_params(route, method, params.clone(), request_id_hex)?;
-        response = match rpc_call_timeout_duration(
+        response = match local_rpc_call_timeout_duration(
             sock,
             "peer.leader.call",
             refreshed,
@@ -6546,16 +6675,7 @@ fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value,
     daemon_result(sock, method, params)
 }
 
-fn rpc_call_timeout(
-    sock: &PathBuf,
-    method: &str,
-    params: Value,
-    timeout_secs: u64,
-) -> Result<Value, String> {
-    rpc_call_timeout_duration(sock, method, params, Duration::from_secs(timeout_secs))
-}
-
-fn rpc_call_timeout_duration(
+fn local_rpc_call_timeout_duration(
     sock: &PathBuf,
     method: &str,
     params: Value,
@@ -9042,6 +9162,13 @@ fn main() {
     let team = resolve_team_name(cli.team.as_deref());
     let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
 
+    if let Some(error) =
+        remote_leader_lifecycle_rejection(remote_leader_route().is_some(), &cli.command)
+    {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    }
+
     if reports_claude_inbox(&cli.command) {
         report_claude_inbox(&sock);
     }
@@ -9732,6 +9859,27 @@ fn main() {
                 eprintln!("Invalid JSON: {e}");
                 process::exit(1);
             }
+            if remote_leader_route().is_some() {
+                let response = rpc_batch_per_call(&[payload], |method, params| {
+                    rpc_call(&sock, method, params)
+                })
+                .and_then(|mut results| {
+                    results.pop().ok_or_else(|| "no response".to_string())
+                });
+                match response {
+                    Ok(value) => {
+                        println!("{}", serde_json::to_string(&value).unwrap_or_default());
+                        if rpc_response_failed(&value) {
+                            process::exit(1);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
             let stream = UnixStream::connect(&sock).map_err(|e| format!("connect: {e}"));
             match stream {
                 Ok(stream) => {
@@ -9774,7 +9922,7 @@ fn main() {
             eprintln!("Destroying team '{team}'...");
             cleanup_old_results(&team);
             // Also destroy headless team if it exists
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 let _ = rpc_call_timeout(
                     &daemon_sock,
                     "headless.destroy_team",
@@ -9804,7 +9952,7 @@ fn main() {
             lines,
         } => {
             // Check if agent is headless — route to daemon socket
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, agent_name) {
                     print_result(rpc_call(
                         &daemon_sock,
@@ -9950,7 +10098,7 @@ fn main() {
             let model = model.unwrap_or_else(|| default_model_for_cli(&cli).to_string());
 
             // Try headless path first
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 // Check if the team exists as a headless team
                 if let Ok(resp) = rpc_call(&daemon_sock, "headless.list_teams", json!({})) {
                     let is_headless = resp["result"]
@@ -10237,7 +10385,7 @@ fn main() {
             // must reach the GUI resolution path below rather than being
             // silently dropped by the headless route.
             if panel.is_none() && agent_instance_id.is_none() {
-                if let Some(daemon_sock) = detect_daemon_socket() {
+                if let Some(daemon_sock) = team_headless_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
                         let delivery = successful_rpc_envelope(rpc_call(
                             &daemon_sock,
@@ -11533,7 +11681,7 @@ fn register_correlation_mailbox(
     if timeout.is_zero() {
         return Err("correlation registration deadline expired".to_string());
     }
-    successful_rpc_envelope(rpc_call_with_timeout_duration(
+    successful_rpc_envelope(rpc_call_timeout_duration(
         sock,
         "team.correlation.register",
         json!({
@@ -11548,7 +11696,7 @@ fn register_correlation_mailbox(
 }
 
 fn cancel_correlation_mailbox(sock: &PathBuf, team: &str, token: &str) {
-    let _ = successful_rpc_envelope(rpc_call_with_timeout_duration(
+    let _ = successful_rpc_envelope(rpc_call_timeout_duration(
         sock,
         "team.correlation.cancel",
         json!({
@@ -11659,7 +11807,7 @@ fn wait_for_correlated_reply(
         correlation_id,
         timeout,
         |remaining| {
-            rpc_call_with_timeout_duration(
+            rpc_call_timeout_duration(
                 sock,
                 "team.correlation.get",
                 json!({
@@ -11770,7 +11918,7 @@ fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Re
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(120);
-        rpc_call_with_timeout_secs(sock, method, params, timeout)
+        rpc_call_timeout(sock, method, params, timeout)
     } else {
         rpc_call(sock, method, params)
     };
@@ -13508,7 +13656,8 @@ fn maybe_auto_watch_after_team_change(
     no_auto_watch: bool,
     working_dir: &std::path::Path,
 ) {
-    if no_auto_watch || is_auto_watch_disabled_by_env() {
+    // The watcher would run on this host for a team the owning host manages.
+    if no_auto_watch || is_auto_watch_disabled_by_env() || remote_leader_route().is_some() {
         return;
     }
     let status = match rpc_call_timeout(
@@ -13943,7 +14092,7 @@ fn run_add_gui(
         params["directory"] = json!(d);
     }
 
-    let resp = match rpc_call_with_timeout_secs(sock, "team.add_agent", params, 10) {
+    let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -14302,6 +14451,23 @@ fn daemon_socket_candidates() -> Vec<PathBuf> {
 
 fn detect_daemon_socket() -> Option<PathBuf> {
     daemon_socket_candidates().into_iter().find(is_socket_alive)
+}
+
+/// The daemon whose headless agents are members of this process's team. A
+/// remote leader's team lives on the owning host, so a same-name headless team
+/// on this host's daemon is unrelated and must never be resolved.
+fn team_headless_daemon_socket() -> Option<PathBuf> {
+    headless_daemon_socket_for_route(remote_leader_route().is_some(), detect_daemon_socket)
+}
+
+fn headless_daemon_socket_for_route(
+    has_route: bool,
+    detect: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if has_route {
+        return None;
+    }
+    detect()
 }
 
 #[derive(Debug, Clone)]
@@ -16467,7 +16633,7 @@ fn run_delegate_result(
                 format_task_instruction(sock, team, task_ref, text, no_report, context, fix_budget);
 
             // Headless agent path: route via daemon socket if available
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
                     let headless_ok = match rpc_call(
                         &daemon_sock,
@@ -16603,6 +16769,12 @@ fn run_delegate_result(
         return Ok(v);
     }
 
+    if remote_leader_route().is_some() {
+        return Err("owner does not support team.delegate; \
+             legacy fallback is disabled for a scoped remote leader"
+            .to_string());
+    }
+
     // Fallback: 2-RPC path (server may not support team.delegate yet).
     // Reuse a single UnixStream connection for task.create → team.send to avoid
     // two separate connect() calls. task_id from create is needed for the send
@@ -16662,7 +16834,7 @@ fn run_delegate_result(
     let send_text = format!("{instruction}\n");
 
     // Headless agent path: route via daemon socket for 2-RPC fallback too
-    if let Some(daemon_sock) = detect_daemon_socket() {
+    if let Some(daemon_sock) = team_headless_daemon_socket() {
         if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
             let sent_ok = match rpc_call(
                 &daemon_sock,
@@ -17436,7 +17608,7 @@ fn run_delegate_result_with_worktree(
         format_task_instruction(sock, team, &task, text, no_report, context, fix_budget);
     let send_text = format!("{instruction}\n");
 
-    if let Some(daemon_sock) = detect_daemon_socket() {
+    if let Some(daemon_sock) = team_headless_daemon_socket() {
         if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
             let sent_ok = match rpc_call(
                 &daemon_sock,
@@ -22546,6 +22718,48 @@ fn wait_report_outcome<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'sta
     if failed { "failed" } else { "completed" }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WaitPushSource {
+    LocalDaemon,
+    /// The local daemon never sees the owning host's task_status events.
+    RemoteLeaderPolling,
+    Disabled,
+}
+
+fn wait_push_source(has_route: bool, push_disabled: bool, kinds_empty: bool) -> WaitPushSource {
+    if push_disabled || kinds_empty {
+        WaitPushSource::Disabled
+    } else if has_route {
+        WaitPushSource::RemoteLeaderPolling
+    } else {
+        WaitPushSource::LocalDaemon
+    }
+}
+
+#[cfg(test)]
+mod wait_push_source_tests {
+    use super::*;
+
+    #[test]
+    fn remote_leader_wait_does_not_subscribe_to_the_local_daemon() {
+        use WaitPushSource::*;
+        for (has_route, push_disabled, kinds_empty, expected) in [
+            (false, false, false, LocalDaemon),
+            (true, false, false, RemoteLeaderPolling),
+            (true, true, false, Disabled),
+            (true, false, true, Disabled),
+            (false, true, false, Disabled),
+            (false, false, true, Disabled),
+        ] {
+            assert_eq!(
+                wait_push_source(has_route, push_disabled, kinds_empty),
+                expected,
+                "route={has_route} disabled={push_disabled} kinds_empty={kinds_empty}"
+            );
+        }
+    }
+}
+
 /// Tracked tasks a timed-out wait should be re-armed for. A task the list never
 /// returned is still pending: absence is not completion.
 fn wait_pending_tasks(
@@ -22691,33 +22905,41 @@ fn run_wait(
         "blocked" | "review_ready" => &["task_status"],
         _ => &[],
     };
-    // events.subscribe lives on the daemon socket, not the app socket.
-    // Resolve it here so the caller's app `sock` is not misrouted.
-    let daemon_sock_for_push = detect_daemon_socket();
-    let mut event_rx: Option<std::sync::mpsc::Receiver<Value>> =
-        if !push_disabled && !subscribe_kinds.is_empty() {
-            match daemon_sock_for_push.as_ref() {
-                Some(ds) => match subscribe_events_channel(ds, subscribe_kinds) {
-                    Ok(rx) => {
-                        eprintln!(
-                            "wait: subscribed to push events ({})",
-                            subscribe_kinds.join(",")
-                        );
-                        Some(rx)
-                    }
-                    Err(e) => {
-                        eprintln!("wait: subscribe failed: {e}; falling back to polling");
-                        None
-                    }
-                },
-                None => {
-                    eprintln!("wait: daemon socket not found; using polling");
+    let push_source = wait_push_source(
+        remote_leader_route().is_some(),
+        push_disabled,
+        subscribe_kinds.is_empty(),
+    );
+    let mut event_rx: Option<std::sync::mpsc::Receiver<Value>> = match push_source {
+        WaitPushSource::Disabled => None,
+        WaitPushSource::RemoteLeaderPolling => {
+            eprintln!(
+                "wait: remote leader — owner events are not relayed; polling every {interval}s"
+            );
+            None
+        }
+        // events.subscribe lives on the daemon socket, not the app socket.
+        // Resolve it here so the caller's app `sock` is not misrouted.
+        WaitPushSource::LocalDaemon => match detect_daemon_socket() {
+            Some(ds) => match subscribe_events_channel(&ds, subscribe_kinds) {
+                Ok(rx) => {
+                    eprintln!(
+                        "wait: subscribed to push events ({})",
+                        subscribe_kinds.join(",")
+                    );
+                    Some(rx)
+                }
+                Err(e) => {
+                    eprintln!("wait: subscribe failed: {e}; falling back to polling");
                     None
                 }
+            },
+            None => {
+                eprintln!("wait: daemon socket not found; using polling");
+                None
             }
-        } else {
-            None
-        };
+        },
+    };
 
     let wait_started = std::time::Instant::now();
     let mut elapsed: u32 = 0;
@@ -23670,7 +23892,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                 let instruction =
                     format_task_instruction(sock, team, &task, &goal, false, None, None);
                 let send_text = format!("{instruction}\n");
-                let send_result = if let Some(daemon_sock) = detect_daemon_socket() {
+                let send_result = if let Some(daemon_sock) = team_headless_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, team, agent) {
                         match rpc_call(
                             &daemon_sock,
