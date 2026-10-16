@@ -3623,11 +3623,13 @@ fn now_ms() -> u64 {
 /// - STATUS is not exactly DONE | BLOCKED | NEEDS_REVIEW
 /// - the same event content was just fired (idempotency via content_hash)
 ///
-/// Only a reply that passes all three consumes the expected task id, so a
-/// template echo or a duplicate cannot spend the expectation of the real reply.
+/// Only a DONE that passes all three consumes the expected task id, so a
+/// template echo, a duplicate, or an interim BLOCKED/NEEDS_REVIEW cannot spend
+/// the expectation of the task's final reply.
 ///
 /// A failure before any write puts the taken expectation back, unless a newer
-/// capsule already recorded one.
+/// capsule already recorded one, and forgets the content hash so the same
+/// reply can be emitted again.
 ///
 /// All failures log + drop. Never returns an error — auto-reply must not
 /// disrupt the PTY reader loop. Caller is the headless stdout reader task.
@@ -3643,26 +3645,33 @@ async fn try_emit_auto_reply(
         tracing::debug!("auto-reply skipped: no app socket configured (agent={agent_name})");
         return;
     };
-    if crate::auto_reply_emit::validated_status(&event.status).is_none() {
+    let Some(task_status) = crate::auto_reply_emit::validated_status(&event.status) else {
         tracing::debug!(
             "auto-reply skipped: invalid STATUS {:?} (agent={agent_name})",
             event.status
         );
         return;
-    }
+    };
     let hash = event.content_hash();
-    {
+    let previous_hash = {
         let mut guard = last_hash.lock().expect("auto-reply hash lock poisoned");
         if *guard == Some(hash) {
             tracing::debug!("auto-reply skipped: duplicate content hash (agent={agent_name})");
             return;
         }
-        *guard = Some(hash);
-    }
-    let preferred = expected_task
-        .lock()
-        .expect("expected task id lock poisoned")
-        .take();
+        guard.replace(hash)
+    };
+    let closes_task = task_status == "completed";
+    let preferred = {
+        let mut guard = expected_task
+            .lock()
+            .expect("expected task id lock poisoned");
+        if closes_task {
+            guard.take()
+        } else {
+            guard.clone()
+        }
+    };
     let preferred_label = preferred.as_deref().unwrap_or("none");
     match crate::auto_reply_emit::emit(sock, team_name, agent_name, &event, preferred.as_deref())
         .await
@@ -3677,7 +3686,11 @@ async fn try_emit_auto_reply(
         ),
         Err(e) => {
             let before_write = matches!(e, crate::auto_reply_emit::EmitError::BeforeWrite(_));
+            if before_write {
+                rollback_hash_if_current(last_hash, hash, previous_hash);
+            }
             let restored = before_write
+                && closes_task
                 && preferred
                     .clone()
                     .is_some_and(|id| restore_expected_task_if_empty(expected_task, id));
@@ -3687,6 +3700,17 @@ async fn try_emit_auto_reply(
                 event.status
             );
         }
+    }
+}
+
+fn rollback_hash_if_current(
+    last_hash: &Arc<std::sync::Mutex<Option<u64>>>,
+    attempted: u64,
+    previous: Option<u64>,
+) {
+    let mut guard = last_hash.lock().expect("auto-reply hash lock poisoned");
+    if *guard == Some(attempted) {
+        *guard = previous;
     }
 }
 
@@ -5178,6 +5202,155 @@ mod tests {
             "a refused team.report may already be filed, so it is not given back"
         );
         assert_eq!(methods(&recorded), ["team.task.list", "team.report"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_reply_interim_status_keeps_the_expectation_for_done() {
+        use crate::auto_reply_emit::tests::{fake_app_socket, methods, task};
+        let event = |status: &str| crate::auto_reply::AutoReplyEvent {
+            status: status.to_string(),
+            files: "n/a".to_string(),
+            verify: "n/a".to_string(),
+            next: "NONE".to_string(),
+            full_report: "n/a".to_string(),
+            body: status.to_string(),
+            raw: format!("STATUS: {status}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tasks = serde_json::json!([
+            task("t-1", "in_progress", "2026-10-16T00:00:01Z"),
+            task("newer", "in_progress", "2026-10-16T00:00:09Z"),
+        ]);
+        let path = dir.path().join("ok.sock");
+        let (recorded, server) = fake_app_socket(&path, tasks, false).await;
+        let last_hash = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let expected = Arc::new(std::sync::Mutex::new(Some("t-1".to_string())));
+        let reported_task = || {
+            recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(m, _)| m == "team.report")
+                .map(|(_, p)| p["task_id"].as_str().unwrap_or("").to_string())
+        };
+
+        for interim in ["BLOCKED", "NEEDS_REVIEW"] {
+            try_emit_auto_reply(
+                "team",
+                "agent",
+                path.to_str(),
+                &last_hash,
+                &expected,
+                event(interim),
+            )
+            .await;
+            assert_eq!(
+                reported_task().as_deref(),
+                Some("t-1"),
+                "{interim} targets the capsule"
+            );
+            assert_eq!(
+                expected.lock().unwrap().as_deref(),
+                Some("t-1"),
+                "{interim} leaves the expectation for the final reply"
+            );
+            recorded.lock().unwrap().clear();
+        }
+
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            path.to_str(),
+            &last_hash,
+            &expected,
+            event("DONE"),
+        )
+        .await;
+        assert_eq!(
+            reported_task().as_deref(),
+            Some("t-1"),
+            "DONE targets the capsule"
+        );
+        assert_eq!(*expected.lock().unwrap(), None, "only DONE spends it");
+        assert_eq!(
+            methods(&recorded),
+            ["team.task.list", "team.report", "team.task.update"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_reply_forgets_the_hash_only_when_nothing_was_written() {
+        use crate::auto_reply_emit::tests::{fake_app_socket, methods, task};
+        let event = |body: &str| crate::auto_reply::AutoReplyEvent {
+            status: "DONE".to_string(),
+            files: "n/a".to_string(),
+            verify: "n/a".to_string(),
+            next: "NONE".to_string(),
+            full_report: "n/a".to_string(),
+            body: body.to_string(),
+            raw: format!("STATUS: DONE\\n\\n{body}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tasks = serde_json::json!([task("t-1", "in_progress", "2026-10-16T00:00:01Z")]);
+        let earlier = event("earlier").content_hash();
+        let last_hash = Arc::new(std::sync::Mutex::new(Some(earlier)));
+        let expected = Arc::new(std::sync::Mutex::new(None::<String>));
+        let reply = event("shipped");
+
+        let missing = dir.path().join("absent.sock");
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            missing.to_str(),
+            &last_hash,
+            &expected,
+            reply.clone(),
+        )
+        .await;
+        assert_eq!(
+            *last_hash.lock().unwrap(),
+            Some(earlier),
+            "a reply that wrote nothing does not count as sent"
+        );
+
+        let ok_path = dir.path().join("ok.sock");
+        let (recorded, server) = fake_app_socket(&ok_path, tasks.clone(), false).await;
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            ok_path.to_str(),
+            &last_hash,
+            &expected,
+            reply.clone(),
+        )
+        .await;
+        assert_eq!(
+            methods(&recorded),
+            ["team.task.list", "team.report", "team.task.update"],
+            "the identical reply is emitted again"
+        );
+        assert_eq!(*last_hash.lock().unwrap(), Some(reply.content_hash()));
+        server.abort();
+
+        let fail_path = dir.path().join("fail.sock");
+        let (_recorded, server) = fake_app_socket(&fail_path, tasks, true).await;
+        let refused = event("refused");
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            fail_path.to_str(),
+            &last_hash,
+            &expected,
+            refused.clone(),
+        )
+        .await;
+        assert_eq!(
+            *last_hash.lock().unwrap(),
+            Some(refused.content_hash()),
+            "a reply that may already be filed stays deduped"
+        );
         server.abort();
     }
 
