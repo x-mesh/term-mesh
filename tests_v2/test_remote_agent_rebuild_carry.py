@@ -37,7 +37,7 @@ REQUIRE_CARRY_ENV = "TERMMESH_E2E_REQUIRE_CARRY"
 REBUILD_LOSS_MARKER = "the pane was rebuilt (host reconnected)"
 CORRELATION_LOST = "agent.task.correlation.lost"
 TERMINAL_STATUSES = {"completed", "blocked", "failed", "cancelled", "review_ready"}
-WORKER_SLEEP_S = 45
+WORKER_SLEEP_S = 120
 # The rebuild must land inside the worker's `sleep`, after the turn is
 # visibly running; well short of WORKER_SLEEP_S leaves room for model latency.
 REBUILD_AFTER_IN_PROGRESS_S = 12
@@ -172,9 +172,11 @@ def main() -> int:
 
             delegated = _tm_agent_json(
                 team, "delegate", str(agent["name"]),
-                f"E2E rebuild-carry probe. Run the shell command `sleep {WORKER_SLEEP_S}` in the "
-                "foreground and wait for it to finish. Do not edit files. Then reply with exactly "
-                f"one line: STATUS: DONE {nonce}",
+                "E2E rebuild-carry probe. Use the Bash tool once with run_in_background set to "
+                f"true to run: python3 -c \"import time; time.sleep({WORKER_SLEEP_S})\" . Then end "
+                "your turn right away by saying 'waiting'. Do not poll, sleep, or use Monitor. Do "
+                "not edit files. When you are notified that the background job finished, reply "
+                f"with exactly one line: STATUS: DONE {nonce}",
                 "--worktree", "off", "--title", f"rebuild carry {nonce}",
             )
             task_id = str((delegated.get("result") or {}).get("task", {}).get("id") or "")
@@ -194,13 +196,23 @@ def main() -> int:
             # A cold remote worker can take minutes to start its first turn.
             if _wait(running, timeout_s=480, interval_s=1) is None:
                 raise termmeshError(f"worker never started task {task_id}: {task_by_id(c, team, task_id)!r}")
+
+            # The carried case: the worker handed its job to the background and
+            # ended the turn, so the task is pending with no turn in flight.
+            def idle_with_pending_task():
+                task = task_by_id(c, team, task_id)
+                if task.get("status") in TERMINAL_STATUSES:
+                    raise _TerminalTestFailure(f"task settled before the rebuild could land: {task!r}")
+                state = agent_row(c, team, instance_id).get("agent_state")
+                return task if task.get("status") == "in_progress" and state != "running" else None
+
+            if _wait(idle_with_pending_task, timeout_s=180, interval_s=1) is None:
+                raise termmeshError(f"worker never ended its first turn: {task_by_id(c, team, task_id)!r}")
             time.sleep(REBUILD_AFTER_IN_PROGRESS_S)
             before = task_by_id(c, team, task_id)
             agent_state = agent_row(c, team, instance_id).get("agent_state")
-            if before.get("status") != "in_progress" or agent_state != "running":
-                raise termmeshError(
-                    f"turn ended before the rebuild (agent_state={agent_state!r}): {before!r}"
-                )
+            if before.get("status") != "in_progress":
+                raise termmeshError(f"task settled before the rebuild: {before!r}")
             evidence["agent_state_at_rebuild"] = agent_state
 
             old_panel = agent_panel(c, team, instance_id)
