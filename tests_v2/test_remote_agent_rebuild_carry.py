@@ -4,7 +4,7 @@
 Evidence run for #786/#788, not a merge gate: the worker is a real LLM, so the
 turn timing is nondeterministic. `peer.host.reconnect` drops the worker pane
 with "host reconnected" while its turn runs `sleep 45`. The task must then end
-either completed by the rebuilt pane's STATUS: DONE <nonce> (carry installed)
+either completed by the rebuilt pane's STATUS: DONE plus nonce line (carry installed)
 or blocked exactly once with the rebuild reason (carry impossible) — never
 left in_progress.
 
@@ -177,7 +177,7 @@ def main() -> int:
                 f"true to run: python3 -c \"import time; time.sleep({WORKER_SLEEP_S})\" . Then end "
                 "your turn right away by saying 'waiting'. Do not poll, sleep, or use Monitor. Do "
                 "not edit files. When you are notified that the background job finished, reply "
-                f"with exactly one line: STATUS: DONE {nonce}",
+                f"with exactly two lines: first `STATUS: DONE`, then `{nonce}`",
                 "--worktree", "off", "--title", f"rebuild carry {nonce}",
             )
             task_id = str((delegated.get("result") or {}).get("task", {}).get("id") or "")
