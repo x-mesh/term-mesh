@@ -22828,8 +22828,9 @@ fn wait_report_outcome<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'sta
 #[derive(Debug, PartialEq, Eq)]
 enum WaitPushSource {
     LocalDaemon,
-    /// The local daemon never sees the owning host's task_status events.
-    RemoteLeaderPolling,
+    /// The local daemon never sees the owning host's task_status events, so
+    /// the owner is long-polled through the leader route instead.
+    RemoteOwnerWake,
     Disabled,
 }
 
@@ -22837,9 +22838,212 @@ fn wait_push_source(has_route: bool, push_disabled: bool, kinds_empty: bool) -> 
     if push_disabled || kinds_empty {
         WaitPushSource::Disabled
     } else if has_route {
-        WaitPushSource::RemoteLeaderPolling
+        WaitPushSource::RemoteOwnerWake
     } else {
         WaitPushSource::LocalDaemon
+    }
+}
+
+const OWNER_WAKE_METHOD: &str = "team.events.wait";
+/// The owner caps a hold at 7 s so the reply beats every hop's timeout.
+const OWNER_WAKE_HOLD: Duration = Duration::from_millis(7000);
+const OWNER_WAKE_MIN_GAP: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerWakeCursor {
+    epoch: String,
+    revision: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerWakeStep {
+    Wake(OwnerWakeCursor),
+    Rearm(OwnerWakeCursor),
+    Unsupported,
+    Retry,
+}
+
+/// An owner app older than `team.events.wait` rejects it as `invalid_method`
+/// in its own validator; an older host daemon or a PeerServer-routed owner
+/// answers `method_not_allowed`.
+fn owner_wake_unsupported(error: &str) -> bool {
+    error.contains("method_not_allowed") || error.contains("[invalid_method]")
+}
+
+fn owner_wake_step(
+    prev: Option<&OwnerWakeCursor>,
+    response: Result<Value, String>,
+) -> OwnerWakeStep {
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if owner_wake_unsupported(&error) => return OwnerWakeStep::Unsupported,
+        Err(_) => return OwnerWakeStep::Retry,
+    };
+    let result = &response["result"];
+    let (Some(epoch), Some(revision)) = (result["epoch"].as_str(), result["revision"].as_u64())
+    else {
+        return OwnerWakeStep::Retry;
+    };
+    let cursor = OwnerWakeCursor { epoch: epoch.to_string(), revision };
+    match prev {
+        Some(prev) if result["changed"].as_bool() == Some(true) || *prev != cursor => {
+            OwnerWakeStep::Wake(cursor)
+        }
+        _ => OwnerWakeStep::Rearm(cursor),
+    }
+}
+
+fn owner_wake_params(team: &str, since: Option<&OwnerWakeCursor>) -> Value {
+    json!({
+        "team_name": team,
+        "since": since.map(|cursor| json!({
+            "epoch": cursor.epoch,
+            "revision": cursor.revision,
+        })),
+        "timeout_ms": OWNER_WAKE_HOLD.as_millis() as u64,
+    })
+}
+
+fn owner_wake_pause(last_start: Option<Instant>, now: Instant) -> Duration {
+    last_start
+        .map(|start| OWNER_WAKE_MIN_GAP.saturating_sub(now.saturating_duration_since(start)))
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Feeds `run_wait`'s wake channel from the owner long-poll. Returning drops
+/// the sender, which the wait loop reads as "fall back to polling".
+fn spawn_remote_owner_wake(
+    sock: PathBuf,
+    team: String,
+    interval: u32,
+) -> std::sync::mpsc::Receiver<Value> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut cursor: Option<OwnerWakeCursor> = None;
+        let mut last_start: Option<Instant> = None;
+        loop {
+            thread::sleep(owner_wake_pause(last_start, Instant::now()));
+            last_start = Some(Instant::now());
+            let response = rpc_call_timeout_duration(
+                &sock,
+                OWNER_WAKE_METHOD,
+                owner_wake_params(&team, cursor.as_ref()),
+                remote_leader_timeout(OWNER_WAKE_METHOD, OWNER_WAKE_HOLD),
+            );
+            match owner_wake_step(cursor.as_ref(), response) {
+                OwnerWakeStep::Wake(next) => {
+                    let event = json!({
+                        "kind": "owner_wake",
+                        "epoch": next.epoch,
+                        "revision": next.revision,
+                    });
+                    cursor = Some(next);
+                    if tx.send(event).is_err() {
+                        return;
+                    }
+                }
+                OwnerWakeStep::Rearm(next) => cursor = Some(next),
+                OwnerWakeStep::Unsupported => return,
+                OwnerWakeStep::Retry => thread::sleep(Duration::from_secs(u64::from(interval))),
+            }
+        }
+    });
+    rx
+}
+
+#[cfg(test)]
+mod owner_wake_tests {
+    use super::*;
+
+    fn cursor(epoch: &str, revision: u64) -> OwnerWakeCursor {
+        OwnerWakeCursor { epoch: epoch.to_string(), revision }
+    }
+
+    fn answer(epoch: &str, revision: u64, changed: bool) -> Result<Value, String> {
+        Ok(json!({
+            "ok": true,
+            "result": {"epoch": epoch, "revision": revision, "changed": changed},
+            "remote_leader_proxy": true,
+        }))
+    }
+
+    #[test]
+    fn owner_wake_step_table() {
+        use OwnerWakeStep::*;
+        let armed = cursor("e1", 3);
+        for (name, prev, response, expected) in [
+            ("first arm", None, answer("e1", 3, false), Rearm(cursor("e1", 3))),
+            ("first arm ignores changed", None, answer("e1", 3, true), Rearm(cursor("e1", 3))),
+            ("unchanged revision", Some(&armed), answer("e1", 3, false), Rearm(cursor("e1", 3))),
+            ("higher revision", Some(&armed), answer("e1", 4, true), Wake(cursor("e1", 4))),
+            ("cursor moved without flag", Some(&armed), answer("e1", 5, false), Wake(cursor("e1", 5))),
+            ("epoch change", Some(&armed), answer("e2", 0, true), Wake(cursor("e2", 0))),
+            (
+                "rust host rejects",
+                Some(&armed),
+                Err("method_not_allowed: team.events.wait".to_string()),
+                Unsupported,
+            ),
+            (
+                "owner rejects on the PeerServer route",
+                Some(&armed),
+                Err("remote leader proxy [method_not_allowed]: team.events.wait is served only on the reverse leader route".to_string()),
+                Unsupported,
+            ),
+            (
+                "old owner app",
+                None,
+                Err("remote leader proxy [invalid_method]: remote leader command rejected".to_string()),
+                Unsupported,
+            ),
+            (
+                "transport error",
+                Some(&armed),
+                Err("authorized peer viewer is not connected".to_string()),
+                Retry,
+            ),
+            ("malformed result", Some(&armed), Ok(json!({"ok": true, "result": {}})), Retry),
+        ] {
+            assert_eq!(owner_wake_step(prev, response), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn owner_wake_params_carry_the_cursor_and_hold() {
+        assert_eq!(
+            owner_wake_params("alpha", None),
+            json!({"team_name": "alpha", "since": null, "timeout_ms": 7000})
+        );
+        assert_eq!(
+            owner_wake_params("alpha", Some(&cursor("e1", 9))),
+            json!({
+                "team_name": "alpha",
+                "since": {"epoch": "e1", "revision": 9},
+                "timeout_ms": 7000,
+            })
+        );
+    }
+
+    #[test]
+    fn owner_wake_pause_spaces_long_poll_starts_by_a_second() {
+        let start = Instant::now();
+        assert_eq!(owner_wake_pause(None, start), Duration::ZERO);
+        assert_eq!(owner_wake_pause(Some(start), start), Duration::from_secs(1));
+        assert_eq!(
+            owner_wake_pause(Some(start), start + Duration::from_millis(400)),
+            Duration::from_millis(600)
+        );
+        assert_eq!(owner_wake_pause(Some(start), start + Duration::from_secs(8)), Duration::ZERO);
+    }
+
+    #[test]
+    fn owner_wake_transport_outlives_the_owner_hold() {
+        assert!(remote_leader_timeout(OWNER_WAKE_METHOD, OWNER_WAKE_HOLD) > OWNER_WAKE_HOLD);
+        assert!(peer_proto::team_leader::scoped_method_allowed(OWNER_WAKE_METHOD));
+        assert_eq!(
+            remote_leader_rpc_policy(true, OWNER_WAKE_METHOD),
+            RemoteLeaderRpcPolicy::Proxy
+        );
     }
 }
 
@@ -22852,7 +23056,7 @@ mod wait_push_source_tests {
         use WaitPushSource::*;
         for (has_route, push_disabled, kinds_empty, expected) in [
             (false, false, false, LocalDaemon),
-            (true, false, false, RemoteLeaderPolling),
+            (true, false, false, RemoteOwnerWake),
             (true, true, false, Disabled),
             (true, false, true, Disabled),
             (false, true, false, Disabled),
@@ -23019,11 +23223,9 @@ fn run_wait(
     );
     let mut event_rx: Option<std::sync::mpsc::Receiver<Value>> = match push_source {
         WaitPushSource::Disabled => None,
-        WaitPushSource::RemoteLeaderPolling => {
-            eprintln!(
-                "wait: remote leader — owner events are not relayed; polling every {interval}s"
-            );
-            None
+        WaitPushSource::RemoteOwnerWake => {
+            eprintln!("wait: remote leader — waking on owner events (long-poll)");
+            Some(spawn_remote_owner_wake(sock.clone(), team.to_string(), interval))
         }
         // events.subscribe lives on the daemon socket, not the app socket.
         // Resolve it here so the caller's app `sock` is not misrouted.
