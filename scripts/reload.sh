@@ -152,6 +152,35 @@ remove_tag_artifacts() {
   fi
 }
 
+# `--cleanup` must report what it actually removed. The reminder prints raw
+# directory names, and release.py's dotted ones (term-mesh-release-0.273.0)
+# sanitize to a slug that names no directory, so the raw name is the fallback.
+# `prod` is the Makefile's PROD_DERIVED_DATA, never a reload.sh tag.
+reclaim_tag_build() {
+  local raw="$1"
+  local slug="$2"
+  local name=""
+
+  if [[ "$slug" == "prod" ]]; then
+    echo "error: refusing to reclaim ${TAG_TMP_ROOT}/term-mesh-prod — it is the Makefile prod build, not a tag" >&2
+    return 1
+  fi
+  if [[ -d "${TAG_TMP_ROOT}/term-mesh-${slug}" ]]; then
+    name="$slug"
+  elif [[ "$raw" != "$slug" && "$raw" =~ ^[a-z0-9][a-z0-9._-]*$ \
+     && -d "${TAG_TMP_ROOT}/term-mesh-${raw}" ]]; then
+    name="$raw"
+  else
+    echo "nothing to reclaim: no tag build at ${TAG_TMP_ROOT}/term-mesh-${slug}"
+    return 0
+  fi
+  if ! remove_tag_artifacts "$name"; then
+    echo "error: refusing to reclaim ${TAG_TMP_ROOT}/term-mesh-${name} — not a managed tag directory" >&2
+    return 1
+  fi
+  echo "reclaimed tagged build ${name}"
+}
+
 # A session file binds a tag build to the exact app PID launched from it. On a
 # later reload, a missing/reused PID proves that session ended and its derived
 # data can be reclaimed without waiting for the age-based fallback.
@@ -258,7 +287,7 @@ list_stale_tags() {
   # "stale tags: none" while ~100G piled up.
   while IFS= read -r -d '' path; do
     tag="${path##*/term-mesh-}"
-    if [[ -z "$tag" || "$tag" == "$current_slug" ]]; then
+    if [[ -z "$tag" || "$tag" == "$current_slug" || "$tag" == "prod" ]]; then
       continue
     fi
     if [[ ! -d "$path/Build" ]]; then
@@ -496,9 +525,8 @@ if [[ "$CLEANUP_ONLY" -eq 1 ]]; then
     pkill -f "$APP_PROCESS_PATTERN" || true
   fi
   stop_daemon_for_socket "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${TAG_SLUG}.sock"
-  remove_tag_artifacts "$TAG_SLUG"
   rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG}.session"
-  echo "reclaimed tagged build ${TAG_SLUG}"
+  reclaim_tag_build "$TAG" "$TAG_SLUG" || exit $?
   exit 0
 fi
 
