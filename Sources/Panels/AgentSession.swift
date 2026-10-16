@@ -1463,21 +1463,31 @@ final class AgentSession {
     /// worker's own STATUS. `reason` is written to the task as it stands.
     enum TaskCorrelationLoss: Equatable {
         case superseded(by: String)
-        case noStatusDeadline(TimeInterval)
-        case noStatusWithBackgroundWork(TimeInterval)
+        case noStatusDeadline(TimeInterval, statedOutsideTask: Bool = false)
+        case noStatusWithBackgroundWork(TimeInterval, statedOutsideTask: Bool = false)
         case sessionEnded(String)
 
         var reason: String {
             switch self {
             case .superseded(let next):
                 return "superseded by dispatch of \(next) before an explicit STATUS"
-            case .noStatusDeadline(let interval):
+            case .noStatusDeadline(let interval, let statedOutsideTask):
                 return "No explicit STATUS after \(Self.span(interval)) without activity"
-            case .noStatusWithBackgroundWork(let interval):
+                    + Self.outsideTaskNote(statedOutsideTask)
+            case .noStatusWithBackgroundWork(let interval, let statedOutsideTask):
                 return "No explicit STATUS after \(Self.span(interval)) while background work was still running"
+                    + Self.outsideTaskNote(statedOutsideTask)
             case .sessionEnded(let why):
                 return why
             }
+        }
+
+        /// The worker's text did state a verdict, so the leader must not read
+        /// the block as the worker having said nothing.
+        private static func outsideTaskNote(_ stated: Bool) -> String {
+            stated
+                ? "; a STATUS was stated in a turn not tied to this task (leader message without TASK_ID or person input)"
+                : ""
         }
 
         private static func span(_ interval: TimeInterval) -> String {
@@ -2780,6 +2790,7 @@ final class AgentSession {
         }
         taskCorrelationGeneration &+= 1
         pendingTask = PendingTask(taskId: taskId, generation: taskCorrelationGeneration)
+        uncorrelatedStatusGeneration = nil
     }
 
     private func loseTaskCorrelation(_ task: PendingTask, _ loss: TaskCorrelationLoss) {
@@ -2861,6 +2872,10 @@ final class AgentSession {
 
     @ObservationIgnored private var pendingTask: PendingTask?
     @ObservationIgnored private var taskCorrelationGeneration: UInt64 = 0
+    /// The pending correlation a turn not tied to it stated a STATUS during.
+    /// That turn may be answering something else, so it cannot settle the
+    /// task, but a later block must not claim the worker stated nothing.
+    @ObservationIgnored private var uncorrelatedStatusGeneration: UInt64?
 
     /// Who opened the running turn. Only a TASK_ID dispatch and a turn the
     /// CLI started itself may answer the pending task; a person's turn or a
@@ -3379,9 +3394,11 @@ final class AgentSession {
         // stated rather than inferred from a screen going quiet.
         saidThisTurn.removeAll()
         noteTaskActivity()
-        if let answered, pendingTask == answered,
-           AgentPipeCompletion.explicitStatus(in: final) != nil {
+        let stated = AgentPipeCompletion.explicitStatus(in: final) != nil
+        if let answered, pendingTask == answered, stated {
             pendingTask = nil
+        } else if answered == nil, stated, let pendingTask {
+            uncorrelatedStatusGeneration = pendingTask.generation
         } else if answered != nil {
             // The worker just took a turn on this task, so it is still there:
             // the cap is for a worker that went away, not one whose job runs
@@ -3650,7 +3667,9 @@ final class AgentSession {
                 }
                 self.taskStatusDeadline = nil
                 self.loseTaskCorrelation(
-                    task, .noStatusWithBackgroundWork(self.pendingTaskStatusCap))
+                    task, .noStatusWithBackgroundWork(
+                        self.pendingTaskStatusCap,
+                        statedOutsideTask: self.uncorrelatedStatusGeneration == task.generation))
                 return
             }
             let remaining = self.pendingTaskStatusDeadline
@@ -3661,7 +3680,9 @@ final class AgentSession {
                 return
             }
             self.taskStatusDeadline = nil
-            self.loseTaskCorrelation(task, .noStatusDeadline(self.pendingTaskStatusDeadline))
+            self.loseTaskCorrelation(task, .noStatusDeadline(
+                self.pendingTaskStatusDeadline,
+                statedOutsideTask: self.uncorrelatedStatusGeneration == task.generation))
         }
         taskStatusDeadline = item
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)

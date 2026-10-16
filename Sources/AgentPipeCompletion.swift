@@ -281,10 +281,18 @@ final class AgentPipeCompletion {
         let stated = Self.explicitStatus(in: finalText) != nil
         // The expectation outlives a verdict-less turn, so each later one
         // would refile the same NEEDS_REVIEW default over the first: another
-        // report message and an overwritten result for no new verdict.
+        // report message and an overwritten result for no new verdict. The
+        // turn still happened, so it is kept as progress.
         if !stated,
            TeamDataStore.shared.getTask(teamName: watch.teamName, taskId: pendingTaskId)?
                .status == "review_ready" {
+            AutoReplyEmit.recordProgressWithoutStatus(
+                teamName: watch.teamName,
+                agentName: watch.agentName,
+                agentInstanceId: watch.agentInstanceId,
+                final: finalText,
+                taskId: pendingTaskId
+            )
             return
         }
         AutoReplyEmit.emit(

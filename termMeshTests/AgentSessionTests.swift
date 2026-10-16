@@ -3224,6 +3224,50 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertNil(s.pendingTaskIdForTesting)
     }
 
+    /// A STATUS in a turn not tied to the task still settles nothing, but the
+    /// block that follows says it was stated rather than claiming silence.
+    func testAStatusStatedOutsideTheTaskIsNamedWhenTheDeadlineBlocksIt() async throws {
+        for speaker in [AgentSession.Speaker.leader, .person] {
+            var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+            let s = AgentSession(pendingTaskStatusDeadline: 0.05)
+            s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+            s.startRemote { _ in }
+            try s.send("TASK_ID: outside1\nwork", from: .leader)
+            s.ingestForTesting(resultSaying("Running in the background."))
+            try s.send("how is it going?", from: speaker)
+            s.ingestForTesting(resultSaying("STATUS: DONE"))
+            XCTAssertEqual(s.pendingTaskIdForTesting, "outside1", "\(speaker) turn settles nothing")
+
+            let fired = await waitUntil { !lost.isEmpty }
+            XCTAssertTrue(fired)
+            XCTAssertEqual(lost.map(\.0), ["outside1"])
+            XCTAssertEqual(lost.first?.1, .noStatusDeadline(0.05, statedOutsideTask: true))
+            s.stop()
+        }
+        XCTAssertEqual(
+            AgentSession.TaskCorrelationLoss.noStatusDeadline(10 * 60, statedOutsideTask: true).reason,
+            "No explicit STATUS after 10 min without activity; a STATUS was stated in a turn not tied to this task (leader message without TASK_ID or person input)")
+    }
+
+    func testANewCorrelationForgetsAStatusStatedOutsideTheOldOne() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession(pendingTaskStatusDeadline: 0.05)
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: outside1\nwork", from: .leader)
+        s.ingestForTesting(resultSaying("Running in the background."))
+        try s.send("how is it going?", from: .person)
+        s.ingestForTesting(resultSaying("STATUS: DONE"))
+        try s.send("TASK_ID: outside2\nnext", from: .leader)
+        s.ingestForTesting(resultSaying("Running in the background."))
+
+        let fired = await waitUntil { lost.count == 2 }
+        XCTAssertTrue(fired)
+        XCTAssertEqual(lost.map(\.0), ["outside1", "outside2"])
+        XCTAssertEqual(lost.last?.1, .noStatusDeadline(0.05))
+        s.stop()
+    }
+
     // MARK: - The incident against a real task board
 
     /// Wired exactly as `TeamOrchestrator.wireNativeWorkerCompletion` wires a
@@ -3374,22 +3418,22 @@ final class AgentSessionTests: XCTestCase {
 
     func testTheDeadlineCountsFromWhenBackgroundWorkFinished() async throws {
         var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
-        let s = try backgroundedWorker(deadline: 0.3, cap: 5) { task, loss in lost.append((task, loss)) }
-        try? await Task.sleep(nanoseconds: 500_000_000)
+        let s = try backgroundedWorker(deadline: 0.5, cap: 5) { task, loss in lost.append((task, loss)) }
+        try? await Task.sleep(nanoseconds: 600_000_000)
         XCTAssertTrue(lost.isEmpty)
 
         for line in backgroundFinished("bygdymlig") { s.ingestForTesting(line) }
         let emptied = Date()
         s.ingestForTesting(event(["type": "system", "subtype": "init", "model": "claude"]))
         s.ingestForTesting(event(["type": "system", "subtype": "status"]))
-        try? await Task.sleep(nanoseconds: 150_000_000)
+        try? await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertTrue(lost.isEmpty, "not before a full deadline after the job finished")
 
         let fired = await waitUntil { !lost.isEmpty }
         XCTAssertTrue(fired)
-        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(emptied), 0.29)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(emptied), 0.49)
         XCTAssertEqual(lost.map(\.0), ["bg000001"])
-        XCTAssertEqual(lost.first?.1, .noStatusDeadline(0.3))
+        XCTAssertEqual(lost.first?.1, .noStatusDeadline(0.5))
     }
 
     /// A server started in the background never finishes, so the hold ends
@@ -3397,17 +3441,17 @@ final class AgentSessionTests: XCTestCase {
     func testBackgroundWorkThatNeverEndsIsCappedWithItsOwnReason() async throws {
         var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
         let started = Date()
-        let s = try backgroundedWorker(deadline: 0.05, cap: 0.4) { task, loss in lost.append((task, loss)) }
-        try? await Task.sleep(nanoseconds: 250_000_000)
+        let s = try backgroundedWorker(deadline: 0.05, cap: 1) { task, loss in lost.append((task, loss)) }
+        try? await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertTrue(lost.isEmpty)
 
         let fired = await waitUntil { !lost.isEmpty }
         XCTAssertTrue(fired)
-        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.39)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.99)
         XCTAssertEqual(lost.map(\.0), ["bg000001"])
-        XCTAssertEqual(lost.first?.1, .noStatusWithBackgroundWork(0.4))
+        XCTAssertEqual(lost.first?.1, .noStatusWithBackgroundWork(1))
         XCTAssertEqual(lost.first?.1.reason,
-                       "No explicit STATUS after 0s while background work was still running")
+                       "No explicit STATUS after 1s while background work was still running")
         XCTAssertEqual(AgentSession.TaskCorrelationLoss.noStatusWithBackgroundWork(60 * 60).reason,
                        "No explicit STATUS after 60 min while background work was still running")
         XCTAssertEqual(AgentSession.TaskCorrelationLoss.noStatusDeadline(10 * 60).reason,
@@ -3422,19 +3466,19 @@ final class AgentSessionTests: XCTestCase {
     /// the worker is still there, so the cap counts from the latest one.
     func testATurnOnTheTaskRestartsTheBackgroundCap() async throws {
         var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
-        let s = try backgroundedWorker(deadline: 0.05, cap: 0.4) { task, loss in lost.append((task, loss)) }
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        let s = try backgroundedWorker(deadline: 0.05, cap: 1) { task, loss in lost.append((task, loss)) }
+        try? await Task.sleep(nanoseconds: 500_000_000)
 
         let stepEnded = Date()
         s.ingestForTesting(assistantSaid("Step one finished; starting step two in the background."))
         s.ingestForTesting(resultSaying("Step two is running in the background."))
-        try? await Task.sleep(nanoseconds: 250_000_000)
+        try? await Task.sleep(nanoseconds: 650_000_000)
         XCTAssertTrue(lost.isEmpty, "the cap must not count from the first wait")
 
         let fired = await waitUntil { !lost.isEmpty }
         XCTAssertTrue(fired)
-        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(stepEnded), 0.39)
-        XCTAssertEqual(lost.first?.1, .noStatusWithBackgroundWork(0.4))
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(stepEnded), 0.99)
+        XCTAssertEqual(lost.first?.1, .noStatusWithBackgroundWork(1))
         withExtendedLifetime(s) {}
     }
 

@@ -7251,17 +7251,6 @@ final class TeamOrchestrator: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    /// File a turn's full text where the leader looks for it.
-    ///
-    /// Written by the CLI until now, as a side effect of the agent running
-    /// `tm-agent reply`. Dropping that command from the instruction — because
-    /// it can only fail here — took the file with it, and the leader's
-    /// documented way to read a full report is `cat
-    /// ~/.term-mesh/results/<team>/<task_id>.md`. Replies are truncated to
-    /// 1500 characters over the socket, so without the file a long report is
-    /// simply gone.
-    ///
-    /// Both names, as the CLI writes them: the task's, and the agent's latest.
     /// The one place a native worker's turns reach the task board, for local
     /// and peer-owned panes alike.
     ///
@@ -7295,6 +7284,17 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// File a turn's full text where the leader looks for it.
+    ///
+    /// Written by the CLI until now, as a side effect of the agent running
+    /// `tm-agent reply`. Dropping that command from the instruction — because
+    /// it can only fail here — took the file with it, and the leader's
+    /// documented way to read a full report is `cat
+    /// ~/.term-mesh/results/<team>/<task_id>.md`. Replies are truncated to
+    /// 1500 characters over the socket, so without the file a long report is
+    /// simply gone.
+    ///
+    /// Both names, as the CLI writes them: the task's, and the agent's latest.
     static func fileReport(teamName: String, agentName: String,
                            agentInstanceId: String? = nil,
                            taskId: String?, text: String) {

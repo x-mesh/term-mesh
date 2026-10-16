@@ -229,9 +229,10 @@ enum AutoReplyEmit {
             : String(trimmed.prefix(resultTruncChars))
         return store.updateTask(
             teamName: teamName, taskId: taskId,
-            assigneeInstanceId: task.assigneeInstanceId,
             progressNote: note,
-            expectedAssignee: agentName
+            expectedStatus: task.status,
+            expectedAssignee: agentName,
+            expectedAssigneeInstanceId: task.assigneeInstanceId
         ) != nil
     }
 
@@ -260,10 +261,10 @@ enum AutoReplyEmit {
         guard let updated = store.updateTask(
             teamName: teamName, taskId: taskId,
             status: "blocked",
-            assigneeInstanceId: task.assigneeInstanceId,
             blockedReason: reason,
             expectedStatus: "in_progress",
-            expectedAssignee: agentName
+            expectedAssignee: agentName,
+            expectedAssigneeInstanceId: task.assigneeInstanceId
         ) else { return false }
         publishTaskStatus(
             teamName: teamName, agentName: updated.assignee ?? agentName,

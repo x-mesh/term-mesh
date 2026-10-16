@@ -296,6 +296,34 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
     }
 
+    func testAGuardedUpdateComparesThePinnedInstanceUnderTheLock() throws {
+        let (team, store) = nativeTeam("guarded-instance", agents: [
+            .init(name: "executor", instanceId: "instance-a"),
+            .init(name: "executor", instanceId: "instance-b"),
+        ])
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try runningTask(team, store, assigneeInstanceId: "instance-b")
+
+        for stale in ["instance-a", nil] as [String?] {
+            XCTAssertNil(store.updateTask(
+                teamName: team, taskId: task.id, status: "blocked",
+                blockedReason: "stale", progressNote: "stale",
+                expectedStatus: "in_progress", expectedAssignee: "executor",
+                expectedAssigneeInstanceId: stale))
+        }
+        let after = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(after.status, "in_progress")
+        XCTAssertEqual(after.assigneeInstanceId, "instance-b")
+        XCTAssertNil(after.blockedReason)
+        XCTAssertEqual(after.updatedAt, task.updatedAt)
+        XCTAssertTrue(store.getMessages(teamName: team, type: "progress").isEmpty)
+
+        XCTAssertNotNil(store.updateTask(
+            teamName: team, taskId: task.id, status: "blocked",
+            expectedStatus: "in_progress", expectedAssignee: "executor",
+            expectedAssigneeInstanceId: "instance-b"))
+    }
+
     /// A worker that states its verdict late still closes the task it named,
     /// whether the pipe path left it review_ready or the native fallback left
     /// it blocked.

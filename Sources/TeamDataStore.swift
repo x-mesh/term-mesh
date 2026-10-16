@@ -1834,7 +1834,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         worktreeFinishMode: String? = nil,
         worktreeRemoved: Bool? = nil,
         expectedStatus: String? = nil,
-        expectedAssignee: String? = nil
+        expectedAssignee: String? = nil,
+        // `.some(nil)` expects the task to be unpinned; omitted skips the check.
+        expectedAssigneeInstanceId: String?? = nil
     ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
@@ -1842,6 +1844,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
         if let expectedStatus, tasks[idx].status != expectedStatus { return nil }
         if let expectedAssignee, tasks[idx].assignee != expectedAssignee { return nil }
+        if let expectedAssigneeInstanceId,
+           tasks[idx].assigneeInstanceId != expectedAssigneeInstanceId { return nil }
         let now = Date()
         if let assignee {
             guard let resolvedAssignee = resolveAssigneeUnsafe(

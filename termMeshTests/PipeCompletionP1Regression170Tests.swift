@@ -177,6 +177,8 @@ final class PipeCompletionP1Regression170Tests: XCTestCase {
 
         try appendResult("Still waiting on the build.", to: watched)
         XCTAssertEqual(reports(watched), 1, "no second report for no new verdict")
+        XCTAssertTrue(store.getMessages(teamName: watched.team, type: "progress")
+            .contains { $0.content == "Still waiting on the build." }, "the turn is kept as progress")
         XCTAssertEqual(storedResult(watched), firstResult, "the filed result is not overwritten")
         XCTAssertEqual(store.getTask(teamName: watched.team, taskId: watched.taskId)?.status, "review_ready")
 
