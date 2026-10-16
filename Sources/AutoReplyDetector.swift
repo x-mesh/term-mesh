@@ -64,6 +64,27 @@ final class AutoReplyDetector {
         self.config = config
     }
 
+    /// A verdict in the agent's own final reply: the first word must be an
+    /// exact protocol verdict, and anything after it is the agent's note
+    /// (`STATUS: DONE all tests pass`). Not for screen scraping, where an echoed
+    /// instruction can carry a line shaped like that.
+    static func statedVerdict(_ value: String) -> String? {
+        let words = value.split(whereSeparator: \.isWhitespace)
+        guard let first = words.first, let verdict = validatedStatus(String(first)),
+              value.first?.isWhitespace == false else { return nil }
+        // A spaced choice list (`DONE | BLOCKED`, `DONE or BLOCKED`) is the
+        // template, not a verdict. Only the words right after the verdict are
+        // read, so a note that mentions a path or another verdict still counts.
+        let rest = words.dropFirst().prefix(2).map(String.init)
+        if let next = rest.first {
+            let bare = { (word: String) in word.trimmingCharacters(in: CharacterSet(charactersIn: "|/,()[]")) }
+            let isVerdict = { (word: String) in validatedStatus(bare(word)) != nil }
+            if next.hasPrefix("|") || next.hasPrefix("/") || isVerdict(next) { return nil }
+            if bare(next).lowercased() == "or", rest.count > 1, isVerdict(rest[1]) { return nil }
+        }
+        return verdict
+    }
+
     /// Accept only protocol verdicts, exactly as written. Deliberately does no
     /// trimming or case folding: placeholders, comma-separated choices, partial
     /// matches, and values with extra whitespace are not agent verdicts.

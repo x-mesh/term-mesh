@@ -26,11 +26,32 @@ use crate::auto_reply::AutoReplyEvent;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const RESULT_TRUNC_CHARS: usize = 1500;
 
-/// Maps an agent STATUS verdict to the task status it sets. Exact match only —
-/// a template echo such as `DONE|BLOCKED|NEEDS_REVIEW`, a lowercase or padded
-/// value must not close a task (mirrors `AutoReplyDetector.validatedStatus`).
+/// Maps an agent STATUS verdict to the task status it sets. The first word must
+/// be an exact verdict; anything after it is the agent's note. A template echo
+/// such as `DONE|BLOCKED|NEEDS_REVIEW`, a lowercase or leading-space value must
+/// not close a task (mirrors `AutoReplyDetector.statedVerdict`).
 pub fn validated_status(status: &str) -> Option<&'static str> {
-    match status {
+    if status.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut words = status.split_whitespace();
+    let first = words.next().unwrap_or("");
+    // A spaced choice list (`DONE | BLOCKED`, `DONE or BLOCKED`) is the
+    // template. Only the words right after the verdict are read, so a note
+    // that mentions a path or another verdict still counts.
+    let bare = |word: &str| word.trim_matches(|c| "|/,()[]".contains(c)).to_string();
+    let is_verdict = |word: &str| matches!(bare(word).as_str(), "DONE" | "BLOCKED" | "NEEDS_REVIEW");
+    let next = words.next();
+    let after = words.next();
+    let template = match next {
+        Some(word) if word.starts_with('|') || word.starts_with('/') || is_verdict(word) => true,
+        Some(word) if bare(word).eq_ignore_ascii_case("or") => after.is_some_and(is_verdict),
+        _ => false,
+    };
+    if template {
+        return None;
+    }
+    match first {
         "DONE" => Some("completed"),
         "BLOCKED" => Some("blocked"),
         "NEEDS_REVIEW" => Some("review_ready"),
@@ -292,12 +313,25 @@ pub(crate) mod tests {
         assert_eq!(validated_status("DONE"), Some("completed"));
         assert_eq!(validated_status("BLOCKED"), Some("blocked"));
         assert_eq!(validated_status("NEEDS_REVIEW"), Some("review_ready"));
+        assert_eq!(validated_status("DONE "), Some("completed"));
+        assert_eq!(validated_status("DONE CARRY-1a2b"), Some("completed"));
+        assert_eq!(validated_status("BLOCKED\twaiting on the db"), Some("blocked"));
+        assert_eq!(validated_status("DONE wrote /tmp/out.txt"), Some("completed"));
+        assert_eq!(validated_status("DONE the BLOCKED test passes now"), Some("completed"));
         for rejected in [
             "DONE|BLOCKED|NEEDS_REVIEW",
             "IN_PROGRESS",
             "done",
+            "done all good",
             " DONE",
-            "DONE ",
+            "DONE.",
+            "DONEISH note",
+            "DONE | BLOCKED | NEEDS_REVIEW",
+            "DONE / BLOCKED",
+            "DONE or BLOCKED",
+            "DONE BLOCKED NEEDS_REVIEW",
+            "DONE [BLOCKED]",
+            "DONE (or BLOCKED)",
             "",
         ] {
             assert_eq!(validated_status(rejected), None, "{rejected:?}");
