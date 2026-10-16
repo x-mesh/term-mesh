@@ -3120,6 +3120,167 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(lost.first?.1, .sessionEnded("the session was stopped before an explicit STATUS"))
     }
 
+    private func doneReport(_ marker: String) -> String {
+        "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: \(marker)"
+    }
+
+    private func turnEndedCount(_ s: AgentSession) -> Int {
+        s.entries.filter { if case .turnEnded = $0 { return true }; return false }.count
+    }
+
+    /// A rebuilt pane replays the turn the retired pane already filed. Its
+    /// DONE must not close the carried task or overwrite the reply file; the
+    /// first result the retired pane never saw does both.
+    func testAReplayedResultNeitherSettlesTheCarriedTaskNorReachesOnTurnEnd() async throws {
+        var ended: [(String, String?)] = []
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { text, _, taskId in ended.append((text, taskId)) }
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        let history = Data((resultSaying(doneReport("old")) + "\n").utf8)
+        let fresh = Data((resultSaying(doneReport("new")) + "\n").utf8)
+
+        s.expectReplayHistory(
+            bytes: UInt64(history.count),
+            carried: .init(taskId: "c0c0c0c0", turnWasInFlight: true)
+        )
+        s.consume(history)
+        let replayed = await waitUntil { self.turnEndedCount(s) == 1 }
+        XCTAssertTrue(replayed, "the replayed turn still renders")
+        XCTAssertTrue(ended.isEmpty, "a replayed turn must not reach onTurnEnd")
+        XCTAssertEqual(s.pendingTaskIdForTesting, "c0c0c0c0", "the replayed DONE settled nothing")
+
+        s.consume(fresh)
+        let settled = await waitUntil { ended.count == 1 }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(ended.first?.1, "c0c0c0c0")
+        XCTAssertTrue(ended.first?.0.contains("new") ?? false)
+        XCTAssertNil(s.pendingTaskIdForTesting)
+        XCTAssertTrue(lost.isEmpty)
+    }
+
+    func testTheReplayBoundaryHoldsWhereverTheChunksSplit() async throws {
+        let history = Data((assistantSaid("working") + "\n"
+            + resultSaying(doneReport("old")) + "\n").utf8)
+        let fresh = Data((resultSaying(doneReport("new")) + "\n").utf8)
+        let wire = history + fresh
+        for chunkSize in [7, history.count, history.count + 5, wire.count] {
+            var ended: [String?] = []
+            let s = AgentSession()
+            s.onTurnEnd = { _, _, taskId in ended.append(taskId) }
+            s.startRemote { _ in }
+            s.expectReplayHistory(
+                bytes: UInt64(history.count),
+                carried: .init(taskId: "d1d1d1d1", turnWasInFlight: false)
+            )
+            var offset = 0
+            while offset < wire.count {
+                let end = min(offset + chunkSize, wire.count)
+                s.consume(wire.subdata(in: offset..<end))
+                offset = end
+            }
+            let done = await waitUntil { self.turnEndedCount(s) == 2 }
+            XCTAssertTrue(done, "chunk size \(chunkSize)")
+            XCTAssertEqual(ended, ["d1d1d1d1"], "chunk size \(chunkSize)")
+            XCTAssertNil(s.pendingTaskIdForTesting, "chunk size \(chunkSize)")
+        }
+    }
+
+    func testNoReplayedBytesInstallsTheCarryBeforeTheFirstLine() async throws {
+        var ended: [String?] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, taskId in ended.append(taskId) }
+        s.startRemote { _ in }
+
+        s.expectReplayHistory(bytes: 0, carried: .init(taskId: "e2e2e2e2", turnWasInFlight: false))
+        XCTAssertEqual(s.pendingTaskIdForTesting, "e2e2e2e2")
+
+        s.consume(Data((resultSaying(doneReport("first")) + "\n").utf8))
+        let settled = await waitUntil { ended.count == 1 }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(ended, ["e2e2e2e2"])
+    }
+
+    func testACarryingRebuildStopNeitherLosesTheTaskNorFilesItsId() throws {
+        var ended: [String?] = []
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, taskId in ended.append(taskId) }
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: f3f3f3f3\nbuild it", from: .leader)
+
+        let carried = s.stopForPaneRebuild(after: "stream rewound", carry: true)
+
+        XCTAssertEqual(carried, .init(taskId: "f3f3f3f3", turnWasInFlight: true))
+        XCTAssertTrue(lost.isEmpty)
+        XCTAssertEqual(ended, [nil], "the stopped turn ends without the carried task's id")
+    }
+
+    /// Only a turn that could answer the task carries as in flight; a person's
+    /// turn running at the rebuild must not become a dispatch on the new pane.
+    func testAPersonsTurnInFlightDoesNotCarryAsTheTasksTurn() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("TASK_ID: a4a4a4a4\nbuild it", from: .leader)
+        s.ingestForTesting(resultSaying("in the background"))
+        try s.send("how is it going?", from: .person)
+        XCTAssertTrue(s.isTurnInFlightForTesting)
+
+        let carried = s.stopForPaneRebuild(after: "stream rewound", carry: true)
+
+        XCTAssertEqual(carried, .init(taskId: "a4a4a4a4", turnWasInFlight: false))
+    }
+
+    func testAbandoningACarryReportsTheRebuildLossOnce() throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        s.expectReplayHistory(bytes: 512, carried: .init(taskId: "b5b5b5b5", turnWasInFlight: false))
+        let reason = AgentSession.paneRebuildLossReason(cause: "stream rewound")
+
+        s.abandonCarriedCorrelation(reason: reason)
+        s.abandonCarriedCorrelation(reason: reason)
+        s.stop()
+
+        XCTAssertEqual(lost.count, 1)
+        XCTAssertEqual(lost.first?.0, "b5b5b5b5")
+        XCTAssertEqual(lost.first?.1, .sessionEnded(reason))
+    }
+
+    /// Rebuilt again before its replay ended: the carry moves on with its
+    /// original boundary, and the stopped session reports nothing.
+    func testARebuildDuringReplayRetakesTheUninstalledCarry() throws {
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        let carry = AgentSession.CarriedTaskCorrelation(
+            taskId: "c6c6c6c6", turnWasInFlight: true, replayBoundarySeq: 9_000
+        )
+        s.expectReplayHistory(bytes: 512, carried: carry)
+
+        XCTAssertEqual(s.stopForPaneRebuild(after: "disconnected", carry: true), carry)
+        XCTAssertTrue(lost.isEmpty)
+    }
+
+    func testStoppingDuringReplayLosesTheUninstalledCarryOnce() throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        s.expectReplayHistory(bytes: 512, carried: .init(taskId: "d7d7d7d7", turnWasInFlight: false))
+
+        s.stopForPaneRebuild(after: "disconnected")
+        s.stop()
+
+        XCTAssertEqual(lost.count, 1)
+        XCTAssertEqual(lost.first?.1.reason,
+                       AgentSession.paneRebuildLossReason(cause: "disconnected"))
+    }
+
     /// One instruction, one turn, one result still holds when the running
     /// turn is one the CLI started: a dispatch landing in it is queued, not
     /// merged into it.

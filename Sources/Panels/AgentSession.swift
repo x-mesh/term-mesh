@@ -1699,6 +1699,9 @@ final class AgentSession {
         let queue = DispatchQueue(label: "com.termmesh.agent-session.remote-stream")
         /// Read and written only on `queue`.
         var closed = false
+        /// Replayed bytes still to come before the stream reaches what the
+        /// retired pane never received. Read and written only on `queue`.
+        var historyBytesRemaining: UInt64?
         let decoder = AgentStreamDecoder(maxLineBytes: AgentStreamDecoder.defaultMaxLineBytes)
         let batcher: AgentLineBatcher
 
@@ -2396,12 +2399,93 @@ final class AgentSession {
         stop(lossReason: "the session was stopped before an explicit STATUS")
     }
 
-    /// Stop a session whose pane is being torn down and rebuilt. The rebuilt
-    /// pane starts a new session with no correlation, so the leader is told
-    /// the pending task was lost to the rebuild rather than to a plain stop.
-    func stopForPaneRebuild(after cause: String) {
-        stop(lossReason: "the pane was rebuilt (\(cause)); a STATUS from the rebuilt pane "
-            + "will not close this task — check the agent's reply and re-dispatch if needed")
+    /// The task this session was waiting on, handed to the session that
+    /// replaces it. `replayBoundarySeq` is set only when the correlation had
+    /// not reached its own session yet, so a second rebuild keeps the first
+    /// boundary instead of measuring from bytes that were themselves replay.
+    struct CarriedTaskCorrelation: Equatable {
+        let taskId: String
+        let turnWasInFlight: Bool
+        var replayBoundarySeq: UInt64?
+    }
+
+    nonisolated static func paneRebuildLossReason(cause: String, acrossGap: Bool = false) -> String {
+        let rebuilt = acrossGap
+            ? "the pane was rebuilt (\(cause)) across a stream gap"
+            : "the pane was rebuilt (\(cause))"
+        return rebuilt + "; a STATUS from the rebuilt pane "
+            + "will not close this task — check the agent's reply and re-dispatch if needed"
+    }
+
+    /// Stop a session whose pane is being torn down and rebuilt. Without
+    /// `carry` the rebuilt pane starts with no correlation, so the leader is
+    /// told the pending task was lost to the rebuild rather than to a plain
+    /// stop. With `carry` the correlation is returned instead of lost, for the
+    /// rebuilt session's `expectReplayHistory`.
+    @discardableResult
+    func stopForPaneRebuild(after cause: String, carry: Bool = false) -> CarriedTaskCorrelation? {
+        var carried: CarriedTaskCorrelation?
+        if carry {
+            if let task = pendingTask {
+                carried = CarriedTaskCorrelation(
+                    taskId: task.taskId,
+                    turnWasInFlight: turnInFlight && correlatedTask != nil
+                )
+                pendingTask = nil
+            } else if let waiting = uninstalledCarry {
+                carried = waiting
+                uninstalledCarry = nil
+            }
+        }
+        stop(lossReason: Self.paneRebuildLossReason(cause: cause))
+        return carried
+    }
+
+    /// Before any byte is consumed: the first `bytes` of the stream repeat
+    /// what the retired pane already received. They render, but no turn they
+    /// end reaches `onTurnEnd`, and `carried` becomes this session's pending
+    /// task only once the stream has passed them.
+    func expectReplayHistory(bytes: UInt64, carried: CarriedTaskCorrelation?) {
+        uninstalledCarry = carried
+        guard bytes > 0 else {
+            installCarriedCorrelation()
+            return
+        }
+        guard let streams = remoteStreamsBox.current() else { return }
+        replayingHistory = true
+        streams.queue.async { streams.historyBytesRemaining = bytes }
+    }
+
+    /// Give up on a carried correlation that has not reached this session.
+    func abandonCarriedCorrelation(reason: String) {
+        guard let carry = uninstalledCarry else { return }
+        uninstalledCarry = nil
+        loseCarriedCorrelation(carry, reason: reason)
+    }
+
+    private func installCarriedCorrelation() {
+        replayingHistory = false
+        guard let carry = uninstalledCarry else { return }
+        uninstalledCarry = nil
+        taskCorrelationGeneration &+= 1
+        pendingTask = PendingTask(taskId: carry.taskId, generation: taskCorrelationGeneration)
+        noteTaskActivity()
+        if carry.turnWasInFlight {
+            if turnInFlight {
+                turnOrigin = .dispatch
+            } else {
+                openTurn(.dispatch)
+            }
+        } else if !turnInFlight {
+            armTaskStatusDeadline()
+        }
+    }
+
+    private func loseCarriedCorrelation(_ carry: CarriedTaskCorrelation, reason: String) {
+        #if DEBUG
+        dlog("agent.task.correlation.lost task=\(carry.taskId) reason=\(reason)")
+        #endif
+        onTaskCorrelationLost?(carry.taskId, .sessionEnded(reason))
     }
 
     private func stop(lossReason: String) {
@@ -2637,9 +2721,11 @@ final class AgentSession {
             turnInFlight = false
             turnOrigin = nil
             turnStartedAt = nil
-            onTurnEnd?(stopped ? "the session was stopped before this turn finished"
-                               : "the agent exited before finishing this turn",
-                       end, answered?.taskId)
+            if !replayingHistory {
+                onTurnEnd?(stopped ? "the session was stopped before this turn finished"
+                                   : "the agent exited before finishing this turn",
+                           end, answered?.taskId)
+            }
         }
         // Nothing can reach this session's correlation any more — no stdin, no
         // stream — so waiting for a STATUS would only delay the leader.
@@ -2647,6 +2733,12 @@ final class AgentSession {
             pendingTask = nil
             loseTaskCorrelation(task, .sessionEnded(
                 stoppedLossReason ?? "the agent exited before an explicit STATUS"))
+        }
+        replayingHistory = false
+        if let carry = uninstalledCarry {
+            uninstalledCarry = nil
+            loseCarriedCorrelation(carry, reason:
+                stoppedLossReason ?? "the agent exited before an explicit STATUS")
         }
         if !queued.isEmpty {
             append(.notice(id: UUID(),
@@ -2876,6 +2968,10 @@ final class AgentSession {
     /// That turn may be answering something else, so it cannot settle the
     /// task, but a later block must not claim the worker stated nothing.
     @ObservationIgnored private var uncorrelatedStatusGeneration: UInt64?
+    /// A rebuilt pane's carried task, waiting for the replay to end.
+    @ObservationIgnored private var uninstalledCarry: CarriedTaskCorrelation?
+    /// The stream is still repeating what the retired pane received.
+    @ObservationIgnored private var replayingHistory = false
 
     /// Who opened the running turn. Only a TASK_ID dispatch and a turn the
     /// CLI started itself may answer the pending task; a person's turn or a
@@ -3039,18 +3135,7 @@ final class AgentSession {
         guard let streams = remoteStreamsBox.current() else { return }
         streams.queue.async { [weak self] in
             guard !streams.closed else { return }
-            let parsed = streams.decoder.consume(data).map { output -> AgentParsedLine in
-                switch output {
-                case .line(let line):
-                    return AgentParsedLine(line)
-                case .oversized(let count):
-                    // A raw (non-JSON) line renders as a notice in `handle`.
-                    return AgentParsedLine(
-                        "dropped an unterminated line of \(count) bytes"
-                    )
-                }
-            }
-            streams.batcher.enqueue(parsed) { [weak self] batch in
+            let flush: @Sendable ([AgentParsedLine]) -> Void = { [weak self] batch in
                 DispatchQueue.main.async { [weak self] in
                     // The identity guard is the remote twin of the local
                     // path's `self.process === p`: a batch from a retired
@@ -3060,6 +3145,40 @@ final class AgentSession {
                     self.apply(batch)
                 }
             }
+            func feed(_ bytes: Data) {
+                let parsed = streams.decoder.consume(bytes).map { output -> AgentParsedLine in
+                    switch output {
+                    case .line(let line):
+                        return AgentParsedLine(line)
+                    case .oversized(let count):
+                        // A raw (non-JSON) line renders as a notice in `handle`.
+                        return AgentParsedLine(
+                            "dropped an unterminated line of \(count) bytes"
+                        )
+                    }
+                }
+                streams.batcher.enqueue(parsed, flush: flush)
+            }
+            guard let remaining = streams.historyBytesRemaining else {
+                feed(data)
+                return
+            }
+            guard UInt64(data.count) >= remaining else {
+                streams.historyBytesRemaining = remaining - UInt64(data.count)
+                feed(data)
+                return
+            }
+            // A line that ends at the boundary was delivered to the retired
+            // pane; one that straddles it completes in the new bytes.
+            let cut = data.startIndex + Int(remaining)
+            feed(data[data.startIndex..<cut])
+            streams.historyBytesRemaining = nil
+            streams.batcher.flushPending(flush)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.remoteStreamsBox.current() === streams else { return }
+                self.installCarriedCorrelation()
+            }
+            if cut < data.endIndex { feed(data[cut...]) }
         }
     }
 
@@ -3405,7 +3524,9 @@ final class AgentSession {
             // in several long background steps.
             taskStatusWaitStart = nil
         }
-        onTurnEnd?(final, end, answered?.taskId)
+        if !replayingHistory {
+            onTurnEnd?(final, end, answered?.taskId)
+        }
 
         // The next leader turn only now, so it gets a turn of its own. A
         // remote session has no local process to ask; the sink still being
