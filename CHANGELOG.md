@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.274.0] - 2026-10-16
+
+### Added
+
+- The title bar shows whether term-mesh is keeping this Mac awake for remote sessions. A cup icon sits next to the socket status icon. Green means keep-awake is on: a filled cup with a number (for example `2`) means it is holding the Mac awake right now for that many remote connections, and an empty cup means it will start as soon as a remote host connects. Orange means the last connection just ended and the Mac stays awake for one more minute, or the system refused the request. Grey means keep-awake is off, or it is waiting for the power adapter because you chose "On power adapter" and the Mac is on battery. Click the icon to see the state and switch the mode. The menu bar menu has the same choice under "Keep Mac Awake". Only sleep is prevented; the display can still turn off.
+- A remote leader's `tm-agent wait` now wakes within a fraction of a second when a task changes on the Project's owner Mac, instead of checking again every few seconds. The owner app and the remote host's term-meshd both need this version. With an older one on either side, `wait` keeps polling as before.
+
+### Fixed
+
+- A worker that hands a long job to the background and ends its turn without a `STATUS:` line no longer leaves its task marked "review ready" with nobody told. In 0.273.0 that turn was read as a request for review, and the worker's real `STATUS: DONE` in the next turn, the one it starts by itself when the background job finishes, was dropped, so the Review Board and the leader never saw the task complete. Now only a turn that states a STATUS changes the task. The task stays open until the worker states one, and the same task is closed by the worker's later `STATUS: DONE`. A worker that never states one is marked blocked after 10 minutes without activity, or after 60 minutes while background work is still running. A new task for the same worker blocks the earlier one, and a session that ends does too.
+- A reply such as `STATUS: DONE all tests pass` now counts as DONE. Before, any text after the word made the reply count as having no STATUS, and the task was blocked 10 minutes later. Lowercase, a leading space, and a copy of the instruction template such as `DONE | BLOCKED | NEEDS_REVIEW` still do not close a task.
+- Rebuilding a peer agent pane (after a stream rewind, a host reconnect, or Repair) no longer blocks the task the agent was working on. The rebuilt pane skips the output it receives again from before the rebuild, so an old DONE cannot close the task, then takes the task over and closes it when the agent finishes. When it cannot take the task over, the task is blocked once, with the reason. A task sent to the agent while the old output is replayed waits until the replay ends.
+- A remote leader is now woken for every kind of task change, not only some of them. `task done`, review, reassign, unblock, approve, reject and claim never woke it before, so the most common completion went unnoticed until the next check.
+- When a long-poll waiter limit is reached, the owner app answers "busy" with a retry time. The remote `wait` backs off for that time instead of asking again every second, gives up on the long-poll after three failures in a row and falls back to polling, and no longer depends on error text to detect an older owner.
+- Agents that the daemon runs without a window (headless) no longer finish a task from a status line that is not a verdict. Only `DONE`, `BLOCKED` and `NEEDS_REVIEW` count. Before, any other value, for example a copy of the instruction template, completed the task. The report is filed on the task the agent was sent, and the daemon no longer guesses a task when it knows which one it sent. A blocked or review-ready task is not picked by guessing. A failed report to the app is retried instead of being lost.
+- `tm-agent wait --task` and `tm-agent batch` from a remote leader now go to the Project's owner Mac like every other command. Before, they asked the local app, which does not have the team, and `wait --task` waited until its time ran out. `tm-agent create` and `destroy` from a remote leader are now refused before they change anything, and the other commands that touch the team follow the same rule.
+- `./scripts/reload.sh --tag <tag> --cleanup` no longer says "reclaimed" when it removed nothing. A build whose tag contains a dot, such as `release-0.273.0`, was never removed, and the list of old builds kept suggesting it. It now removes the build, its cargo target, and the leftover socket and log, and says "nothing to reclaim" when nothing is left. The Makefile's `/tmp/term-mesh-prod` is never treated as a tag.
+- `cargo test -p term-mesh-cli --bin tm-agent` no longer stops with a stack overflow in the default test thread.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.273.0] - 2026-10-16
 
 ### Fixed
