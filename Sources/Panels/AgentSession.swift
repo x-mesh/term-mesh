@@ -2383,9 +2383,21 @@ final class AgentSession {
     }
 
     func stop() {
+        stop(lossReason: "the session was stopped before an explicit STATUS")
+    }
+
+    /// Stop a session whose pane is being torn down and rebuilt. The rebuilt
+    /// pane starts a new session with no correlation, so the leader is told
+    /// the pending task was lost to the rebuild rather than to a plain stop.
+    func stopForPaneRebuild(after cause: String) {
+        stop(lossReason: "the pane was rebuilt (\(cause)); a STATUS from the rebuilt pane "
+            + "will not close this task — check the agent's reply and re-dispatch if needed")
+    }
+
+    private func stop(lossReason: String) {
         if process == nil, remoteSink != nil {
             teardownRemote()
-            finishAfterDrain(code: 0, stopped: true)
+            finishAfterDrain(code: 0, stoppedLossReason: lossReason)
             return
         }
         guard let process else { return }
@@ -2396,7 +2408,7 @@ final class AgentSession {
         // `in_progress` for a pane that has gone while every instruction behind
         // it waited on a queue nothing will drain. Closing a pane mid-turn was
         // measured leaving exactly that.
-        finishAfterDrain(code: 0, stopped: true)
+        finishAfterDrain(code: 0, stoppedLossReason: lossReason)
     }
 
     /// Finish a transport-owned agent from the host's authoritative process
@@ -2579,9 +2591,10 @@ final class AgentSession {
 
     private func finishAfterDrain(
         code: Int32,
-        stopped: Bool = false,
+        stoppedLossReason: String? = nil,
         failureAlreadyReported: Bool = false
     ) {
+        let stopped = stoppedLossReason != nil
         cancelExtendedSilenceWatchdog()
         cancelTaskStatusDeadline()
         backgroundTaskCount = 0
@@ -2623,8 +2636,7 @@ final class AgentSession {
         if let task = pendingTask {
             pendingTask = nil
             loseTaskCorrelation(task, .sessionEnded(
-                stopped ? "the session was stopped before an explicit STATUS"
-                        : "the agent exited before an explicit STATUS"))
+                stoppedLossReason ?? "the agent exited before an explicit STATUS"))
         }
         if !queued.isEmpty {
             append(.notice(id: UUID(),

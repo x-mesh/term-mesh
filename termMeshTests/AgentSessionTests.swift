@@ -3091,6 +3091,35 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(lost, ["5e5e5e5e"])
     }
 
+    func testAPaneRebuildNamesTheRebuildWhenItLosesThePendingTask() throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: 9a9a9a9a\nbuild it", from: .leader)
+
+        s.stopForPaneRebuild(after: "stream rewound")
+        s.stop()
+
+        XCTAssertEqual(lost.count, 1)
+        XCTAssertEqual(lost.first?.0, "9a9a9a9a")
+        XCTAssertTrue(lost.first?.1.reason.contains("rebuilt") ?? false)
+        XCTAssertTrue(lost.first?.1.reason.contains("stream rewound") ?? false)
+    }
+
+    func testAPlainStopStillReportsAPlainStop() throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: 8b8b8b8b\nbuild it", from: .leader)
+
+        s.stop()
+
+        XCTAssertEqual(lost.count, 1)
+        XCTAssertEqual(lost.first?.1, .sessionEnded("the session was stopped before an explicit STATUS"))
+    }
+
     /// One instruction, one turn, one result still holds when the running
     /// turn is one the CLI started: a dispatch landing in it is queued, not
     /// merged into it.
