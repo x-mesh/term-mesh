@@ -1930,6 +1930,10 @@ actor RelayLeaderSessionGate {
         }
         // A held `team.events.wait` is an active command; release it now so
         // the heal waits for real work, not for a long-poll window.
+        // The interrupt is process-wide: the gate has no link to a team, so
+        // every other relay's held waiter is released too. Each pays one
+        // `changed: false` answer and one re-poll, which the CLI spaces at
+        // least 1 s after the previous long-poll start.
         if activeCommands > 0 {
             TeamEventWakeSignal.shared.interruptAll()
         }
