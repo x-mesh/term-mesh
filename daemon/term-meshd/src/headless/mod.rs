@@ -3626,6 +3626,9 @@ fn now_ms() -> u64 {
 /// Only a reply that passes all three consumes the expected task id, so a
 /// template echo or a duplicate cannot spend the expectation of the real reply.
 ///
+/// A failure before any write puts the taken expectation back, unless a newer
+/// capsule already recorded one.
+///
 /// All failures log + drop. Never returns an error — auto-reply must not
 /// disrupt the PTY reader loop. Caller is the headless stdout reader task.
 async fn try_emit_auto_reply(
@@ -3672,11 +3675,31 @@ async fn try_emit_auto_reply(
             "auto-reply wrote nothing: agent={agent_name} status={} expected_task={preferred_label} (expected task missing or terminal, or no eligible task)",
             event.status
         ),
-        Err(e) => tracing::warn!(
-            "auto-reply emit failed: agent={agent_name} status={} expected_task={preferred_label} err={e}",
-            event.status
-        ),
+        Err(e) => {
+            let before_write = matches!(e, crate::auto_reply_emit::EmitError::BeforeWrite(_));
+            let restored = before_write
+                && preferred
+                    .clone()
+                    .is_some_and(|id| restore_expected_task_if_empty(expected_task, id));
+            let stage = if before_write { "before_write" } else { "after_write" };
+            tracing::warn!(
+                "auto-reply emit failed: agent={agent_name} status={} expected_task={preferred_label} stage={stage} expectation_restored={restored} err={e}",
+                event.status
+            );
+        }
     }
+}
+
+fn restore_expected_task_if_empty(
+    slot: &Arc<std::sync::Mutex<Option<String>>>,
+    task_id: String,
+) -> bool {
+    let mut guard = slot.lock().expect("expected task id lock poisoned");
+    if guard.is_some() {
+        return false;
+    }
+    *guard = Some(task_id);
+    true
 }
 
 #[cfg(test)]
@@ -5083,10 +5106,90 @@ mod tests {
         let fresh = event("DONE", "shipped again");
         try_emit_auto_reply("team", "agent", sock, &last_hash, &expected, fresh).await;
         assert_eq!(
+            expected.lock().unwrap().as_deref(),
+            Some("t-1"),
+            "a reply that could not reach the app gives the expectation back"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_reply_keeps_the_expectation_spent_once_anything_was_written() {
+        use crate::auto_reply_emit::tests::{fake_app_socket, methods, task};
+        let event = |body: &str| crate::auto_reply::AutoReplyEvent {
+            status: "DONE".to_string(),
+            files: "n/a".to_string(),
+            verify: "n/a".to_string(),
+            next: "NONE".to_string(),
+            full_report: "n/a".to_string(),
+            body: body.to_string(),
+            raw: format!("STATUS: DONE\\n\\n{body}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tasks = serde_json::json!([
+            task("t-1", "in_progress", "2026-10-16T00:00:01Z"),
+            task("t-done", "completed", "2026-10-16T00:00:02Z"),
+        ]);
+        let last_hash = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let expected = Arc::new(std::sync::Mutex::new(None::<String>));
+        let arm = |id: &str| *expected.lock().unwrap() = Some(id.to_string());
+
+        let ok_path = dir.path().join("ok.sock");
+        let (recorded, server) = fake_app_socket(&ok_path, tasks.clone(), false).await;
+        let ok_sock = ok_path.to_str();
+
+        arm("t-1");
+        try_emit_auto_reply("team", "agent", ok_sock, &last_hash, &expected, event("a")).await;
+        assert_eq!(
             *expected.lock().unwrap(),
             None,
-            "a validated new reply consumes it"
+            "a successful DONE spends it"
         );
+        assert_eq!(
+            methods(&recorded),
+            ["team.task.list", "team.report", "team.task.update"]
+        );
+        recorded.lock().unwrap().clear();
+
+        arm("t-done");
+        try_emit_auto_reply("team", "agent", ok_sock, &last_hash, &expected, event("b")).await;
+        assert_eq!(
+            *expected.lock().unwrap(),
+            None,
+            "a terminal named task spends it"
+        );
+        assert_eq!(methods(&recorded), ["team.task.list"]);
+        server.abort();
+
+        let fail_path = dir.path().join("fail.sock");
+        let (recorded, server) = fake_app_socket(&fail_path, tasks, true).await;
+        arm("t-1");
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            fail_path.to_str(),
+            &last_hash,
+            &expected,
+            event("c"),
+        )
+        .await;
+        assert_eq!(
+            *expected.lock().unwrap(),
+            None,
+            "a refused team.report may already be filed, so it is not given back"
+        );
+        assert_eq!(methods(&recorded), ["team.task.list", "team.report"]);
+        server.abort();
+    }
+
+    #[test]
+    fn auto_reply_restore_never_overwrites_a_newer_expectation() {
+        let slot = Arc::new(std::sync::Mutex::new(None::<String>));
+        assert!(restore_expected_task_if_empty(&slot, "t-1".to_string()));
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("t-1"));
+
+        *slot.lock().unwrap() = Some("t-2".to_string());
+        assert!(!restore_expected_task_if_empty(&slot, "t-1".to_string()));
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("t-2"));
     }
 
     #[test]

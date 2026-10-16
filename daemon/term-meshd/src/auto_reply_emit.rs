@@ -87,6 +87,22 @@ pub fn select_task<'a>(tasks: &'a [Value], preferred: Option<&str>) -> Option<&'
         })
 }
 
+/// Where an emit failed relative to the first write. A `team.report` that
+/// timed out may already be filed, so it counts as [`EmitError::AfterWrite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitError {
+    BeforeWrite(String),
+    AfterWrite(String),
+}
+
+impl std::fmt::Display for EmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmitError::BeforeWrite(msg) | EmitError::AfterWrite(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// Send the synthesised reply to the Swift app socket. Returns `Ok(true)`
 /// when a task was selected, reported and updated; `Ok(false)` when nothing
 /// was written (invalid STATUS, or no eligible task); `Err` on RPC failure.
@@ -96,7 +112,7 @@ pub async fn emit(
     agent_name: &str,
     event: &AutoReplyEvent,
     preferred_task_id: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<bool, EmitError> {
     let Some(task_status) = validated_status(&event.status) else {
         return Ok(false);
     };
@@ -111,7 +127,7 @@ pub async fn emit(
         }),
     )
     .await
-    .map_err(|e| format!("team.task.list failed: {e}"))?;
+    .map_err(|e| EmitError::BeforeWrite(format!("team.task.list failed: {e}")))?;
 
     let tasks = tasks_resp
         .get("tasks")
@@ -138,7 +154,7 @@ pub async fn emit(
     }
     rpc_call(socket_path, "team.report", report_params)
         .await
-        .map_err(|e| format!("team.report failed: {e}"))?;
+        .map_err(|e| EmitError::AfterWrite(format!("team.report failed: {e}")))?;
 
     let summary: String = reply_text.chars().take(RESULT_TRUNC_CHARS).collect();
     let mut update_params = json!({
@@ -157,7 +173,7 @@ pub async fn emit(
     }
     rpc_call(socket_path, "team.task.update", update_params)
         .await
-        .map_err(|e| format!("team.task.update failed: {e}"))?;
+        .map_err(|e| EmitError::AfterWrite(format!("team.task.update failed: {e}")))?;
 
     Ok(true)
 }
@@ -239,7 +255,7 @@ fn normalize_full_report_path(s: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn ev(status: &str, body: &str) -> AutoReplyEvent {
@@ -307,7 +323,7 @@ mod tests {
         assert_eq!(capsule_task_id("no task here"), None);
     }
 
-    fn task(id: &str, status: &str, created_at: &str) -> Value {
+    pub(crate) fn task(id: &str, status: &str, created_at: &str) -> Value {
         json!({"id": id, "status": status, "created_at": created_at})
     }
 
@@ -362,9 +378,9 @@ mod tests {
         assert_eq!(selected_id(&tasks, Some("stuck")).as_deref(), Some("stuck"));
     }
 
-    type Recorded = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+    pub(crate) type Recorded = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
-    async fn fake_app_socket(
+    pub(crate) async fn fake_app_socket(
         path: &std::path::Path,
         tasks: Value,
         report_fails: bool,
@@ -407,7 +423,7 @@ mod tests {
         (recorded, handle)
     }
 
-    fn methods(recorded: &Recorded) -> Vec<String> {
+    pub(crate) fn methods(recorded: &Recorded) -> Vec<String> {
         recorded
             .lock()
             .unwrap()
@@ -471,8 +487,29 @@ mod tests {
             Some("t-1"),
         )
         .await;
-        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            matches!(&refused, Err(EmitError::AfterWrite(msg)) if msg.starts_with("team.report failed:")),
+            "{refused:?}"
+        );
         assert_eq!(methods(&recorded), ["team.task.list", "team.report"]);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn emit_classifies_an_unreachable_app_as_before_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("absent.sock");
+        let result = emit(
+            absent.to_str().unwrap(),
+            "team",
+            "agent",
+            &ev("DONE", "shipped"),
+            Some("t-1"),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(EmitError::BeforeWrite(msg)) if msg.starts_with("team.task.list failed:")),
+            "{result:?}"
+        );
     }
 }
