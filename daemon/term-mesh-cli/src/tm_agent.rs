@@ -6082,17 +6082,6 @@ mod remote_leader_route_file_tests {
 
     #[test]
     fn remote_leader_lifecycle_commands_are_rejected_only_under_a_route() {
-        // Parsing the full `Cli` overflows the default 2 MiB test-thread stack
-        // in debug builds.
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(lifecycle_rejection_cases)
-            .expect("spawn")
-            .join()
-            .expect("lifecycle rejection cases");
-    }
-
-    fn lifecycle_rejection_cases() {
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
         for args in [
             &["tm-agent", "create", "2"][..],
