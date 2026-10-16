@@ -72,12 +72,16 @@ final class AutoReplyDetector {
         let words = value.split(whereSeparator: \.isWhitespace)
         guard let first = words.first, let verdict = validatedStatus(String(first)),
               value.first?.isWhitespace == false else { return nil }
-        // A spaced choice list (`DONE | BLOCKED | NEEDS_REVIEW`) is the template,
-        // not a verdict.
-        for word in words.dropFirst() {
-            if word.hasPrefix("|") || word.hasPrefix("/") { return nil }
-            let bare = word.trimmingCharacters(in: CharacterSet(charactersIn: "|/,()[]"))
-            if validatedStatus(bare) != nil { return nil }
+        // A spaced choice list (`DONE | BLOCKED`, `DONE or BLOCKED`) is the
+        // template, not a verdict. Only the words right after the verdict are
+        // read, so a note that mentions a path or another verdict still counts.
+        let rest = words.dropFirst().prefix(2).map(String.init)
+        if let next = rest.first {
+            let isVerdict = { (word: String) in
+                validatedStatus(word.trimmingCharacters(in: CharacterSet(charactersIn: "|/,"))) != nil
+            }
+            if next.hasPrefix("|") || next.hasPrefix("/") || isVerdict(next) { return nil }
+            if next.lowercased() == "or", rest.count > 1, isVerdict(rest[1]) { return nil }
         }
         return verdict
     }

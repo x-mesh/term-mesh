@@ -36,15 +36,22 @@ pub fn validated_status(status: &str) -> Option<&'static str> {
     }
     let mut words = status.split_whitespace();
     let first = words.next().unwrap_or("");
-    // A spaced choice list (`DONE | BLOCKED | NEEDS_REVIEW`) is the template.
-    let template = words.any(|word| {
-        word.starts_with('|')
-            || word.starts_with('/')
-            || matches!(
-                word.trim_matches(|c| "|/,()[]".contains(c)),
-                "DONE" | "BLOCKED" | "NEEDS_REVIEW"
-            )
-    });
+    // A spaced choice list (`DONE | BLOCKED`, `DONE or BLOCKED`) is the
+    // template. Only the words right after the verdict are read, so a note
+    // that mentions a path or another verdict still counts.
+    let is_verdict = |word: &str| {
+        matches!(
+            word.trim_matches(|c| "|/,".contains(c)),
+            "DONE" | "BLOCKED" | "NEEDS_REVIEW"
+        )
+    };
+    let next = words.next();
+    let after = words.next();
+    let template = match next {
+        Some(word) if word.starts_with('|') || word.starts_with('/') || is_verdict(word) => true,
+        Some(word) if word.eq_ignore_ascii_case("or") => after.is_some_and(is_verdict),
+        _ => false,
+    };
     if template {
         return None;
     }
@@ -313,6 +320,8 @@ pub(crate) mod tests {
         assert_eq!(validated_status("DONE "), Some("completed"));
         assert_eq!(validated_status("DONE CARRY-1a2b"), Some("completed"));
         assert_eq!(validated_status("BLOCKED\twaiting on the db"), Some("blocked"));
+        assert_eq!(validated_status("DONE wrote /tmp/out.txt"), Some("completed"));
+        assert_eq!(validated_status("DONE the BLOCKED test passes now"), Some("completed"));
         for rejected in [
             "DONE|BLOCKED|NEEDS_REVIEW",
             "IN_PROGRESS",
@@ -324,6 +333,7 @@ pub(crate) mod tests {
             "DONE | BLOCKED | NEEDS_REVIEW",
             "DONE / BLOCKED",
             "DONE or BLOCKED",
+            "DONE BLOCKED NEEDS_REVIEW",
             "",
         ] {
             assert_eq!(validated_status(rejected), None, "{rejected:?}");
