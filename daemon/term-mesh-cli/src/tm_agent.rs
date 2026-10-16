@@ -5974,6 +5974,112 @@ mod remote_leader_route_file_tests {
         assert_eq!(team_headless_daemon_socket(), None);
     }
 
+    /// `RouteEnv` does not save these keys, and `SocketDiscoveryEnv` takes a
+    /// lock `RouteEnv` already holds, so a test sets them through this guard
+    /// while the route lock is held.
+    struct ExtraEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl ExtraEnv {
+        fn set(values: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
+            let saved = values
+                .iter()
+                .map(|(key, value)| {
+                    let original = env::var_os(key);
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                    (*key, original)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for ExtraEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(original) => env::set_var(key, original),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn assert_listener_untouched(listener: &std::os::unix::net::UnixListener, why: &str) {
+        assert_eq!(
+            listener.accept().map_err(|error| error.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn remote_leader_team_headless_daemon_socket_is_wired_to_the_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon = dir.path().join("daemon.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&daemon).expect("bind");
+        let guard = RouteEnv::new();
+        let _daemon_env = ExtraEnv::set(&[("TERMMESH_DAEMON_SOCKET", Some(daemon.as_os_str()))]);
+
+        assert_eq!(team_headless_daemon_socket(), Some(daemon.clone()));
+        guard.set_env_route(&"11".repeat(32));
+        assert_eq!(
+            team_headless_daemon_socket(),
+            None,
+            "a live local daemon must not be resolved for a remote leader's team"
+        );
+    }
+
+    #[test]
+    fn remote_leader_skips_auto_watch_without_asking_for_team_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let guard = RouteEnv::new();
+        let _auto_watch_env = ExtraEnv::set(&[("TERMMESH_AUTO_WATCH", None)]);
+        guard.set_env_route(&"11".repeat(32));
+
+        maybe_auto_watch_after_team_change(&sock, "remote-team", false, dir.path());
+
+        assert_listener_untouched(
+            &listener,
+            "the owning host manages the watcher; no team.status may be proxied",
+        );
+    }
+
+    #[test]
+    fn remote_leader_raw_payload_goes_through_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+
+        let rejected = run_raw_routed(&sock, r#"{"method":"team.create","params":{}}"#)
+            .expect("a per-call failure is reported as an error entry");
+        let error = rejected["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("is not allowed from a scoped remote leader"),
+            "{rejected}"
+        );
+        assert!(rpc_response_failed(&rejected));
+        assert_listener_untouched(
+            &listener,
+            "a rejected raw team method must not reach the peer host's local app",
+        );
+
+        listener.set_nonblocking(false).expect("blocking");
+        let server = std::thread::spawn(move || answer_one_local_rpc(&listener));
+        let proxied =
+            run_raw_routed(&sock, r#"{"method":"team.inbox","params":{}}"#).expect("proxied");
+        assert_eq!(proxied["remote_leader_proxy"], json!(true));
+        assert_eq!(server.join().expect("server thread"), "peer.leader.call");
+    }
+
     #[test]
     fn remote_leader_lifecycle_commands_are_rejected_only_under_a_route() {
         // Parsing the full `Cli` overflows the default 2 MiB test-thread stack
@@ -6840,6 +6946,13 @@ fn rpc_batch_per_call(
         .into_iter()
         .map(|(method, params)| call(&method, params).unwrap_or_else(|e| json!({ "error": e })))
         .collect())
+}
+
+fn run_raw_routed(sock: &PathBuf, payload: &str) -> Result<Value, String> {
+    rpc_batch_per_call(&[payload.to_string()], |method, params| {
+        rpc_call(sock, method, params)
+    })
+    .and_then(|mut results| results.pop().ok_or_else(|| "no response".to_string()))
 }
 
 /// Parse human-readable semicolon-separated commands into JSON-RPC payload strings
@@ -9860,13 +9973,7 @@ fn main() {
                 process::exit(1);
             }
             if remote_leader_route().is_some() {
-                let response = rpc_batch_per_call(&[payload], |method, params| {
-                    rpc_call(&sock, method, params)
-                })
-                .and_then(|mut results| {
-                    results.pop().ok_or_else(|| "no response".to_string())
-                });
-                match response {
+                match run_raw_routed(&sock, &payload) {
                     Ok(value) => {
                         println!("{}", serde_json::to_string(&value).unwrap_or_default());
                         if rpc_response_failed(&value) {
