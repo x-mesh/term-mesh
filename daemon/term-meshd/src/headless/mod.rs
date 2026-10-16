@@ -143,6 +143,9 @@ pub struct HeadlessAgent {
     pub auto_recycle_every: Option<u32>,
     /// Running count of completed tasks since last recycle.
     pub completed_task_count: u32,
+    /// TASK_ID of the last task capsule written to stdin. Shared with the
+    /// stdout reader so an auto-reply closes only the task it was given.
+    pub expected_task_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Phase 2.5: lock-free cumulative token counters for one headless agent.
@@ -845,6 +848,8 @@ impl HeadlessManager {
         let ar_agent = args.name.clone();
         let ar_socket = args.app_socket_path.clone();
         let ar_last_hash = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let expected_task_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        let ar_expected_task = expected_task_id.clone();
         tokio::spawn(async move {
             use crate::auto_reply::AutoReplyDetector;
             let mut reader = BufReader::new(stdout).lines();
@@ -878,6 +883,7 @@ impl HeadlessManager {
                                             &ar_agent,
                                             ar_socket.as_deref(),
                                             &ar_last_hash,
+                                            &ar_expected_task,
                                             ev,
                                         ).await;
                                     }
@@ -893,6 +899,7 @@ impl HeadlessManager {
                                 &ar_agent,
                                 ar_socket.as_deref(),
                                 &ar_last_hash,
+                                &ar_expected_task,
                                 ev,
                             ).await;
                         }
@@ -907,6 +914,7 @@ impl HeadlessManager {
                         &ar_agent,
                         ar_socket.as_deref(),
                         &ar_last_hash,
+                        &ar_expected_task,
                         ev,
                     )
                     .await;
@@ -969,6 +977,7 @@ impl HeadlessManager {
                 usage: usage_counters,
                 auto_recycle_every: args.auto_recycle_every,
                 completed_task_count: args.preloaded_completed_task_count,
+                expected_task_id,
             },
         );
         live_agent_pids()
@@ -1032,6 +1041,15 @@ impl HeadlessManager {
             .flush()
             .await
             .map_err(|e| format!("flush stdin failed: {e}"))?;
+
+        // A send that names no task (a nudge, a broadcast) must not drop the
+        // pending expectation of an earlier delegated task.
+        if let Some(task_id) = crate::auto_reply_emit::capsule_task_id(text) {
+            *agent
+                .expected_task_id
+                .lock()
+                .expect("expected task id lock poisoned") = Some(task_id);
+        }
 
         // codex exec - reads the whole prompt then blocks on stdin EOF before it
         // starts; drop stdin so the child sees end-of-input. claude keeps stdin
@@ -3602,7 +3620,16 @@ fn now_ms() -> u64 {
 
 /// Best-effort auto-reply emission. Skips when:
 /// - no app socket is configured (no GUI side to call back to)
+/// - STATUS is not exactly DONE | BLOCKED | NEEDS_REVIEW
 /// - the same event content was just fired (idempotency via content_hash)
+///
+/// Only a DONE that passes all three consumes the expected task id, so a
+/// template echo, a duplicate, or an interim BLOCKED/NEEDS_REVIEW cannot spend
+/// the expectation of the task's final reply.
+///
+/// A failure before any write puts the taken expectation back, unless a newer
+/// capsule already recorded one, and forgets the content hash so the same
+/// reply can be emitted again.
 ///
 /// All failures log + drop. Never returns an error — auto-reply must not
 /// disrupt the PTY reader loop. Caller is the headless stdout reader task.
@@ -3611,35 +3638,92 @@ async fn try_emit_auto_reply(
     agent_name: &str,
     socket_path: Option<&str>,
     last_hash: &Arc<std::sync::Mutex<Option<u64>>>,
+    expected_task: &Arc<std::sync::Mutex<Option<String>>>,
     event: crate::auto_reply::AutoReplyEvent,
 ) {
     let Some(sock) = socket_path else {
         tracing::debug!("auto-reply skipped: no app socket configured (agent={agent_name})");
         return;
     };
+    let Some(task_status) = crate::auto_reply_emit::validated_status(&event.status) else {
+        tracing::debug!(
+            "auto-reply skipped: invalid STATUS {:?} (agent={agent_name})",
+            event.status
+        );
+        return;
+    };
     let hash = event.content_hash();
-    {
+    let previous_hash = {
         let mut guard = last_hash.lock().expect("auto-reply hash lock poisoned");
         if *guard == Some(hash) {
             tracing::debug!("auto-reply skipped: duplicate content hash (agent={agent_name})");
             return;
         }
-        *guard = Some(hash);
-    }
-    match crate::auto_reply_emit::emit(sock, team_name, agent_name, &event).await {
+        guard.replace(hash)
+    };
+    let closes_task = task_status == "completed";
+    let preferred = {
+        let mut guard = expected_task
+            .lock()
+            .expect("expected task id lock poisoned");
+        if closes_task {
+            guard.take()
+        } else {
+            guard.clone()
+        }
+    };
+    let preferred_label = preferred.as_deref().unwrap_or("none");
+    match crate::auto_reply_emit::emit(sock, team_name, agent_name, &event, preferred.as_deref())
+        .await
+    {
         Ok(true) => tracing::info!(
-            "auto-reply emitted: agent={agent_name} status={} task_updated=true",
+            "auto-reply emitted: agent={agent_name} status={} expected_task={preferred_label} task_updated=true",
             event.status
         ),
         Ok(false) => tracing::info!(
-            "auto-reply emitted: agent={agent_name} status={} task_updated=false (no matching task)",
+            "auto-reply wrote nothing: agent={agent_name} status={} expected_task={preferred_label} (expected task missing or terminal, or no eligible task)",
             event.status
         ),
-        Err(e) => tracing::warn!(
-            "auto-reply emit failed: agent={agent_name} status={} err={e}",
-            event.status
-        ),
+        Err(e) => {
+            let before_write = matches!(e, crate::auto_reply_emit::EmitError::BeforeWrite(_));
+            if before_write {
+                rollback_hash_if_current(last_hash, hash, previous_hash);
+            }
+            let restored = before_write
+                && closes_task
+                && preferred
+                    .clone()
+                    .is_some_and(|id| restore_expected_task_if_empty(expected_task, id));
+            let stage = if before_write { "before_write" } else { "after_write" };
+            tracing::warn!(
+                "auto-reply emit failed: agent={agent_name} status={} expected_task={preferred_label} stage={stage} expectation_restored={restored} err={e}",
+                event.status
+            );
+        }
     }
+}
+
+fn rollback_hash_if_current(
+    last_hash: &Arc<std::sync::Mutex<Option<u64>>>,
+    attempted: u64,
+    previous: Option<u64>,
+) {
+    let mut guard = last_hash.lock().expect("auto-reply hash lock poisoned");
+    if *guard == Some(attempted) {
+        *guard = previous;
+    }
+}
+
+fn restore_expected_task_if_empty(
+    slot: &Arc<std::sync::Mutex<Option<String>>>,
+    task_id: String,
+) -> bool {
+    let mut guard = slot.lock().expect("expected task id lock poisoned");
+    if guard.is_some() {
+        return false;
+    }
+    *guard = Some(task_id);
+    true
 }
 
 #[cfg(test)]
@@ -4929,6 +5013,7 @@ mod tests {
             usage: Arc::new(UsageCounters::default()),
             auto_recycle_every: None,
             completed_task_count: 0,
+            expected_task_id: Arc::new(std::sync::Mutex::new(None)),
         };
 
         let mut mgr = HeadlessManager::new();
@@ -4944,6 +5029,340 @@ mod tests {
         );
         assert!(a.child.is_none(), "child handle should be cleared");
         assert!(a.stdin.is_none(), "stdin handle should be cleared");
+    }
+
+    #[tokio::test]
+    async fn auto_reply_expectation_follows_task_capsule() {
+        let _scope = scoped_root();
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn `cat`");
+        let stdin = child.stdin.take().expect("cat stdin");
+
+        let agent_id = "test-expect-agent".to_string();
+        let expected = Arc::new(std::sync::Mutex::new(None::<String>));
+        let agent = HeadlessAgent {
+            id: agent_id.clone(),
+            name: agent_id.clone(),
+            cli: "claude".into(),
+            model: "sonnet".into(),
+            effort: String::new(),
+            team_name: "test-team".into(),
+            team_uuid: "00000000-0000-0000-0000-000000000000".into(),
+            working_directory: "/tmp".into(),
+            child: Some(child),
+            stdin: Some(stdin),
+            stdout_buffer: Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100))),
+            protocol: Box::new(protocol::ClaudeStreamJson),
+            status: AgentStatus::Running,
+            pid: 0,
+            created_at: 0,
+            session_id: None,
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            parked: false,
+            usage: Arc::new(UsageCounters::default()),
+            auto_recycle_every: None,
+            completed_task_count: 0,
+            expected_task_id: expected.clone(),
+        };
+        let mut mgr = HeadlessManager::new();
+        mgr.agents.insert(agent_id.clone(), agent);
+        let current = || expected.lock().unwrap().clone();
+
+        mgr.send_message(&agent_id, "Do the work.\nTASK_ID: t-1\nTEAM: test-team")
+            .await
+            .expect("send capsule");
+        assert_eq!(current().as_deref(), Some("t-1"));
+
+        mgr.send_message(&agent_id, "any progress?")
+            .await
+            .expect("send nudge");
+        assert_eq!(current().as_deref(), Some("t-1"), "taskless send keeps it");
+
+        mgr.send_message(&agent_id, "TASK_ID: t-2")
+            .await
+            .expect("send second capsule");
+        assert_eq!(current().as_deref(), Some("t-2"));
+
+        mgr.agents.get_mut(&agent_id).unwrap().stdin = None;
+        assert!(mgr.send_message(&agent_id, "TASK_ID: t-3").await.is_err());
+        assert_eq!(current().as_deref(), Some("t-2"), "failed send keeps it");
+    }
+
+    #[tokio::test]
+    async fn auto_reply_consumes_expectation_only_after_validation_and_dedupe() {
+        let event = |status: &str, body: &str| crate::auto_reply::AutoReplyEvent {
+            status: status.to_string(),
+            files: "n/a".to_string(),
+            verify: "n/a".to_string(),
+            next: "NONE".to_string(),
+            full_report: "n/a".to_string(),
+            body: body.to_string(),
+            raw: format!("STATUS: {status}\\n\\n{body}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_sock = dir.path().join("absent.sock");
+        let sock = missing_sock.to_str();
+        let last_hash = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let expected = Arc::new(std::sync::Mutex::new(Some("t-1".to_string())));
+
+        let echo = event("DONE|BLOCKED|NEEDS_REVIEW", "template");
+        try_emit_auto_reply("team", "agent", sock, &last_hash, &expected, echo).await;
+        assert_eq!(expected.lock().unwrap().as_deref(), Some("t-1"));
+        assert_eq!(
+            *last_hash.lock().unwrap(),
+            None,
+            "invalid STATUS leaves dedupe alone"
+        );
+
+        let done = event("DONE", "shipped");
+        *last_hash.lock().unwrap() = Some(done.content_hash());
+        try_emit_auto_reply("team", "agent", sock, &last_hash, &expected, done.clone()).await;
+        assert_eq!(
+            expected.lock().unwrap().as_deref(),
+            Some("t-1"),
+            "duplicate keeps it"
+        );
+
+        let fresh = event("DONE", "shipped again");
+        try_emit_auto_reply("team", "agent", sock, &last_hash, &expected, fresh).await;
+        assert_eq!(
+            expected.lock().unwrap().as_deref(),
+            Some("t-1"),
+            "a reply that could not reach the app gives the expectation back"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_reply_keeps_the_expectation_spent_once_anything_was_written() {
+        use crate::auto_reply_emit::tests::{fake_app_socket, methods, task};
+        let event = |body: &str| crate::auto_reply::AutoReplyEvent {
+            status: "DONE".to_string(),
+            files: "n/a".to_string(),
+            verify: "n/a".to_string(),
+            next: "NONE".to_string(),
+            full_report: "n/a".to_string(),
+            body: body.to_string(),
+            raw: format!("STATUS: DONE\\n\\n{body}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tasks = serde_json::json!([
+            task("t-1", "in_progress", "2026-10-16T00:00:01Z"),
+            task("t-done", "completed", "2026-10-16T00:00:02Z"),
+        ]);
+        let last_hash = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let expected = Arc::new(std::sync::Mutex::new(None::<String>));
+        let arm = |id: &str| *expected.lock().unwrap() = Some(id.to_string());
+
+        let ok_path = dir.path().join("ok.sock");
+        let (recorded, server) = fake_app_socket(&ok_path, tasks.clone(), false).await;
+        let ok_sock = ok_path.to_str();
+
+        arm("t-1");
+        try_emit_auto_reply("team", "agent", ok_sock, &last_hash, &expected, event("a")).await;
+        assert_eq!(
+            *expected.lock().unwrap(),
+            None,
+            "a successful DONE spends it"
+        );
+        assert_eq!(
+            methods(&recorded),
+            ["team.task.list", "team.report", "team.task.update"]
+        );
+        recorded.lock().unwrap().clear();
+
+        arm("t-done");
+        try_emit_auto_reply("team", "agent", ok_sock, &last_hash, &expected, event("b")).await;
+        assert_eq!(
+            *expected.lock().unwrap(),
+            None,
+            "a terminal named task spends it"
+        );
+        assert_eq!(methods(&recorded), ["team.task.list"]);
+        server.abort();
+
+        let fail_path = dir.path().join("fail.sock");
+        let (recorded, server) = fake_app_socket(&fail_path, tasks, true).await;
+        arm("t-1");
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            fail_path.to_str(),
+            &last_hash,
+            &expected,
+            event("c"),
+        )
+        .await;
+        assert_eq!(
+            *expected.lock().unwrap(),
+            None,
+            "a refused team.report may already be filed, so it is not given back"
+        );
+        assert_eq!(methods(&recorded), ["team.task.list", "team.report"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_reply_interim_status_keeps_the_expectation_for_done() {
+        use crate::auto_reply_emit::tests::{fake_app_socket, methods, task};
+        let event = |status: &str| crate::auto_reply::AutoReplyEvent {
+            status: status.to_string(),
+            files: "n/a".to_string(),
+            verify: "n/a".to_string(),
+            next: "NONE".to_string(),
+            full_report: "n/a".to_string(),
+            body: status.to_string(),
+            raw: format!("STATUS: {status}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tasks = serde_json::json!([
+            task("t-1", "in_progress", "2026-10-16T00:00:01Z"),
+            task("newer", "in_progress", "2026-10-16T00:00:09Z"),
+        ]);
+        let path = dir.path().join("ok.sock");
+        let (recorded, server) = fake_app_socket(&path, tasks, false).await;
+        let last_hash = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let expected = Arc::new(std::sync::Mutex::new(Some("t-1".to_string())));
+        let reported_task = || {
+            recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(m, _)| m == "team.report")
+                .map(|(_, p)| p["task_id"].as_str().unwrap_or("").to_string())
+        };
+
+        for interim in ["BLOCKED", "NEEDS_REVIEW"] {
+            try_emit_auto_reply(
+                "team",
+                "agent",
+                path.to_str(),
+                &last_hash,
+                &expected,
+                event(interim),
+            )
+            .await;
+            assert_eq!(
+                reported_task().as_deref(),
+                Some("t-1"),
+                "{interim} targets the capsule"
+            );
+            assert_eq!(
+                expected.lock().unwrap().as_deref(),
+                Some("t-1"),
+                "{interim} leaves the expectation for the final reply"
+            );
+            recorded.lock().unwrap().clear();
+        }
+
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            path.to_str(),
+            &last_hash,
+            &expected,
+            event("DONE"),
+        )
+        .await;
+        assert_eq!(
+            reported_task().as_deref(),
+            Some("t-1"),
+            "DONE targets the capsule"
+        );
+        assert_eq!(*expected.lock().unwrap(), None, "only DONE spends it");
+        assert_eq!(
+            methods(&recorded),
+            ["team.task.list", "team.report", "team.task.update"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_reply_forgets_the_hash_only_when_nothing_was_written() {
+        use crate::auto_reply_emit::tests::{fake_app_socket, methods, task};
+        let event = |body: &str| crate::auto_reply::AutoReplyEvent {
+            status: "DONE".to_string(),
+            files: "n/a".to_string(),
+            verify: "n/a".to_string(),
+            next: "NONE".to_string(),
+            full_report: "n/a".to_string(),
+            body: body.to_string(),
+            raw: format!("STATUS: DONE\\n\\n{body}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tasks = serde_json::json!([task("t-1", "in_progress", "2026-10-16T00:00:01Z")]);
+        let earlier = event("earlier").content_hash();
+        let last_hash = Arc::new(std::sync::Mutex::new(Some(earlier)));
+        let expected = Arc::new(std::sync::Mutex::new(None::<String>));
+        let reply = event("shipped");
+
+        let missing = dir.path().join("absent.sock");
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            missing.to_str(),
+            &last_hash,
+            &expected,
+            reply.clone(),
+        )
+        .await;
+        assert_eq!(
+            *last_hash.lock().unwrap(),
+            Some(earlier),
+            "a reply that wrote nothing does not count as sent"
+        );
+
+        let ok_path = dir.path().join("ok.sock");
+        let (recorded, server) = fake_app_socket(&ok_path, tasks.clone(), false).await;
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            ok_path.to_str(),
+            &last_hash,
+            &expected,
+            reply.clone(),
+        )
+        .await;
+        assert_eq!(
+            methods(&recorded),
+            ["team.task.list", "team.report", "team.task.update"],
+            "the identical reply is emitted again"
+        );
+        assert_eq!(*last_hash.lock().unwrap(), Some(reply.content_hash()));
+        server.abort();
+
+        let fail_path = dir.path().join("fail.sock");
+        let (_recorded, server) = fake_app_socket(&fail_path, tasks, true).await;
+        let refused = event("refused");
+        try_emit_auto_reply(
+            "team",
+            "agent",
+            fail_path.to_str(),
+            &last_hash,
+            &expected,
+            refused.clone(),
+        )
+        .await;
+        assert_eq!(
+            *last_hash.lock().unwrap(),
+            Some(refused.content_hash()),
+            "a reply that may already be filed stays deduped"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn auto_reply_restore_never_overwrites_a_newer_expectation() {
+        let slot = Arc::new(std::sync::Mutex::new(None::<String>));
+        assert!(restore_expected_task_if_empty(&slot, "t-1".to_string()));
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("t-1"));
+
+        *slot.lock().unwrap() = Some("t-2".to_string());
+        assert!(!restore_expected_task_if_empty(&slot, "t-1".to_string()));
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("t-2"));
     }
 
     #[test]
