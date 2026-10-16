@@ -24,24 +24,32 @@ enum AutoReplyEmit {
     /// another turn had parked as blocked, marking it completed, and leaving
     /// its own task untouched — losing the block reason on the way.
     ///
-    /// So a blocked task is now only closable by a reply that names it. Parking
-    /// something is a decision; a drive-by reply is not entitled to undo one.
-    /// Among the rest the most recent wins, because a reply is far likelier to
-    /// answer the instruction just given than the oldest one still open.
+    /// So a blocked or review_ready task is now only closable by a reply that
+    /// names it. Parking something is a decision; a drive-by reply is not
+    /// entitled to undo one. Among the rest the most recent wins, because a
+    /// reply is far likelier to answer the instruction just given than the
+    /// oldest one still open.
+    ///
+    /// A reply that names a task never falls back to a guess: when the named
+    /// task is gone or already terminal there is nothing for it to close.
     static func selectTask(
         from tasks: [TeamOrchestrator.TeamTask],
         preferredTaskId: String?
     ) -> TeamOrchestrator.TeamTask? {
-        if let preferredTaskId,
-           let named = tasks.first(where: { $0.id == preferredTaskId }) {
-            return named
+        if let preferredTaskId {
+            return tasks.first {
+                $0.id == preferredTaskId && !terminalStatuses.contains($0.status)
+            }
         }
         if let running = tasks.filter({ $0.status == "in_progress" })
             .max(by: { $0.createdAt < $1.createdAt }) {
             return running
         }
         return tasks
-            .filter { !terminalStatuses.contains($0.status) && $0.status != "blocked" }
+            .filter {
+                !terminalStatuses.contains($0.status)
+                    && $0.status != "blocked" && $0.status != "review_ready"
+            }
             .max(by: { $0.createdAt < $1.createdAt })
     }
 
@@ -62,11 +70,7 @@ enum AutoReplyEmit {
         // The task this reply is answering, when the caller knows it.
         //
         // The scrollback path never can: it sees an answer appear on a screen
-        // with nothing tying it to a request. So it guesses — first
-        // `in_progress`, else the first non-terminal task — and `blocked` is
-        // not in that terminal set, so an unrelated turn can walk up and mark
-        // a blocked task completed. Observed doing exactly that.
-        //
+        // with nothing tying it to a request, so `selectTask` has to guess.
         // A caller that sent the instruction does know, and passing it here is
         // the difference between closing a task and closing *this* task.
         preferredTaskId: String? = nil,

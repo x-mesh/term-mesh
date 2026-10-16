@@ -416,6 +416,27 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertNil(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: nil))
     }
 
+    func testANamedFinishedTaskIsNotReopened() {
+        let tasks = [task("done", "completed", minutesAgo: 1),
+                     task("open", "in_progress", minutesAgo: 5)]
+        XCTAssertNil(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: "done"))
+    }
+
+    func testAMissingNamedTaskIsNotReplacedByAGuess() {
+        let tasks = [task("open", "in_progress", minutesAgo: 5)]
+        XCTAssertNil(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: "gone"))
+    }
+
+    func testAnUnnamedReplyLeavesAReviewReadyTaskAlone() {
+        let tasks = [task("review", "review_ready", minutesAgo: 1)]
+        XCTAssertNil(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: nil))
+    }
+
+    func testANamedReviewReadyTaskCanStillBeClosed() {
+        let tasks = [task("review", "review_ready", minutesAgo: 1)]
+        XCTAssertEqual(AutoReplyEmit.selectTask(from: tasks, preferredTaskId: "review")?.id, "review")
+    }
+
     /// `exec` takes only the first word, and the caller prefixes the launch
     /// line with it when the agent works in a worktree. Handing back a bare
     /// `rm -f … && …` chain replaced the pane's shell with `rm`, which did its
