@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import IOKit.ps
@@ -26,6 +27,25 @@ enum PeerKeepAwakePolicy {
         return connections > 0 ? .hold : .releaseAfterGrace
     }
 
+    static func status(
+        mode: PeerKeepAwakeMode,
+        onACPower: Bool,
+        connections: Int,
+        isHolding: Bool
+    ) -> PeerKeepAwakeStatus {
+        if isHolding {
+            return connections > 0 ? .holding(connections: connections) : .releasingSoon
+        }
+        switch decision(mode: mode, onACPower: onACPower, connections: connections) {
+        case .hold:
+            return .failed
+        case .releaseAfterGrace:
+            return .noConnections
+        case .releaseNow:
+            return mode == .never ? .off : .onBattery
+        }
+    }
+
     /// On an unattended Mac, a napping host sat at priority 4 and took 159ms at
     /// the median from a keystroke's echo to its send. With its display off and
     /// a viewer attached, user-initiated work alone reached priority 20 and
@@ -38,6 +58,49 @@ enum PeerKeepAwakePolicy {
     }
 }
 
+/// What the keep-awake assertion is doing right now. The mode alone cannot say
+/// whether the Mac may sleep: an enabled mode with nothing connected, or on
+/// battery, holds nothing.
+enum PeerKeepAwakeStatus: Equatable {
+    case holding(connections: Int)
+    case releasingSoon
+    case noConnections
+    case onBattery
+    case off
+    case failed
+
+    var isPreventingSleep: Bool {
+        switch self {
+        case .holding, .releasingSoon: return true
+        case .noConnections, .onBattery, .off, .failed: return false
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .holding(let connections):
+            return String(
+                format: LanguageSettings.localized("Keeping this Mac awake: %lld remote connection(s)"),
+                Int64(connections)
+            )
+        case .releasingSoon:
+            return LanguageSettings.localized("Keeping this Mac awake for a minute after the last remote connection ended")
+        case .noConnections:
+            return LanguageSettings.localized("On: keeps this Mac awake once a remote session connects")
+        case .onBattery:
+            return LanguageSettings.localized("This Mac can sleep: paused on battery (On power adapter mode)")
+        case .off:
+            return LanguageSettings.localized("This Mac can sleep: keep-awake is off")
+        case .failed:
+            return LanguageSettings.localized("Could not keep this Mac awake")
+        }
+    }
+
+    var detail: String? {
+        isPreventingSleep ? LanguageSettings.localized("The display can still turn off.") : nil
+    }
+}
+
 /// Holds an idle-sleep assertion while remote sessions are connected, and for
 /// `PeerKeepAwakePolicy.releaseGraceSeconds` after the last one ends.
 ///
@@ -46,8 +109,10 @@ enum PeerKeepAwakePolicy {
 /// one `caffeinate -i` takes: the display still sleeps, and closing the lid or
 /// choosing Sleep still sleeps the Mac.
 @MainActor
-final class PeerKeepAwakeController {
+final class PeerKeepAwakeController: ObservableObject {
     static let shared = PeerKeepAwakeController()
+
+    @Published private(set) var status: PeerKeepAwakeStatus = .noConnections
 
     private var assertionID: IOPMAssertionID?
     private var latencyActivity: NSObjectProtocol?
@@ -130,6 +195,7 @@ final class PeerKeepAwakeController {
     }
 
     private func evaluate() {
+        defer { publishStatus() }
         switch decision {
         case .hold:
             cancelPendingRelease()
@@ -151,6 +217,19 @@ final class PeerKeepAwakeController {
         pendingRelease = nil
         if decision != .hold {
             release()
+        }
+        publishStatus()
+    }
+
+    private func publishStatus() {
+        let next = PeerKeepAwakePolicy.status(
+            mode: PeerFederationSettings.keepAwakeMode,
+            onACPower: onACPower,
+            connections: connectedHosts + attachedPeers,
+            isHolding: assertionID != nil
+        )
+        if next != status {
+            status = next
         }
     }
 
@@ -210,6 +289,67 @@ final class PeerKeepAwakeController {
               let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue()
         else { return true }
         return (type as String) == kIOPMACPowerKey
+    }
+}
+
+/// The keep-awake menu shared by the titlebar indicator and the menu bar
+/// extra: what the assertion is doing now, then the mode to change it.
+@MainActor
+final class PeerKeepAwakeMenu: NSObject {
+    static let shared = PeerKeepAwakeMenu()
+
+    static func symbolName(for status: PeerKeepAwakeStatus) -> String {
+        switch status {
+        case .holding, .releasingSoon: return "cup.and.saucer.fill"
+        case .noConnections, .onBattery: return "cup.and.saucer"
+        case .off: return "zzz"
+        case .failed: return "exclamationmark.triangle"
+        }
+    }
+
+    func populate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        menu.autoenablesItems = false
+        let status = PeerKeepAwakeController.shared.status
+        for line in [status.summary, status.detail].compactMap({ $0 }) {
+            let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+
+        let header = NSMenuItem(
+            title: LanguageSettings.localized("Keep Mac awake while connected"),
+            action: nil,
+            keyEquivalent: ""
+        )
+        header.isEnabled = false
+        menu.addItem(header)
+        let current = PeerFederationSettings.keepAwakeMode
+        for mode in PeerKeepAwakeMode.allCases {
+            let item = NSMenuItem(
+                title: LanguageSettings.localized(mode.displayName),
+                action: #selector(selectModeAction(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = mode.rawValue
+            item.state = mode == current ? .on : .off
+            menu.addItem(item)
+        }
+    }
+
+    func popUpAtMouse() {
+        let menu = NSMenu()
+        populate(menu)
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+
+    @objc private func selectModeAction(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              PeerKeepAwakeMode(rawValue: raw) != nil
+        else { return }
+        UserDefaults.standard.set(raw, forKey: PeerFederationSettings.keepAwakeKey)
     }
 }
 
