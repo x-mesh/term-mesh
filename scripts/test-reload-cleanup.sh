@@ -82,6 +82,127 @@ echo "remove_tag_artifacts"
   exit $FAIL
 ) || FAIL=$((FAIL + $?))
 
+echo "reclaim_tag_build"
+(
+  sandbox
+  mkdir -p "${TAG_TMP_ROOT}/term-mesh-release-0.273.0/Build"
+  out="$(reclaim_tag_build release-0.273.0 release-0-273-0)" && rc=0 || rc=$?
+  check "a dotted release dir is reclaimed by its raw name" "$rc" "0"
+  [[ -e "${TAG_TMP_ROOT}/term-mesh-release-0.273.0" ]] && r=yes || r=no
+  check "the dotted release dir is gone" "$r" "no"
+  check "reports the name it removed" "$out" "reclaimed tagged build release-0.273.0"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  seed_tag bystander
+  out="$(reclaim_tag_build gone gone)" && rc=0 || rc=$?
+  check "a missing tag build is not an error" "$rc" "0"
+  [[ "$out" == "nothing to reclaim:"* ]] && r=yes || r=no
+  check "a missing tag build says nothing to reclaim" "$r" "yes"
+  [[ -d "${TAG_TMP_ROOT}/term-mesh-bystander" && -d "${CARGO_TARGET_ROOT}/bystander" ]] && r=yes || r=no
+  check "a missing tag build removes nothing else" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "${TAG_TMP_ROOT}/term-mesh-release-0-273-0/Build" \
+    "${TAG_TMP_ROOT}/term-mesh-release-0.273.0/Build"
+  out="$(reclaim_tag_build release-0.273.0 release-0-273-0)" || true
+  [[ -e "${TAG_TMP_ROOT}/term-mesh-release-0-273-0" || -e "${TAG_TMP_ROOT}/term-mesh-release-0.273.0" ]] && r=yes || r=no
+  check "both the slug and the dotted dir are reclaimed" "$r" "no"
+  check "both reclaimed names are reported" "$out" "reclaimed tagged build release-0-273-0 release-0.273.0"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "${TAG_TMP_ROOT}/term-mesh-alpha.1/Build"
+  out="$(reclaim_tag_build alpha alpha)" && rc=0 || rc=$?
+  [[ "$rc" == 0 && "$out" == "nothing to reclaim:"* ]] && r=yes || r=no
+  check "an unsanitized tag never falls back to another dir" "$r" "yes"
+  [[ -d "${TAG_TMP_ROOT}/term-mesh-alpha.1" ]] && r=yes || r=no
+  check "the unrelated dotted dir survives" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "${TAG_TMP_ROOT}/term-mesh-prod/Build"
+  reclaim_tag_build prod prod >/dev/null 2>&1 && rc=0 || rc=$?
+  check "refuses the Makefile prod build" "$rc" "1"
+  [[ -d "${TAG_TMP_ROOT}/term-mesh-prod/Build" ]] && r=yes || r=no
+  check "the prod build survives" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "$SB/outside"; : > "$SB/outside/keep"
+  ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-linked"
+  out="$(reclaim_tag_build linked linked 2>/dev/null)" && rc=0 || rc=$?
+  check "refuses a symlinked tag dir with status 1" "$rc" "1"
+  [[ "$out" != *reclaimed* && -e "$SB/outside/keep" ]] && r=yes || r=no
+  check "a refused tag dir is neither removed nor reported reclaimed" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "${CARGO_TARGET_ROOT}/cargoonly/release"
+  out="$(reclaim_tag_build cargoonly cargoonly)" && rc=0 || rc=$?
+  [[ "$rc" == 0 && "$out" == "reclaimed tagged build cargoonly" ]] && r=yes || r=no
+  check "a tag whose derived data is gone still reclaims its other artifacts" "$r" "yes"
+  [[ ! -e "${CARGO_TARGET_ROOT}/cargoonly" ]] && r=yes || r=no
+  check "the cargo target of that tag is removed" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  : > "${TAG_TMP_ROOT}/term-mesh-debug-logonly.log"
+  out="$(reclaim_tag_build logonly logonly)" && rc=0 || rc=$?
+  [[ "$rc" == 0 && ! -e "${TAG_TMP_ROOT}/term-mesh-debug-logonly.log" ]] && r=yes || r=no
+  check "a tag with only its debug log left has the log reclaimed" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "${TAG_TMP_ROOT}/term-mesh-foo/Build"
+  tag_cleanup_refusal Foo foo 2>/dev/null && r=allowed || r=refused
+  check "an uppercase tag is not refused for its own slug directory" "$r" "allowed"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "$SB/outside"
+  ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-linked"
+  ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-dotted.1"
+  tag_cleanup_refusal prod prod 2>/dev/null && r=allowed || r=refused
+  check "cleanup refuses prod before touching anything" "$r" "refused"
+  tag_cleanup_refusal linked linked 2>/dev/null && r=allowed || r=refused
+  check "cleanup refuses a symlinked tag dir before touching anything" "$r" "refused"
+  tag_cleanup_refusal dotted.1 dotted-1 2>/dev/null && r=allowed || r=refused
+  check "cleanup refuses a symlinked dotted dir before touching anything" "$r" "refused"
+  tag_cleanup_refusal fresh fresh 2>/dev/null && r=allowed || r=refused
+  check "cleanup allows a tag with no directory yet" "$r" "allowed"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+echo "list_stale_tags"
+(
+  sandbox
+  mkdir -p "${TAG_TMP_ROOT}/term-mesh-prod/Build" "${TAG_TMP_ROOT}/term-mesh-alpha/Build" \
+    "${TAG_TMP_ROOT}/term-mesh-release-0.273.0/Build"
+  out="$(list_stale_tags current | sort | tr '\n' ' ')"
+  check "lists tags and dotted release dirs, never prod" "$out" "alpha release-0.273.0 "
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
 echo "reclaim_ended_tag_sessions"
 (
   sandbox

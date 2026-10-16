@@ -152,6 +152,75 @@ remove_tag_artifacts() {
   fi
 }
 
+# Every artifact `remove_tag_artifacts` owns, not just the derived data: a tag
+# whose Xcode build is gone can still hold its cargo target, socket and log.
+tag_artifacts_exist() {
+  local tag="$1"
+  [[ -e "${TAG_TMP_ROOT}/term-mesh-${tag}" \
+     || -e "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.sock" \
+     || -e "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.log" \
+     || -e "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock" ]] && return 0
+  [[ -n "${CARGO_TARGET_ROOT:-}" && "$tag" =~ ^[a-z0-9][a-z0-9-]*$ \
+     && -e "${CARGO_TARGET_ROOT}/${tag}" ]]
+}
+
+# Checked before `--cleanup` quits the app or touches the session, so a refused
+# cleanup changes nothing. `prod` is the Makefile's PROD_DERIVED_DATA, never a
+# reload.sh tag. The dotted raw name is checked too when it names a directory.
+tag_cleanup_refusal() {
+  local raw="$1"
+  local slug="$2"
+  local path=""
+  if [[ "$slug" == "prod" || "$raw" == "prod" ]]; then
+    echo "error: refusing to reclaim ${TAG_TMP_ROOT}/term-mesh-prod — it is the Makefile prod build, not a tag" >&2
+    return 1
+  fi
+  for path in "${TAG_TMP_ROOT}/term-mesh-${slug}" "${TAG_TMP_ROOT}/term-mesh-${raw}"; do
+    if [[ "$path" != "${TAG_TMP_ROOT}/term-mesh-${slug}" ]]; then
+      # Only a raw name reclaim_tag_build would act on; on a case-insensitive
+      # volume an uppercase `--tag` resolves to the slug's own directory.
+      [[ "$raw" != "$slug" && "$raw" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || continue
+      [[ -e "$path" || -L "$path" ]] || continue
+    fi
+    if ! safe_managed_tag_path "$path"; then
+      echo "error: refusing to reclaim ${path} — not a managed tag directory" >&2
+      return 1
+    fi
+  done
+}
+
+# `--cleanup` must report what it actually removed. The reminder prints raw
+# directory names, and release.py's dotted ones (term-mesh-release-0.273.0)
+# sanitize to a slug that names no directory, so both names are reclaimed.
+reclaim_tag_build() {
+  local raw="$1"
+  local slug="$2"
+  local name=""
+  local -a names=()
+  local -a reclaimed=()
+
+  tag_cleanup_refusal "$raw" "$slug" || return 1
+  if tag_artifacts_exist "$slug"; then
+    names+=("$slug")
+  fi
+  if [[ "$raw" != "$slug" && "$raw" =~ ^[a-z0-9][a-z0-9._-]*$ \
+     && -d "${TAG_TMP_ROOT}/term-mesh-${raw}" ]]; then
+    names+=("$raw")
+  fi
+  if [[ "${#names[@]}" -eq 0 ]]; then
+    echo "nothing to reclaim: no tag build at ${TAG_TMP_ROOT}/term-mesh-${slug}"
+    return 0
+  fi
+  for name in "${names[@]}"; do
+    if ! remove_tag_artifacts "$name"; then
+      echo "error: refusing to reclaim ${TAG_TMP_ROOT}/term-mesh-${name} — not a managed tag directory" >&2
+      return 1
+    fi
+    reclaimed+=("$name")
+  done
+  echo "reclaimed tagged build ${reclaimed[*]}"
+}
+
 # A session file binds a tag build to the exact app PID launched from it. On a
 # later reload, a missing/reused PID proves that session ended and its derived
 # data can be reclaimed without waiting for the age-based fallback.
@@ -258,7 +327,7 @@ list_stale_tags() {
   # "stale tags: none" while ~100G piled up.
   while IFS= read -r -d '' path; do
     tag="${path##*/term-mesh-}"
-    if [[ -z "$tag" || "$tag" == "$current_slug" ]]; then
+    if [[ -z "$tag" || "$tag" == "$current_slug" || "$tag" == "prod" ]]; then
       continue
     fi
     if [[ ! -d "$path/Build" ]]; then
@@ -490,15 +559,15 @@ if [[ -n "$TAG" ]]; then
 fi
 
 if [[ "$CLEANUP_ONLY" -eq 1 ]]; then
+  tag_cleanup_refusal "$TAG" "$TAG_SLUG" || exit 1
   APP_PROCESS_PATTERN="${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}"
   /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
   if ! wait_for_app_exit "$APP_PROCESS_PATTERN"; then
     pkill -f "$APP_PROCESS_PATTERN" || true
   fi
   stop_daemon_for_socket "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${TAG_SLUG}.sock"
-  remove_tag_artifacts "$TAG_SLUG"
+  reclaim_tag_build "$TAG" "$TAG_SLUG" || exit $?
   rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG}.session"
-  echo "reclaimed tagged build ${TAG_SLUG}"
   exit 0
 fi
 
