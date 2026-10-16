@@ -109,6 +109,31 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(event.verify, "swift build 2>&1 | grep error")
     }
 
+    /// `headerEvent` answers NEEDS_REVIEW whether or not the agent wrote it.
+    /// Only a STATUS that was actually stated, and is one of the three
+    /// verdicts, counts as the agent's last word on a task.
+    func testExplicitStatusIsOnlyAStatedVerdict() {
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: ""))
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(
+            in: "I started the build in the background and will report back."))
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(
+            in: "the last run said STATUS: DONE, but that was another task"),
+            "a STATUS inside prose is not a header")
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: "STATUS: in progress"))
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: "STATUS:"))
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: "STATUS: done"))
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: "status: DONE"))
+        XCTAssertEqual(AgentPipeCompletion.explicitStatus(
+            in: "summary\n\nSTATUS: DONE|FILES: none|VERIFY: n/a|NEXT: NONE|FULL_REPORT: n/a"),
+            "DONE")
+        XCTAssertEqual(AgentPipeCompletion.explicitStatus(in: "STATUS: DONE"), "DONE")
+        XCTAssertEqual(AgentPipeCompletion.explicitStatus(in: "STATUS: BLOCKED\nNEXT: ask"), "BLOCKED")
+        XCTAssertEqual(AgentPipeCompletion.explicitStatus(in: "  STATUS: NEEDS_REVIEW  "), "NEEDS_REVIEW")
+        XCTAssertEqual(
+            AgentPipeCompletion.headerEvent(from: "no verdict here").status, "NEEDS_REVIEW",
+            "the pipe path keeps its default; only the explicit question is new")
+    }
+
     func testUnknownStatusDoesNotCompleteOrWriteResult() throws {
         let team = "unknown-status-p0-\(UUID().uuidString)"
         let store = TeamDataStore.shared
@@ -132,6 +157,163 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, task.status)
         XCTAssertNil(store.readResult(teamName: team, taskId: task.id, agentName: "executor"))
         XCTAssertTrue(store.collectResults(teamName: team).isEmpty)
+    }
+
+    // MARK: - Settling a native worker's turn
+
+    private func nativeTeam(
+        _ label: String,
+        agents: [TeamDataStore.AgentRegistration] = [.init(name: "executor", instanceId: nil)]
+    ) -> (team: String, store: TeamDataStore) {
+        let team = "\(label)-\(UUID().uuidString)"
+        TeamDataStore.shared.registerTeam(team, agents: agents)
+        return (team, TeamDataStore.shared)
+    }
+
+    private func runningTask(
+        _ team: String, _ store: TeamDataStore,
+        assigneeInstanceId: String? = nil
+    ) throws -> TeamOrchestrator.TeamTask {
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "work", assignee: "executor",
+            assigneeInstanceId: assigneeInstanceId))
+        return try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "in_progress"))
+    }
+
+    /// The incident: the worker handed a long job to the background and ended
+    /// its turn without a verdict. That turn must not settle the task.
+    func testAVerdictlessNativeTurnRecordsProgressAndNothingElse() throws {
+        let (team, store) = nativeTeam("native-progress")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try runningTask(team, store)
+        let before = try XCTUnwrap(task.lastProgressAt)
+
+        for final in ["Started the build in the background; waiting for it.",
+                      "STATUS: in progress"] {
+            AutoReplyEmit.settleNativeTurn(
+                teamName: team, agentName: "executor", agentInstanceId: nil,
+                final: final, taskId: task.id, store: store)
+        }
+
+        let after = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(after.status, "in_progress")
+        XCTAssertNil(after.result)
+        XCTAssertGreaterThan(try XCTUnwrap(after.lastProgressAt), before)
+        XCTAssertEqual(store.getMessages(teamName: team, type: "progress").count, 2)
+        XCTAssertTrue(store.getMessages(teamName: team, type: "report").isEmpty)
+        XCTAssertNil(store.readResult(teamName: team, taskId: task.id, agentName: "executor"))
+        XCTAssertTrue(store.collectResults(teamName: team).isEmpty)
+    }
+
+    func testANativeTurnWithNoTaskTouchesNothing() throws {
+        let (team, store) = nativeTeam("native-untracked")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try runningTask(team, store)
+
+        AutoReplyEmit.settleNativeTurn(
+            teamName: team, agentName: "executor", agentInstanceId: nil,
+            final: "STATUS: DONE", taskId: nil, store: store)
+
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "in_progress")
+        XCTAssertTrue(store.getMessages(teamName: team).isEmpty)
+    }
+
+    func testAGuardedUpdateMutatesNothingOnMismatch() throws {
+        let (team, store) = nativeTeam("guarded-update")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try runningTask(team, store)
+
+        XCTAssertNil(store.updateTask(
+            teamName: team, taskId: task.id, status: "blocked",
+            blockedReason: "stale", progressNote: "stale", expectedStatus: "review_ready"))
+        XCTAssertNil(store.updateTask(
+            teamName: team, taskId: task.id, status: "blocked",
+            blockedReason: "stale", progressNote: "stale", expectedAssignee: "someone-else"))
+
+        let after = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(after.status, "in_progress")
+        XCTAssertNil(after.blockedReason)
+        XCTAssertEqual(after.updatedAt, task.updatedAt)
+        XCTAssertTrue(store.getMessages(teamName: team, type: "progress").isEmpty)
+    }
+
+    func testAnUnsettledTaskIsBlockedOnlyWhileInProgress() throws {
+        let (team, store) = nativeTeam("block-unsettled")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try runningTask(team, store)
+        func block() -> Bool {
+            AutoReplyEmit.blockUnsettledTask(
+                teamName: team, agentName: "executor", agentInstanceId: nil,
+                taskId: task.id, reason: "No explicit STATUS", store: store)
+        }
+
+        XCTAssertTrue(block(), "an unpinned unique-name task follows emit's identity rule")
+        let blocked = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(blocked.status, "blocked")
+        XCTAssertEqual(blocked.blockedReason, "No explicit STATUS")
+        XCTAssertFalse(block(), "already blocked")
+
+        for status in ["review_ready", "completed"] {
+            XCTAssertNotNil(store.updateTask(teamName: team, taskId: task.id, status: status))
+            XCTAssertFalse(block(), "\(status) is settled")
+            XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, status)
+        }
+    }
+
+    func testAReassignedTaskIsNotBlockedByItsFormerWorker() throws {
+        let (team, store) = nativeTeam("block-reassigned", agents: [
+            .init(name: "executor", instanceId: nil), .init(name: "other", instanceId: nil),
+        ])
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try runningTask(team, store)
+        XCTAssertNotNil(store.reassignTask(teamName: team, taskId: task.id, assignee: "other"))
+        XCTAssertNotNil(store.updateTask(teamName: team, taskId: task.id, status: "in_progress"))
+
+        XCTAssertFalse(AutoReplyEmit.blockUnsettledTask(
+            teamName: team, agentName: "executor", agentInstanceId: nil,
+            taskId: task.id, reason: "stale", store: store))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "in_progress")
+    }
+
+    func testAPinnedTaskIsBlockedOnlyByItsOwnInstance() throws {
+        let (team, store) = nativeTeam("block-pinned", agents: [
+            .init(name: "executor", instanceId: "instance-a"),
+            .init(name: "executor", instanceId: "instance-b"),
+        ])
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try runningTask(team, store, assigneeInstanceId: "instance-a")
+        XCTAssertEqual(task.assigneeInstanceId, "instance-a")
+        func block(_ instance: String?) -> Bool {
+            AutoReplyEmit.blockUnsettledTask(
+                teamName: team, agentName: "executor", agentInstanceId: instance,
+                taskId: task.id, reason: "stale", store: store)
+        }
+
+        XCTAssertFalse(block("instance-b"))
+        XCTAssertFalse(block(nil))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "in_progress")
+        XCTAssertTrue(block("instance-a"))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
+    }
+
+    /// A worker that states its verdict late still closes the task it named,
+    /// whether the pipe path left it review_ready or the native fallback left
+    /// it blocked.
+    func testALateExplicitDoneClosesAReviewReadyOrBlockedTask() throws {
+        let (team, store) = nativeTeam("late-done")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        for parked in ["review_ready", "blocked"] {
+            let task = try runningTask(team, store)
+            XCTAssertNotNil(store.updateTask(teamName: team, taskId: task.id, status: parked))
+
+            AutoReplyEmit.settleNativeTurn(
+                teamName: team, agentName: "executor", agentInstanceId: nil,
+                final: "STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a",
+                taskId: task.id, store: store)
+
+            XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed",
+                           "from \(parked)")
+        }
     }
 
     // MARK: - Which task the answer belongs to

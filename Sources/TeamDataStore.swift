@@ -1832,12 +1832,16 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         worktreeInit: String? = nil,
         worktreeFinishedAt: Date? = nil,
         worktreeFinishMode: String? = nil,
-        worktreeRemoved: Bool? = nil
+        worktreeRemoved: Bool? = nil,
+        expectedStatus: String? = nil,
+        expectedAssignee: String? = nil
     ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard var tasks = taskBoards[teamName],
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
+        if let expectedStatus, tasks[idx].status != expectedStatus { return nil }
+        if let expectedAssignee, tasks[idx].assignee != expectedAssignee { return nil }
         let now = Date()
         if let assignee {
             guard let resolvedAssignee = resolveAssigneeUnsafe(

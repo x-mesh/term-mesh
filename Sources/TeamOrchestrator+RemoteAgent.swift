@@ -8630,21 +8630,10 @@ extension TeamOrchestrator {
                 agentInstanceId: agentInstanceId, busy: busy
             )
         }
-        panel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
-            Self.fileReport(
-                teamName: teamName, agentName: agentName,
-                agentInstanceId: agentInstanceId,
-                taskId: taskId, text: final
-            )
-            guard let taskId else { return }
-            AutoReplyEmit.emit(
-                teamName: teamName,
-                agentName: agentName,
-                event: AgentPipeCompletion.headerEvent(from: final),
-                preferredTaskId: taskId,
-                agentInstanceId: agentInstanceId
-            )
-        }
+        Self.wireNativeWorkerCompletion(
+            panel.session, teamName: teamName,
+            agentName: agentName, agentInstanceId: agentInstanceId
+        )
     }
 
     /// Rebuild the local pane for a peer-owned agent whose previous one was
@@ -9638,21 +9627,10 @@ extension TeamOrchestrator {
                 agentInstanceId: agentInstanceId, busy: busy
             )
         }
-        panel.session.onTurnEnd = { [teamName = team.id, agentName, agentInstanceId] final, _, taskId in
-            Self.fileReport(
-                teamName: teamName, agentName: agentName,
-                agentInstanceId: agentInstanceId,
-                taskId: taskId, text: final
-            )
-            guard let taskId else { return }
-            AutoReplyEmit.emit(
-                teamName: teamName,
-                agentName: agentName,
-                event: AgentPipeCompletion.headerEvent(from: final),
-                preferredTaskId: taskId,
-                agentInstanceId: agentInstanceId
-            )
-        }
+        Self.wireNativeWorkerCompletion(
+            panel.session, teamName: team.id,
+            agentName: agentName, agentInstanceId: agentInstanceId
+        )
         workspace.setPanelCustomTitle(
             panelId: panel.id,
             title: "\(Self.colorEmoji(color)) \(agentName) @\(host.displayName)"

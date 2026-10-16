@@ -205,10 +205,6 @@ def main() -> int:
             worker_done = [
                 task for task in wave_tasks
                 if task.get("status") == "completed"
-                or (
-                    task.get("status") == "review_ready"
-                    and "STATUS: DONE" in str(task.get("result") or "")
-                )
             ]
             if len(wave_tasks) != 2 or len(worker_done) != 2:
                 raise termmeshError(

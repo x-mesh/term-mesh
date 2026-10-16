@@ -141,14 +141,10 @@ enum AutoReplyEmit {
         //    woken and auto-recycle counters increment — bypassed when calling
         //    store.updateTask directly without going through the socket RPC path.
         if taskStatus != prevStatus {
-            _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
-                "kind": "task_status",
-                "team": teamName,
-                "agent": updated.assignee ?? agentName,
-                "task_id": updated.id,
-                "status": taskStatus,
-                "prev_status": prevStatus
-            ] as [String: Any])
+            publishTaskStatus(
+                teamName: teamName, agentName: updated.assignee ?? agentName,
+                taskId: updated.id, status: taskStatus, prevStatus: prevStatus
+            )
             if taskStatus == "completed" {
                 let tn = teamName, an = updated.assignee ?? agentName, ai = updated.assigneeInstanceId
                 Task { @MainActor in
@@ -158,6 +154,117 @@ enum AutoReplyEmit {
                 }
             }
         }
+        return true
+    }
+
+    static func publishTaskStatus(
+        teamName: String, agentName: String, taskId: String,
+        status: String, prevStatus: String
+    ) {
+        _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
+            "kind": "task_status",
+            "team": teamName,
+            "agent": agentName,
+            "task_id": taskId,
+            "status": status,
+            "prev_status": prevStatus
+        ] as [String: Any])
+    }
+
+    /// Settle a native worker's turn against the task it was correlated with.
+    ///
+    /// Only a STATUS the agent actually stated moves the task. A turn without
+    /// one is often not the agent's last word on it — it can hand a long job
+    /// to the background and finish the task in a later turn it starts itself
+    /// — so it is recorded as progress and the task stays open.
+    static func settleNativeTurn(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String?,
+        final: String,
+        taskId: String?,
+        store: TeamDataStore = .shared
+    ) {
+        guard let taskId else { return }
+        if AgentPipeCompletion.explicitStatus(in: final) != nil {
+            emit(
+                teamName: teamName, agentName: agentName,
+                event: AgentPipeCompletion.headerEvent(from: final),
+                preferredTaskId: taskId, agentInstanceId: agentInstanceId,
+                store: store
+            )
+        } else {
+            recordProgressWithoutStatus(
+                teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId, final: final,
+                taskId: taskId, store: store
+            )
+        }
+    }
+
+    @discardableResult
+    static func recordProgressWithoutStatus(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String?,
+        final: String,
+        taskId: String,
+        store: TeamDataStore = .shared
+    ) -> Bool {
+        guard let task = store.getTask(teamName: teamName, taskId: taskId),
+              task.assignee == agentName,
+              store.agentIdentityMatches(
+                  teamName: teamName, agentName: agentName,
+                  expectedInstanceId: task.assigneeInstanceId,
+                  reportedInstanceId: agentInstanceId),
+              !terminalStatuses.contains(task.status)
+        else { return false }
+        let trimmed = final.trimmingCharacters(in: .whitespacesAndNewlines)
+        let note = trimmed.isEmpty
+            ? "turn ended without an explicit STATUS"
+            : String(trimmed.prefix(resultTruncChars))
+        return store.updateTask(
+            teamName: teamName, taskId: taskId,
+            assigneeInstanceId: task.assigneeInstanceId,
+            progressNote: note,
+            expectedAssignee: agentName
+        ) != nil
+    }
+
+    /// Move a task its worker never settled to `blocked`.
+    ///
+    /// `review_ready` stays reserved for an agent that said NEEDS_REVIEW;
+    /// `blocked` is settled for `tm-agent wait` and asks the leader to look.
+    /// Status, assignee and a pinned instance are re-checked under the store
+    /// lock, so a completion or reassignment that landed first wins.
+    @discardableResult
+    static func blockUnsettledTask(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String?,
+        taskId: String,
+        reason: String,
+        store: TeamDataStore = .shared
+    ) -> Bool {
+        guard let task = store.getTask(teamName: teamName, taskId: taskId),
+              task.assignee == agentName,
+              store.agentIdentityMatches(
+                  teamName: teamName, agentName: agentName,
+                  expectedInstanceId: task.assigneeInstanceId,
+                  reportedInstanceId: agentInstanceId)
+        else { return false }
+        guard let updated = store.updateTask(
+            teamName: teamName, taskId: taskId,
+            status: "blocked",
+            assigneeInstanceId: task.assigneeInstanceId,
+            blockedReason: reason,
+            expectedStatus: "in_progress",
+            expectedAssignee: agentName
+        ) else { return false }
+        publishTaskStatus(
+            teamName: teamName, agentName: updated.assignee ?? agentName,
+            taskId: updated.id, status: "blocked", prevStatus: "in_progress"
+        )
         return true
     }
 
