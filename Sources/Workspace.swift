@@ -3932,7 +3932,7 @@ final class Workspace: Identifiable {
         // End any in-flight turn as session_stopped so the task board is
         // not left holding an in_progress task for a pane that is going
         // away. Safe when already stopped.
-        (panels[panelId] as? AgentPanel)?.session.stop()
+        (panels[panelId] as? AgentPanel)?.session.stopForPaneRebuild(after: reason)
         session.teardown()
         let surfaceID = session.originSurface.surfaceID
         let isLocalDaemonSession = Self.isLocalSessionHost(session.originSpec)
@@ -3995,7 +3995,7 @@ final class Workspace: Identifiable {
             return false
         }
         session.relaySession.onPtyData = nil
-        (panels[panelId] as? AgentPanel)?.session.stop()
+        (panels[panelId] as? AgentPanel)?.session.stopForPaneRebuild(after: "repair requested")
         session.teardown()
         let surfaceID = session.originSurface.surfaceID
         _ = closePanel(panelId, force: true)

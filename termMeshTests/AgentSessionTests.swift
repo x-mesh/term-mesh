@@ -1447,7 +1447,7 @@ final class AgentSessionTests: XCTestCase {
 
     /// A person typing in the composer opens a turn too. This used to be set
     /// only for leader writes, so a task arriving during a person's turn went
-    /// straight into the same stdin and took `currentTaskId` with it — the
+    /// straight into the same stdin and took the task correlation with it — the
     /// person's result would then close the leader's task.
     func testALeaderTaskWaitsBehindAPersonsTurn() throws {
         var answered: [String?] = []
@@ -1465,17 +1465,40 @@ final class AgentSessionTests: XCTestCase {
     /// and everything queued behind it would never be delivered.
     func testAProcessThatDiesMidTurnEndsTheTurn() {
         var reported: [(String, String?)] = []
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
         let s = AgentSession()
         s.onTurnEnd = { text, _, task in reported.append((text, task)) }
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
         s.openTurnForTesting(from: .leader, taskId: "e82188a0")
         s.finishForTesting(code: 1)
 
         XCTAssertEqual(reported.count, 1)
         XCTAssertEqual(reported.first?.1, "e82188a0")
-        // No STATUS in that text, so it reads as NEEDS_REVIEW rather than a
-        // success: nobody said it worked and the agent is not there to say.
-        XCTAssertEqual(AgentPipeCompletion.headerEvent(from: reported.first!.0).status,
-                       "NEEDS_REVIEW")
+        // Nobody said it worked and the agent is not there to say: the task
+        // is handed back as lost, not settled by this text.
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: reported.first!.0))
+        XCTAssertEqual(lost.map(\.0), ["e82188a0"])
+        XCTAssertEqual(lost.first?.1, .sessionEnded("the agent exited before an explicit STATUS"))
+        XCTAssertNil(s.pendingTaskIdForTesting)
+    }
+
+    /// A worker that ended its turn without a verdict and then went away has
+    /// no turn in flight to end, but its task still must not sit open.
+    func testAnExitBetweenTurnsStillHandsBackThePendingTask() {
+        var ends = 0
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, _ in ends += 1 }
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.openTurnForTesting(from: .leader, taskId: "between")
+        s.ingestForTesting(event(["type": "result", "result": "running it in the background"]))
+        XCTAssertEqual(ends, 1)
+
+        s.finishForTesting(code: 0)
+
+        XCTAssertEqual(ends, 1, "no turn was running, so none is ended")
+        XCTAssertEqual(lost.map(\.0), ["between"])
+        XCTAssertEqual(lost.first?.1, .sessionEnded("the agent exited before an explicit STATUS"))
     }
 
     /// Process termination and the last readability callback are independent.
@@ -2983,17 +3006,510 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(answered, ["e82188a0"])
     }
 
-    /// And it is cleared, so the next turn cannot inherit it.
-    func testATaskIsAnsweredOnlyOnce() throws {
+    /// A turn without a verdict is not the worker's last word, so the task
+    /// stays with it; an explicit STATUS is, and nothing after inherits it.
+    func testATaskIsAnsweredUntilAnExplicitStatus() throws {
         var seen: [String?] = []
         let s = AgentSession()
         s.onTurnEnd = { _, _, task in seen.append(task) }
         s.beginTurnForTesting(taskId: "e82188a0")
         s.ingestForTesting(event(["type": "result", "result": "one"]))
-        s.ingestForTesting(event(["type": "result", "result": "two"]))
-        XCTAssertEqual(seen.count, 2)
-        XCTAssertEqual(seen[0], "e82188a0")
-        XCTAssertNil(seen[1])
+        XCTAssertEqual(s.pendingTaskIdForTesting, "e82188a0")
+        s.ingestForTesting(event(["type": "result", "result": "STATUS: DONE"]))
+        XCTAssertNil(s.pendingTaskIdForTesting)
+        s.ingestForTesting(event(["type": "result", "result": "three"]))
+        XCTAssertEqual(seen, ["e82188a0", "e82188a0", nil])
+    }
+
+    // MARK: - A task the worker finishes in a turn of its own
+
+    private func assistantSaid(_ text: String) -> String {
+        event(["type": "assistant", "message": ["content": [["type": "text", "text": text]]]])
+    }
+
+    private func resultSaying(_ text: String) -> String {
+        event(["type": "result", "stop_reason": "end_turn", "result": text])
+    }
+
+    private func hook() -> String {
+        event(["type": "system", "subtype": "hook_response", "hook_name": "Stop"])
+    }
+
+    /// The incident. The worker started a job longer than the tool timeout in
+    /// the background and ended its turn without a verdict; when the job
+    /// finished the CLI started a turn of its own — no write from this side —
+    /// and that turn said STATUS: DONE. It must close the same task.
+    func testAContinuationTheCLIStartsItselfAnswersThePendingTask() throws {
+        var seen: [String?] = []
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, task in seen.append(task) }
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: 7c1e0d2a\nrun the full suite", from: .leader)
+        s.ingestForTesting(resultSaying("The suite is running in the background."))
+        XCTAssertEqual(seen, ["7c1e0d2a"])
+        XCTAssertEqual(s.pendingTaskIdForTesting, "7c1e0d2a")
+        XCTAssertFalse(s.isTurnInFlightForTesting)
+
+        s.ingestForTesting(assistantSaid("The background suite finished: all green."))
+        XCTAssertTrue(s.isTurnInFlightForTesting, "the CLI's own turn is a turn")
+        XCTAssertTrue(s.isThinking)
+        s.ingestForTesting(resultSaying("STATUS: DONE\nFILES: none\nVERIFY: suite\nNEXT: NONE\nFULL_REPORT: n/a"))
+
+        XCTAssertEqual(seen, ["7c1e0d2a", "7c1e0d2a"])
+        XCTAssertNil(s.pendingTaskIdForTesting)
+        s.stop()
+        XCTAssertTrue(lost.isEmpty, "a settled task is not handed back")
+    }
+
+    /// A person's question, a leader message without TASK_ID, and a person
+    /// joining a turn the CLI started all answer something else.
+    func testOnlyTheDispatchOrTheCLIsOwnTurnAnswersThePendingTask() throws {
+        var seen: [String?] = []
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { _, _, task in seen.append(task) }
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: 5e5e5e5e\nbuild it", from: .leader)
+        s.ingestForTesting(resultSaying("started"))
+
+        try s.send("how is it going?", from: .person)
+        s.ingestForTesting(resultSaying("STATUS: DONE"))
+        try s.send("status check", from: .leader)
+        s.ingestForTesting(resultSaying("STATUS: DONE"))
+        s.ingestForTesting(assistantSaid("background job done"))
+        try s.send("wait, one more thing", from: .person)
+        s.ingestForTesting(resultSaying("STATUS: DONE"))
+
+        XCTAssertEqual(seen, ["5e5e5e5e", nil, nil, nil])
+        XCTAssertEqual(s.pendingTaskIdForTesting, "5e5e5e5e")
+        XCTAssertTrue(lost.isEmpty)
+        s.stop()
+        XCTAssertEqual(lost, ["5e5e5e5e"])
+    }
+
+    func testAPaneRebuildNamesTheRebuildWhenItLosesThePendingTask() throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: 9a9a9a9a\nbuild it", from: .leader)
+
+        s.stopForPaneRebuild(after: "stream rewound")
+        s.stop()
+
+        XCTAssertEqual(lost.count, 1)
+        XCTAssertEqual(lost.first?.0, "9a9a9a9a")
+        XCTAssertTrue(lost.first?.1.reason.contains("rebuilt") ?? false)
+        XCTAssertTrue(lost.first?.1.reason.contains("stream rewound") ?? false)
+    }
+
+    func testAPlainStopStillReportsAPlainStop() throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: 8b8b8b8b\nbuild it", from: .leader)
+
+        s.stop()
+
+        XCTAssertEqual(lost.count, 1)
+        XCTAssertEqual(lost.first?.1, .sessionEnded("the session was stopped before an explicit STATUS"))
+    }
+
+    /// One instruction, one turn, one result still holds when the running
+    /// turn is one the CLI started: a dispatch landing in it is queued, not
+    /// merged into it.
+    func testALeaderDispatchWaitsBehindATurnTheCLIStartedItself() async throws {
+        let sink = RemoteSinkRecorder()
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        var dispositions: [String] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { sink.record($0) }
+        try s.send("TASK_ID: aaaa1111\nfirst", from: .leader)
+        s.ingestForTesting(resultSaying("in the background"))
+        var delivered = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(delivered)
+
+        s.ingestForTesting(assistantSaid("background finished"))
+        try s.send("TASK_ID: bbbb2222\nsecond", from: .leader) { disposition in
+            if case .queuedBehindTurn = disposition { dispositions.append("queued") }
+        }
+        XCTAssertEqual(dispositions, ["queued"])
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(sink.all.count, 1, "the dispatch must not merge into the running turn")
+        XCTAssertTrue(lost.isEmpty)
+
+        s.ingestForTesting(resultSaying("still no verdict"))
+        delivered = await waitUntil { sink.all.count == 2 }
+        XCTAssertTrue(delivered)
+        XCTAssertTrue(String(data: try XCTUnwrap(sink.all.last), encoding: .utf8)?
+            .contains("bbbb2222") == true)
+        XCTAssertEqual(lost.map(\.0), ["aaaa1111"])
+        XCTAssertEqual(lost.first?.1, .superseded(by: "bbbb2222"))
+        XCTAssertEqual(lost.first?.1.reason,
+                       "superseded by dispatch of bbbb2222 before an explicit STATUS")
+        XCTAssertEqual(s.pendingTaskIdForTesting, "bbbb2222")
+    }
+
+    func testRedispatchingTheSameTaskDoesNotSupersedeIt() {
+        var lost: [String] = []
+        let s = AgentSession()
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.openTurnForTesting(from: .leader, taskId: "same")
+        s.ingestForTesting(resultSaying("started"))
+        s.openTurnForTesting(from: .leader, taskId: "same")
+        XCTAssertTrue(lost.isEmpty)
+        XCTAssertEqual(s.pendingTaskIdForTesting, "same")
+    }
+
+    /// Hooks and token estimates arrive between turns. They are not the model
+    /// generating, so they open no turn — a leader send behind a phantom turn
+    /// would queue forever — and they are not activity on the task, or the
+    /// deadline would never run out.
+    func testIdleSystemEventsOpenNoTurnAndDoNotDeferTheDeadline() async throws {
+        let sink = RemoteSinkRecorder()
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession(pendingTaskStatusDeadline: 0.3)
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { sink.record($0) }
+        try s.send("TASK_ID: 0ddba11\nwork", from: .leader)
+        s.ingestForTesting(resultSaying("background"))
+
+        let started = Date()
+        while Date().timeIntervalSince(started) < 0.6 {
+            s.ingestForTesting(hook())
+            XCTAssertFalse(s.isTurnInFlightForTesting)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(lost.map(\.0), ["0ddba11"], "system events must not keep the deadline away")
+        XCTAssertEqual(lost.first?.1, .noStatusDeadline(0.3))
+
+        try s.send("anything else?", from: .leader)
+        let written = await waitUntil { sink.all.count == 2 }
+        XCTAssertTrue(written, "no phantom turn holds the leader back")
+    }
+
+    func testTheStatusDeadlineFiresOnceForAQuietUnsettledTask() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession(pendingTaskStatusDeadline: 0.05)
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: quiet\nwork", from: .leader)
+        s.ingestForTesting(resultSaying("background"))
+
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertEqual(lost.map(\.0), ["quiet"])
+        XCTAssertEqual(lost.first?.1, .noStatusDeadline(0.05))
+        XCTAssertEqual(s.pendingTaskIdForTesting, "quiet",
+                       "a late explicit STATUS can still close it")
+    }
+
+    func testTheStatusDeadlineNeverFiresAfterAnExplicitStatus() async throws {
+        var lost: [String] = []
+        let s = AgentSession(pendingTaskStatusDeadline: 0.05)
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: stated\nwork", from: .leader)
+        s.ingestForTesting(resultSaying("STATUS: BLOCKED\nNEXT: need a key"))
+
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertTrue(lost.isEmpty)
+        XCTAssertNil(s.pendingTaskIdForTesting)
+    }
+
+    /// A STATUS in a turn not tied to the task still settles nothing, but the
+    /// block that follows says it was stated rather than claiming silence.
+    func testAStatusStatedOutsideTheTaskIsNamedWhenTheDeadlineBlocksIt() async throws {
+        for speaker in [AgentSession.Speaker.leader, .person] {
+            var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+            let s = AgentSession(pendingTaskStatusDeadline: 0.05)
+            s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+            s.startRemote { _ in }
+            try s.send("TASK_ID: outside1\nwork", from: .leader)
+            s.ingestForTesting(resultSaying("Running in the background."))
+            try s.send("how is it going?", from: speaker)
+            s.ingestForTesting(resultSaying("STATUS: DONE"))
+            XCTAssertEqual(s.pendingTaskIdForTesting, "outside1", "\(speaker) turn settles nothing")
+
+            let fired = await waitUntil { !lost.isEmpty }
+            XCTAssertTrue(fired)
+            XCTAssertEqual(lost.map(\.0), ["outside1"])
+            XCTAssertEqual(lost.first?.1, .noStatusDeadline(0.05, statedOutsideTask: true))
+            s.stop()
+        }
+        XCTAssertEqual(
+            AgentSession.TaskCorrelationLoss.noStatusDeadline(10 * 60, statedOutsideTask: true).reason,
+            "No explicit STATUS after 10 min without activity; a STATUS was stated in a turn not tied to this task (leader message without TASK_ID or person input)")
+    }
+
+    func testANewCorrelationForgetsAStatusStatedOutsideTheOldOne() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = AgentSession(pendingTaskStatusDeadline: 0.05)
+        s.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: outside1\nwork", from: .leader)
+        s.ingestForTesting(resultSaying("Running in the background."))
+        try s.send("how is it going?", from: .person)
+        s.ingestForTesting(resultSaying("STATUS: DONE"))
+        try s.send("TASK_ID: outside2\nnext", from: .leader)
+        s.ingestForTesting(resultSaying("Running in the background."))
+
+        let fired = await waitUntil { lost.count == 2 }
+        XCTAssertTrue(fired)
+        XCTAssertEqual(lost.map(\.0), ["outside1", "outside2"])
+        XCTAssertEqual(lost.last?.1, .noStatusDeadline(0.05))
+        s.stop()
+    }
+
+    // MARK: - The incident against a real task board
+
+    /// Wired exactly as `TeamOrchestrator.wireNativeWorkerCompletion` wires a
+    /// worker, minus `fileReport`, which writes under the real home directory.
+    private func boardWiredSession(
+        team: String, instance: String, deadline: TimeInterval = 10 * 60
+    ) -> AgentSession {
+        let s = AgentSession(pendingTaskStatusDeadline: deadline)
+        s.onTurnEnd = { final, _, taskId in
+            AutoReplyEmit.settleNativeTurn(
+                teamName: team, agentName: "executor", agentInstanceId: instance,
+                final: final, taskId: taskId, store: .shared)
+        }
+        s.onTaskCorrelationLost = { taskId, loss in
+            AutoReplyEmit.blockUnsettledTask(
+                teamName: team, agentName: "executor", agentInstanceId: instance,
+                taskId: taskId, reason: loss.reason, store: .shared)
+        }
+        return s
+    }
+
+    private func boardTask(team: String, instance: String) throws -> TeamOrchestrator.TeamTask {
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [.init(name: "executor", instanceId: instance)])
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "long suite", assignee: "executor",
+            assigneeInstanceId: instance))
+        return try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "in_progress"))
+    }
+
+    private let doneHeader = "STATUS: DONE\nFILES: none\nVERIFY: suite green\nNEXT: NONE\nFULL_REPORT: n/a"
+
+    func testTheIncidentClosesTheSameTaskOnTheContinuationsVerdict() throws {
+        let team = "incident-continuation-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let s = boardWiredSession(team: team, instance: "inst-1")
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nrun the full suite", from: .leader)
+        s.ingestForTesting(resultSaying("The suite runs past the tool timeout; it is in the background."))
+
+        let waiting = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(waiting.status, "in_progress", "a turn without a verdict settles nothing")
+        XCTAssertNil(waiting.result)
+        XCTAssertEqual(store.getMessages(teamName: team, type: "progress").count, 1)
+        XCTAssertNil(store.readResult(teamName: team, taskId: task.id, agentName: "executor"))
+
+        s.ingestForTesting(assistantSaid("The background suite finished."))
+        s.ingestForTesting(resultSaying(doneHeader))
+
+        let done = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(done.status, "completed")
+        XCTAssertEqual(done.assigneeInstanceId, "inst-1")
+        XCTAssertNotNil(store.readResult(teamName: team, taskId: task.id, agentName: "executor"))
+        s.stop()
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed",
+                       "stopping after the verdict must not reopen or block it")
+    }
+
+    func testAWorkerThatNeverStatesAVerdictIsBlockedThenClosedByALateOne() async throws {
+        let team = "incident-deadline-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let s = boardWiredSession(team: team, instance: "inst-1", deadline: 0.05)
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nrun the full suite", from: .leader)
+        s.ingestForTesting(resultSaying("Running in the background."))
+        let blocked = await waitUntil {
+            store.getTask(teamName: team, taskId: task.id)?.status == "blocked"
+        }
+        XCTAssertTrue(blocked, "never review_ready: nobody said NEEDS_REVIEW")
+        XCTAssertTrue(store.getTask(teamName: team, taskId: task.id)?.blockedReason?
+            .hasPrefix("No explicit STATUS") == true)
+
+        s.ingestForTesting(assistantSaid("The background suite finished."))
+        s.ingestForTesting(resultSaying(doneHeader))
+
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+        s.stop()
+    }
+
+    func testTheStatusDeadlineNeverFiresWhileATurnIsRunning() async throws {
+        var lost: [String] = []
+        let s = AgentSession(pendingTaskStatusDeadline: 0.05)
+        s.onTaskCorrelationLost = { task, _ in lost.append(task) }
+        s.startRemote { _ in }
+        try s.send("TASK_ID: busy\nwork", from: .leader)
+        s.ingestForTesting(resultSaying("background"))
+        s.ingestForTesting(assistantSaid("the job finished, checking the output"))
+
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertTrue(lost.isEmpty)
+        XCTAssertTrue(s.isTurnInFlightForTesting)
+    }
+
+    // MARK: - Background work holds the deadline, up to a cap
+
+    private func backgroundTasksChanged(_ ids: [String]) -> String {
+        event(["type": "system", "subtype": "background_tasks_changed",
+               "tasks": ids.map { ["task_id": $0, "run_id": "run-\($0)",
+                                   "task_type": "local_bash", "description": "npm test"] }])
+    }
+
+    private func backgroundStarted(_ id: String) -> String {
+        event(["type": "system", "subtype": "task_started", "task_id": id, "is_backgrounded": true])
+    }
+
+    private func backgroundFinished(_ id: String) -> [String] {
+        [
+            event(["type": "system", "subtype": "task_updated", "task_id": id,
+                   "patch": ["status": "completed"]]),
+            event(["type": "system", "subtype": "task_notification", "task_id": id,
+                   "status": "completed", "output_file": "/tmp/\(id).out", "summary": "done"]),
+            backgroundTasksChanged([]),
+        ]
+    }
+
+    /// Dispatch, background a job inside the turn, end the turn without a
+    /// verdict — the measured shape of the incident.
+    private func backgroundedWorker(
+        deadline: TimeInterval, cap: TimeInterval,
+        lost: @escaping (String, AgentSession.TaskCorrelationLoss) -> Void
+    ) throws -> AgentSession {
+        let s = AgentSession(pendingTaskStatusDeadline: deadline, pendingTaskStatusCap: cap)
+        s.onTaskCorrelationLost = lost
+        s.startRemote { _ in }
+        try s.send("TASK_ID: bg000001\nrun the suite", from: .leader)
+        s.ingestForTesting(backgroundTasksChanged(["bygdymlig"]))
+        s.ingestForTesting(backgroundStarted("bygdymlig"))
+        s.ingestForTesting(resultSaying("The suite is running in the background."))
+        return s
+    }
+
+    func testRunningBackgroundWorkHoldsTheDeadline() async throws {
+        var lost: [String] = []
+        let s = try backgroundedWorker(deadline: 0.05, cap: 5) { task, _ in lost.append(task) }
+
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertTrue(lost.isEmpty, "the worker is still waiting on its own job")
+        XCTAssertEqual(s.pendingTaskIdForTesting, "bg000001")
+    }
+
+    func testTheDeadlineCountsFromWhenBackgroundWorkFinished() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = try backgroundedWorker(deadline: 0.5, cap: 5) { task, loss in lost.append((task, loss)) }
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertTrue(lost.isEmpty)
+
+        for line in backgroundFinished("bygdymlig") { s.ingestForTesting(line) }
+        let emptied = Date()
+        s.ingestForTesting(event(["type": "system", "subtype": "init", "model": "claude"]))
+        s.ingestForTesting(event(["type": "system", "subtype": "status"]))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(lost.isEmpty, "not before a full deadline after the job finished")
+
+        let fired = await waitUntil { !lost.isEmpty }
+        XCTAssertTrue(fired)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(emptied), 0.49)
+        XCTAssertEqual(lost.map(\.0), ["bg000001"])
+        XCTAssertEqual(lost.first?.1, .noStatusDeadline(0.5))
+    }
+
+    /// A server started in the background never finishes, so the hold ends
+    /// at the cap with its own reason.
+    func testBackgroundWorkThatNeverEndsIsCappedWithItsOwnReason() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let started = Date()
+        let s = try backgroundedWorker(deadline: 0.05, cap: 1) { task, loss in lost.append((task, loss)) }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(lost.isEmpty)
+
+        let fired = await waitUntil { !lost.isEmpty }
+        XCTAssertTrue(fired)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.99)
+        XCTAssertEqual(lost.map(\.0), ["bg000001"])
+        XCTAssertEqual(lost.first?.1, .noStatusWithBackgroundWork(1))
+        XCTAssertEqual(lost.first?.1.reason,
+                       "No explicit STATUS after 1s while background work was still running")
+        XCTAssertEqual(AgentSession.TaskCorrelationLoss.noStatusWithBackgroundWork(60 * 60).reason,
+                       "No explicit STATUS after 60 min while background work was still running")
+        XCTAssertEqual(AgentSession.TaskCorrelationLoss.noStatusDeadline(10 * 60).reason,
+                       "No explicit STATUS after 10 min without activity")
+
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(lost.count, 1)
+        XCTAssertEqual(s.pendingTaskIdForTesting, "bg000001", "a late explicit STATUS can still close it")
+    }
+
+    /// A job in several long background steps: each step's own turn proves
+    /// the worker is still there, so the cap counts from the latest one.
+    func testATurnOnTheTaskRestartsTheBackgroundCap() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = try backgroundedWorker(deadline: 0.05, cap: 1) { task, loss in lost.append((task, loss)) }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        let stepEnded = Date()
+        s.ingestForTesting(assistantSaid("Step one finished; starting step two in the background."))
+        s.ingestForTesting(resultSaying("Step two is running in the background."))
+        try? await Task.sleep(nanoseconds: 650_000_000)
+        XCTAssertTrue(lost.isEmpty, "the cap must not count from the first wait")
+
+        let fired = await waitUntil { !lost.isEmpty }
+        XCTAssertTrue(fired)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(stepEnded), 0.99)
+        XCTAssertEqual(lost.first?.1, .noStatusWithBackgroundWork(1))
+        withExtendedLifetime(s) {}
+    }
+
+    func testANewDispatchOrAnExplicitStatusStillEndsTheHold() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = try backgroundedWorker(deadline: 0.05, cap: 0.3) { task, loss in lost.append((task, loss)) }
+
+        try s.send("TASK_ID: bg000002\nnext thing", from: .leader)
+        XCTAssertEqual(lost.map(\.0), ["bg000001"])
+        XCTAssertEqual(lost.first?.1, .superseded(by: "bg000002"))
+        s.ingestForTesting(resultSaying("STATUS: DONE"))
+        XCTAssertNil(s.pendingTaskIdForTesting)
+
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(lost.count, 1, "nothing is left to time out")
+    }
+
+    func testAnEndedSessionForgetsItsBackgroundWork() async throws {
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
+        let s = try backgroundedWorker(deadline: 0.05, cap: 5) { task, loss in lost.append((task, loss)) }
+        s.stop()
+        XCTAssertEqual(lost.map(\.0), ["bg000001"])
+
+        s.startRemote { _ in }
+        try s.send("TASK_ID: bg000003\nagain", from: .leader)
+        s.ingestForTesting(resultSaying("no verdict"))
+
+        let fired = await waitUntil(timeout: 1) { lost.count == 2 }
+        XCTAssertTrue(fired, "the old process's job list must not hold the new session's deadline")
+        XCTAssertEqual(lost.last?.0, "bg000003")
+        XCTAssertEqual(lost.last?.1, .noStatusDeadline(0.05))
     }
 
     // MARK: - The instruction the agent is given

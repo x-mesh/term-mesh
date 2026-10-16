@@ -278,6 +278,23 @@ final class AgentPipeCompletion {
             )
             return
         }
+        let stated = Self.explicitStatus(in: finalText) != nil
+        // The expectation outlives a verdict-less turn, so each later one
+        // would refile the same NEEDS_REVIEW default over the first: another
+        // report message and an overwritten result for no new verdict. The
+        // turn still happened, so it is kept as progress.
+        if !stated,
+           TeamDataStore.shared.getTask(teamName: watch.teamName, taskId: pendingTaskId)?
+               .status == "review_ready" {
+            AutoReplyEmit.recordProgressWithoutStatus(
+                teamName: watch.teamName,
+                agentName: watch.agentName,
+                agentInstanceId: watch.agentInstanceId,
+                final: finalText,
+                taskId: pendingTaskId
+            )
+            return
+        }
         AutoReplyEmit.emit(
             teamName: watch.teamName,
             agentName: watch.agentName,
@@ -285,6 +302,9 @@ final class AgentPipeCompletion {
             preferredTaskId: pendingTaskId,
             agentInstanceId: watch.agentInstanceId
         )
+        // A verdict-less turn is not the agent's last word: a later turn that
+        // does state STATUS still has to find the same task.
+        guard stated else { return }
         watches[agentId]?.pendingTaskId = nil
         watches[agentId]?.pendingExpectationToken = nil
     }
@@ -307,7 +327,7 @@ final class AgentPipeCompletion {
     /// the agent stated no verdict, and inventing the good one is the worst
     /// available guess. NEEDS_REVIEW says what is true: it is finished and
     /// nobody has said whether it worked.
-    static let headerKeys = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"]
+    nonisolated static let headerKeys = ["STATUS", "FILES", "VERIFY", "NEXT", "FULL_REPORT"]
 
     /// Split a line that packed several fields onto it.
     ///
@@ -319,7 +339,7 @@ final class AgentPipeCompletion {
     ///
     /// Only splits when the line really does carry more than one field, so a
     /// `VERIFY: a | b` pipeline is left intact.
-    static func headerLines(in text: String) -> [String] {
+    nonisolated static func headerLines(in text: String) -> [String] {
         text.components(separatedBy: "\n").flatMap { raw -> [String] in
             let line = raw.trimmingCharacters(in: .whitespaces)
             let packed = headerKeys.filter { line.contains($0 + ":") }.count
@@ -329,7 +349,7 @@ final class AgentPipeCompletion {
         }
     }
 
-    static func headerEvent(from text: String) -> AutoReplyEvent {
+    private nonisolated static func headerFields(in text: String) -> [String: String] {
         var fields: [String: String] = [:]
         for line in headerLines(in: text) {
             for key in headerKeys {
@@ -339,6 +359,19 @@ final class AgentPipeCompletion {
                     .trimmingCharacters(in: .whitespaces)
             }
         }
+        return fields
+    }
+
+    /// The STATUS the agent actually stated, or nil when it stated none.
+    ///
+    /// `headerEvent` cannot answer this: it turns a missing STATUS into
+    /// NEEDS_REVIEW, which is indistinguishable from an agent that wrote it.
+    nonisolated static func explicitStatus(in text: String) -> String? {
+        headerFields(in: text)["STATUS"].flatMap(AutoReplyDetector.validatedStatus)
+    }
+
+    nonisolated static func headerEvent(from text: String) -> AutoReplyEvent {
+        let fields = headerFields(in: text)
         return AutoReplyEvent(
             status: fields["STATUS"] ?? "NEEDS_REVIEW",
             files: fields["FILES"] ?? "none",
