@@ -6298,7 +6298,6 @@ class TerminalController {
             // Publish task_status event to daemon broadcast channel best-effort
             // so tm-agent wait push subscribers receive a real-time signal.
             if let newStatus = status, newStatus != prevStatus {
-                TeamEventWakeSignal.shared.bump(team: teamName)
                 _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
                     "kind": "task_status",
                     "team": teamName,

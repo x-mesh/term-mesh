@@ -5,7 +5,8 @@ import PeerProto
 /// `tm-agent wait` cannot subscribe to this machine's daemon bus, so it holds
 /// a request here and wakes when the team's task events move.
 ///
-/// `bump` is called from `teamDataQueue`, so this is a lock, not an actor, and
+/// `bump` is called from dispatch queues (`teamDataQueue`, the task store's
+/// status-wake queue), so this is a lock, not an actor, and
 /// continuations are resumed only after the lock is released.
 final class TeamEventWakeSignal: @unchecked Sendable {
     static let shared = TeamEventWakeSignal()
@@ -14,6 +15,9 @@ final class TeamEventWakeSignal: @unchecked Sendable {
     /// Below the shortest hop that carries the reply: the Swift-host proxy's
     /// 10 s `callTeamLeader` and the daemon's 15 s pending window.
     static let timeoutRangeMs: ClosedRange<Int> = 1...7000
+    /// A full table answers at once instead of holding, so without a hint
+    /// every overflowed caller would come straight back.
+    static let busyRetryAfterMs = 2000
 
     struct Cursor: Equatable, Sendable {
         let epoch: String
@@ -23,6 +27,7 @@ final class TeamEventWakeSignal: @unchecked Sendable {
     struct Outcome: Equatable, Sendable {
         let cursor: Cursor
         let changed: Bool
+        var busy = false
     }
 
     struct Request: Equatable, Sendable {
@@ -87,7 +92,7 @@ final class TeamEventWakeSignal: @unchecked Sendable {
                     if since != current {
                         immediate = Outcome(cursor: current, changed: true)
                     } else if waiters.count >= Self.maxWaiters {
-                        immediate = Outcome(cursor: current, changed: false)
+                        immediate = Outcome(cursor: current, changed: false, busy: true)
                     } else {
                         waiters[id] = Waiter(team: team, continuation: continuation)
                         immediate = nil
@@ -148,10 +153,10 @@ final class TeamEventWakeSignal: @unchecked Sendable {
         }
         var timeoutMs = timeoutRangeMs.upperBound
         if let raw = params["timeout_ms"], !(raw is NSNull) {
-            guard let value = Self.unsignedInteger(raw), value <= UInt64(Int.max) else {
+            guard let value = Self.unsignedInteger(raw) else {
                 return invalid("timeout_ms must be an unsigned integer")
             }
-            timeoutMs = Int(value)
+            timeoutMs = max(Int(min(value, UInt64(timeoutRangeMs.upperBound))), timeoutRangeMs.lowerBound)
         }
         return .success(Request(team: team, since: since, timeoutMs: timeoutMs))
     }
@@ -173,11 +178,15 @@ final class TeamEventWakeSignal: @unchecked Sendable {
         case .failure(let failure): return .failure(failure)
         }
         let outcome = await wait(team: request.team, since: request.since, timeoutMs: request.timeoutMs)
-        let result: [String: Any] = [
+        var result: [String: Any] = [
             "epoch": outcome.cursor.epoch,
             "revision": NSNumber(value: outcome.cursor.revision),
             "changed": outcome.changed,
         ]
+        if outcome.busy {
+            result["busy"] = true
+            result["retry_after_ms"] = Self.busyRetryAfterMs
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: result),
               let json = String(data: data, encoding: .utf8) else {
             return .failure(PeerTeamCallFailure(
