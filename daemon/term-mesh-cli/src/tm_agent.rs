@@ -23008,7 +23008,10 @@ fn owner_wake_loop(
                 retries = 0;
                 cursor = Some(next);
             }
-            OwnerWakeStep::Backoff(pause) => sleep(pause),
+            OwnerWakeStep::Backoff(pause) => {
+                retries = 0;
+                sleep(pause);
+            }
             OwnerWakeStep::Unsupported => return,
             OwnerWakeStep::Retry => {
                 retries += 1;
@@ -23249,6 +23252,19 @@ mod owner_wake_tests {
             failure(),
         ]);
         assert_eq!(calls.len(), 6, "the loop must still be polling after the fifth answer");
+    }
+
+    #[test]
+    fn owner_wake_loop_resets_the_retry_budget_on_busy() {
+        let failure = || hop_error("authorized peer viewer is not connected");
+        let (_, calls, _) = run_loop(vec![
+            failure(),
+            failure(),
+            busy(Some(1500)),
+            failure(),
+            failure(),
+        ]);
+        assert_eq!(calls.len(), 6, "a busy answer reached the owner, so it is not a failure in a row");
     }
 
     #[test]
