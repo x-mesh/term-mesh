@@ -2576,25 +2576,10 @@ final class TeamOrchestrator: ObservableObject {
                     teamName: teamName, agentName: agentName,
                     agentInstanceId: agentInstanceId, busy: busy)
             }
-            agentPanel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
-                Self.fileReport(teamName: teamName, agentName: agentName,
-                                agentInstanceId: agentInstanceId,
-                                taskId: taskId, text: final)
-                // A turn with no task behind it must not close somebody
-                // else's. Broadcasts and anything typed in the composer carry
-                // no `TASK_ID`, and `selectTask` would then guess — the newest
-                // open task — so answering a question could mark an unrelated
-                // assigned task completed. The report is still filed; only the
-                // board is left alone.
-                guard let taskId else { return }
-                AutoReplyEmit.emit(
-                    teamName: teamName,
-                    agentName: agentName,
-                    event: AgentPipeCompletion.headerEvent(from: final),
-                    preferredTaskId: taskId,
-                    agentInstanceId: agentInstanceId
-                )
-            }
+            Self.wireNativeWorkerCompletion(
+                agentPanel.session, teamName: teamName,
+                agentName: agentName, agentInstanceId: agentInstanceId
+            )
             let colorEmoji = Self.colorEmoji(agentColor)
             workspace.setPanelCustomTitle(panelId: agentPanel.id,
                                           title: "\(colorEmoji) \(agentName)")
@@ -7264,6 +7249,39 @@ final class TeamOrchestrator: ObservableObject {
         // header in your reply" — which is now the opposite of what is wanted.
         lines.removeAll { $0.hasPrefix("[REMINDER]") && $0.contains("tm-agent reply") }
         return lines.joined(separator: "\n")
+    }
+
+    /// The one place a native worker's turns reach the task board, for local
+    /// and peer-owned panes alike.
+    ///
+    /// A turn with no task behind it must not close somebody else's.
+    /// Broadcasts and anything typed in the composer carry no `TASK_ID`, and
+    /// `selectTask` would then guess — the newest open task — so answering a
+    /// question could mark an unrelated assigned task completed. The report is
+    /// still filed; only the board is left alone.
+    static func wireNativeWorkerCompletion(
+        _ session: AgentSession,
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String?
+    ) {
+        session.onTurnEnd = { final, _, taskId in
+            fileReport(teamName: teamName, agentName: agentName,
+                       agentInstanceId: agentInstanceId,
+                       taskId: taskId, text: final)
+            AutoReplyEmit.settleNativeTurn(
+                teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId,
+                final: final, taskId: taskId
+            )
+        }
+        session.onTaskCorrelationLost = { taskId, loss in
+            AutoReplyEmit.blockUnsettledTask(
+                teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId,
+                taskId: taskId, reason: loss.reason
+            )
+        }
     }
 
     /// File a turn's full text where the leader looks for it.

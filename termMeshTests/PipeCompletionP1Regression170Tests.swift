@@ -100,6 +100,106 @@ final class PipeCompletionP1Regression170Tests: XCTestCase {
         XCTAssertEqual(AgentPipeCompletion.shared.pendingTaskIdForTesting(agentId: agentId), "T2")
     }
 
+    private struct WatchedPipeTask {
+        let team: String
+        let taskId: String
+        let agentId: String
+        let path: String
+    }
+
+    private func watchedPipeTask(_ label: String) throws -> WatchedPipeTask {
+        let team = "\(label)-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [.init(name: "executor", instanceId: nil)])
+        addTeardownBlock {
+            TeamDataStore.shared.clearResults(teamName: team)
+            TeamDataStore.shared.unregisterTeam(team)
+        }
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "long job", assignee: "executor"))
+        XCTAssertNotNil(store.updateTask(teamName: team, taskId: task.id, status: "in_progress"))
+
+        let agentId = "\(label)-\(UUID().uuidString)"
+        let path = AgentPipeCompletion.eventsPath(agentId: agentId)
+        AgentPipeTransport.prepareDirectory()
+        try Data().write(to: URL(fileURLWithPath: path))
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: path) }
+        AgentPipeCompletion.shared.watch(agentId: agentId, teamName: team, agentName: "executor")
+        addTeardownBlock { @MainActor in AgentPipeCompletion.shared.forget(agentId: agentId) }
+        AgentPipeCompletion.shared.expect(agentId: agentId, instruction: "TASK_ID: \(task.id)\ngo")
+        return WatchedPipeTask(team: team, taskId: task.id, agentId: agentId, path: path)
+    }
+
+    private func appendResult(_ text: String, to watched: WatchedPipeTask) throws {
+        let line = try JSONSerialization.data(withJSONObject: [
+            "type": "result", "stop_reason": "end_turn", "result": text,
+        ]) + Data("\n".utf8)
+        let handle = try XCTUnwrap(FileHandle(forWritingAtPath: watched.path))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: line)
+        try handle.close()
+        AgentPipeCompletion.shared.tickForTesting()
+    }
+
+    private func reports(_ watched: WatchedPipeTask) -> Int {
+        TeamDataStore.shared.getMessages(teamName: watched.team, type: "report").count
+    }
+
+    private func storedResult(_ watched: WatchedPipeTask) -> String? {
+        TeamDataStore.shared.readResult(
+            teamName: watched.team, taskId: watched.taskId, agentName: "executor")?["content"] as? String
+    }
+
+    /// A verdict-less result still settles a pipe task as review_ready, but it
+    /// is not the agent's last word: the expectation stays so a later explicit
+    /// STATUS closes the same task instead of being dropped as untracked.
+    func testAVerdictlessResultKeepsTheExpectationForTheExplicitOne() throws {
+        let watched = try watchedPipeTask("pipe-verdictless")
+        let store = TeamDataStore.shared
+
+        try appendResult("Started the build in the background; it will take a while.", to: watched)
+        XCTAssertEqual(store.getTask(teamName: watched.team, taskId: watched.taskId)?.status, "review_ready")
+        XCTAssertEqual(AgentPipeCompletion.shared.pendingTaskIdForTesting(agentId: watched.agentId), watched.taskId)
+
+        try appendResult("STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a", to: watched)
+        XCTAssertEqual(store.getTask(teamName: watched.team, taskId: watched.taskId)?.status, "completed")
+        XCTAssertNil(AgentPipeCompletion.shared.pendingTaskIdForTesting(agentId: watched.agentId))
+    }
+
+    /// Keeping the expectation must not turn every later verdict-less turn
+    /// into another filing of the same default over the first one.
+    func testARepeatedVerdictlessResultDoesNotRefileTheDefault() throws {
+        let watched = try watchedPipeTask("pipe-refile")
+        let store = TeamDataStore.shared
+
+        try appendResult("Started the build in the background.", to: watched)
+        XCTAssertEqual(reports(watched), 1)
+        let firstResult = try XCTUnwrap(storedResult(watched))
+
+        try appendResult("Still waiting on the build.", to: watched)
+        XCTAssertEqual(reports(watched), 1, "no second report for no new verdict")
+        XCTAssertTrue(store.getMessages(teamName: watched.team, type: "progress")
+            .contains { $0.content == "Still waiting on the build." }, "the turn is kept as progress")
+        XCTAssertEqual(storedResult(watched), firstResult, "the filed result is not overwritten")
+        XCTAssertEqual(store.getTask(teamName: watched.team, taskId: watched.taskId)?.status, "review_ready")
+
+        try appendResult("STATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a", to: watched)
+        XCTAssertEqual(store.getTask(teamName: watched.team, taskId: watched.taskId)?.status, "completed")
+        XCTAssertEqual(reports(watched), 2)
+    }
+
+    /// A NEEDS_REVIEW the agent actually wrote is a verdict, even against a
+    /// task the default already left review_ready.
+    func testAnExplicitNeedsReviewIsStillFiled() throws {
+        let watched = try watchedPipeTask("pipe-explicit-review")
+
+        try appendResult("Started the build in the background.", to: watched)
+        try appendResult("STATUS: NEEDS_REVIEW\nFILES: a.swift\nVERIFY: n/a\nNEXT: review\nFULL_REPORT: n/a", to: watched)
+
+        XCTAssertEqual(reports(watched), 2)
+        XCTAssertTrue(storedResult(watched)?.contains("FILES: a.swift") == true)
+        XCTAssertNil(AgentPipeCompletion.shared.pendingTaskIdForTesting(agentId: watched.agentId))
+    }
+
     func testAnUnwatchedAgentIsStillIgnored() {
         let agentId = "expect-unwatched-\(UUID().uuidString)"
         AgentPipeCompletion.shared.expect(agentId: agentId, instruction: "TASK_ID: T1")

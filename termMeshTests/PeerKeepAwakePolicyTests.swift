@@ -41,6 +41,33 @@ final class PeerKeepAwakePolicyTests: XCTestCase {
         }
     }
 
+    private func status(
+        _ mode: PeerKeepAwakeMode,
+        ac: Bool = true,
+        connections: Int,
+        holding: Bool
+    ) -> PeerKeepAwakeStatus {
+        PeerKeepAwakePolicy.status(mode: mode, onACPower: ac, connections: connections, isHolding: holding)
+    }
+
+    func test_statusReportsAHeldAssertionAsPreventingSleep() {
+        XCTAssertEqual(status(.always, connections: 2, holding: true), .holding(connections: 2))
+        XCTAssertEqual(status(.always, connections: 0, holding: true), .releasingSoon)
+        XCTAssertTrue(PeerKeepAwakeStatus.holding(connections: 1).isPreventingSleep)
+        XCTAssertTrue(PeerKeepAwakeStatus.releasingSoon.isPreventingSleep)
+    }
+
+    func test_anEnabledModeWithoutAnAssertionStillLetsTheMacSleep() {
+        XCTAssertEqual(status(.always, connections: 0, holding: false), .noConnections)
+        XCTAssertEqual(status(.onPowerAdapter, ac: false, connections: 2, holding: false), .onBattery)
+        XCTAssertEqual(status(.never, connections: 2, holding: false), .off)
+        XCTAssertEqual(status(.always, connections: 1, holding: false), .failed, "a connection with no assertion means IOKit refused it")
+        for sleeping in [PeerKeepAwakeStatus.noConnections, .onBattery, .off, .failed] {
+            XCTAssertFalse(sleeping.isPreventingSleep)
+            XCTAssertNil(sleeping.detail)
+        }
+    }
+
     func test_anUnknownStoredModeFallsBackToTheDefault() {
         let key = PeerFederationSettings.keepAwakeKey
         let saved = UserDefaults.standard.object(forKey: key)

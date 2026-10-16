@@ -5151,7 +5151,7 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(6);
-    rpc_call_with_timeout_secs(sock, method, params, timeout)
+    rpc_call_timeout(sock, method, params, timeout)
 }
 
 /// The durable request body crosses a file/RPC boundary before it reaches the
@@ -5390,39 +5390,33 @@ mod durable_leader_request_tests {
     }
 }
 
-fn rpc_call_with_timeout_secs(
+fn rpc_call_timeout(
     sock: &PathBuf,
     method: &str,
     params: Value,
     timeout_secs: u64,
 ) -> Result<Value, String> {
     match remote_leader_rpc_policy(remote_leader_route().is_some(), method) {
-        RemoteLeaderRpcPolicy::Proxy => {
-            return remote_leader_rpc_call(
-                sock,
-                method,
-                params,
-                remote_leader_timeout(method, Duration::from_secs(timeout_secs)).as_secs(),
-            );
-        }
+        RemoteLeaderRpcPolicy::Proxy => remote_leader_rpc_call(
+            sock,
+            method,
+            params,
+            remote_leader_timeout(method, Duration::from_secs(timeout_secs)).as_secs(),
+        ),
         // A remote leader's TERMMESH_SOCKET points at the peer host's local
         // app. Falling through for a disallowed team method therefore acts on
         // that app, not on the GUI team that owns the leader. In particular,
         // `tm-agent create` used to create a second same-name team after a
         // window restore. Team methods must fail closed; non-team utilities
         // may still use the local socket deliberately.
-        RemoteLeaderRpcPolicy::RejectTeam => {
-            return Err(format!(
-                "{method} is not allowed from a scoped remote leader; \
-                 use the owning project window to change team lifecycle"
-            ));
+        RemoteLeaderRpcPolicy::RejectTeam => Err(remote_leader_team_rejection(method)),
+        RemoteLeaderRpcPolicy::Local => {
+            local_rpc_call_timeout_duration(sock, method, params, Duration::from_secs(timeout_secs))
         }
-        RemoteLeaderRpcPolicy::Local => {}
     }
-    rpc_call_timeout(sock, method, params, timeout_secs)
 }
 
-fn rpc_call_with_timeout_duration(
+fn rpc_call_timeout_duration(
     sock: &PathBuf,
     method: &str,
     params: Value,
@@ -5432,11 +5426,29 @@ fn rpc_call_with_timeout_duration(
         RemoteLeaderRpcPolicy::Proxy => {
             remote_leader_rpc_call_duration(sock, method, params, timeout)
         }
-        RemoteLeaderRpcPolicy::RejectTeam => Err(format!(
-            "{method} is not allowed from a scoped remote leader; use the owning project window to change team lifecycle"
-        )),
-        RemoteLeaderRpcPolicy::Local => rpc_call_timeout_duration(sock, method, params, timeout),
+        RemoteLeaderRpcPolicy::RejectTeam => Err(remote_leader_team_rejection(method)),
+        RemoteLeaderRpcPolicy::Local => {
+            local_rpc_call_timeout_duration(sock, method, params, timeout)
+        }
     }
+}
+
+fn remote_leader_lifecycle_rejection(has_route: bool, command: &Commands) -> Option<String> {
+    if !has_route {
+        return None;
+    }
+    match command {
+        Commands::Create { .. } => Some(remote_leader_team_rejection("team.create")),
+        Commands::Destroy => Some(remote_leader_team_rejection("team.destroy")),
+        _ => None,
+    }
+}
+
+fn remote_leader_team_rejection(method: &str) -> String {
+    format!(
+        "{method} is not allowed from a scoped remote leader; \
+         use the owning project window to change team lifecycle"
+    )
 }
 
 const REMOTE_LEADER_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
@@ -5882,6 +5894,215 @@ mod remote_leader_route_file_tests {
         );
     }
 
+    fn answer_one_local_rpc(listener: &std::os::unix::net::UnixListener) -> String {
+        let (stream, _) = listener.accept().expect("accept local rpc");
+        let mut line = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("read local rpc");
+        let method = serde_json::from_str::<Value>(&line).expect("request json")["method"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let result = if method == "peer.leader.call" {
+            json!({"ok": true, "result": {}, "cached": false})
+        } else {
+            json!({})
+        };
+        (&stream)
+            .write_all(format!("{}\n", json!({"id": 1, "result": result})).as_bytes())
+            .expect("write local rpc response");
+        method
+    }
+
+    #[test]
+    fn remote_leader_timeout_helpers_route_every_call_through_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+
+        for result in [
+            rpc_call_timeout(&sock, "team.create", json!({}), 2),
+            rpc_call_timeout_duration(&sock, "team.destroy", json!({}), Duration::from_secs(2)),
+        ] {
+            let error = result.expect_err("team lifecycle must be rejected");
+            assert!(
+                error.contains("is not allowed from a scoped remote leader"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            listener.accept().map_err(|error| error.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "a rejected team method must not reach the peer host's local app"
+        );
+
+        listener.set_nonblocking(false).expect("blocking");
+        let server = std::thread::spawn(move || {
+            [
+                answer_one_local_rpc(&listener),
+                answer_one_local_rpc(&listener),
+            ]
+        });
+        let local = rpc_call_timeout(&sock, "headless.list", json!({}), 2).expect("local call");
+        assert_eq!(local["result"], json!({}));
+        let proxied = rpc_call_timeout(&sock, "team.inbox", json!({}), 2).expect("proxied call");
+        assert_eq!(proxied["remote_leader_proxy"], json!(true));
+        assert_eq!(
+            server.join().expect("server thread"),
+            ["headless.list", "peer.leader.call"]
+        );
+    }
+
+    #[test]
+    fn remote_leader_never_resolves_team_members_on_the_local_daemon() {
+        let local = || Some(PathBuf::from("/tmp/local-daemon.sock"));
+        assert_eq!(
+            headless_daemon_socket_for_route(false, local),
+            Some(PathBuf::from("/tmp/local-daemon.sock"))
+        );
+        assert_eq!(
+            headless_daemon_socket_for_route(true, || panic!("must not probe the local daemon")),
+            None
+        );
+
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+        assert_eq!(team_headless_daemon_socket(), None);
+    }
+
+    /// `RouteEnv` does not save these keys, and `SocketDiscoveryEnv` takes a
+    /// lock `RouteEnv` already holds, so a test sets them through this guard
+    /// while the route lock is held.
+    struct ExtraEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl ExtraEnv {
+        fn set(values: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
+            let saved = values
+                .iter()
+                .map(|(key, value)| {
+                    let original = env::var_os(key);
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                    (*key, original)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for ExtraEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(original) => env::set_var(key, original),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn assert_listener_untouched(listener: &std::os::unix::net::UnixListener, why: &str) {
+        assert_eq!(
+            listener.accept().map_err(|error| error.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn remote_leader_team_headless_daemon_socket_is_wired_to_the_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon = dir.path().join("daemon.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&daemon).expect("bind");
+        let guard = RouteEnv::new();
+        let _daemon_env = ExtraEnv::set(&[("TERMMESH_DAEMON_SOCKET", Some(daemon.as_os_str()))]);
+
+        assert_eq!(team_headless_daemon_socket(), Some(daemon.clone()));
+        guard.set_env_route(&"11".repeat(32));
+        assert_eq!(
+            team_headless_daemon_socket(),
+            None,
+            "a live local daemon must not be resolved for a remote leader's team"
+        );
+    }
+
+    #[test]
+    fn remote_leader_skips_auto_watch_without_asking_for_team_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let guard = RouteEnv::new();
+        let _auto_watch_env = ExtraEnv::set(&[("TERMMESH_AUTO_WATCH", None)]);
+        guard.set_env_route(&"11".repeat(32));
+
+        maybe_auto_watch_after_team_change(&sock, "remote-team", false, dir.path());
+
+        assert_listener_untouched(
+            &listener,
+            "the owning host manages the watcher; no team.status may be proxied",
+        );
+    }
+
+    #[test]
+    fn remote_leader_raw_payload_goes_through_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+
+        let rejected = run_raw_routed(&sock, r#"{"method":"team.create","params":{}}"#)
+            .expect("a per-call failure is reported as an error entry");
+        let error = rejected["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("is not allowed from a scoped remote leader"),
+            "{rejected}"
+        );
+        assert!(rpc_response_failed(&rejected));
+        assert_listener_untouched(
+            &listener,
+            "a rejected raw team method must not reach the peer host's local app",
+        );
+
+        listener.set_nonblocking(false).expect("blocking");
+        let server = std::thread::spawn(move || answer_one_local_rpc(&listener));
+        let proxied =
+            run_raw_routed(&sock, r#"{"method":"team.inbox","params":{}}"#).expect("proxied");
+        assert_eq!(proxied["remote_leader_proxy"], json!(true));
+        assert_eq!(server.join().expect("server thread"), "peer.leader.call");
+    }
+
+    #[test]
+    fn remote_leader_lifecycle_commands_are_rejected_only_under_a_route() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        for args in [
+            &["tm-agent", "create", "2"][..],
+            &["tm-agent", "create", "2", "--headless"],
+            &["tm-agent", "create", "0", "--adopt"],
+            &["tm-agent", "destroy"],
+        ] {
+            let command = parse(args);
+            let rejection = remote_leader_lifecycle_rejection(true, &command)
+                .unwrap_or_else(|| panic!("{args:?} must be rejected under a route"));
+            assert!(
+                rejection.contains("is not allowed from a scoped remote leader"),
+                "{rejection}"
+            );
+            assert_eq!(remote_leader_lifecycle_rejection(false, &command), None);
+        }
+        for args in [&["tm-agent", "status"][..], &["tm-agent", "wait"]] {
+            assert_eq!(remote_leader_lifecycle_rejection(true, &parse(args)), None);
+        }
+    }
+
     #[test]
     fn staged_route_wins_over_the_spawn_time_environment() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6126,7 +6347,7 @@ fn remote_leader_rpc_call(
     // A dropped local daemon response may be retried, but the opaque request
     // id stays fixed so the viewer returns its cached outcome and never
     // inserts text or presses Return twice.
-    let first = rpc_call_timeout_duration(
+    let first = local_rpc_call_timeout_duration(
         sock,
         "peer.leader.call",
         proxy_params.clone(),
@@ -6140,7 +6361,8 @@ fn remote_leader_rpc_call(
                 append_remote_leader_route_failure(&route, method, &request_id_hex);
                 return Err(first_error);
             }
-            match rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining) {
+            match local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining)
+            {
                 Ok(value) => value,
                 Err(error) => {
                     append_remote_leader_route_failure(&route, method, &request_id_hex);
@@ -6165,34 +6387,51 @@ fn remote_leader_rpc_call_duration(
     params: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
+    remote_leader_call_typed(sock, method, params, timeout).map_err(|error| error.to_string())
+}
+
+fn remote_leader_call_typed(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, RemoteLeaderCallError> {
+    use RemoteLeaderCallError::Hop;
     let request_id_hex = remote_leader_request_id_hex();
-    let mut route =
-        remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
+    let mut route = remote_leader_route()
+        .ok_or_else(|| Hop("invalid remote leader route".to_string()))?;
     let proxy_params =
-        remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex)?;
+        remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex).map_err(Hop)?;
     let deadline = Instant::now() + timeout;
-    let first = rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
+    let first =
+        local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
     let mut outer = match first {
         Ok(value) => value,
         Err(first_error) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 append_remote_leader_route_failure(&route, method, &request_id_hex);
-                return Err(first_error);
+                return Err(Hop(first_error));
             }
-            match rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining) {
+            match local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining)
+            {
                 Ok(value) => value,
                 Err(error) => {
                     append_remote_leader_route_failure(&route, method, &request_id_hex);
-                    return Err(error);
+                    return Err(Hop(error));
                 }
             }
         }
     };
     outer = retry_remote_leader_after_viewer_error(
         sock, method, &params, &request_id_hex, deadline, &mut route, outer,
-    )?;
-    let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
+    )
+    .map_err(Hop)?;
+    let result = decode_daemon_response(outer)
+        .map_err(Hop)
+        .and_then(|proxied| {
+            remote_leader_proxy_outcome(proxied).map_err(RemoteLeaderCallError::Owner)
+        });
     if result.is_err() {
         append_remote_leader_route_failure(&route, method, &request_id_hex);
     }
@@ -6249,7 +6488,7 @@ fn retry_remote_leader_after_viewer_error(
         .expect("viewer unavailability is retryable");
         let refreshed =
             remote_leader_proxy_params(route, method, params.clone(), request_id_hex)?;
-        response = match rpc_call_timeout_duration(
+        response = match local_rpc_call_timeout_duration(
             sock,
             "peer.leader.call",
             refreshed,
@@ -6319,7 +6558,38 @@ fn current_leader_session_id() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteLeaderProxyError {
+    code: Option<String>,
+    text: String,
+}
+
+impl std::fmt::Display for RemoteLeaderProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteLeaderCallError {
+    Owner(RemoteLeaderProxyError),
+    Hop(String),
+}
+
+impl std::fmt::Display for RemoteLeaderCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteLeaderCallError::Owner(error) => error.fmt(f),
+            RemoteLeaderCallError::Hop(message) => f.write_str(message),
+        }
+    }
+}
+
 fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
+    remote_leader_proxy_outcome(proxied).map_err(|error| error.text)
+}
+
+fn remote_leader_proxy_outcome(proxied: Value) -> Result<Value, RemoteLeaderProxyError> {
     if !proxied["ok"].as_bool().unwrap_or(false) {
         let result = &proxied["result"];
         let error_code = result["error_code"]
@@ -6341,7 +6611,10 @@ fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
                 "; reconnect or restart the remote leader pane from its owning project window",
             );
         }
-        return Err(message);
+        return Err(RemoteLeaderProxyError {
+            code: error_code.map(String::from),
+            text: message,
+        });
     }
     Ok(json!({
         "ok": true,
@@ -6546,16 +6819,7 @@ fn run_project_sync_command(sock: &PathBuf, command: &Commands) -> Result<Value,
     daemon_result(sock, method, params)
 }
 
-fn rpc_call_timeout(
-    sock: &PathBuf,
-    method: &str,
-    params: Value,
-    timeout_secs: u64,
-) -> Result<Value, String> {
-    rpc_call_timeout_duration(sock, method, params, Duration::from_secs(timeout_secs))
-}
-
-fn rpc_call_timeout_duration(
+fn local_rpc_call_timeout_duration(
     sock: &PathBuf,
     method: &str,
     params: Value,
@@ -6696,6 +6960,37 @@ fn rpc_batch(sock: &PathBuf, payloads: &[String]) -> Result<Vec<Value>, String> 
         }
     }
     Ok(results)
+}
+
+/// Batch counterpart for a remote leader: one policy-routed call per payload,
+/// in order. A failed call becomes an `{"error": ...}` entry, as in
+/// `rpc_batch`, so the output keeps one entry per payload.
+fn rpc_batch_per_call(
+    payloads: &[String],
+    mut call: impl FnMut(&str, Value) -> Result<Value, String>,
+) -> Result<Vec<Value>, String> {
+    let mut requests = Vec::with_capacity(payloads.len());
+    for (i, payload) in payloads.iter().enumerate() {
+        let request: Value = serde_json::from_str(payload)
+            .map_err(|e| format!("invalid JSON in payload {i}: {e}"))?;
+        let method = request["method"]
+            .as_str()
+            .ok_or_else(|| format!("payload {i} has no method"))?
+            .to_string();
+        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+        requests.push((method, params));
+    }
+    Ok(requests
+        .into_iter()
+        .map(|(method, params)| call(&method, params).unwrap_or_else(|e| json!({ "error": e })))
+        .collect())
+}
+
+fn run_raw_routed(sock: &PathBuf, payload: &str) -> Result<Value, String> {
+    rpc_batch_per_call(&[payload.to_string()], |method, params| {
+        rpc_call(sock, method, params)
+    })
+    .and_then(|mut results| results.pop().ok_or_else(|| "no response".to_string()))
 }
 
 /// Parse human-readable semicolon-separated commands into JSON-RPC payload strings
@@ -9018,6 +9313,13 @@ fn main() {
     let team = resolve_team_name(cli.team.as_deref());
     let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
 
+    if let Some(error) =
+        remote_leader_lifecycle_rejection(remote_leader_route().is_some(), &cli.command)
+    {
+        eprintln!("Error: {error}");
+        process::exit(1);
+    }
+
     if reports_claude_inbox(&cli.command) {
         report_claude_inbox(&sock);
     }
@@ -9685,7 +9987,12 @@ fn main() {
                     process::exit(1);
                 }
             };
-            match rpc_batch(&sock, &payloads) {
+            let results = if remote_leader_route().is_some() {
+                rpc_batch_per_call(&payloads, |method, params| rpc_call(&sock, method, params))
+            } else {
+                rpc_batch(&sock, &payloads)
+            };
+            match results {
                 Ok(results) => {
                     for r in &results {
                         println!("{}", serde_json::to_string(r).unwrap_or_default());
@@ -9702,6 +10009,21 @@ fn main() {
             if let Err(e) = serde_json::from_str::<Value>(&payload) {
                 eprintln!("Invalid JSON: {e}");
                 process::exit(1);
+            }
+            if remote_leader_route().is_some() {
+                match run_raw_routed(&sock, &payload) {
+                    Ok(value) => {
+                        println!("{}", serde_json::to_string(&value).unwrap_or_default());
+                        if rpc_response_failed(&value) {
+                            process::exit(1);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
+                }
             }
             let stream = UnixStream::connect(&sock).map_err(|e| format!("connect: {e}"));
             match stream {
@@ -9745,7 +10067,7 @@ fn main() {
             eprintln!("Destroying team '{team}'...");
             cleanup_old_results(&team);
             // Also destroy headless team if it exists
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 let _ = rpc_call_timeout(
                     &daemon_sock,
                     "headless.destroy_team",
@@ -9775,7 +10097,7 @@ fn main() {
             lines,
         } => {
             // Check if agent is headless — route to daemon socket
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, agent_name) {
                     print_result(rpc_call(
                         &daemon_sock,
@@ -9921,7 +10243,7 @@ fn main() {
             let model = model.unwrap_or_else(|| default_model_for_cli(&cli).to_string());
 
             // Try headless path first
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 // Check if the team exists as a headless team
                 if let Ok(resp) = rpc_call(&daemon_sock, "headless.list_teams", json!({})) {
                     let is_headless = resp["result"]
@@ -10208,7 +10530,7 @@ fn main() {
             // must reach the GUI resolution path below rather than being
             // silently dropped by the headless route.
             if panel.is_none() && agent_instance_id.is_none() {
-                if let Some(daemon_sock) = detect_daemon_socket() {
+                if let Some(daemon_sock) = team_headless_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
                         let delivery = successful_rpc_envelope(rpc_call(
                             &daemon_sock,
@@ -11504,7 +11826,7 @@ fn register_correlation_mailbox(
     if timeout.is_zero() {
         return Err("correlation registration deadline expired".to_string());
     }
-    successful_rpc_envelope(rpc_call_with_timeout_duration(
+    successful_rpc_envelope(rpc_call_timeout_duration(
         sock,
         "team.correlation.register",
         json!({
@@ -11519,7 +11841,7 @@ fn register_correlation_mailbox(
 }
 
 fn cancel_correlation_mailbox(sock: &PathBuf, team: &str, token: &str) {
-    let _ = successful_rpc_envelope(rpc_call_with_timeout_duration(
+    let _ = successful_rpc_envelope(rpc_call_timeout_duration(
         sock,
         "team.correlation.cancel",
         json!({
@@ -11630,7 +11952,7 @@ fn wait_for_correlated_reply(
         correlation_id,
         timeout,
         |remaining| {
-            rpc_call_with_timeout_duration(
+            rpc_call_timeout_duration(
                 sock,
                 "team.correlation.get",
                 json!({
@@ -11741,7 +12063,7 @@ fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Re
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(120);
-        rpc_call_with_timeout_secs(sock, method, params, timeout)
+        rpc_call_timeout(sock, method, params, timeout)
     } else {
         rpc_call(sock, method, params)
     };
@@ -13479,7 +13801,8 @@ fn maybe_auto_watch_after_team_change(
     no_auto_watch: bool,
     working_dir: &std::path::Path,
 ) {
-    if no_auto_watch || is_auto_watch_disabled_by_env() {
+    // The watcher would run on this host for a team the owning host manages.
+    if no_auto_watch || is_auto_watch_disabled_by_env() || remote_leader_route().is_some() {
         return;
     }
     let status = match rpc_call_timeout(
@@ -13914,7 +14237,7 @@ fn run_add_gui(
         params["directory"] = json!(d);
     }
 
-    let resp = match rpc_call_with_timeout_secs(sock, "team.add_agent", params, 10) {
+    let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -14273,6 +14596,23 @@ fn daemon_socket_candidates() -> Vec<PathBuf> {
 
 fn detect_daemon_socket() -> Option<PathBuf> {
     daemon_socket_candidates().into_iter().find(is_socket_alive)
+}
+
+/// The daemon whose headless agents are members of this process's team. A
+/// remote leader's team lives on the owning host, so a same-name headless team
+/// on this host's daemon is unrelated and must never be resolved.
+fn team_headless_daemon_socket() -> Option<PathBuf> {
+    headless_daemon_socket_for_route(remote_leader_route().is_some(), detect_daemon_socket)
+}
+
+fn headless_daemon_socket_for_route(
+    has_route: bool,
+    detect: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if has_route {
+        return None;
+    }
+    detect()
 }
 
 #[derive(Debug, Clone)]
@@ -16438,7 +16778,7 @@ fn run_delegate_result(
                 format_task_instruction(sock, team, task_ref, text, no_report, context, fix_budget);
 
             // Headless agent path: route via daemon socket if available
-            if let Some(daemon_sock) = detect_daemon_socket() {
+            if let Some(daemon_sock) = team_headless_daemon_socket() {
                 if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
                     let headless_ok = match rpc_call(
                         &daemon_sock,
@@ -16574,6 +16914,12 @@ fn run_delegate_result(
         return Ok(v);
     }
 
+    if remote_leader_route().is_some() {
+        return Err("owner does not support team.delegate; \
+             legacy fallback is disabled for a scoped remote leader"
+            .to_string());
+    }
+
     // Fallback: 2-RPC path (server may not support team.delegate yet).
     // Reuse a single UnixStream connection for task.create → team.send to avoid
     // two separate connect() calls. task_id from create is needed for the send
@@ -16633,7 +16979,7 @@ fn run_delegate_result(
     let send_text = format!("{instruction}\n");
 
     // Headless agent path: route via daemon socket for 2-RPC fallback too
-    if let Some(daemon_sock) = detect_daemon_socket() {
+    if let Some(daemon_sock) = team_headless_daemon_socket() {
         if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
             let sent_ok = match rpc_call(
                 &daemon_sock,
@@ -17407,7 +17753,7 @@ fn run_delegate_result_with_worktree(
         format_task_instruction(sock, team, &task, text, no_report, context, fix_budget);
     let send_text = format!("{instruction}\n");
 
-    if let Some(daemon_sock) = detect_daemon_socket() {
+    if let Some(daemon_sock) = team_headless_daemon_socket() {
         if let Some(agent_id) = is_headless_agent(&daemon_sock, team, target) {
             let sent_ok = match rpc_call(
                 &daemon_sock,
@@ -22517,6 +22863,482 @@ fn wait_report_outcome<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'sta
     if failed { "failed" } else { "completed" }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WaitPushSource {
+    LocalDaemon,
+    /// The local daemon never sees the owning host's task_status events, so
+    /// the owner is long-polled through the leader route instead.
+    RemoteOwnerWake,
+    Disabled,
+}
+
+fn wait_push_source(has_route: bool, push_disabled: bool, kinds_empty: bool) -> WaitPushSource {
+    if push_disabled || kinds_empty {
+        WaitPushSource::Disabled
+    } else if has_route {
+        WaitPushSource::RemoteOwnerWake
+    } else {
+        WaitPushSource::LocalDaemon
+    }
+}
+
+const OWNER_WAKE_METHOD: &str = "team.events.wait";
+/// The owner caps a hold at 7 s so the reply beats every hop's timeout.
+const OWNER_WAKE_HOLD: Duration = Duration::from_millis(7000);
+const OWNER_WAKE_MIN_GAP: Duration = Duration::from_secs(1);
+/// Each failed attempt can block for the whole transport window (about 31 s)
+/// and appends a `route_failed` record to the turn log, so an owner that stays
+/// unreachable is left to the interval poll instead of being retried forever.
+const OWNER_WAKE_MAX_CONSECUTIVE_RETRIES: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerWakeCursor {
+    epoch: String,
+    revision: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerWakeStep {
+    Wake(OwnerWakeCursor),
+    Rearm(OwnerWakeCursor),
+    Unsupported,
+    Retry,
+    Backoff(Duration),
+}
+
+/// An owner app older than `team.events.wait` rejects it as `invalid_method`
+/// in its own validator; a PeerServer-routed owner answers
+/// `method_not_allowed`. An older host daemon refuses it before the owner, and
+/// that hop carries only a message (every refusal there becomes -32601), so it
+/// is matched by its exact text: it cannot be typed without a daemon change.
+fn owner_wake_unsupported(error: &RemoteLeaderCallError) -> bool {
+    match error {
+        RemoteLeaderCallError::Owner(error) => {
+            matches!(error.code.as_deref(), Some("method_not_allowed" | "invalid_method"))
+        }
+        RemoteLeaderCallError::Hop(message) => {
+            *message == format!("method_not_allowed: {OWNER_WAKE_METHOD}")
+        }
+    }
+}
+
+fn owner_wake_step(
+    prev: Option<&OwnerWakeCursor>,
+    response: Result<Value, RemoteLeaderCallError>,
+    interval: Duration,
+) -> OwnerWakeStep {
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if owner_wake_unsupported(&error) => return OwnerWakeStep::Unsupported,
+        Err(_) => return OwnerWakeStep::Retry,
+    };
+    let result = &response["result"];
+    if result["busy"].as_bool() == Some(true) {
+        let hint = result["retry_after_ms"]
+            .as_u64()
+            .map(Duration::from_millis)
+            .unwrap_or(OWNER_WAKE_MIN_GAP);
+        return OwnerWakeStep::Backoff(
+            hint.clamp(OWNER_WAKE_MIN_GAP, interval.max(OWNER_WAKE_MIN_GAP)),
+        );
+    }
+    let (Some(epoch), Some(revision)) = (result["epoch"].as_str(), result["revision"].as_u64())
+    else {
+        return OwnerWakeStep::Retry;
+    };
+    let cursor = OwnerWakeCursor { epoch: epoch.to_string(), revision };
+    match prev {
+        Some(prev) if result["changed"].as_bool() == Some(true) || *prev != cursor => {
+            OwnerWakeStep::Wake(cursor)
+        }
+        _ => OwnerWakeStep::Rearm(cursor),
+    }
+}
+
+fn owner_wake_params(team: &str, since: Option<&OwnerWakeCursor>) -> Value {
+    json!({
+        "team_name": team,
+        "since": since.map(|cursor| json!({
+            "epoch": cursor.epoch,
+            "revision": cursor.revision,
+        })),
+        "timeout_ms": OWNER_WAKE_HOLD.as_millis() as u64,
+    })
+}
+
+fn owner_wake_pause(last_start: Option<Instant>, now: Instant) -> Duration {
+    last_start
+        .map(|start| OWNER_WAKE_MIN_GAP.saturating_sub(now.saturating_duration_since(start)))
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Feeds `run_wait`'s wake channel from the owner long-poll. Returning drops
+/// the sender, which the wait loop reads as "fall back to polling".
+///
+/// The call is injected because a test holding `REMOTE_LEADER_ENV_LOCK` would
+/// deadlock a loop thread that reached `remote_leader_route()` itself.
+fn owner_wake_loop(
+    team: &str,
+    interval: Duration,
+    tx: std::sync::mpsc::Sender<Value>,
+    mut call: impl FnMut(Value) -> Result<Value, RemoteLeaderCallError>,
+    mut sleep: impl FnMut(Duration),
+) {
+    let mut cursor: Option<OwnerWakeCursor> = None;
+    let mut last_start: Option<Instant> = None;
+    let mut retries: u32 = 0;
+    loop {
+        sleep(owner_wake_pause(last_start, Instant::now()));
+        last_start = Some(Instant::now());
+        let response = call(owner_wake_params(team, cursor.as_ref()));
+        match owner_wake_step(cursor.as_ref(), response, interval) {
+            OwnerWakeStep::Wake(next) => {
+                retries = 0;
+                let event = json!({
+                    "kind": "owner_wake",
+                    "epoch": next.epoch,
+                    "revision": next.revision,
+                });
+                cursor = Some(next);
+                if tx.send(event).is_err() {
+                    return;
+                }
+            }
+            OwnerWakeStep::Rearm(next) => {
+                retries = 0;
+                cursor = Some(next);
+            }
+            OwnerWakeStep::Backoff(pause) => {
+                retries = 0;
+                sleep(pause);
+            }
+            OwnerWakeStep::Unsupported => return,
+            OwnerWakeStep::Retry => {
+                retries += 1;
+                if retries >= OWNER_WAKE_MAX_CONSECUTIVE_RETRIES {
+                    eprintln!(
+                        "wait: owner long-poll failed {retries} times in a row; polling every {}s",
+                        interval.as_secs()
+                    );
+                    return;
+                }
+                sleep(interval);
+            }
+        }
+    }
+}
+
+fn spawn_remote_owner_wake(
+    sock: PathBuf,
+    team: String,
+    interval: u32,
+) -> std::sync::mpsc::Receiver<Value> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        owner_wake_loop(
+            &team,
+            Duration::from_secs(u64::from(interval)),
+            tx,
+            |params| {
+                remote_leader_call_typed(
+                    &sock,
+                    OWNER_WAKE_METHOD,
+                    params,
+                    remote_leader_timeout(OWNER_WAKE_METHOD, OWNER_WAKE_HOLD),
+                )
+            },
+            thread::sleep,
+        )
+    });
+    rx
+}
+
+#[derive(Debug, PartialEq)]
+enum PushWait {
+    Event(Value),
+    Elapsed,
+    Closed,
+}
+
+fn recv_push_or_interval(rx: &std::sync::mpsc::Receiver<Value>, wait: Duration) -> PushWait {
+    use std::sync::mpsc::RecvTimeoutError;
+    match rx.recv_timeout(wait) {
+        Ok(event) => PushWait::Event(event),
+        Err(RecvTimeoutError::Timeout) => PushWait::Elapsed,
+        Err(RecvTimeoutError::Disconnected) => PushWait::Closed,
+    }
+}
+
+#[cfg(test)]
+mod owner_wake_tests {
+    use super::*;
+
+    fn cursor(epoch: &str, revision: u64) -> OwnerWakeCursor {
+        OwnerWakeCursor { epoch: epoch.to_string(), revision }
+    }
+
+    const INTERVAL: Duration = Duration::from_secs(30);
+
+    fn answer(epoch: &str, revision: u64, changed: bool) -> Result<Value, RemoteLeaderCallError> {
+        Ok(json!({
+            "ok": true,
+            "result": {"epoch": epoch, "revision": revision, "changed": changed},
+            "remote_leader_proxy": true,
+        }))
+    }
+
+    fn busy(retry_after_ms: Option<u64>) -> Result<Value, RemoteLeaderCallError> {
+        let mut result = json!({"epoch": "e1", "revision": 3, "changed": false, "busy": true});
+        if let Some(ms) = retry_after_ms {
+            result["retry_after_ms"] = json!(ms);
+        }
+        Ok(json!({"ok": true, "result": result, "remote_leader_proxy": true}))
+    }
+
+    fn owner_error(code: &str, text: &str) -> Result<Value, RemoteLeaderCallError> {
+        Err(RemoteLeaderCallError::Owner(RemoteLeaderProxyError {
+            code: Some(code.to_string()),
+            text: text.to_string(),
+        }))
+    }
+
+    fn hop_error(message: &str) -> Result<Value, RemoteLeaderCallError> {
+        Err(RemoteLeaderCallError::Hop(message.to_string()))
+    }
+
+    /// Runs the loop to completion on the test thread. Once `script` is used
+    /// up the owner answers "unsupported", so a loop that should have stopped
+    /// earlier shows up as extra calls instead of hanging the suite.
+    fn run_loop(
+        script: Vec<Result<Value, RemoteLeaderCallError>>,
+    ) -> (Vec<Value>, Vec<Value>, Vec<Duration>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut script = script.into_iter();
+        let mut calls = Vec::new();
+        let mut sleeps = Vec::new();
+        owner_wake_loop(
+            "alpha",
+            INTERVAL,
+            tx,
+            |params| {
+                calls.push(params);
+                script
+                    .next()
+                    .unwrap_or_else(|| owner_error("method_not_allowed", "script exhausted"))
+            },
+            |pause| sleeps.push(pause),
+        );
+        (rx.try_iter().collect(), calls, sleeps)
+    }
+
+    #[test]
+    fn owner_wake_step_table() {
+        use OwnerWakeStep::*;
+        let armed = cursor("e1", 3);
+        for (name, prev, response, expected) in [
+            ("first arm", None, answer("e1", 3, false), Rearm(cursor("e1", 3))),
+            ("first arm ignores changed", None, answer("e1", 3, true), Rearm(cursor("e1", 3))),
+            ("unchanged revision", Some(&armed), answer("e1", 3, false), Rearm(cursor("e1", 3))),
+            ("higher revision", Some(&armed), answer("e1", 4, true), Wake(cursor("e1", 4))),
+            ("cursor moved without flag", Some(&armed), answer("e1", 5, false), Wake(cursor("e1", 5))),
+            ("epoch change", Some(&armed), answer("e2", 0, true), Wake(cursor("e2", 0))),
+            ("rust host rejects", Some(&armed), hop_error("method_not_allowed: team.events.wait"), Unsupported),
+            (
+                "owner rejects on the PeerServer route",
+                Some(&armed),
+                owner_error(
+                    "method_not_allowed",
+                    "remote leader proxy [method_not_allowed]: team.events.wait is served only on the reverse leader route",
+                ),
+                Unsupported,
+            ),
+            (
+                "old owner app",
+                None,
+                owner_error("invalid_method", "remote leader proxy [invalid_method]: remote leader command rejected"),
+                Unsupported,
+            ),
+            (
+                "owner text mentions the code under another code",
+                Some(&armed),
+                owner_error(
+                    "host_error",
+                    "remote leader proxy [host_error]: upstream said method_not_allowed [invalid_method]",
+                ),
+                Retry,
+            ),
+            (
+                "hop text only contains the daemon refusal",
+                Some(&armed),
+                hop_error("relay failed: method_not_allowed: team.events.wait"),
+                Retry,
+            ),
+            ("transport error", Some(&armed), hop_error("authorized peer viewer is not connected"), Retry),
+            ("malformed result", Some(&armed), Ok(json!({"ok": true, "result": {}})), Retry),
+            ("busy with a hint", Some(&armed), busy(Some(2500)), Backoff(Duration::from_millis(2500))),
+            ("busy without a hint", Some(&armed), busy(None), Backoff(Duration::from_secs(1))),
+            ("busy before arming", None, busy(Some(2500)), Backoff(Duration::from_millis(2500))),
+            ("busy hint below the floor", Some(&armed), busy(Some(10)), Backoff(Duration::from_secs(1))),
+            ("busy hint above the interval", Some(&armed), busy(Some(600_000)), Backoff(INTERVAL)),
+        ] {
+            assert_eq!(owner_wake_step(prev, response, INTERVAL), expected, "{name}");
+        }
+        assert_eq!(
+            owner_wake_step(Some(&armed), busy(Some(5000)), Duration::ZERO),
+            Backoff(Duration::from_secs(1)),
+            "an interval below the floor still backs off by the floor"
+        );
+    }
+
+    #[test]
+    fn owner_wake_loop_sends_wake_on_a_higher_revision() {
+        let (events, calls, _) = run_loop(vec![answer("e1", 3, false), answer("e1", 4, true)]);
+        assert_eq!(events, vec![json!({"kind": "owner_wake", "epoch": "e1", "revision": 4})]);
+        assert_eq!(calls[1]["since"], json!({"epoch": "e1", "revision": 3}));
+        assert_eq!(calls[2]["since"], json!({"epoch": "e1", "revision": 4}));
+    }
+
+    #[test]
+    fn owner_wake_loop_drops_the_sender_when_unsupported() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut calls = 0;
+        owner_wake_loop(
+            "alpha",
+            INTERVAL,
+            tx,
+            |_| {
+                calls += 1;
+                hop_error("method_not_allowed: team.events.wait")
+            },
+            |_| {},
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(recv_push_or_interval(&rx, Duration::from_secs(5)), PushWait::Closed);
+    }
+
+    #[test]
+    fn recv_push_or_interval_reports_closed_after_the_sender_drops() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert_eq!(recv_push_or_interval(&rx, Duration::from_millis(20)), PushWait::Elapsed);
+        tx.send(json!({"kind": "owner_wake"})).unwrap();
+        assert_eq!(
+            recv_push_or_interval(&rx, Duration::from_secs(5)),
+            PushWait::Event(json!({"kind": "owner_wake"}))
+        );
+        drop(tx);
+        assert_eq!(recv_push_or_interval(&rx, Duration::from_secs(5)), PushWait::Closed);
+    }
+
+    #[test]
+    fn owner_wake_loop_gives_up_after_consecutive_retries() {
+        let failures = (0..10).map(|_| hop_error("authorized peer viewer is not connected")).collect();
+        let (events, calls, sleeps) = run_loop(failures);
+        assert!(events.is_empty());
+        assert_eq!(calls.len(), OWNER_WAKE_MAX_CONSECUTIVE_RETRIES as usize);
+        assert_eq!(
+            sleeps.iter().filter(|pause| **pause == INTERVAL).count(),
+            OWNER_WAKE_MAX_CONSECUTIVE_RETRIES as usize - 1
+        );
+    }
+
+    #[test]
+    fn owner_wake_loop_resets_the_retry_budget_on_rearm() {
+        let failure = || hop_error("authorized peer viewer is not connected");
+        let (_, calls, _) = run_loop(vec![
+            failure(),
+            failure(),
+            answer("e1", 3, false),
+            failure(),
+            failure(),
+        ]);
+        assert_eq!(calls.len(), 6, "the loop must still be polling after the fifth answer");
+    }
+
+    #[test]
+    fn owner_wake_loop_resets_the_retry_budget_on_busy() {
+        let failure = || hop_error("authorized peer viewer is not connected");
+        let (_, calls, _) = run_loop(vec![
+            failure(),
+            failure(),
+            busy(Some(1500)),
+            failure(),
+            failure(),
+        ]);
+        assert_eq!(calls.len(), 6, "a busy answer reached the owner, so it is not a failure in a row");
+    }
+
+    #[test]
+    fn owner_wake_loop_backs_off_on_busy_without_moving_the_cursor() {
+        let (events, calls, sleeps) =
+            run_loop(vec![answer("e1", 3, false), busy(Some(2500)), answer("e1", 3, false)]);
+        assert!(events.is_empty());
+        assert!(sleeps.contains(&Duration::from_millis(2500)));
+        assert_eq!(calls[2]["since"], json!({"epoch": "e1", "revision": 3}));
+    }
+
+    #[test]
+    fn owner_wake_params_carry_the_cursor_and_hold() {
+        assert_eq!(
+            owner_wake_params("alpha", None),
+            json!({"team_name": "alpha", "since": null, "timeout_ms": 7000})
+        );
+        assert_eq!(
+            owner_wake_params("alpha", Some(&cursor("e1", 9))),
+            json!({
+                "team_name": "alpha",
+                "since": {"epoch": "e1", "revision": 9},
+                "timeout_ms": 7000,
+            })
+        );
+    }
+
+    #[test]
+    fn owner_wake_pause_spaces_long_poll_starts_by_a_second() {
+        let start = Instant::now();
+        assert_eq!(owner_wake_pause(None, start), Duration::ZERO);
+        assert_eq!(owner_wake_pause(Some(start), start), Duration::from_secs(1));
+        assert_eq!(
+            owner_wake_pause(Some(start), start + Duration::from_millis(400)),
+            Duration::from_millis(600)
+        );
+        assert_eq!(owner_wake_pause(Some(start), start + Duration::from_secs(8)), Duration::ZERO);
+    }
+
+    #[test]
+    fn owner_wake_transport_outlives_the_owner_hold() {
+        assert!(remote_leader_timeout(OWNER_WAKE_METHOD, OWNER_WAKE_HOLD) > OWNER_WAKE_HOLD);
+        assert!(peer_proto::team_leader::scoped_method_allowed(OWNER_WAKE_METHOD));
+        assert_eq!(
+            remote_leader_rpc_policy(true, OWNER_WAKE_METHOD),
+            RemoteLeaderRpcPolicy::Proxy
+        );
+    }
+}
+
+#[cfg(test)]
+mod wait_push_source_tests {
+    use super::*;
+
+    #[test]
+    fn remote_leader_wait_does_not_subscribe_to_the_local_daemon() {
+        use WaitPushSource::*;
+        for (has_route, push_disabled, kinds_empty, expected) in [
+            (false, false, false, LocalDaemon),
+            (true, false, false, RemoteOwnerWake),
+            (true, true, false, Disabled),
+            (true, false, true, Disabled),
+            (false, true, false, Disabled),
+            (false, false, true, Disabled),
+        ] {
+            assert_eq!(
+                wait_push_source(has_route, push_disabled, kinds_empty),
+                expected,
+                "route={has_route} disabled={push_disabled} kinds_empty={kinds_empty}"
+            );
+        }
+    }
+}
+
 /// Tracked tasks a timed-out wait should be re-armed for. A task the list never
 /// returned is still pending: absence is not completion.
 fn wait_pending_tasks(
@@ -22662,33 +23484,39 @@ fn run_wait(
         "blocked" | "review_ready" => &["task_status"],
         _ => &[],
     };
-    // events.subscribe lives on the daemon socket, not the app socket.
-    // Resolve it here so the caller's app `sock` is not misrouted.
-    let daemon_sock_for_push = detect_daemon_socket();
-    let mut event_rx: Option<std::sync::mpsc::Receiver<Value>> =
-        if !push_disabled && !subscribe_kinds.is_empty() {
-            match daemon_sock_for_push.as_ref() {
-                Some(ds) => match subscribe_events_channel(ds, subscribe_kinds) {
-                    Ok(rx) => {
-                        eprintln!(
-                            "wait: subscribed to push events ({})",
-                            subscribe_kinds.join(",")
-                        );
-                        Some(rx)
-                    }
-                    Err(e) => {
-                        eprintln!("wait: subscribe failed: {e}; falling back to polling");
-                        None
-                    }
-                },
-                None => {
-                    eprintln!("wait: daemon socket not found; using polling");
+    let push_source = wait_push_source(
+        remote_leader_route().is_some(),
+        push_disabled,
+        subscribe_kinds.is_empty(),
+    );
+    let mut event_rx: Option<std::sync::mpsc::Receiver<Value>> = match push_source {
+        WaitPushSource::Disabled => None,
+        WaitPushSource::RemoteOwnerWake => {
+            eprintln!("wait: remote leader — waking on owner events (long-poll)");
+            Some(spawn_remote_owner_wake(sock.clone(), team.to_string(), interval))
+        }
+        // events.subscribe lives on the daemon socket, not the app socket.
+        // Resolve it here so the caller's app `sock` is not misrouted.
+        WaitPushSource::LocalDaemon => match detect_daemon_socket() {
+            Some(ds) => match subscribe_events_channel(&ds, subscribe_kinds) {
+                Ok(rx) => {
+                    eprintln!(
+                        "wait: subscribed to push events ({})",
+                        subscribe_kinds.join(",")
+                    );
+                    Some(rx)
+                }
+                Err(e) => {
+                    eprintln!("wait: subscribe failed: {e}; falling back to polling");
                     None
                 }
+            },
+            None => {
+                eprintln!("wait: daemon socket not found; using polling");
+                None
             }
-        } else {
-            None
-        };
+        },
+    };
 
     let wait_started = std::time::Instant::now();
     let mut elapsed: u32 = 0;
@@ -22711,27 +23539,14 @@ fn run_wait(
         std::collections::HashMap::new();
     while elapsed < timeout {
         if current_interval > 0 {
-            // B1: push channel replaces sleep. Decay toward interval deadline in
-            // 200ms chunks so events get sub-200ms responsiveness while a quiet
-            // stream keeps the configured cadence (no 5Hz RPC hammering).
+            // B1: a push event ends the sleep early; a quiet stream keeps the
+            // configured cadence.
             if let Some(ref rx) = event_rx {
-                use std::sync::mpsc::RecvTimeoutError;
-                let deadline = std::time::Instant::now() + Duration::from_secs(current_interval);
-                loop {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        break; // interval elapsed: do the fallback poll
-                    }
-                    let cap = remaining.min(Duration::from_millis(200));
-                    match rx.recv_timeout(cap) {
-                        Ok(_event) => break,                        // real push: poll immediately
-                        Err(RecvTimeoutError::Timeout) => continue, // no event yet, keep waiting
-                        Err(RecvTimeoutError::Disconnected) => {
-                            eprintln!("wait: subscribe stream closed; falling back to polling");
-                            event_rx = None;
-                            break;
-                        }
-                    }
+                if recv_push_or_interval(rx, Duration::from_secs(current_interval))
+                    == PushWait::Closed
+                {
+                    eprintln!("wait: subscribe stream closed; falling back to polling");
+                    event_rx = None;
                 }
             } else {
                 thread::sleep(Duration::from_secs(current_interval));
@@ -22875,13 +23690,20 @@ fn run_wait(
                     "method": "team.task.get", "params": { "team_name": team, "task_id": tid }
                 }))
                 .unwrap_or_default();
-                let (inbox_r, task_r) = match rpc_batch(sock, &[p_inbox, p_task_get]) {
-                    Ok(mut results) if results.len() >= 2 => {
+                // rpc_batch only reaches the local socket; under a remote leader
+                // route both methods must go through the proxy instead.
+                let batched = if remote_leader_route().is_none() {
+                    rpc_batch(sock, &[p_inbox, p_task_get]).ok()
+                } else {
+                    None
+                };
+                let (inbox_r, task_r) = match batched {
+                    Some(mut results) if results.len() >= 2 => {
                         let tr = results.remove(1);
                         let ir = results.remove(0);
                         (Ok(ir), Ok(tr))
                     }
-                    Ok(_) | Err(_) => (
+                    _ => (
                         rpc_call(sock, "team.inbox", json!({ "team_name": team })),
                         rpc_call(
                             sock,
@@ -23634,7 +24456,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                 let instruction =
                     format_task_instruction(sock, team, &task, &goal, false, None, None);
                 let send_text = format!("{instruction}\n");
-                let send_result = if let Some(daemon_sock) = detect_daemon_socket() {
+                let send_result = if let Some(daemon_sock) = team_headless_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, team, agent) {
                         match rpc_call(
                             &daemon_sock,
@@ -25541,6 +26363,85 @@ mod auto_watch_tests {
             remote_leader_rpc_policy(false, "team.create"),
             RemoteLeaderRpcPolicy::Local
         );
+    }
+
+    #[test]
+    fn remote_leader_batch_and_wait_methods_are_proxied() {
+        for method in [
+            "team.status",
+            "team.task.list",
+            "team.send",
+            "team.broadcast",
+            "team.inbox",
+            "team.task.get",
+        ] {
+            assert_eq!(
+                remote_leader_rpc_policy(true, method),
+                RemoteLeaderRpcPolicy::Proxy,
+                "{method}"
+            );
+            assert_eq!(
+                remote_leader_rpc_policy(false, method),
+                RemoteLeaderRpcPolicy::Local,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_leader_batch_per_call_preserves_order_and_errors() {
+        let payloads = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "team.status", "params": {"team_name": "t"}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "team.create", "params": {"name": "x"}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "team.task.list"}).to_string(),
+        ];
+        let mut calls: Vec<(String, Value)> = Vec::new();
+        let results = rpc_batch_per_call(&payloads, |method, params| {
+            calls.push((method.to_string(), params.clone()));
+            if method == "team.create" {
+                Err("rejected".to_string())
+            } else {
+                Ok(json!({ "ok": true, "result": { "method": method } }))
+            }
+        })
+        .expect("valid payloads");
+
+        assert_eq!(
+            calls,
+            vec![
+                ("team.status".to_string(), json!({"team_name": "t"})),
+                ("team.create".to_string(), json!({"name": "x"})),
+                ("team.task.list".to_string(), json!({})),
+            ]
+        );
+        assert_eq!(results.len(), payloads.len());
+        assert_eq!(results[0]["result"]["method"], "team.status");
+        assert_eq!(results[1], json!({ "error": "rejected" }));
+        assert_eq!(results[2]["result"]["method"], "team.task.list");
+
+        let mut invalid_calls = 0;
+        let invalid = rpc_batch_per_call(
+            &[
+                json!({"method": "team.status"}).to_string(),
+                "{not json".to_string(),
+            ],
+            |_, _| {
+                invalid_calls += 1;
+                Ok(json!({}))
+            },
+        );
+        assert!(invalid.is_err());
+        assert_eq!(invalid_calls, 0, "no call before every payload validates");
+
+        let mut methodless_calls = 0;
+        let methodless = rpc_batch_per_call(&[json!({"params": {}}).to_string()], |_, _| {
+            methodless_calls += 1;
+            Ok(json!({}))
+        });
+        assert!(methodless.is_err());
+        assert_eq!(methodless_calls, 0);
     }
 
     #[test]

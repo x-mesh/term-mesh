@@ -360,6 +360,94 @@ final class PeerAgentPaneRecoveryCoordinator {
     }
 }
 
+/// A rebuilt peer agent pane's pending task, between the drop that took it
+/// and the recovery that rebinds the same member and surface. Whatever does
+/// not reach a rebuilt session is blocked through `lose` exactly once.
+@MainActor
+final class PeerAgentCorrelationCarryStore {
+    typealias Schedule = (TimeInterval, @escaping @MainActor () -> Void) -> Void
+
+    struct Entry {
+        let id = UUID()
+        let key: String
+        let surfaceID: Data
+        let boundarySeq: UInt64
+        let retiredInitialSeq: UInt64
+        let carry: AgentSession.CarriedTaskCorrelation
+        let cause: String
+        let deadline: Date
+        let lose: (String) -> Void
+
+        var rebuildLossReason: String { AgentSession.paneRebuildLossReason(cause: cause) }
+    }
+
+    static let carryDeadline: TimeInterval = 120
+    static let shared = PeerAgentCorrelationCarryStore()
+
+    private var entries: [String: Entry] = [:]
+    private let now: () -> Date
+    private let schedule: Schedule
+
+    init(
+        now: @escaping () -> Date = Date.init,
+        schedule: @escaping Schedule = { delay, work in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                MainActor.assumeIsolated { work() }
+            }
+        }
+    ) {
+        self.now = now
+        self.schedule = schedule
+    }
+
+    func store(
+        key: String,
+        surfaceID: Data,
+        boundarySeq: UInt64,
+        retiredInitialSeq: UInt64,
+        carry: AgentSession.CarriedTaskCorrelation,
+        cause: String,
+        lose: @escaping (String) -> Void
+    ) {
+        insert(Entry(
+            key: key, surfaceID: surfaceID, boundarySeq: boundarySeq,
+            retiredInitialSeq: retiredInitialSeq, carry: carry,
+            cause: cause, deadline: now().addingTimeInterval(Self.carryDeadline), lose: lose
+        ))
+    }
+
+    /// The carry for this member, only when the rebind is the same surface.
+    func claim(key: String, surfaceID: Data) -> Entry? {
+        guard let entry = entries[key], entry.surfaceID == surfaceID else { return nil }
+        entries.removeValue(forKey: key)
+        return entry
+    }
+
+    /// A claimed carry whose rebind did not happen, back under its deadline.
+    func restore(_ entry: Entry) {
+        insert(entry)
+    }
+
+    /// The host no longer holds the surface: nothing can rebind it.
+    func fail(key: String, surfaceID: Data) {
+        guard let entry = claim(key: key, surfaceID: surfaceID) else { return }
+        entry.lose(entry.rebuildLossReason)
+    }
+
+    private func insert(_ entry: Entry) {
+        if let replaced = entries.updateValue(entry, forKey: entry.key), replaced.id != entry.id {
+            replaced.lose(replaced.rebuildLossReason)
+        }
+        let id = entry.id
+        let key = entry.key
+        schedule(max(0, entry.deadline.timeIntervalSince(now()))) { [weak self] in
+            guard let self, let expired = self.entries[key], expired.id == id else { return }
+            self.entries.removeValue(forKey: key)
+            expired.lose(expired.rebuildLossReason)
+        }
+    }
+}
+
 extension TeamOrchestrator {
     struct ExactRepairIdentity: Equatable {
         let hostKey: String
@@ -8630,21 +8718,10 @@ extension TeamOrchestrator {
                 agentInstanceId: agentInstanceId, busy: busy
             )
         }
-        panel.session.onTurnEnd = { [teamName, agentName, agentInstanceId] final, _, taskId in
-            Self.fileReport(
-                teamName: teamName, agentName: agentName,
-                agentInstanceId: agentInstanceId,
-                taskId: taskId, text: final
-            )
-            guard let taskId else { return }
-            AutoReplyEmit.emit(
-                teamName: teamName,
-                agentName: agentName,
-                event: AgentPipeCompletion.headerEvent(from: final),
-                preferredTaskId: taskId,
-                agentInstanceId: agentInstanceId
-            )
-        }
+        Self.wireNativeWorkerCompletion(
+            panel.session, teamName: teamName,
+            agentName: agentName, agentInstanceId: agentInstanceId
+        )
     }
 
     /// Rebuild the local pane for a peer-owned agent whose previous one was
@@ -8738,6 +8815,11 @@ extension TeamOrchestrator {
             guard let self else { return .transientFailure }
             return await self.attemptPeerOwnedAgentPaneRecovery(request)
         }
+        if result == .authoritativeMissing {
+            PeerAgentCorrelationCarryStore.shared.fail(
+                key: request.key, surfaceID: request.surfaceID
+            )
+        }
         if result != .transientFailure {
             PeerAgentPaneRecoveryCoordinator.shared.forget(request)
         } else {
@@ -8822,7 +8904,13 @@ extension TeamOrchestrator {
             onMismatch: { session.teardown() }
         ) else { return .authoritativeMissing }
 
-        guard let panel = workspace.openRemoteAgentPane(session: session, focus: false) else {
+        let carry = PeerAgentCorrelationCarryStore.shared.claim(
+            key: request.key, surfaceID: request.surfaceID
+        )
+        guard let panel = workspace.openRemoteAgentPane(
+            session: session, focus: false, rebuildCarry: carry
+        ) else {
+            if let carry { PeerAgentCorrelationCarryStore.shared.restore(carry) }
             session.teardown()
             RemoteWorkLog.info("Cannot reattach \(agent.name): no local pane can host it")
             return .transientFailure
@@ -9638,21 +9726,10 @@ extension TeamOrchestrator {
                 agentInstanceId: agentInstanceId, busy: busy
             )
         }
-        panel.session.onTurnEnd = { [teamName = team.id, agentName, agentInstanceId] final, _, taskId in
-            Self.fileReport(
-                teamName: teamName, agentName: agentName,
-                agentInstanceId: agentInstanceId,
-                taskId: taskId, text: final
-            )
-            guard let taskId else { return }
-            AutoReplyEmit.emit(
-                teamName: teamName,
-                agentName: agentName,
-                event: AgentPipeCompletion.headerEvent(from: final),
-                preferredTaskId: taskId,
-                agentInstanceId: agentInstanceId
-            )
-        }
+        Self.wireNativeWorkerCompletion(
+            panel.session, teamName: team.id,
+            agentName: agentName, agentInstanceId: agentInstanceId
+        )
         workspace.setPanelCustomTitle(
             panelId: panel.id,
             title: "\(Self.colorEmoji(color)) \(agentName) @\(host.displayName)"

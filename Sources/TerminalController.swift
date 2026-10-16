@@ -5998,6 +5998,7 @@ class TerminalController {
 
         // Publish reply event best-effort so tm-agent wait push subscribers are woken.
         let headerPreview = String(content.prefix(200))
+        TeamEventWakeSignal.shared.bump(team: teamName)
         _ = TermMeshDaemon.shared.rpcCallRaw(method: "events.publish", params: [
             "kind": "reply",
             "team": teamName,

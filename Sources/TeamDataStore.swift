@@ -103,6 +103,26 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
     }
 
+    private let statusWakeQueue = DispatchQueue(label: "team.data.status-wake", qos: .utility)
+
+    /// `lock` must be held. A remote leader's `tm-agent wait` sleeps on
+    /// `team.events.wait` rather than the daemon bus, so a status transition
+    /// that skipped the bump left it asleep until its next poll. Bumping here
+    /// covers every socket handler that changes a status, not only the ones
+    /// that remembered to.
+    private func commitTaskBoardLocked(_ tasks: [TeamOrchestrator.TeamTask], teamName: String) {
+        let previous = Dictionary(
+            (taskBoards[teamName] ?? []).map { ($0.id, $0.status) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        taskBoards[teamName] = tasks
+        guard tasks.contains(where: { task in previous[task.id].map { $0 != task.status } ?? false })
+        else { return }
+        statusWakeQueue.async {
+            TeamEventWakeSignal.shared.bump(team: teamName)
+        }
+    }
+
     struct AgentRegistration: Equatable {
         let name: String
         let instanceId: String?
@@ -1832,12 +1852,20 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         worktreeInit: String? = nil,
         worktreeFinishedAt: Date? = nil,
         worktreeFinishMode: String? = nil,
-        worktreeRemoved: Bool? = nil
+        worktreeRemoved: Bool? = nil,
+        expectedStatus: String? = nil,
+        expectedAssignee: String? = nil,
+        // `.some(nil)` expects the task to be unpinned; omitted skips the check.
+        expectedAssigneeInstanceId: String?? = nil
     ) -> TeamOrchestrator.TeamTask? {
         lock.lock()
         defer { lock.unlock() }
         guard var tasks = taskBoards[teamName],
               let idx = tasks.firstIndex(where: { $0.id == taskId }) else { return nil }
+        if let expectedStatus, tasks[idx].status != expectedStatus { return nil }
+        if let expectedAssignee, tasks[idx].assignee != expectedAssignee { return nil }
+        if let expectedAssigneeInstanceId,
+           tasks[idx].assigneeInstanceId != expectedAssigneeInstanceId { return nil }
         let now = Date()
         if let assignee {
             guard let resolvedAssignee = resolveAssigneeUnsafe(
@@ -1942,7 +1970,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             }
         }
         tasks[idx].updatedAt = now
-        taskBoards[teamName] = tasks
+        commitTaskBoardLocked(tasks, teamName: teamName)
         noteTasksChanged()
         notifyChanged()
         return tasks[idx]
@@ -2001,7 +2029,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             || previousAssigneeInstanceId != tasks[idx].assigneeInstanceId {
             tasks[idx].reassignmentCount += 1
         }
-        taskBoards[teamName] = tasks
+        commitTaskBoardLocked(tasks, teamName: teamName)
         noteTasksChanged()
         notifyChanged()
         return tasks[idx]
@@ -2084,7 +2112,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         tasks[idx].status = "assigned"
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
-        taskBoards[teamName] = tasks
+        commitTaskBoardLocked(tasks, teamName: teamName)
         noteTasksChanged()
         notifyChanged()
         return tasks[idx]
@@ -2107,7 +2135,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
         tasks[idx].reassignmentCount += 1
-        taskBoards[teamName] = tasks
+        commitTaskBoardLocked(tasks, teamName: teamName)
         noteTasksChanged()
         notifyChanged()
         return tasks[idx]
@@ -2135,7 +2163,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now
-        taskBoards[teamName] = tasks
+        commitTaskBoardLocked(tasks, teamName: teamName)
         noteTasksChanged()
         notifyChanged()
         return tasks[idx]
@@ -2166,7 +2194,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             changed.append(tasks[index])
         }
         guard !changed.isEmpty else { return [] }
-        taskBoards[teamName] = tasks
+        commitTaskBoardLocked(tasks, teamName: teamName)
         noteTasksChanged()
         notifyChanged()
         return changed

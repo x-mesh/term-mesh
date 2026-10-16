@@ -36,6 +36,8 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
 
     private let profileSubmenuItem = NSMenuItem(title: "CLI Profile", action: nil, keyEquivalent: "")
     private let profileSubmenu = NSMenu(title: "CLI Profile")
+    private let keepAwakeSubmenuItem = NSMenuItem(title: "Keep Mac Awake", action: nil, keyEquivalent: "")
+    private let keepAwakeSubmenu = NSMenu(title: "Keep Mac Awake")
     private var profileObserver: NSObjectProtocol?
 
 
@@ -172,6 +174,10 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         // Sidebar-first peer UX: connecting/opening lives in the sidebar;
         // the menu keeps host management + server controls. The raw
         // socket-path connect dialogs stay as DEBUG-only tools.
+        keepAwakeSubmenuItem.submenu = keepAwakeSubmenu
+        menu.addItem(keepAwakeSubmenuItem)
+        updateKeepAwakeSubmenu()
+
         menu.addItem(PeerMenu.addRemoteHostItem())
         menu.addItem(PeerMenu.connectionsItem())
 #if DEBUG
@@ -204,11 +210,30 @@ final class MenuBarExtraController: NSObject, NSMenuDelegate {
         quitItem.title = LanguageSettings.localized("Quit Term-Mesh")
         profileSubmenuItem.title = LanguageSettings.localized("CLI Profile")
         profileSubmenu.title = profileSubmenuItem.title
+        keepAwakeSubmenuItem.title = LanguageSettings.localized("Keep Mac Awake")
+        keepAwakeSubmenu.title = keepAwakeSubmenuItem.title
+    }
+
+    private func updateKeepAwakeSubmenu() {
+        let status = PeerKeepAwakeController.shared.status
+        PeerKeepAwakeMenu.shared.populate(keepAwakeSubmenu)
+        keepAwakeSubmenuItem.image = NSImage(
+            systemSymbolName: PeerKeepAwakeMenu.symbolName(for: status),
+            accessibilityDescription: status.summary
+        )
+        keepAwakeSubmenuItem.toolTip = status.summary
+        let title = LanguageSettings.localized("Keep Mac Awake")
+        if case .holding(let connections) = status {
+            keepAwakeSubmenuItem.title = "\(title) · \(connections)"
+        } else {
+            keepAwakeSubmenuItem.title = title
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         refreshUI()
         updateProfileSubmenu()
+        updateKeepAwakeSubmenu()
     }
 
     func refreshForDebugControls() {

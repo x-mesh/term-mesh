@@ -161,10 +161,12 @@ final class AgentPaneRegression169Tests: XCTestCase {
     /// call it.
     func testStoppingASessionEndsTheTurnItWasHolding() {
         var reported: [(text: String, task: String?, stop: String)] = []
+        var lost: [(String, AgentSession.TaskCorrelationLoss)] = []
         let session = AgentSession()
         session.onTurnEnd = { text, end, task in
             reported.append((text: text, task: task, stop: end.stop))
         }
+        session.onTaskCorrelationLost = { task, loss in lost.append((task, loss)) }
         session.start(.init(
             executable: "/bin/sleep", arguments: ["30"],
             workingDirectory: NSTemporaryDirectory(),
@@ -178,23 +180,27 @@ final class AgentPaneRegression169Tests: XCTestCase {
         XCTAssertEqual(reported.count, 1, "the interrupted turn is closed exactly once")
         XCTAssertEqual(reported.first?.task, "69f02ac3")
         XCTAssertEqual(reported.first?.stop, "session_stopped")
-        // Nobody said the work succeeded, so it must not read as one.
-        XCTAssertEqual(
-            AgentPipeCompletion.headerEvent(from: reported.first?.text ?? "").status,
-            "NEEDS_REVIEW")
+        // Nobody said the work succeeded, so it must not read as one: the
+        // task is handed back as lost rather than settled by this text.
+        XCTAssertNil(AgentPipeCompletion.explicitStatus(in: reported.first?.text ?? ""))
+        XCTAssertEqual(lost.map(\.0), ["69f02ac3"])
+        XCTAssertEqual(lost.first?.1, .sessionEnded("the session was stopped before an explicit STATUS"))
         XCTAssertFalse(session.isThinking)
         XCTAssertFalse(session.isRunning)
 
         session.stop()
         XCTAssertEqual(reported.count, 1, "a second stop has no turn left to end")
+        XCTAssertEqual(lost.count, 1, "nor a task left to hand back")
     }
 
     /// And a stop with nothing running invents nothing: a pane closed between
     /// turns has no task to report on.
     func testStoppingBetweenTurnsReportsNothing() {
         var ends = 0
+        var lost = 0
         let session = AgentSession()
         session.onTurnEnd = { _, _, _ in ends += 1 }
+        session.onTaskCorrelationLost = { _, _ in lost += 1 }
         session.start(.init(
             executable: "/bin/sleep", arguments: ["30"],
             workingDirectory: NSTemporaryDirectory(),
@@ -204,6 +210,7 @@ final class AgentPaneRegression169Tests: XCTestCase {
         session.stop()
 
         XCTAssertEqual(ends, 0)
+        XCTAssertEqual(lost, 0)
         XCTAssertFalse(session.isRunning)
     }
 

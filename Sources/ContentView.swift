@@ -1117,6 +1117,7 @@ struct ContentView: View {
             }
             titlebarInfoSeparator
             SocketStatusControl()
+            KeepAwakeStatusControl()
 
             titlebarInfoSeparator
             Text(Self.appVersion)

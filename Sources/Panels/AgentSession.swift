@@ -1,6 +1,7 @@
 import Foundation
 import PeerProto
 import Combine
+import Bonsplit
 
 struct AgentEnvironmentSummary: Equatable, Sendable {
     static let visibleKeys = [
@@ -227,6 +228,8 @@ final class AgentStreamDecoder {
 
     private var bytes: [UInt8] = []
     private var scanOffset = 0
+    /// Stream offset of `bytes[0]`.
+    private var releasedBytes: UInt64 = 0
     private let maxLineBytes: Int
 
     init(maxLineBytes: Int) {
@@ -234,8 +237,13 @@ final class AgentStreamDecoder {
     }
 
     func consume(_ data: Data) -> [Output] {
+        consumeTracked(data).map(\.output)
+    }
+
+    /// `consume`, each output paired with the stream offset just past its line.
+    func consumeTracked(_ data: Data) -> [(output: Output, end: UInt64)] {
         bytes.append(contentsOf: data)
-        var output: [Output] = []
+        var output: [(output: Output, end: UInt64)] = []
         var lineStart = 0
         var index = scanOffset
 
@@ -248,10 +256,11 @@ final class AgentStreamDecoder {
             if end > lineStart, bytes[end - 1] == 0x0D { end -= 1 }
             if end > lineStart {
                 let lineBytes = bytes[lineStart..<end]
+                let lineEnd = releasedBytes + UInt64(index + 1)
                 if lineBytes.count > maxLineBytes {
-                    output.append(.oversized(lineBytes.count))
+                    output.append((.oversized(lineBytes.count), lineEnd))
                 } else if let line = String(bytes: lineBytes, encoding: .utf8), !line.isEmpty {
-                    output.append(.line(line))
+                    output.append((.line(line), lineEnd))
                 }
             }
             lineStart = index + 1
@@ -260,12 +269,14 @@ final class AgentStreamDecoder {
 
         if lineStart > 0 {
             bytes.removeFirst(lineStart)
+            releasedBytes += UInt64(lineStart)
             index -= lineStart
         }
         scanOffset = index
 
         if bytes.count > maxLineBytes {
-            output.append(.oversized(bytes.count))
+            releasedBytes += UInt64(bytes.count)
+            output.append((.oversized(bytes.count), releasedBytes))
             bytes.removeAll(keepingCapacity: true)
             scanOffset = 0
         }
@@ -302,6 +313,8 @@ private struct AgentParsedLine: @unchecked Sendable {
     let preparedToolIDs: Set<String>
     let sourceLineCount: Int
     let sourceBytes: Int
+    /// Remote stream offset just past this line's bytes.
+    var streamEnd: UInt64?
 
     init(_ raw: String) {
         self.raw = raw
@@ -329,13 +342,19 @@ private struct AgentParsedLine: @unchecked Sendable {
         preparedToolIDs = toolIDs
     }
 
-    private init(object: [String: Any], sourceLineCount: Int, sourceBytes: Int) {
+    private init(
+        object: [String: Any],
+        sourceLineCount: Int,
+        sourceBytes: Int,
+        streamEnd: UInt64?
+    ) {
         raw = ""
         self.object = object
         preparedChanges = [:]
         preparedToolIDs = []
         self.sourceLineCount = sourceLineCount
         self.sourceBytes = sourceBytes
+        self.streamEnd = streamEnd
     }
 
     private var deltaParts: (index: Int, field: String, text: String)? {
@@ -370,7 +389,8 @@ private struct AgentParsedLine: @unchecked Sendable {
         return AgentParsedLine(
             object: outer,
             sourceLineCount: sourceLineCount + next.sourceLineCount,
-            sourceBytes: sourceBytes + next.sourceBytes
+            sourceBytes: sourceBytes + next.sourceBytes,
+            streamEnd: next.streamEnd ?? streamEnd
         )
     }
 
@@ -1454,8 +1474,50 @@ final class AgentSession {
     private(set) var streamingIds: Set<UUID> = []
 
     /// Called when a turn ends, with the agent's final text. The task-board
-    /// side reads its own header out of this; the session does not interpret it.
+    /// side reads its own header out of this; the session only checks whether
+    /// a STATUS was stated, which ends the task correlation.
     @ObservationIgnored var onTurnEnd: ((String, TurnEnd, String?) -> Void)?
+
+    /// Why a task this session was carrying can no longer be settled by its
+    /// worker's own STATUS. `reason` is written to the task as it stands.
+    enum TaskCorrelationLoss: Equatable {
+        case superseded(by: String)
+        case noStatusDeadline(TimeInterval, statedOutsideTask: Bool = false)
+        case noStatusWithBackgroundWork(TimeInterval, statedOutsideTask: Bool = false)
+        case sessionEnded(String)
+
+        var reason: String {
+            switch self {
+            case .superseded(let next):
+                return "superseded by dispatch of \(next) before an explicit STATUS"
+            case .noStatusDeadline(let interval, let statedOutsideTask):
+                return "No explicit STATUS after \(Self.span(interval)) without activity"
+                    + Self.outsideTaskNote(statedOutsideTask)
+            case .noStatusWithBackgroundWork(let interval, let statedOutsideTask):
+                return "No explicit STATUS after \(Self.span(interval)) while background work was still running"
+                    + Self.outsideTaskNote(statedOutsideTask)
+            case .sessionEnded(let why):
+                return why
+            }
+        }
+
+        /// The worker's text did state a verdict, so the leader must not read
+        /// the block as the worker having said nothing.
+        private static func outsideTaskNote(_ stated: Bool) -> String {
+            stated
+                ? "; a STATUS was stated in a turn not tied to this task (leader message without TASK_ID or person input)"
+                : ""
+        }
+
+        private static func span(_ interval: TimeInterval) -> String {
+            interval >= 60 ? "\(Int(interval / 60)) min" : "\(Int(interval.rounded()))s"
+        }
+    }
+
+    /// Called when the pending task can no longer be closed by a STATUS from
+    /// this session: a different task was dispatched, the inactivity deadline
+    /// ran out, or the session ended.
+    @ObservationIgnored var onTaskCorrelationLost: ((String, TaskCorrelationLoss) -> Void)?
 
     /// Called for a launch, transport, process, or turn diagnostic.
     ///
@@ -1656,6 +1718,9 @@ final class AgentSession {
         let queue = DispatchQueue(label: "com.termmesh.agent-session.remote-stream")
         /// Read and written only on `queue`.
         var closed = false
+        /// Replayed bytes still to come before the stream reaches what the
+        /// retired pane never applied. Read and written only on `queue`.
+        var historyBytesRemaining: UInt64?
         let decoder = AgentStreamDecoder(maxLineBytes: AgentStreamDecoder.defaultMaxLineBytes)
         let batcher: AgentLineBatcher
 
@@ -1727,8 +1792,12 @@ final class AgentSession {
     @ObservationIgnored private var directDecoder = AgentStreamDecoder(maxLineBytes: AgentSession.maxLineBytes)
     #endif
 
-    init(extendedSilenceThreshold: TimeInterval = 30 * 60) {
+    init(extendedSilenceThreshold: TimeInterval = 30 * 60,
+         pendingTaskStatusDeadline: TimeInterval = 10 * 60,
+         pendingTaskStatusCap: TimeInterval = 60 * 60) {
         self.extendedSilenceThreshold = extendedSilenceThreshold
+        self.pendingTaskStatusDeadline = pendingTaskStatusDeadline
+        self.pendingTaskStatusCap = pendingTaskStatusCap
     }
 
     /// A line that never arrives must not grow forever. Far above any real
@@ -2341,14 +2410,178 @@ final class AgentSession {
         // line boundary, and batches from any earlier pipeline must keep
         // failing `apply`'s identity guard.
         remoteStreamsBox.set(RemoteStreamResources())
+        appliedRemoteBytes = 0
         setRunning(true)
         setCanInterrupt(interruptible)
     }
 
     func stop() {
+        stop(lossReason: "the session was stopped before an explicit STATUS")
+    }
+
+    /// The task this session was waiting on, handed to the session that
+    /// replaces it. `replayBoundarySeq` is set only when the correlation had
+    /// not reached its own session yet, so a second rebuild keeps the first
+    /// boundary instead of measuring from bytes that were themselves replay.
+    struct CarriedTaskCorrelation: Equatable {
+        let taskId: String
+        let turnWasInFlight: Bool
+        var replayBoundarySeq: UInt64?
+    }
+
+    nonisolated static func paneRebuildLossReason(cause: String, acrossGap: Bool = false) -> String {
+        let rebuilt = acrossGap
+            ? "the pane was rebuilt (\(cause)) across a stream gap"
+            : "the pane was rebuilt (\(cause))"
+        return rebuilt + "; a STATUS from the rebuilt pane "
+            + "will not close this task — check the agent's reply and re-dispatch if needed"
+    }
+
+    /// Stop a session whose pane is being torn down and rebuilt. Without
+    /// `carry` the rebuilt pane starts with no correlation, so the leader is
+    /// told the pending task was lost to the rebuild rather than to a plain
+    /// stop. With `carry` the correlation is returned instead of lost, for the
+    /// rebuilt session's `expectReplayHistory`.
+    @discardableResult
+    func stopForPaneRebuild(after cause: String, carry: Bool = false) -> CarriedTaskCorrelation? {
+        var carried: CarriedTaskCorrelation?
+        if carry {
+            if let task = pendingTask {
+                carried = CarriedTaskCorrelation(
+                    taskId: task.taskId,
+                    turnWasInFlight: turnInFlight && correlatedTask != nil
+                )
+                pendingTask = nil
+            } else if let waiting = uninstalledCarry {
+                carried = waiting.carry
+                uninstalledCarry = nil
+            }
+        }
+        stop(lossReason: Self.paneRebuildLossReason(cause: cause))
+        return carried
+    }
+
+    /// Before any byte is consumed: the first `bytes` of the stream repeat
+    /// what the retired pane already applied. They render, but no turn they
+    /// end settles a task or reaches `onTurnEnd`, and `carried` becomes this
+    /// session's pending task only once the stream has passed them. At
+    /// `deadline` the window closes and an uninstalled carry is lost with
+    /// `lossReason`. Returns false, taking nothing, when no remote stream is
+    /// installed to measure.
+    @discardableResult
+    func expectReplayHistory(
+        bytes: UInt64,
+        carried: CarriedTaskCorrelation,
+        lossReason: String,
+        deadline: TimeInterval
+    ) -> Bool {
+        guard let streams = remoteStreamsBox.current() else { return false }
+        // Not `abandonCarriedCorrelation`: a window about to reopen must not
+        // deliver a queued instruction into it.
+        let closedOpenWindow = endReplayWindow()
+        if let displaced = uninstalledCarry {
+            uninstalledCarry = nil
+            loseCarriedCorrelation(displaced.carry, .sessionEnded(displaced.lossReason))
+        }
+        uninstalledCarry = UninstalledCarry(carry: carried, lossReason: lossReason)
+        guard bytes > 0 else {
+            installCarriedCorrelation()
+            if closedOpenWindow { deliverQueuedInstructionAfterReplay() }
+            return true
+        }
+        replayingHistory = true
+        streams.queue.async { streams.historyBytesRemaining = bytes }
+        let item = DispatchWorkItem { [weak self] in
+            self?.replayDeadlinePassed(lossReason: lossReason)
+        }
+        replayDeadline = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline), execute: item)
+        return true
+    }
+
+    /// Lines the stream queue already counted as history may still be in the
+    /// batcher or on their way to main. Closing the window from the queue,
+    /// as the boundary does, applies them as history first.
+    private func replayDeadlinePassed(lossReason: String) {
+        guard let streams = remoteStreamsBox.current() else {
+            abandonCarriedCorrelation(reason: lossReason)
+            return
+        }
+        let deadline = replayDeadline
+        let flush = remoteApplyFlush(streams)
+        streams.queue.async {
+            guard !streams.closed else { return }
+            streams.historyBytesRemaining = nil
+            streams.batcher.flushPending(flush)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.remoteStreamsBox.current() === streams,
+                      let deadline, self.replayDeadline === deadline else { return }
+                self.abandonCarriedCorrelation(reason: lossReason)
+            }
+        }
+    }
+
+    /// Close the replay window and give up on a carried correlation that has
+    /// not reached this session.
+    func abandonCarriedCorrelation(reason: String) {
+        let closed = endReplayWindow()
+        if let waiting = uninstalledCarry {
+            uninstalledCarry = nil
+            loseCarriedCorrelation(waiting.carry, .sessionEnded(reason))
+        }
+        if closed { deliverQueuedInstructionAfterReplay() }
+    }
+
+    @discardableResult
+    private func endReplayWindow() -> Bool {
+        replayDeadline?.cancel()
+        replayDeadline = nil
+        guard replayingHistory else { return false }
+        replayingHistory = false
+        if let streams = remoteStreamsBox.current() {
+            streams.queue.async { streams.historyBytesRemaining = nil }
+        }
+        return true
+    }
+
+    private func installCarriedCorrelation() {
+        let closed = endReplayWindow()
+        if let carry = uninstalledCarry?.carry {
+            uninstalledCarry = nil
+            taskCorrelationGeneration &+= 1
+            pendingTask = PendingTask(taskId: carry.taskId, generation: taskCorrelationGeneration)
+            noteTaskActivity()
+            if carry.turnWasInFlight {
+                if turnInFlight {
+                    turnOrigin = .dispatch
+                } else {
+                    openTurn(.dispatch)
+                }
+            } else if !turnInFlight {
+                armTaskStatusDeadline()
+            }
+        }
+        if closed { deliverQueuedInstructionAfterReplay() }
+    }
+
+    /// A replayed result does not start the next queued instruction, so the
+    /// window's close does, unless a live turn will end and start it.
+    private func deliverQueuedInstructionAfterReplay() {
+        guard !turnInFlight else { return }
+        deliverNextQueuedInstruction()
+    }
+
+    private func loseCarriedCorrelation(_ carry: CarriedTaskCorrelation, _ loss: TaskCorrelationLoss) {
+        #if DEBUG
+        dlog("agent.task.correlation.lost task=\(carry.taskId) reason=\(loss.reason)")
+        #endif
+        onTaskCorrelationLost?(carry.taskId, loss)
+    }
+
+    private func stop(lossReason: String) {
         if process == nil, remoteSink != nil {
             teardownRemote()
-            finishAfterDrain(code: 0, stopped: true)
+            finishAfterDrain(code: 0, stoppedLossReason: lossReason)
             return
         }
         guard let process else { return }
@@ -2358,9 +2591,8 @@ final class AgentSession {
         // turn is not going to end on its own, so its task would sit
         // `in_progress` for a pane that has gone while every instruction behind
         // it waited on a queue nothing will drain. Closing a pane mid-turn was
-        // measured leaving exactly that. Nobody said the work succeeded, so it
-        // reports as NEEDS_REVIEW — the same verdict a process that died gets.
-        finishAfterDrain(code: 0, stopped: true)
+        // measured leaving exactly that.
+        finishAfterDrain(code: 0, stoppedLossReason: lossReason)
     }
 
     /// Finish a transport-owned agent from the host's authoritative process
@@ -2543,10 +2775,13 @@ final class AgentSession {
 
     private func finishAfterDrain(
         code: Int32,
-        stopped: Bool = false,
+        stoppedLossReason: String? = nil,
         failureAlreadyReported: Bool = false
     ) {
+        let stopped = stoppedLossReason != nil
         cancelExtendedSilenceWatchdog()
+        cancelTaskStatusDeadline()
+        backgroundTaskCount = 0
         setThinking(false)
         streamOpen.removeAll()
         clearStreamingIds()
@@ -2572,15 +2807,28 @@ final class AgentSession {
                               tokensIn: nil, tokensOut: nil,
                               completedAt: completedAt)
             append(.turnEnded(id: UUID(), end))
-            let answered = currentTaskId
-            currentTaskId = nil
+            let answered = correlatedTask
             turnInFlight = false
+            turnOrigin = nil
             turnStartedAt = nil
-            // No STATUS, so this reads as NEEDS_REVIEW rather than a success —
-            // nobody said it worked, and the agent is not there to say.
-            onTurnEnd?(stopped ? "the session was stopped before this turn finished"
-                               : "the agent exited before finishing this turn",
-                       end, answered)
+            if !replayingHistory {
+                onTurnEnd?(stopped ? "the session was stopped before this turn finished"
+                                   : "the agent exited before finishing this turn",
+                           end, answered?.taskId)
+            }
+        }
+        // Nothing can reach this session's correlation any more — no stdin, no
+        // stream — so waiting for a STATUS would only delay the leader.
+        if let task = pendingTask {
+            pendingTask = nil
+            loseTaskCorrelation(task, .sessionEnded(
+                stoppedLossReason ?? "the agent exited before an explicit STATUS"))
+        }
+        endReplayWindow()
+        if let waiting = uninstalledCarry {
+            uninstalledCarry = nil
+            loseCarriedCorrelation(waiting.carry, .sessionEnded(
+                stoppedLossReason ?? "the agent exited before an explicit STATUS"))
         }
         if !queued.isEmpty {
             append(.notice(id: UUID(),
@@ -2663,9 +2911,10 @@ final class AgentSession {
     ///
     /// This used to be set only for leader writes, so a person typing in the
     /// composer left it false — and a task arriving during that turn was
-    /// written straight into the same stdin, taking `currentTaskId` with it.
-    /// The person's `result` would then close the leader's task, or the CLI
-    /// would merge the two and one completion would simply never arrive.
+    /// written straight into the same stdin, taking the task correlation with
+    /// it. The person's `result` would then close the leader's task, or the
+    /// CLI would merge the two and one completion would simply never arrive.
+    /// A turn the CLI starts on its own counts too, for the same reason.
     @ObservationIgnored private var turnInFlight = false
     /// Local fallback for providers that do not include `duration_ms` in their
     /// result event. Kept off the observation graph: no view needs live time.
@@ -2684,13 +2933,62 @@ final class AgentSession {
         // Shown from the receipt (`isReplay`) rather than from here, so what is
         // drawn is what the agent confirmed receiving — not what was hoped for.
         pendingSpeaker = speaker
-        // Any write opens a turn. Only a leader's carries a task.
-        if !turnInFlight { turnStartedAt = Date() }
+        beginWrittenTurn(from: speaker, taskId: taskId)
+        return payload.count
+    }
+
+    /// Any write opens a turn or joins the running one. Only a leader's
+    /// TASK_ID moves the task correlation.
+    private func beginWrittenTurn(from speaker: Speaker, taskId: String?) {
+        noteTaskActivity()
+        if speaker == .leader, let taskId { correlate(taskId) }
+        // A person joining a turn the CLI started itself makes it theirs: the
+        // result may now answer them, so it must not close the pending task.
+        if turnInFlight, speaker == .person, turnOrigin == .selfStarted {
+            turnOrigin = .person
+        }
+        if speaker == .person {
+            openTurn(.person)
+        } else {
+            openTurn(taskId == nil ? .leaderPlain : .dispatch)
+        }
+    }
+
+    private func openTurn(_ origin: TurnOrigin) {
+        if !turnInFlight {
+            turnStartedAt = Date()
+            turnOrigin = origin
+        }
         turnInFlight = true
-        if speaker == .leader { currentTaskId = taskId }
+        cancelTaskStatusDeadline()
         setThinking(true)
         armExtendedSilenceWatchdog()
-        return payload.count
+    }
+
+    private func correlate(_ taskId: String) {
+        if let previous = pendingTask, previous.taskId != taskId {
+            pendingTask = nil
+            loseTaskCorrelation(previous, .superseded(by: taskId))
+        }
+        if let carry = uninstalledCarry?.carry {
+            uninstalledCarry = nil
+            if carry.taskId != taskId {
+                loseCarriedCorrelation(carry, .superseded(by: taskId))
+            } else {
+                // The leader re-sent the carried task; this dispatch carries
+                // its correlation now, and a loss would block the task it renews.
+            }
+        }
+        taskCorrelationGeneration &+= 1
+        pendingTask = PendingTask(taskId: taskId, generation: taskCorrelationGeneration)
+        uncorrelatedStatusGeneration = nil
+    }
+
+    private func loseTaskCorrelation(_ task: PendingTask, _ loss: TaskCorrelationLoss) {
+        #if DEBUG
+        dlog("agent.task.correlation.lost task=\(task.taskId) reason=\(loss.reason)")
+        #endif
+        onTaskCorrelationLost?(task.taskId, loss)
     }
 
     /// One NDJSON line onto whatever carries this session's input — the local
@@ -2747,13 +3045,76 @@ final class AgentSession {
         }
     }
 
-    /// The task this turn is answering, named by the capsule that carried it.
+    /// The task the leader's last TASK_ID dispatch named, held until a turn
+    /// correlated with it states an explicit STATUS.
     ///
     /// The screen path could never make this correlation — an answer on a
     /// screen has nothing tying it to a request — so it guessed, and a reply
     /// was measured closing an unrelated blocked task. Here the instruction
     /// says which task it is, and this side is the one that wrote it.
-    @ObservationIgnored private(set) var currentTaskId: String?
+    ///
+    /// It outlives a turn that ends without a verdict: the worker can hand a
+    /// long job to the background, end the turn, and finish the task in a
+    /// turn the CLI starts on its own with no write from this side.
+    private struct PendingTask: Equatable {
+        let taskId: String
+        let generation: UInt64
+    }
+
+    @ObservationIgnored private var pendingTask: PendingTask?
+    @ObservationIgnored private var taskCorrelationGeneration: UInt64 = 0
+    /// The pending correlation a turn not tied to it stated a STATUS during.
+    /// That turn may be answering something else, so it cannot settle the
+    /// task, but a later block must not claim the worker stated nothing.
+    @ObservationIgnored private var uncorrelatedStatusGeneration: UInt64?
+    private struct UninstalledCarry {
+        let carry: CarriedTaskCorrelation
+        let lossReason: String
+    }
+
+    /// A rebuilt pane's carried task, waiting for the replay to end.
+    @ObservationIgnored private var uninstalledCarry: UninstalledCarry?
+    /// The stream is still repeating what the retired pane applied.
+    @ObservationIgnored private var replayingHistory = false
+    @ObservationIgnored private var replayDeadline: DispatchWorkItem?
+    /// Remote stream bytes up to the end of the last applied line.
+    @ObservationIgnored private(set) var appliedRemoteBytes: UInt64 = 0
+
+    /// Who opened the running turn. Only a TASK_ID dispatch and a turn the
+    /// CLI started itself may answer the pending task; a person's turn or a
+    /// leader message without TASK_ID is about something else.
+    private enum TurnOrigin {
+        case dispatch
+        case leaderPlain
+        case person
+        case selfStarted
+    }
+
+    @ObservationIgnored private var turnOrigin: TurnOrigin?
+
+    private var correlatedTask: PendingTask? {
+        switch turnOrigin {
+        case .dispatch, .selfStarted: return pendingTask
+        case .leaderPlain, .person, nil: return nil
+        }
+    }
+
+    @ObservationIgnored private let pendingTaskStatusDeadline: TimeInterval
+    /// App writes, receipts, results, and the CLI's background work running
+    /// out. Not other system events: hooks and token estimates also arrive
+    /// between turns and would keep pushing the deadline back.
+    @ObservationIgnored private var lastTaskActivity = Date.distantPast
+    @ObservationIgnored private var taskStatusDeadline: DispatchWorkItem?
+    @ObservationIgnored private var taskStatusDeadlineGeneration: UInt64 = 0
+    /// Background work keeps an unsettled task waiting past the deadline, but
+    /// only up to this long: a server started in the background never ends.
+    @ObservationIgnored private let pendingTaskStatusCap: TimeInterval
+    /// When the current correlation started waiting after its latest
+    /// verdict-less turn on that task.
+    @ObservationIgnored private var taskStatusWaitStart: (generation: UInt64, at: Date)?
+    /// Size of the CLI's own background task list, as its last
+    /// `background_tasks_changed` stated it. Only Claude reports this.
+    @ObservationIgnored private var backgroundTaskCount = 0
 
     static func taskId(in text: String) -> String? {
         for raw in text.components(separatedBy: "\n") {
@@ -2879,27 +3240,62 @@ final class AgentSession {
     /// `AgentSession`, never re-fed to this one.
     nonisolated func consume(_ data: Data) {
         guard let streams = remoteStreamsBox.current() else { return }
-        streams.queue.async { [weak self] in
+        let flush = remoteApplyFlush(streams)
+        streams.queue.async {
             guard !streams.closed else { return }
-            let parsed = streams.decoder.consume(data).map { output -> AgentParsedLine in
-                switch output {
-                case .line(let line):
-                    return AgentParsedLine(line)
-                case .oversized(let count):
-                    // A raw (non-JSON) line renders as a notice in `handle`.
-                    return AgentParsedLine(
-                        "dropped an unterminated line of \(count) bytes"
-                    )
+            func feed(_ bytes: Data) {
+                let parsed = streams.decoder.consumeTracked(bytes).map { output, end -> AgentParsedLine in
+                    var parsed: AgentParsedLine
+                    switch output {
+                    case .line(let line):
+                        parsed = AgentParsedLine(line)
+                    case .oversized(let count):
+                        // A raw (non-JSON) line renders as a notice in `handle`.
+                        parsed = AgentParsedLine(
+                            "dropped an unterminated line of \(count) bytes"
+                        )
+                    }
+                    parsed.streamEnd = end
+                    return parsed
                 }
+                streams.batcher.enqueue(parsed, flush: flush)
             }
-            streams.batcher.enqueue(parsed) { [weak self] batch in
-                DispatchQueue.main.async { [weak self] in
-                    // The identity guard is the remote twin of the local
-                    // path's `self.process === p`: a batch from a retired
-                    // pipeline (stop, restart) must not land on the
-                    // session that replaced it.
-                    guard let self, self.remoteStreamsBox.current() === streams else { return }
-                    self.apply(batch)
+            guard let remaining = streams.historyBytesRemaining else {
+                feed(data)
+                return
+            }
+            guard UInt64(data.count) >= remaining else {
+                streams.historyBytesRemaining = remaining - UInt64(data.count)
+                feed(data)
+                return
+            }
+            // A line that ends at the boundary was applied by the retired
+            // pane; one that straddles it completes in the new bytes.
+            let cut = data.startIndex + Int(remaining)
+            feed(data[data.startIndex..<cut])
+            streams.historyBytesRemaining = nil
+            streams.batcher.flushPending(flush)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.remoteStreamsBox.current() === streams else { return }
+                self.installCarriedCorrelation()
+            }
+            if cut < data.endIndex { feed(data[cut...]) }
+        }
+    }
+
+    private nonisolated func remoteApplyFlush(
+        _ streams: RemoteStreamResources
+    ) -> @Sendable ([AgentParsedLine]) -> Void {
+        { [weak self] batch in
+            DispatchQueue.main.async { [weak self] in
+                // The identity guard is the remote twin of the local
+                // path's `self.process === p`: a batch from a retired
+                // pipeline (stop, restart) must not land on the
+                // session that replaced it.
+                guard let self, self.remoteStreamsBox.current() === streams else { return }
+                self.apply(batch)
+                if let applied = batch.last?.streamEnd {
+                    self.appliedRemoteBytes = applied
                 }
             }
         }
@@ -2952,7 +3348,14 @@ final class AgentSession {
     private func handle(_ obj: [String: Any],
                         preparedChanges: [String: AgentDiff.Change] = [:],
                         preparedToolIDs: Set<String> = []) {
-        switch obj["type"] as? String {
+        let type = obj["type"] as? String
+        if !turnInFlight, isRunning, type == "assistant" || type == "stream_event" {
+            #if DEBUG
+            dlog("agent.turn.selfStarted event=\(type ?? "?") task=\(pendingTask?.taskId ?? "-")")
+            #endif
+            openTurn(.selfStarted)
+        }
+        switch type {
         case "system":  system(obj)
         case "user":    user(obj)
         case "assistant": assistant(obj, preparedChanges: preparedChanges,
@@ -2964,6 +3367,11 @@ final class AgentSession {
     }
 
     private func system(_ o: [String: Any]) {
+        if o["subtype"] as? String == "background_tasks_changed",
+           let tasks = o["tasks"] as? [Any] {
+            noteBackgroundTasks(count: tasks.count)
+            return
+        }
         if let environment = AgentEnvironmentSummary.parse(o) {
             guard environmentSummary != environment else { return }
             environmentSummary = environment
@@ -2993,6 +3401,7 @@ final class AgentSession {
     private func user(_ o: [String: Any]) {
         let message = o["message"] as? [String: Any] ?? [:]
         if let text = message["content"] as? String {
+            noteTaskActivity()
             // The receipt. This is the only place a sent turn is drawn from,
             // so what appears is what the agent confirmed it received.
             append(.said(id: UUID(), pendingSpeaker, text))
@@ -3144,6 +3553,13 @@ final class AgentSession {
 
     private func result(_ o: [String: Any]) {
         cancelExtendedSilenceWatchdog()
+        if !turnInFlight {
+            #if DEBUG
+            dlog("agent.turn.selfStarted event=result task=\(pendingTask?.taskId ?? "-")")
+            #endif
+            turnOrigin = .selfStarted
+        }
+        let answered = correlatedTask
         let usage = o["usage"] as? [String: Any] ?? [:]
         let completedAt = Date()
         // A turn we stopped on purpose is not a failure.
@@ -3209,22 +3625,43 @@ final class AgentSession {
         append(.turnEnded(id: UUID(), end))
         setThinking(false)
         turnInFlight = false
+        turnOrigin = nil
         turnStartedAt = nil
         stopRequested = false
         // `result` carries the final answer as a clean string — the boundary is
         // stated rather than inferred from a screen going quiet.
         saidThisTurn.removeAll()
-        let answered = currentTaskId
-        currentTaskId = nil
-        onTurnEnd?(final, end, answered)
+        noteTaskActivity()
+        let stated = AgentPipeCompletion.explicitStatus(in: final) != nil
+        if replayingHistory {
+            // A replayed result answered the retired pane, never this one.
+        } else if let answered, pendingTask == answered, stated {
+            pendingTask = nil
+        } else if answered == nil, stated, let pendingTask {
+            uncorrelatedStatusGeneration = pendingTask.generation
+        } else if answered != nil {
+            // The worker just took a turn on this task, so it is still there:
+            // the cap is for a worker that went away, not one whose job runs
+            // in several long background steps.
+            taskStatusWaitStart = nil
+        }
+        if !replayingHistory {
+            onTurnEnd?(final, end, answered?.taskId)
+        }
 
         // The next leader turn only now, so it gets a turn of its own. A
         // remote session has no local process to ask; the sink still being
         // installed is what "still deliverable" means there.
-        if isRunning, process?.isRunning == true || remoteSink != nil, !queued.isEmpty {
-            let next = queued.removeFirst()
-            try? write(next.text, from: .leader, taskId: next.taskId)
+        if !replayingHistory {
+            deliverNextQueuedInstruction()
         }
+        if pendingTask != nil, !turnInFlight { armTaskStatusDeadline() }
+    }
+
+    private func deliverNextQueuedInstruction() {
+        guard isRunning, process?.isRunning == true || remoteSink != nil, !queued.isEmpty else { return }
+        let next = queued.removeFirst()
+        try? write(next.text, from: .leader, taskId: next.taskId)
     }
 
     /// Return only the failed turn detail that the transcript has not already
@@ -3426,6 +3863,84 @@ final class AgentSession {
         setExtendedSilence(false)
     }
 
+    private func noteTaskActivity() {
+        lastTaskActivity = Date()
+    }
+
+    /// A pending task whose worker went quiet without a verdict. Same shape as
+    /// the silence watchdog: one timer that re-arms for whatever is left.
+    private func armTaskStatusDeadline() {
+        cancelTaskStatusDeadline()
+        guard let task = pendingTask else { return }
+        let waitingSince: Date
+        if let start = taskStatusWaitStart, start.generation == task.generation {
+            waitingSince = start.at
+        } else {
+            waitingSince = Date()
+            taskStatusWaitStart = (task.generation, waitingSince)
+        }
+        scheduleTaskStatusDeadline(for: task, waitingSince: waitingSince,
+                                   after: pendingTaskStatusDeadline)
+    }
+
+    /// The deadline counts from when the background work finished, not from
+    /// the turn that started it.
+    private func noteBackgroundTasks(count: Int) {
+        let finished = backgroundTaskCount > 0 && count == 0
+        backgroundTaskCount = count
+        guard finished else { return }
+        noteTaskActivity()
+        if taskStatusDeadline != nil { armTaskStatusDeadline() }
+    }
+
+    private func scheduleTaskStatusDeadline(for task: PendingTask, waitingSince: Date,
+                                            after delay: TimeInterval) {
+        let generation = taskStatusDeadlineGeneration
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.taskStatusDeadlineGeneration == generation,
+                  self.taskStatusDeadline != nil else { return }
+            guard self.pendingTask == task, !self.turnInFlight, self.isRunning else {
+                self.taskStatusDeadline = nil
+                return
+            }
+            if self.backgroundTaskCount > 0 {
+                let capRemaining = self.pendingTaskStatusCap
+                    - Date().timeIntervalSince(waitingSince)
+                guard capRemaining <= Self.extendedSilenceTolerance else {
+                    self.scheduleTaskStatusDeadline(for: task, waitingSince: waitingSince,
+                                                    after: capRemaining)
+                    return
+                }
+                self.taskStatusDeadline = nil
+                self.loseTaskCorrelation(
+                    task, .noStatusWithBackgroundWork(
+                        self.pendingTaskStatusCap,
+                        statedOutsideTask: self.uncorrelatedStatusGeneration == task.generation))
+                return
+            }
+            let remaining = self.pendingTaskStatusDeadline
+                - Date().timeIntervalSince(self.lastTaskActivity)
+            guard remaining <= Self.extendedSilenceTolerance else {
+                self.scheduleTaskStatusDeadline(for: task, waitingSince: waitingSince,
+                                                after: remaining)
+                return
+            }
+            self.taskStatusDeadline = nil
+            self.loseTaskCorrelation(task, .noStatusDeadline(
+                self.pendingTaskStatusDeadline,
+                statedOutsideTask: self.uncorrelatedStatusGeneration == task.generation))
+        }
+        taskStatusDeadline = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func cancelTaskStatusDeadline() {
+        taskStatusDeadline?.cancel()
+        taskStatusDeadlineGeneration &+= 1
+        taskStatusDeadline = nil
+    }
+
     /// Drop the oldest entries once the session exceeds its cap.
     ///
     /// A long session is a memory leak with a scrollbar. The terminal had the
@@ -3566,17 +4081,22 @@ final class AgentSession {
 
     /// A leader turn in flight, without a process to write it to.
     func beginTurnForTesting(taskId: String?) {
-        turnInFlight = true
-        currentTaskId = taskId
+        openTurnForTesting(from: .leader, taskId: taskId)
     }
 
     /// A turn opened by either speaker, without a process.
     func openTurnForTesting(from speaker: Speaker, taskId: String? = nil) {
         pendingSpeaker = speaker
-        turnInFlight = true
-        setThinking(true)
-        if speaker == .leader { currentTaskId = taskId }
+        beginWrittenTurn(from: speaker, taskId: taskId)
     }
+
+    var pendingTaskIdForTesting: String? { pendingTask?.taskId }
+
+    var isReplayingHistoryForTesting: Bool { replayingHistory }
+
+    var replayDeadlineForTesting: DispatchWorkItem? { replayDeadline }
+
+    var isTurnInFlightForTesting: Bool { turnInFlight }
 
     /// A leader instruction arriving while a turn is already running.
     func queueForTesting(_ text: String) {

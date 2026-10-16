@@ -1928,6 +1928,15 @@ actor RelayLeaderSessionGate {
             healActive = true
             return true
         }
+        // A held `team.events.wait` is an active command; release it now so
+        // the heal waits for real work, not for a long-poll window.
+        // The interrupt is process-wide: the gate has no link to a team, so
+        // every other relay's held waiter is released too. Each pays one
+        // `changed: false` answer and one re-poll, which the CLI spaces at
+        // least 1 s after the previous long-poll start.
+        if activeCommands > 0 {
+            TeamEventWakeSignal.shared.interruptAll()
+        }
         let id = UUID()
         let acquired = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -2256,6 +2265,12 @@ final class PeerRelaySession {
     /// before any byte of the restarted stream is delivered. Terminal
     /// (relay) panes never set it — repainted bytes are harmless there.
     var onPtyDeliveryRestart: (@MainActor () -> Void)?
+
+    /// Host-absolute seq of the first byte this relay delivered, or nil when
+    /// the host had no replay ring (its seqs cannot be compared). A consumer
+    /// that is dropped at the first restart sees one contiguous stream from
+    /// here, so its byte count maps onto the host's seq space.
+    let originHostSeq: UInt64?
 
     func setResizeAuthorityEligible(_ eligible: Bool) {
         resizeAuthorityEligible = eligible
@@ -3077,6 +3092,7 @@ final class PeerRelaySession {
         self.onSharedDetach = onSharedDetach
         self.attachInitialSeq = attachInitialSeq
         self.hostSupportsReplayRing = hostSupportsReplayRing
+        self.originHostSeq = hostSupportsReplayRing ? attachInitialSeq : nil
         self.hostResyncsOnOverflow = hostResyncsOnOverflow
         self.ptyDelivery = ptyDelivery
         switch ptyDelivery {

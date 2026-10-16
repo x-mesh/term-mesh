@@ -405,6 +405,44 @@ struct SocketStatusControl: View {
     }
 }
 
+struct KeepAwakeStatusControl: View {
+    @ObservedObject private var controller = PeerKeepAwakeController.shared
+
+    /// Green means the feature will keep this Mac awake once something
+    /// connects; the filled cup and the count say it is doing so right now.
+    private func tint(for status: PeerKeepAwakeStatus) -> Color {
+        switch status {
+        case .holding, .noConnections: return .green.opacity(0.7)
+        case .releasingSoon, .failed: return .orange.opacity(0.9)
+        case .onBattery, .off: return .secondary.opacity(0.7)
+        }
+    }
+
+    var body: some View {
+        let status = controller.status
+        Button(action: {
+            #if DEBUG
+            dlog("titlebar.keepAwakeMenu status=\(status)")
+            #endif
+            PeerKeepAwakeMenu.shared.popUpAtMouse()
+        }) {
+            HStack(spacing: 2) {
+                Image(systemName: PeerKeepAwakeMenu.symbolName(for: status))
+                    .font(.system(size: 11))
+                if case .holding(let connections) = status {
+                    Text(verbatim: "\(connections)")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                }
+            }
+            .foregroundColor(tint(for: status))
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("titlebarControl.keepAwake")
+        .accessibilityLabel(Text(verbatim: status.summary))
+        .help(Text(verbatim: [status.summary, status.detail].compactMap { $0 }.joined(separator: "\n")))
+    }
+}
+
 struct TitlebarControlsView: View {
     @ObservedObject var notificationStore: TerminalNotificationStore
     @ObservedObject var viewModel: TitlebarControlsViewModel
