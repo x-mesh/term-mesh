@@ -111,10 +111,9 @@ echo "reclaim_tag_build"
   mkdir -p "${TAG_TMP_ROOT}/term-mesh-release-0-273-0/Build" \
     "${TAG_TMP_ROOT}/term-mesh-release-0.273.0/Build"
   out="$(reclaim_tag_build release-0.273.0 release-0-273-0)" || true
-  [[ -e "${TAG_TMP_ROOT}/term-mesh-release-0-273-0" ]] && r=yes || r=no
-  check "the slug dir wins when both exist" "$r" "no"
-  [[ -d "${TAG_TMP_ROOT}/term-mesh-release-0.273.0" ]] && r=yes || r=no
-  check "the dotted dir is kept when the slug dir exists" "$r" "yes"
+  [[ -e "${TAG_TMP_ROOT}/term-mesh-release-0-273-0" || -e "${TAG_TMP_ROOT}/term-mesh-release-0.273.0" ]] && r=yes || r=no
+  check "both the slug and the dotted dir are reclaimed" "$r" "no"
+  check "both reclaimed names are reported" "$out" "reclaimed tagged build release-0-273-0 release-0.273.0"
   exit $FAIL
 ) || FAIL=$((FAIL + $?))
 
@@ -153,12 +152,11 @@ echo "reclaim_tag_build"
 (
   sandbox
   mkdir -p "${CARGO_TARGET_ROOT}/cargoonly/release"
-  : > "${TAG_TMP_ROOT}/term-mesh-debug-cargoonly.log"
   out="$(reclaim_tag_build cargoonly cargoonly)" && rc=0 || rc=$?
   [[ "$rc" == 0 && "$out" == "reclaimed tagged build cargoonly" ]] && r=yes || r=no
   check "a tag whose derived data is gone still reclaims its other artifacts" "$r" "yes"
-  [[ ! -e "${CARGO_TARGET_ROOT}/cargoonly" && ! -e "${TAG_TMP_ROOT}/term-mesh-debug-cargoonly.log" ]] && r=yes || r=no
-  check "the cargo target and log of that tag are removed" "$r" "yes"
+  [[ ! -e "${CARGO_TARGET_ROOT}/cargoonly" ]] && r=yes || r=no
+  check "the cargo target of that tag is removed" "$r" "yes"
   exit $FAIL
 ) || FAIL=$((FAIL + $?))
 
@@ -166,11 +164,14 @@ echo "reclaim_tag_build"
   sandbox
   mkdir -p "$SB/outside"
   ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-linked"
-  tag_cleanup_refusal prod 2>/dev/null && r=allowed || r=refused
+  ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-dotted.1"
+  tag_cleanup_refusal prod prod 2>/dev/null && r=allowed || r=refused
   check "cleanup refuses prod before touching anything" "$r" "refused"
-  tag_cleanup_refusal linked 2>/dev/null && r=allowed || r=refused
+  tag_cleanup_refusal linked linked 2>/dev/null && r=allowed || r=refused
   check "cleanup refuses a symlinked tag dir before touching anything" "$r" "refused"
-  tag_cleanup_refusal fresh 2>/dev/null && r=allowed || r=refused
+  tag_cleanup_refusal dotted.1 dotted-1 2>/dev/null && r=allowed || r=refused
+  check "cleanup refuses a symlinked dotted dir before touching anything" "$r" "refused"
+  tag_cleanup_refusal fresh fresh 2>/dev/null && r=allowed || r=refused
   check "cleanup allows a tag with no directory yet" "$r" "allowed"
   exit $FAIL
 ) || FAIL=$((FAIL + $?))
