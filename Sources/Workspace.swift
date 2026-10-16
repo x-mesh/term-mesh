@@ -3713,7 +3713,8 @@ final class Workspace: Identifiable {
         focus: Bool = true,
         from explicitSourcePanelId: UUID? = nil,
         agentName: String? = nil,
-        color: String = ""
+        color: String = "",
+        rebuildCarry: PeerAgentCorrelationCarryStore.Entry? = nil
     ) -> AgentPanel? {
         guard SessionHostPanes.isAgentSurfaceType(session.originSurface.surfaceType) else {
             return nil
@@ -3746,7 +3747,7 @@ final class Workspace: Identifiable {
             color: color,
             focus: focus
         ) else { return nil }
-        bindRemoteAgentPane(session: session, to: panel)
+        bindRemoteAgentPane(session: session, to: panel, rebuildCarry: rebuildCarry)
         #if DEBUG
         dlog(
             "peer.agentPane.open workspace=\(id.uuidString.prefix(8)) "
@@ -3766,7 +3767,11 @@ final class Workspace: Identifiable {
     /// are NDJSON event bytes fed straight into the panel's AgentSession,
     /// and outgoing turns leave as ordered `Input.keys` frames through the
     /// authenticated peer session.
-    func bindRemoteAgentPane(session: PeerPaneSession, to panel: AgentPanel) {
+    func bindRemoteAgentPane(
+        session: PeerPaneSession,
+        to panel: AgentPanel,
+        rebuildCarry: PeerAgentCorrelationCarryStore.Entry? = nil
+    ) {
         let relay = session.relaySession
         let agentSession = panel.session
         let panelId = panel.id
@@ -3838,6 +3843,10 @@ final class Workspace: Identifiable {
             }
         }
 
+        if let rebuildCarry {
+            expectRebuildReplay(rebuildCarry, session: session, agentSession: agentSession)
+        }
+
         // Callback delivery has no helper to accept, so start is quick —
         // but a failure must still be final and visible, matching
         // `bindRemotePane`'s start contract.
@@ -3850,6 +3859,84 @@ final class Workspace: Identifiable {
                 )
                 self?.dropRemoteAgentPane(panelId: panelId, reason: "start failed")
             }
+        }
+    }
+
+    /// The rebuilt session starts past the bytes the retired pane applied.
+    /// Runs before `start()`, so no byte has been delivered yet.
+    private func expectRebuildReplay(
+        _ entry: PeerAgentCorrelationCarryStore.Entry,
+        session: PeerPaneSession,
+        agentSession: AgentSession
+    ) {
+        guard !session.usesLivePresentation else {
+            entry.lose(entry.rebuildLossReason)
+            return
+        }
+        guard let initialSeq = session.relaySession.originHostSeq,
+              let history = RemoteAgentReplayBoundary.historyBytes(
+                  appliedHostSeq: entry.boundarySeq,
+                  retiredInitialSeq: entry.retiredInitialSeq,
+                  newInitialSeq: initialSeq
+              )
+        else {
+            entry.lose(AgentSession.paneRebuildLossReason(cause: entry.cause, acrossGap: true))
+            return
+        }
+        var carried = entry.carry
+        carried.replayBoundarySeq = entry.boundarySeq
+        let armed = agentSession.expectReplayHistory(
+            bytes: history,
+            carried: carried,
+            lossReason: entry.rebuildLossReason,
+            deadline: entry.deadline.timeIntervalSinceNow
+        )
+        if !armed { entry.lose(entry.rebuildLossReason) }
+    }
+
+    /// Stop the pane's session for a rebuild. A peer-owned team member whose
+    /// applied stream position is known hands its pending task to the rebuilt
+    /// pane; every other pane, and any pane whose stream restarted (the host
+    /// no longer holds what follows that position), loses it with the
+    /// rebuild reason.
+    private func stopRemoteAgentForRebuild(
+        session: PeerPaneSession,
+        panelId: UUID,
+        cause: String,
+        streamRestarted: Bool
+    ) {
+        guard let agentSession = (panels[panelId] as? AgentPanel)?.session else { return }
+        let surfaceID = session.originSurface.surfaceID
+        guard !streamRestarted,
+              !session.usesLivePresentation,
+              !Self.isLocalSessionHost(session.originSpec),
+              let origin = session.relaySession.originHostSeq,
+              let (teamName, agent) = TeamOrchestrator.shared.peerOwnedAgentMember(
+                  panelID: panelId, surfaceID: surfaceID
+              )
+        else {
+            agentSession.stopForPaneRebuild(after: cause)
+            return
+        }
+        let report = agentSession.onTaskCorrelationLost
+        guard let carried = agentSession.stopForPaneRebuild(after: cause, carry: true) else {
+            return
+        }
+        let key = PeerAgentPaneRecoveryCoordinator.Request(
+            teamName: teamName,
+            agentInstanceID: agent.agentInstanceId,
+            closedPanelID: panelId,
+            surfaceID: surfaceID
+        ).key
+        PeerAgentCorrelationCarryStore.shared.store(
+            key: key,
+            surfaceID: surfaceID,
+            boundarySeq: carried.replayBoundarySeq ?? (origin &+ agentSession.appliedRemoteBytes),
+            retiredInitialSeq: origin,
+            carry: carried,
+            cause: cause
+        ) { reason in
+            report?(carried.taskId, .sessionEnded(reason))
         }
     }
 
@@ -3874,7 +3961,7 @@ final class Workspace: Identifiable {
         // restarted byte, and clearing `onPtyData` inside it keeps that
         // byte from reaching the retired session.
         relay.onPtyDeliveryRestart = { [weak self] in
-            self?.dropRemoteAgentPane(panelId: panelId, reason: "stream rewound")
+            self?.dropRemoteAgentPane(panelId: panelId, reason: "stream rewound", streamRestarted: true)
         }
         let boundSurfaceID = session.originSurface.surfaceID
         relay.onSurfaceExited = { [weak self] exitCode, signal, reason in
@@ -3923,7 +4010,11 @@ final class Workspace: Identifiable {
     /// reopening it with a fresh AgentSession is the recovery path.
     /// Removing the map entry FIRST is what keeps the panels-didSet
     /// reconciler from recording this close as the user's.
-    private func dropRemoteAgentPane(panelId: UUID, reason: String) {
+    private func dropRemoteAgentPane(
+        panelId: UUID,
+        reason: String,
+        streamRestarted: Bool = false
+    ) {
         guard let session = remoteAgentPaneSessions.removeValue(forKey: panelId) else { return }
         #if DEBUG
         dlog("peer.agentPane.drop panel=\(panelId.uuidString.prefix(8)) reason=\(reason)")
@@ -3932,7 +4023,9 @@ final class Workspace: Identifiable {
         // End any in-flight turn as session_stopped so the task board is
         // not left holding an in_progress task for a pane that is going
         // away. Safe when already stopped.
-        (panels[panelId] as? AgentPanel)?.session.stopForPaneRebuild(after: reason)
+        stopRemoteAgentForRebuild(
+            session: session, panelId: panelId, cause: reason, streamRestarted: streamRestarted
+        )
         session.teardown()
         let surfaceID = session.originSurface.surfaceID
         let isLocalDaemonSession = Self.isLocalSessionHost(session.originSpec)
@@ -3995,7 +4088,9 @@ final class Workspace: Identifiable {
             return false
         }
         session.relaySession.onPtyData = nil
-        (panels[panelId] as? AgentPanel)?.session.stopForPaneRebuild(after: "repair requested")
+        stopRemoteAgentForRebuild(
+            session: session, panelId: panelId, cause: "repair requested", streamRestarted: false
+        )
         session.teardown()
         let surfaceID = session.originSurface.surfaceID
         _ = closePanel(panelId, force: true)

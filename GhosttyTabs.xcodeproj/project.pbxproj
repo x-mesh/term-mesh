@@ -160,6 +160,7 @@
 		ARD00002 /* AutoReplyDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARD00001 /* AutoReplyDetector.swift */; };
 		ARE00002 /* AutoReplyEmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARE00001 /* AutoReplyEmit.swift */; };
 		TEWS0002 /* TeamEventWakeSignal.swift in Sources */ = {isa = PBXBuildFile; fileRef = TEWS0001 /* TeamEventWakeSignal.swift */; };
+		RARB0002 /* RemoteAgentReplayBoundary.swift in Sources */ = {isa = PBXBuildFile; fileRef = RARB0001 /* RemoteAgentReplayBoundary.swift */; };
 		ARP00002 /* AutoReplyPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARP00001 /* AutoReplyPoller.swift */; };
 		PPB00002 /* PeerProjectBootstrap.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPB00001 /* PeerProjectBootstrap.swift */; };
 		WPNM00000000000000003 /* WorkspaceProjectNames.swift in Sources */ = {isa = PBXBuildFile; fileRef = WPNM00000000000000006 /* WorkspaceProjectNames.swift */; };
@@ -334,6 +335,8 @@
 			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
+				FC000000A1B2C3D4E5F6071A /* PeerAgentCorrelationCarryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F6071A /* PeerAgentCorrelationCarryTests.swift */; };
+				FC000000A1B2C3D4E5F60719 /* RemoteAgentReplayBoundaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60719 /* RemoteAgentReplayBoundaryTests.swift */; };
 				CVB00951 /* PeerKeepAwakePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00951 /* PeerKeepAwakePolicyTests.swift */; };
 		FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */; };
 		FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */; };
@@ -553,6 +556,7 @@
 		ARD00001 /* AutoReplyDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyDetector.swift; sourceTree = "<group>"; };
 		ARE00001 /* AutoReplyEmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyEmit.swift; sourceTree = "<group>"; };
 		TEWS0001 /* TeamEventWakeSignal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamEventWakeSignal.swift; sourceTree = "<group>"; };
+		RARB0001 /* RemoteAgentReplayBoundary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteAgentReplayBoundary.swift; sourceTree = "<group>"; };
 		ARP00001 /* AutoReplyPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoReplyPoller.swift; sourceTree = "<group>"; };
 		PPB00001 /* PeerProjectBootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerProjectBootstrap.swift; sourceTree = "<group>"; };
 			WPNM00000000000000006 /* WorkspaceProjectNames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceProjectNames.swift; sourceTree = "<group>"; };
@@ -729,6 +733,8 @@
 			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
+			FC000001A1B2C3D4E5F6071A /* PeerAgentCorrelationCarryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerAgentCorrelationCarryTests.swift; sourceTree = "<group>"; };
+			FC000001A1B2C3D4E5F60719 /* RemoteAgentReplayBoundaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteAgentReplayBoundaryTests.swift; sourceTree = "<group>"; };
 			CVS00951 /* PeerKeepAwakePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerKeepAwakePolicyTests.swift; sourceTree = "<group>"; };
 		FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerServerHostLayoutTests.swift; sourceTree = "<group>"; };
 		FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnelBudgetTests.swift; sourceTree = "<group>"; };
@@ -994,6 +1000,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				ARD00001 /* AutoReplyDetector.swift */,
 				ARE00001 /* AutoReplyEmit.swift */,
 				TEWS0001 /* TeamEventWakeSignal.swift */,
+				RARB0001 /* RemoteAgentReplayBoundary.swift */,
 				ARP00001 /* AutoReplyPoller.swift */,
 				PPB00001 /* PeerProjectBootstrap.swift */,
 				WPNM00000000000000006 /* WorkspaceProjectNames.swift */,
@@ -1190,6 +1197,8 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
+				FC000001A1B2C3D4E5F6071A /* PeerAgentCorrelationCarryTests.swift */,
+				FC000001A1B2C3D4E5F60719 /* RemoteAgentReplayBoundaryTests.swift */,
 				CVS00951 /* PeerKeepAwakePolicyTests.swift */,
 				FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */,
 				FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */,
@@ -1503,6 +1512,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				ARD00002 /* AutoReplyDetector.swift in Sources */,
 				ARE00002 /* AutoReplyEmit.swift in Sources */,
 				TEWS0002 /* TeamEventWakeSignal.swift in Sources */,
+				RARB0002 /* RemoteAgentReplayBoundary.swift in Sources */,
 				ARP00002 /* AutoReplyPoller.swift in Sources */,
 				PPB00002 /* PeerProjectBootstrap.swift in Sources */,
 				WPNM00000000000000003 /* WorkspaceProjectNames.swift in Sources */,
@@ -1669,6 +1679,8 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
+				FC000000A1B2C3D4E5F6071A /* PeerAgentCorrelationCarryTests.swift in Sources */,
+				FC000000A1B2C3D4E5F60719 /* RemoteAgentReplayBoundaryTests.swift in Sources */,
 				CVB00951 /* PeerKeepAwakePolicyTests.swift in Sources */,
 				FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */,
 				FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */,

@@ -2262,6 +2262,12 @@ final class PeerRelaySession {
     /// (relay) panes never set it — repainted bytes are harmless there.
     var onPtyDeliveryRestart: (@MainActor () -> Void)?
 
+    /// Host-absolute seq of the first byte this relay delivered, or nil when
+    /// the host had no replay ring (its seqs cannot be compared). A consumer
+    /// that is dropped at the first restart sees one contiguous stream from
+    /// here, so its byte count maps onto the host's seq space.
+    let originHostSeq: UInt64?
+
     func setResizeAuthorityEligible(_ eligible: Bool) {
         resizeAuthorityEligible = eligible
         Task { await resizeCoalescer?.setAuthorityEligible(eligible) }
@@ -3082,6 +3088,7 @@ final class PeerRelaySession {
         self.onSharedDetach = onSharedDetach
         self.attachInitialSeq = attachInitialSeq
         self.hostSupportsReplayRing = hostSupportsReplayRing
+        self.originHostSeq = hostSupportsReplayRing ? attachInitialSeq : nil
         self.hostResyncsOnOverflow = hostResyncsOnOverflow
         self.ptyDelivery = ptyDelivery
         switch ptyDelivery {
