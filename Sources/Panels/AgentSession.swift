@@ -2410,6 +2410,7 @@ final class AgentSession {
         // line boundary, and batches from any earlier pipeline must keep
         // failing `apply`'s identity guard.
         remoteStreamsBox.set(RemoteStreamResources())
+        appliedRemoteBytes = 0
         setRunning(true)
         setCanInterrupt(interruptible)
     }
@@ -2452,7 +2453,7 @@ final class AgentSession {
                 )
                 pendingTask = nil
             } else if let waiting = uninstalledCarry {
-                carried = waiting
+                carried = waiting.carry
                 uninstalledCarry = nil
             }
         }
@@ -2475,58 +2476,99 @@ final class AgentSession {
         deadline: TimeInterval
     ) -> Bool {
         guard let streams = remoteStreamsBox.current() else { return false }
-        abandonCarriedCorrelation(reason: uninstalledCarryLossReason)
-        uninstalledCarry = carried
-        uninstalledCarryLossReason = lossReason
+        // Not `abandonCarriedCorrelation`: a window about to reopen must not
+        // deliver a queued instruction into it.
+        let closedOpenWindow = endReplayWindow()
+        if let displaced = uninstalledCarry {
+            uninstalledCarry = nil
+            loseCarriedCorrelation(displaced.carry, .sessionEnded(displaced.lossReason))
+        }
+        uninstalledCarry = UninstalledCarry(carry: carried, lossReason: lossReason)
         guard bytes > 0 else {
             installCarriedCorrelation()
+            if closedOpenWindow { deliverQueuedInstructionAfterReplay() }
             return true
         }
         replayingHistory = true
         streams.queue.async { streams.historyBytesRemaining = bytes }
         let item = DispatchWorkItem { [weak self] in
-            self?.abandonCarriedCorrelation(reason: lossReason)
+            self?.replayDeadlinePassed(lossReason: lossReason)
         }
         replayDeadline = item
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline), execute: item)
         return true
     }
 
+    /// Lines the stream queue already counted as history may still be in the
+    /// batcher or on their way to main. Closing the window from the queue,
+    /// as the boundary does, applies them as history first.
+    private func replayDeadlinePassed(lossReason: String) {
+        guard let streams = remoteStreamsBox.current() else {
+            abandonCarriedCorrelation(reason: lossReason)
+            return
+        }
+        let deadline = replayDeadline
+        let flush = remoteApplyFlush(streams)
+        streams.queue.async {
+            guard !streams.closed else { return }
+            streams.historyBytesRemaining = nil
+            streams.batcher.flushPending(flush)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.remoteStreamsBox.current() === streams,
+                      let deadline, self.replayDeadline === deadline else { return }
+                self.abandonCarriedCorrelation(reason: lossReason)
+            }
+        }
+    }
+
     /// Close the replay window and give up on a carried correlation that has
     /// not reached this session.
     func abandonCarriedCorrelation(reason: String) {
-        endReplayWindow()
-        guard let carry = uninstalledCarry else { return }
-        uninstalledCarry = nil
-        loseCarriedCorrelation(carry, .sessionEnded(reason))
+        let closed = endReplayWindow()
+        if let waiting = uninstalledCarry {
+            uninstalledCarry = nil
+            loseCarriedCorrelation(waiting.carry, .sessionEnded(reason))
+        }
+        if closed { deliverQueuedInstructionAfterReplay() }
     }
 
-    private func endReplayWindow() {
+    @discardableResult
+    private func endReplayWindow() -> Bool {
         replayDeadline?.cancel()
         replayDeadline = nil
-        guard replayingHistory else { return }
+        guard replayingHistory else { return false }
         replayingHistory = false
         if let streams = remoteStreamsBox.current() {
             streams.queue.async { streams.historyBytesRemaining = nil }
         }
+        return true
     }
 
     private func installCarriedCorrelation() {
-        endReplayWindow()
-        guard let carry = uninstalledCarry else { return }
-        uninstalledCarry = nil
-        taskCorrelationGeneration &+= 1
-        pendingTask = PendingTask(taskId: carry.taskId, generation: taskCorrelationGeneration)
-        noteTaskActivity()
-        if carry.turnWasInFlight {
-            if turnInFlight {
-                turnOrigin = .dispatch
-            } else {
-                openTurn(.dispatch)
+        let closed = endReplayWindow()
+        if let carry = uninstalledCarry?.carry {
+            uninstalledCarry = nil
+            taskCorrelationGeneration &+= 1
+            pendingTask = PendingTask(taskId: carry.taskId, generation: taskCorrelationGeneration)
+            noteTaskActivity()
+            if carry.turnWasInFlight {
+                if turnInFlight {
+                    turnOrigin = .dispatch
+                } else {
+                    openTurn(.dispatch)
+                }
+            } else if !turnInFlight {
+                armTaskStatusDeadline()
             }
-        } else if !turnInFlight {
-            armTaskStatusDeadline()
         }
+        if closed { deliverQueuedInstructionAfterReplay() }
+    }
+
+    /// A replayed result does not start the next queued instruction, so the
+    /// window's close does, unless a live turn will end and start it.
+    private func deliverQueuedInstructionAfterReplay() {
+        guard !turnInFlight else { return }
+        deliverNextQueuedInstruction()
     }
 
     private func loseCarriedCorrelation(_ carry: CarriedTaskCorrelation, _ loss: TaskCorrelationLoss) {
@@ -2783,9 +2825,9 @@ final class AgentSession {
                 stoppedLossReason ?? "the agent exited before an explicit STATUS"))
         }
         endReplayWindow()
-        if let carry = uninstalledCarry {
+        if let waiting = uninstalledCarry {
             uninstalledCarry = nil
-            loseCarriedCorrelation(carry, .sessionEnded(
+            loseCarriedCorrelation(waiting.carry, .sessionEnded(
                 stoppedLossReason ?? "the agent exited before an explicit STATUS"))
         }
         if !queued.isEmpty {
@@ -2928,10 +2970,13 @@ final class AgentSession {
             pendingTask = nil
             loseTaskCorrelation(previous, .superseded(by: taskId))
         }
-        if let carry = uninstalledCarry {
+        if let carry = uninstalledCarry?.carry {
             uninstalledCarry = nil
             if carry.taskId != taskId {
                 loseCarriedCorrelation(carry, .superseded(by: taskId))
+            } else {
+                // The leader re-sent the carried task; this dispatch carries
+                // its correlation now, and a loss would block the task it renews.
             }
         }
         taskCorrelationGeneration &+= 1
@@ -3022,9 +3067,13 @@ final class AgentSession {
     /// That turn may be answering something else, so it cannot settle the
     /// task, but a later block must not claim the worker stated nothing.
     @ObservationIgnored private var uncorrelatedStatusGeneration: UInt64?
+    private struct UninstalledCarry {
+        let carry: CarriedTaskCorrelation
+        let lossReason: String
+    }
+
     /// A rebuilt pane's carried task, waiting for the replay to end.
-    @ObservationIgnored private var uninstalledCarry: CarriedTaskCorrelation?
-    @ObservationIgnored private var uninstalledCarryLossReason = ""
+    @ObservationIgnored private var uninstalledCarry: UninstalledCarry?
     /// The stream is still repeating what the retired pane applied.
     @ObservationIgnored private var replayingHistory = false
     @ObservationIgnored private var replayDeadline: DispatchWorkItem?
@@ -3191,21 +3240,9 @@ final class AgentSession {
     /// `AgentSession`, never re-fed to this one.
     nonisolated func consume(_ data: Data) {
         guard let streams = remoteStreamsBox.current() else { return }
-        streams.queue.async { [weak self] in
+        let flush = remoteApplyFlush(streams)
+        streams.queue.async {
             guard !streams.closed else { return }
-            let flush: @Sendable ([AgentParsedLine]) -> Void = { [weak self] batch in
-                DispatchQueue.main.async { [weak self] in
-                    // The identity guard is the remote twin of the local
-                    // path's `self.process === p`: a batch from a retired
-                    // pipeline (stop, restart) must not land on the
-                    // session that replaced it.
-                    guard let self, self.remoteStreamsBox.current() === streams else { return }
-                    self.apply(batch)
-                    if let applied = batch.last?.streamEnd {
-                        self.appliedRemoteBytes = applied
-                    }
-                }
-            }
             func feed(_ bytes: Data) {
                 let parsed = streams.decoder.consumeTracked(bytes).map { output, end -> AgentParsedLine in
                     var parsed: AgentParsedLine
@@ -3243,6 +3280,24 @@ final class AgentSession {
                 self.installCarriedCorrelation()
             }
             if cut < data.endIndex { feed(data[cut...]) }
+        }
+    }
+
+    private nonisolated func remoteApplyFlush(
+        _ streams: RemoteStreamResources
+    ) -> @Sendable ([AgentParsedLine]) -> Void {
+        { [weak self] batch in
+            DispatchQueue.main.async { [weak self] in
+                // The identity guard is the remote twin of the local
+                // path's `self.process === p`: a batch from a retired
+                // pipeline (stop, restart) must not land on the
+                // session that replaced it.
+                guard let self, self.remoteStreamsBox.current() === streams else { return }
+                self.apply(batch)
+                if let applied = batch.last?.streamEnd {
+                    self.appliedRemoteBytes = applied
+                }
+            }
         }
     }
 
@@ -3597,11 +3652,16 @@ final class AgentSession {
         // The next leader turn only now, so it gets a turn of its own. A
         // remote session has no local process to ask; the sink still being
         // installed is what "still deliverable" means there.
-        if isRunning, process?.isRunning == true || remoteSink != nil, !queued.isEmpty {
-            let next = queued.removeFirst()
-            try? write(next.text, from: .leader, taskId: next.taskId)
+        if !replayingHistory {
+            deliverNextQueuedInstruction()
         }
         if pendingTask != nil, !turnInFlight { armTaskStatusDeadline() }
+    }
+
+    private func deliverNextQueuedInstruction() {
+        guard isRunning, process?.isRunning == true || remoteSink != nil, !queued.isEmpty else { return }
+        let next = queued.removeFirst()
+        try? write(next.text, from: .leader, taskId: next.taskId)
     }
 
     /// Return only the failed turn detail that the transcript has not already
