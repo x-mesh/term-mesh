@@ -26,11 +26,12 @@ use crate::auto_reply::AutoReplyEvent;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const RESULT_TRUNC_CHARS: usize = 1500;
 
-/// Maps an agent STATUS verdict to the task status it sets. Exact match only —
-/// a template echo such as `DONE|BLOCKED|NEEDS_REVIEW`, a lowercase or padded
-/// value must not close a task (mirrors `AutoReplyDetector.validatedStatus`).
+/// Maps an agent STATUS verdict to the task status it sets. The first word must
+/// be an exact verdict; anything after it is the agent's note. A template echo
+/// such as `DONE|BLOCKED|NEEDS_REVIEW`, a lowercase or leading-space value must
+/// not close a task (mirrors `AutoReplyDetector.statedVerdict`).
 pub fn validated_status(status: &str) -> Option<&'static str> {
-    match status {
+    match status.split(char::is_whitespace).next().unwrap_or("") {
         "DONE" => Some("completed"),
         "BLOCKED" => Some("blocked"),
         "NEEDS_REVIEW" => Some("review_ready"),
@@ -292,12 +293,17 @@ pub(crate) mod tests {
         assert_eq!(validated_status("DONE"), Some("completed"));
         assert_eq!(validated_status("BLOCKED"), Some("blocked"));
         assert_eq!(validated_status("NEEDS_REVIEW"), Some("review_ready"));
+        assert_eq!(validated_status("DONE "), Some("completed"));
+        assert_eq!(validated_status("DONE CARRY-1a2b"), Some("completed"));
+        assert_eq!(validated_status("BLOCKED\twaiting on the db"), Some("blocked"));
         for rejected in [
             "DONE|BLOCKED|NEEDS_REVIEW",
             "IN_PROGRESS",
             "done",
+            "done all good",
             " DONE",
-            "DONE ",
+            "DONE.",
+            "DONEISH note",
             "",
         ] {
             assert_eq!(validated_status(rejected), None, "{rejected:?}");

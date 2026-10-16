@@ -96,6 +96,21 @@ final class AutoReplyDetectorTests: XCTestCase {
         }
     }
 
+    func test_a_stated_verdict_reads_the_first_word_only() {
+        XCTAssertEqual(AutoReplyDetector.statedVerdict("DONE CARRY-1a2b"), "DONE")
+        XCTAssertEqual(AutoReplyDetector.statedVerdict("BLOCKED\twaiting on the db"), "BLOCKED")
+        XCTAssertEqual(AutoReplyDetector.statedVerdict("NEEDS_REVIEW"), "NEEDS_REVIEW")
+        for value in ["done all good", " DONE", "DONE.", "DONE|BLOCKED|NEEDS_REVIEW", "DONEISH note", ""] {
+            XCTAssertNil(
+                AutoReplyDetector.statedVerdict(value),
+                "stated verdict unexpectedly accepted \(String(reflecting: value))"
+            )
+        }
+        XCTAssertNil(AutoReplyDetector.validatedStatus("DONE CARRY-1a2b"),
+                     "the screen path stays exact")
+        XCTAssertEqual(AgentPipeCompletion.explicitStatus(in: "STATUS: DONE CARRY-1a2b"), "DONE")
+    }
+
     func test_terminal_row_padding_after_status_is_accepted() {
         XCTAssertEqual(detect(statusValue: "DONE   \t")?.status, "DONE")
         XCTAssertEqual(detect(statusValue: "NEEDS_REVIEW   ")?.status, "NEEDS_REVIEW")

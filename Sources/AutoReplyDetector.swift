@@ -64,6 +64,14 @@ final class AutoReplyDetector {
         self.config = config
     }
 
+    /// A verdict in the agent's own final reply: the first word must be an
+    /// exact protocol verdict, and anything after it is the agent's note
+    /// (`STATUS: DONE all tests pass`). Not for screen scraping, where an echoed
+    /// instruction can carry a line shaped like that.
+    static func statedVerdict(_ value: String) -> String? {
+        validatedStatus(String(value.prefix { !$0.isWhitespace }))
+    }
+
     /// Accept only protocol verdicts, exactly as written. Deliberately does no
     /// trimming or case folding: placeholders, comma-separated choices, partial
     /// matches, and values with extra whitespace are not agent verdicts.

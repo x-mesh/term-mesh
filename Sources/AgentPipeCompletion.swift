@@ -367,7 +367,7 @@ final class AgentPipeCompletion {
     /// `headerEvent` cannot answer this: it turns a missing STATUS into
     /// NEEDS_REVIEW, which is indistinguishable from an agent that wrote it.
     nonisolated static func explicitStatus(in text: String) -> String? {
-        headerFields(in: text)["STATUS"].flatMap(AutoReplyDetector.validatedStatus)
+        headerFields(in: text)["STATUS"].flatMap(AutoReplyDetector.statedVerdict)
     }
 
     nonisolated static func headerEvent(from text: String) -> AutoReplyEvent {
