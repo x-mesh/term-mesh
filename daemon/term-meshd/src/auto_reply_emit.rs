@@ -39,17 +39,13 @@ pub fn validated_status(status: &str) -> Option<&'static str> {
     // A spaced choice list (`DONE | BLOCKED`, `DONE or BLOCKED`) is the
     // template. Only the words right after the verdict are read, so a note
     // that mentions a path or another verdict still counts.
-    let is_verdict = |word: &str| {
-        matches!(
-            word.trim_matches(|c| "|/,".contains(c)),
-            "DONE" | "BLOCKED" | "NEEDS_REVIEW"
-        )
-    };
+    let bare = |word: &str| word.trim_matches(|c| "|/,()[]".contains(c)).to_string();
+    let is_verdict = |word: &str| matches!(bare(word).as_str(), "DONE" | "BLOCKED" | "NEEDS_REVIEW");
     let next = words.next();
     let after = words.next();
     let template = match next {
         Some(word) if word.starts_with('|') || word.starts_with('/') || is_verdict(word) => true,
-        Some(word) if word.eq_ignore_ascii_case("or") => after.is_some_and(is_verdict),
+        Some(word) if bare(word).eq_ignore_ascii_case("or") => after.is_some_and(is_verdict),
         _ => false,
     };
     if template {
@@ -334,6 +330,8 @@ pub(crate) mod tests {
             "DONE / BLOCKED",
             "DONE or BLOCKED",
             "DONE BLOCKED NEEDS_REVIEW",
+            "DONE [BLOCKED]",
+            "DONE (or BLOCKED)",
             "",
         ] {
             assert_eq!(validated_status(rejected), None, "{rejected:?}");

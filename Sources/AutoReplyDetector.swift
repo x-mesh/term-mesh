@@ -77,11 +77,10 @@ final class AutoReplyDetector {
         // read, so a note that mentions a path or another verdict still counts.
         let rest = words.dropFirst().prefix(2).map(String.init)
         if let next = rest.first {
-            let isVerdict = { (word: String) in
-                validatedStatus(word.trimmingCharacters(in: CharacterSet(charactersIn: "|/,"))) != nil
-            }
+            let bare = { (word: String) in word.trimmingCharacters(in: CharacterSet(charactersIn: "|/,()[]")) }
+            let isVerdict = { (word: String) in validatedStatus(bare(word)) != nil }
             if next.hasPrefix("|") || next.hasPrefix("/") || isVerdict(next) { return nil }
-            if next.lowercased() == "or", rest.count > 1, isVerdict(rest[1]) { return nil }
+            if bare(next).lowercased() == "or", rest.count > 1, isVerdict(rest[1]) { return nil }
         }
         return verdict
     }

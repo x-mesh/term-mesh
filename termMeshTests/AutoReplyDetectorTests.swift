@@ -104,7 +104,7 @@ final class AutoReplyDetectorTests: XCTestCase {
         XCTAssertEqual(AutoReplyDetector.statedVerdict("DONE the BLOCKED test passes now"), "DONE")
         for value in ["done all good", " DONE", "DONE.", "DONE|BLOCKED|NEEDS_REVIEW", "DONEISH note",
                       "DONE | BLOCKED | NEEDS_REVIEW", "DONE / BLOCKED", "DONE or BLOCKED",
-                      "DONE BLOCKED NEEDS_REVIEW", ""] {
+                      "DONE BLOCKED NEEDS_REVIEW", "DONE [BLOCKED]", "DONE (or BLOCKED)", ""] {
             XCTAssertNil(
                 AutoReplyDetector.statedVerdict(value),
                 "stated verdict unexpectedly accepted \(String(reflecting: value))"
