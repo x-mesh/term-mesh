@@ -6698,6 +6698,30 @@ fn rpc_batch(sock: &PathBuf, payloads: &[String]) -> Result<Vec<Value>, String> 
     Ok(results)
 }
 
+/// Batch counterpart for a remote leader: one policy-routed call per payload,
+/// in order. A failed call becomes an `{"error": ...}` entry, as in
+/// `rpc_batch`, so the output keeps one entry per payload.
+fn rpc_batch_per_call(
+    payloads: &[String],
+    mut call: impl FnMut(&str, Value) -> Result<Value, String>,
+) -> Result<Vec<Value>, String> {
+    let mut requests = Vec::with_capacity(payloads.len());
+    for (i, payload) in payloads.iter().enumerate() {
+        let request: Value = serde_json::from_str(payload)
+            .map_err(|e| format!("invalid JSON in payload {i}: {e}"))?;
+        let method = request["method"]
+            .as_str()
+            .ok_or_else(|| format!("payload {i} has no method"))?
+            .to_string();
+        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+        requests.push((method, params));
+    }
+    Ok(requests
+        .into_iter()
+        .map(|(method, params)| call(&method, params).unwrap_or_else(|e| json!({ "error": e })))
+        .collect())
+}
+
 /// Parse human-readable semicolon-separated commands into JSON-RPC payload strings
 /// for use with `rpc_batch`. Supported verbs: status, task list, send, broadcast.
 fn parse_batch_commands(commands: &str, team: &str) -> Result<Vec<String>, String> {
@@ -9685,7 +9709,12 @@ fn main() {
                     process::exit(1);
                 }
             };
-            match rpc_batch(&sock, &payloads) {
+            let results = if remote_leader_route().is_some() {
+                rpc_batch_per_call(&payloads, |method, params| rpc_call(&sock, method, params))
+            } else {
+                rpc_batch(&sock, &payloads)
+            };
+            match results {
                 Ok(results) => {
                     for r in &results {
                         println!("{}", serde_json::to_string(r).unwrap_or_default());
@@ -22875,13 +22904,20 @@ fn run_wait(
                     "method": "team.task.get", "params": { "team_name": team, "task_id": tid }
                 }))
                 .unwrap_or_default();
-                let (inbox_r, task_r) = match rpc_batch(sock, &[p_inbox, p_task_get]) {
-                    Ok(mut results) if results.len() >= 2 => {
+                // rpc_batch only reaches the local socket; under a remote leader
+                // route both methods must go through the proxy instead.
+                let batched = if remote_leader_route().is_none() {
+                    rpc_batch(sock, &[p_inbox, p_task_get]).ok()
+                } else {
+                    None
+                };
+                let (inbox_r, task_r) = match batched {
+                    Some(mut results) if results.len() >= 2 => {
                         let tr = results.remove(1);
                         let ir = results.remove(0);
                         (Ok(ir), Ok(tr))
                     }
-                    Ok(_) | Err(_) => (
+                    _ => (
                         rpc_call(sock, "team.inbox", json!({ "team_name": team })),
                         rpc_call(
                             sock,
@@ -25541,6 +25577,85 @@ mod auto_watch_tests {
             remote_leader_rpc_policy(false, "team.create"),
             RemoteLeaderRpcPolicy::Local
         );
+    }
+
+    #[test]
+    fn remote_leader_batch_and_wait_methods_are_proxied() {
+        for method in [
+            "team.status",
+            "team.task.list",
+            "team.send",
+            "team.broadcast",
+            "team.inbox",
+            "team.task.get",
+        ] {
+            assert_eq!(
+                remote_leader_rpc_policy(true, method),
+                RemoteLeaderRpcPolicy::Proxy,
+                "{method}"
+            );
+            assert_eq!(
+                remote_leader_rpc_policy(false, method),
+                RemoteLeaderRpcPolicy::Local,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_leader_batch_per_call_preserves_order_and_errors() {
+        let payloads = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "team.status", "params": {"team_name": "t"}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "team.create", "params": {"name": "x"}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "team.task.list"}).to_string(),
+        ];
+        let mut calls: Vec<(String, Value)> = Vec::new();
+        let results = rpc_batch_per_call(&payloads, |method, params| {
+            calls.push((method.to_string(), params.clone()));
+            if method == "team.create" {
+                Err("rejected".to_string())
+            } else {
+                Ok(json!({ "ok": true, "result": { "method": method } }))
+            }
+        })
+        .expect("valid payloads");
+
+        assert_eq!(
+            calls,
+            vec![
+                ("team.status".to_string(), json!({"team_name": "t"})),
+                ("team.create".to_string(), json!({"name": "x"})),
+                ("team.task.list".to_string(), json!({})),
+            ]
+        );
+        assert_eq!(results.len(), payloads.len());
+        assert_eq!(results[0]["result"]["method"], "team.status");
+        assert_eq!(results[1], json!({ "error": "rejected" }));
+        assert_eq!(results[2]["result"]["method"], "team.task.list");
+
+        let mut invalid_calls = 0;
+        let invalid = rpc_batch_per_call(
+            &[
+                json!({"method": "team.status"}).to_string(),
+                "{not json".to_string(),
+            ],
+            |_, _| {
+                invalid_calls += 1;
+                Ok(json!({}))
+            },
+        );
+        assert!(invalid.is_err());
+        assert_eq!(invalid_calls, 0, "no call before every payload validates");
+
+        let mut methodless_calls = 0;
+        let methodless = rpc_batch_per_call(&[json!({"params": {}}).to_string()], |_, _| {
+            methodless_calls += 1;
+            Ok(json!({}))
+        });
+        assert!(methodless.is_err());
+        assert_eq!(methodless_calls, 0);
     }
 
     #[test]
