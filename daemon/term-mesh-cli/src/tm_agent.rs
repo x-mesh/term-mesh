@@ -6387,11 +6387,21 @@ fn remote_leader_rpc_call_duration(
     params: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
+    remote_leader_call_typed(sock, method, params, timeout).map_err(|error| error.to_string())
+}
+
+fn remote_leader_call_typed(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, RemoteLeaderCallError> {
+    use RemoteLeaderCallError::Hop;
     let request_id_hex = remote_leader_request_id_hex();
-    let mut route =
-        remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
+    let mut route = remote_leader_route()
+        .ok_or_else(|| Hop("invalid remote leader route".to_string()))?;
     let proxy_params =
-        remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex)?;
+        remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex).map_err(Hop)?;
     let deadline = Instant::now() + timeout;
     let first =
         local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
@@ -6401,22 +6411,27 @@ fn remote_leader_rpc_call_duration(
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 append_remote_leader_route_failure(&route, method, &request_id_hex);
-                return Err(first_error);
+                return Err(Hop(first_error));
             }
             match local_rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining)
             {
                 Ok(value) => value,
                 Err(error) => {
                     append_remote_leader_route_failure(&route, method, &request_id_hex);
-                    return Err(error);
+                    return Err(Hop(error));
                 }
             }
         }
     };
     outer = retry_remote_leader_after_viewer_error(
         sock, method, &params, &request_id_hex, deadline, &mut route, outer,
-    )?;
-    let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
+    )
+    .map_err(Hop)?;
+    let result = decode_daemon_response(outer)
+        .map_err(Hop)
+        .and_then(|proxied| {
+            remote_leader_proxy_outcome(proxied).map_err(RemoteLeaderCallError::Owner)
+        });
     if result.is_err() {
         append_remote_leader_route_failure(&route, method, &request_id_hex);
     }
@@ -6543,7 +6558,38 @@ fn current_leader_session_id() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteLeaderProxyError {
+    code: Option<String>,
+    text: String,
+}
+
+impl std::fmt::Display for RemoteLeaderProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteLeaderCallError {
+    Owner(RemoteLeaderProxyError),
+    Hop(String),
+}
+
+impl std::fmt::Display for RemoteLeaderCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteLeaderCallError::Owner(error) => error.fmt(f),
+            RemoteLeaderCallError::Hop(message) => f.write_str(message),
+        }
+    }
+}
+
 fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
+    remote_leader_proxy_outcome(proxied).map_err(|error| error.text)
+}
+
+fn remote_leader_proxy_outcome(proxied: Value) -> Result<Value, RemoteLeaderProxyError> {
     if !proxied["ok"].as_bool().unwrap_or(false) {
         let result = &proxied["result"];
         let error_code = result["error_code"]
@@ -6565,7 +6611,10 @@ fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
                 "; reconnect or restart the remote leader pane from its owning project window",
             );
         }
-        return Err(message);
+        return Err(RemoteLeaderProxyError {
+            code: error_code.map(String::from),
+            text: message,
+        });
     }
     Ok(json!({
         "ok": true,
@@ -22837,6 +22886,10 @@ const OWNER_WAKE_METHOD: &str = "team.events.wait";
 /// The owner caps a hold at 7 s so the reply beats every hop's timeout.
 const OWNER_WAKE_HOLD: Duration = Duration::from_millis(7000);
 const OWNER_WAKE_MIN_GAP: Duration = Duration::from_secs(1);
+/// Each failed attempt can block for the whole transport window (about 31 s)
+/// and appends a `route_failed` record to the turn log, so an owner that stays
+/// unreachable is left to the interval poll instead of being retried forever.
+const OWNER_WAKE_MAX_CONSECUTIVE_RETRIES: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnerWakeCursor {
@@ -22850,18 +22903,29 @@ enum OwnerWakeStep {
     Rearm(OwnerWakeCursor),
     Unsupported,
     Retry,
+    Backoff(Duration),
 }
 
 /// An owner app older than `team.events.wait` rejects it as `invalid_method`
-/// in its own validator; an older host daemon or a PeerServer-routed owner
-/// answers `method_not_allowed`.
-fn owner_wake_unsupported(error: &str) -> bool {
-    error.contains("method_not_allowed") || error.contains("[invalid_method]")
+/// in its own validator; a PeerServer-routed owner answers
+/// `method_not_allowed`. An older host daemon refuses it before the owner, and
+/// that hop carries only a message (every refusal there becomes -32601), so it
+/// is matched by its exact text: it cannot be typed without a daemon change.
+fn owner_wake_unsupported(error: &RemoteLeaderCallError) -> bool {
+    match error {
+        RemoteLeaderCallError::Owner(error) => {
+            matches!(error.code.as_deref(), Some("method_not_allowed" | "invalid_method"))
+        }
+        RemoteLeaderCallError::Hop(message) => {
+            *message == format!("method_not_allowed: {OWNER_WAKE_METHOD}")
+        }
+    }
 }
 
 fn owner_wake_step(
     prev: Option<&OwnerWakeCursor>,
-    response: Result<Value, String>,
+    response: Result<Value, RemoteLeaderCallError>,
+    interval: Duration,
 ) -> OwnerWakeStep {
     let response = match response {
         Ok(response) => response,
@@ -22869,6 +22933,15 @@ fn owner_wake_step(
         Err(_) => return OwnerWakeStep::Retry,
     };
     let result = &response["result"];
+    if result["busy"].as_bool() == Some(true) {
+        let hint = result["retry_after_ms"]
+            .as_u64()
+            .map(Duration::from_millis)
+            .unwrap_or(OWNER_WAKE_MIN_GAP);
+        return OwnerWakeStep::Backoff(
+            hint.clamp(OWNER_WAKE_MIN_GAP, interval.max(OWNER_WAKE_MIN_GAP)),
+        );
+    }
     let (Some(epoch), Some(revision)) = (result["epoch"].as_str(), result["revision"].as_u64())
     else {
         return OwnerWakeStep::Retry;
@@ -22901,6 +22974,57 @@ fn owner_wake_pause(last_start: Option<Instant>, now: Instant) -> Duration {
 
 /// Feeds `run_wait`'s wake channel from the owner long-poll. Returning drops
 /// the sender, which the wait loop reads as "fall back to polling".
+///
+/// The call is injected because a test holding `REMOTE_LEADER_ENV_LOCK` would
+/// deadlock a loop thread that reached `remote_leader_route()` itself.
+fn owner_wake_loop(
+    team: &str,
+    interval: Duration,
+    tx: std::sync::mpsc::Sender<Value>,
+    mut call: impl FnMut(Value) -> Result<Value, RemoteLeaderCallError>,
+    mut sleep: impl FnMut(Duration),
+) {
+    let mut cursor: Option<OwnerWakeCursor> = None;
+    let mut last_start: Option<Instant> = None;
+    let mut retries: u32 = 0;
+    loop {
+        sleep(owner_wake_pause(last_start, Instant::now()));
+        last_start = Some(Instant::now());
+        let response = call(owner_wake_params(team, cursor.as_ref()));
+        match owner_wake_step(cursor.as_ref(), response, interval) {
+            OwnerWakeStep::Wake(next) => {
+                retries = 0;
+                let event = json!({
+                    "kind": "owner_wake",
+                    "epoch": next.epoch,
+                    "revision": next.revision,
+                });
+                cursor = Some(next);
+                if tx.send(event).is_err() {
+                    return;
+                }
+            }
+            OwnerWakeStep::Rearm(next) => {
+                retries = 0;
+                cursor = Some(next);
+            }
+            OwnerWakeStep::Backoff(pause) => sleep(pause),
+            OwnerWakeStep::Unsupported => return,
+            OwnerWakeStep::Retry => {
+                retries += 1;
+                if retries >= OWNER_WAKE_MAX_CONSECUTIVE_RETRIES {
+                    eprintln!(
+                        "wait: owner long-poll failed {retries} times in a row; polling every {}s",
+                        interval.as_secs()
+                    );
+                    return;
+                }
+                sleep(interval);
+            }
+        }
+    }
+}
+
 fn spawn_remote_owner_wake(
     sock: PathBuf,
     team: String,
@@ -22908,36 +23032,38 @@ fn spawn_remote_owner_wake(
 ) -> std::sync::mpsc::Receiver<Value> {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
-        let mut cursor: Option<OwnerWakeCursor> = None;
-        let mut last_start: Option<Instant> = None;
-        loop {
-            thread::sleep(owner_wake_pause(last_start, Instant::now()));
-            last_start = Some(Instant::now());
-            let response = rpc_call_timeout_duration(
-                &sock,
-                OWNER_WAKE_METHOD,
-                owner_wake_params(&team, cursor.as_ref()),
-                remote_leader_timeout(OWNER_WAKE_METHOD, OWNER_WAKE_HOLD),
-            );
-            match owner_wake_step(cursor.as_ref(), response) {
-                OwnerWakeStep::Wake(next) => {
-                    let event = json!({
-                        "kind": "owner_wake",
-                        "epoch": next.epoch,
-                        "revision": next.revision,
-                    });
-                    cursor = Some(next);
-                    if tx.send(event).is_err() {
-                        return;
-                    }
-                }
-                OwnerWakeStep::Rearm(next) => cursor = Some(next),
-                OwnerWakeStep::Unsupported => return,
-                OwnerWakeStep::Retry => thread::sleep(Duration::from_secs(u64::from(interval))),
-            }
-        }
+        owner_wake_loop(
+            &team,
+            Duration::from_secs(u64::from(interval)),
+            tx,
+            |params| {
+                remote_leader_call_typed(
+                    &sock,
+                    OWNER_WAKE_METHOD,
+                    params,
+                    remote_leader_timeout(OWNER_WAKE_METHOD, OWNER_WAKE_HOLD),
+                )
+            },
+            thread::sleep,
+        )
     });
     rx
+}
+
+#[derive(Debug, PartialEq)]
+enum PushWait {
+    Event(Value),
+    Elapsed,
+    Closed,
+}
+
+fn recv_push_or_interval(rx: &std::sync::mpsc::Receiver<Value>, wait: Duration) -> PushWait {
+    use std::sync::mpsc::RecvTimeoutError;
+    match rx.recv_timeout(wait) {
+        Ok(event) => PushWait::Event(event),
+        Err(RecvTimeoutError::Timeout) => PushWait::Elapsed,
+        Err(RecvTimeoutError::Disconnected) => PushWait::Closed,
+    }
 }
 
 #[cfg(test)]
@@ -22948,12 +23074,58 @@ mod owner_wake_tests {
         OwnerWakeCursor { epoch: epoch.to_string(), revision }
     }
 
-    fn answer(epoch: &str, revision: u64, changed: bool) -> Result<Value, String> {
+    const INTERVAL: Duration = Duration::from_secs(30);
+
+    fn answer(epoch: &str, revision: u64, changed: bool) -> Result<Value, RemoteLeaderCallError> {
         Ok(json!({
             "ok": true,
             "result": {"epoch": epoch, "revision": revision, "changed": changed},
             "remote_leader_proxy": true,
         }))
+    }
+
+    fn busy(retry_after_ms: Option<u64>) -> Result<Value, RemoteLeaderCallError> {
+        let mut result = json!({"epoch": "e1", "revision": 3, "changed": false, "busy": true});
+        if let Some(ms) = retry_after_ms {
+            result["retry_after_ms"] = json!(ms);
+        }
+        Ok(json!({"ok": true, "result": result, "remote_leader_proxy": true}))
+    }
+
+    fn owner_error(code: &str, text: &str) -> Result<Value, RemoteLeaderCallError> {
+        Err(RemoteLeaderCallError::Owner(RemoteLeaderProxyError {
+            code: Some(code.to_string()),
+            text: text.to_string(),
+        }))
+    }
+
+    fn hop_error(message: &str) -> Result<Value, RemoteLeaderCallError> {
+        Err(RemoteLeaderCallError::Hop(message.to_string()))
+    }
+
+    /// Runs the loop to completion on the test thread. Once `script` is used
+    /// up the owner answers "unsupported", so a loop that should have stopped
+    /// earlier shows up as extra calls instead of hanging the suite.
+    fn run_loop(
+        script: Vec<Result<Value, RemoteLeaderCallError>>,
+    ) -> (Vec<Value>, Vec<Value>, Vec<Duration>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut script = script.into_iter();
+        let mut calls = Vec::new();
+        let mut sleeps = Vec::new();
+        owner_wake_loop(
+            "alpha",
+            INTERVAL,
+            tx,
+            |params| {
+                calls.push(params);
+                script
+                    .next()
+                    .unwrap_or_else(|| owner_error("method_not_allowed", "script exhausted"))
+            },
+            |pause| sleeps.push(pause),
+        );
+        (rx.try_iter().collect(), calls, sleeps)
     }
 
     #[test]
@@ -22967,34 +23139,125 @@ mod owner_wake_tests {
             ("higher revision", Some(&armed), answer("e1", 4, true), Wake(cursor("e1", 4))),
             ("cursor moved without flag", Some(&armed), answer("e1", 5, false), Wake(cursor("e1", 5))),
             ("epoch change", Some(&armed), answer("e2", 0, true), Wake(cursor("e2", 0))),
-            (
-                "rust host rejects",
-                Some(&armed),
-                Err("method_not_allowed: team.events.wait".to_string()),
-                Unsupported,
-            ),
+            ("rust host rejects", Some(&armed), hop_error("method_not_allowed: team.events.wait"), Unsupported),
             (
                 "owner rejects on the PeerServer route",
                 Some(&armed),
-                Err("remote leader proxy [method_not_allowed]: team.events.wait is served only on the reverse leader route".to_string()),
+                owner_error(
+                    "method_not_allowed",
+                    "remote leader proxy [method_not_allowed]: team.events.wait is served only on the reverse leader route",
+                ),
                 Unsupported,
             ),
             (
                 "old owner app",
                 None,
-                Err("remote leader proxy [invalid_method]: remote leader command rejected".to_string()),
+                owner_error("invalid_method", "remote leader proxy [invalid_method]: remote leader command rejected"),
                 Unsupported,
             ),
             (
-                "transport error",
+                "owner text mentions the code under another code",
                 Some(&armed),
-                Err("authorized peer viewer is not connected".to_string()),
+                owner_error(
+                    "host_error",
+                    "remote leader proxy [host_error]: upstream said method_not_allowed [invalid_method]",
+                ),
                 Retry,
             ),
+            (
+                "hop text only contains the daemon refusal",
+                Some(&armed),
+                hop_error("relay failed: method_not_allowed: team.events.wait"),
+                Retry,
+            ),
+            ("transport error", Some(&armed), hop_error("authorized peer viewer is not connected"), Retry),
             ("malformed result", Some(&armed), Ok(json!({"ok": true, "result": {}})), Retry),
+            ("busy with a hint", Some(&armed), busy(Some(2500)), Backoff(Duration::from_millis(2500))),
+            ("busy without a hint", Some(&armed), busy(None), Backoff(Duration::from_secs(1))),
+            ("busy before arming", None, busy(Some(2500)), Backoff(Duration::from_millis(2500))),
+            ("busy hint below the floor", Some(&armed), busy(Some(10)), Backoff(Duration::from_secs(1))),
+            ("busy hint above the interval", Some(&armed), busy(Some(600_000)), Backoff(INTERVAL)),
         ] {
-            assert_eq!(owner_wake_step(prev, response), expected, "{name}");
+            assert_eq!(owner_wake_step(prev, response, INTERVAL), expected, "{name}");
         }
+        assert_eq!(
+            owner_wake_step(Some(&armed), busy(Some(5000)), Duration::ZERO),
+            Backoff(Duration::from_secs(1)),
+            "an interval below the floor still backs off by the floor"
+        );
+    }
+
+    #[test]
+    fn owner_wake_loop_sends_wake_on_a_higher_revision() {
+        let (events, calls, _) = run_loop(vec![answer("e1", 3, false), answer("e1", 4, true)]);
+        assert_eq!(events, vec![json!({"kind": "owner_wake", "epoch": "e1", "revision": 4})]);
+        assert_eq!(calls[1]["since"], json!({"epoch": "e1", "revision": 3}));
+        assert_eq!(calls[2]["since"], json!({"epoch": "e1", "revision": 4}));
+    }
+
+    #[test]
+    fn owner_wake_loop_drops_the_sender_when_unsupported() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut calls = 0;
+        owner_wake_loop(
+            "alpha",
+            INTERVAL,
+            tx,
+            |_| {
+                calls += 1;
+                hop_error("method_not_allowed: team.events.wait")
+            },
+            |_| {},
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(recv_push_or_interval(&rx, Duration::from_secs(5)), PushWait::Closed);
+    }
+
+    #[test]
+    fn recv_push_or_interval_reports_closed_after_the_sender_drops() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert_eq!(recv_push_or_interval(&rx, Duration::from_millis(20)), PushWait::Elapsed);
+        tx.send(json!({"kind": "owner_wake"})).unwrap();
+        assert_eq!(
+            recv_push_or_interval(&rx, Duration::from_secs(5)),
+            PushWait::Event(json!({"kind": "owner_wake"}))
+        );
+        drop(tx);
+        assert_eq!(recv_push_or_interval(&rx, Duration::from_secs(5)), PushWait::Closed);
+    }
+
+    #[test]
+    fn owner_wake_loop_gives_up_after_consecutive_retries() {
+        let failures = (0..10).map(|_| hop_error("authorized peer viewer is not connected")).collect();
+        let (events, calls, sleeps) = run_loop(failures);
+        assert!(events.is_empty());
+        assert_eq!(calls.len(), OWNER_WAKE_MAX_CONSECUTIVE_RETRIES as usize);
+        assert_eq!(
+            sleeps.iter().filter(|pause| **pause == INTERVAL).count(),
+            OWNER_WAKE_MAX_CONSECUTIVE_RETRIES as usize - 1
+        );
+    }
+
+    #[test]
+    fn owner_wake_loop_resets_the_retry_budget_on_rearm() {
+        let failure = || hop_error("authorized peer viewer is not connected");
+        let (_, calls, _) = run_loop(vec![
+            failure(),
+            failure(),
+            answer("e1", 3, false),
+            failure(),
+            failure(),
+        ]);
+        assert_eq!(calls.len(), 6, "the loop must still be polling after the fifth answer");
+    }
+
+    #[test]
+    fn owner_wake_loop_backs_off_on_busy_without_moving_the_cursor() {
+        let (events, calls, sleeps) =
+            run_loop(vec![answer("e1", 3, false), busy(Some(2500)), answer("e1", 3, false)]);
+        assert!(events.is_empty());
+        assert!(sleeps.contains(&Duration::from_millis(2500)));
+        assert_eq!(calls[2]["since"], json!({"epoch": "e1", "revision": 3}));
     }
 
     #[test]
@@ -23260,27 +23523,14 @@ fn run_wait(
         std::collections::HashMap::new();
     while elapsed < timeout {
         if current_interval > 0 {
-            // B1: push channel replaces sleep. Decay toward interval deadline in
-            // 200ms chunks so events get sub-200ms responsiveness while a quiet
-            // stream keeps the configured cadence (no 5Hz RPC hammering).
+            // B1: a push event ends the sleep early; a quiet stream keeps the
+            // configured cadence.
             if let Some(ref rx) = event_rx {
-                use std::sync::mpsc::RecvTimeoutError;
-                let deadline = std::time::Instant::now() + Duration::from_secs(current_interval);
-                loop {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        break; // interval elapsed: do the fallback poll
-                    }
-                    let cap = remaining.min(Duration::from_millis(200));
-                    match rx.recv_timeout(cap) {
-                        Ok(_event) => break,                        // real push: poll immediately
-                        Err(RecvTimeoutError::Timeout) => continue, // no event yet, keep waiting
-                        Err(RecvTimeoutError::Disconnected) => {
-                            eprintln!("wait: subscribe stream closed; falling back to polling");
-                            event_rx = None;
-                            break;
-                        }
-                    }
+                if recv_push_or_interval(rx, Duration::from_secs(current_interval))
+                    == PushWait::Closed
+                {
+                    eprintln!("wait: subscribe stream closed; falling back to polling");
+                    event_rx = None;
                 }
             } else {
                 thread::sleep(Duration::from_secs(current_interval));
