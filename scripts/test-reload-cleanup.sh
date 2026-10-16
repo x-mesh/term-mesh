@@ -150,6 +150,31 @@ echo "reclaim_tag_build"
   exit $FAIL
 ) || FAIL=$((FAIL + $?))
 
+(
+  sandbox
+  mkdir -p "${CARGO_TARGET_ROOT}/cargoonly/release"
+  : > "${TAG_TMP_ROOT}/term-mesh-debug-cargoonly.log"
+  out="$(reclaim_tag_build cargoonly cargoonly)" && rc=0 || rc=$?
+  [[ "$rc" == 0 && "$out" == "reclaimed tagged build cargoonly" ]] && r=yes || r=no
+  check "a tag whose derived data is gone still reclaims its other artifacts" "$r" "yes"
+  [[ ! -e "${CARGO_TARGET_ROOT}/cargoonly" && ! -e "${TAG_TMP_ROOT}/term-mesh-debug-cargoonly.log" ]] && r=yes || r=no
+  check "the cargo target and log of that tag are removed" "$r" "yes"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
+(
+  sandbox
+  mkdir -p "$SB/outside"
+  ln -s "$SB/outside" "${TAG_TMP_ROOT}/term-mesh-linked"
+  tag_cleanup_refusal prod 2>/dev/null && r=allowed || r=refused
+  check "cleanup refuses prod before touching anything" "$r" "refused"
+  tag_cleanup_refusal linked 2>/dev/null && r=allowed || r=refused
+  check "cleanup refuses a symlinked tag dir before touching anything" "$r" "refused"
+  tag_cleanup_refusal fresh 2>/dev/null && r=allowed || r=refused
+  check "cleanup allows a tag with no directory yet" "$r" "allowed"
+  exit $FAIL
+) || FAIL=$((FAIL + $?))
+
 echo "list_stale_tags"
 (
   sandbox

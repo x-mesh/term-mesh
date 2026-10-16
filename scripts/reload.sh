@@ -152,20 +152,43 @@ remove_tag_artifacts() {
   fi
 }
 
+# Every artifact `remove_tag_artifacts` owns, not just the derived data: a tag
+# whose Xcode build is gone can still hold its cargo target, socket and log.
+tag_artifacts_exist() {
+  local tag="$1"
+  [[ -e "${TAG_TMP_ROOT}/term-mesh-${tag}" \
+     || -e "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.sock" \
+     || -e "${TAG_TMP_ROOT}/term-mesh-debug-${tag}.log" \
+     || -e "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${tag}.sock" ]] && return 0
+  [[ -n "${CARGO_TARGET_ROOT:-}" && "$tag" =~ ^[a-z0-9][a-z0-9-]*$ \
+     && -e "${CARGO_TARGET_ROOT}/${tag}" ]]
+}
+
+# Checked before `--cleanup` quits the app or touches the session, so a refused
+# cleanup changes nothing. `prod` is the Makefile's PROD_DERIVED_DATA, never a
+# reload.sh tag.
+tag_cleanup_refusal() {
+  local slug="$1"
+  if [[ "$slug" == "prod" ]]; then
+    echo "error: refusing to reclaim ${TAG_TMP_ROOT}/term-mesh-prod — it is the Makefile prod build, not a tag" >&2
+    return 1
+  fi
+  if ! safe_managed_tag_path "${TAG_TMP_ROOT}/term-mesh-${slug}"; then
+    echo "error: refusing to reclaim ${TAG_TMP_ROOT}/term-mesh-${slug} — not a managed tag directory" >&2
+    return 1
+  fi
+}
+
 # `--cleanup` must report what it actually removed. The reminder prints raw
 # directory names, and release.py's dotted ones (term-mesh-release-0.273.0)
 # sanitize to a slug that names no directory, so the raw name is the fallback.
-# `prod` is the Makefile's PROD_DERIVED_DATA, never a reload.sh tag.
 reclaim_tag_build() {
   local raw="$1"
   local slug="$2"
   local name=""
 
-  if [[ "$slug" == "prod" ]]; then
-    echo "error: refusing to reclaim ${TAG_TMP_ROOT}/term-mesh-prod — it is the Makefile prod build, not a tag" >&2
-    return 1
-  fi
-  if [[ -d "${TAG_TMP_ROOT}/term-mesh-${slug}" ]]; then
+  tag_cleanup_refusal "$slug" || return 1
+  if tag_artifacts_exist "$slug"; then
     name="$slug"
   elif [[ "$raw" != "$slug" && "$raw" =~ ^[a-z0-9][a-z0-9._-]*$ \
      && -d "${TAG_TMP_ROOT}/term-mesh-${raw}" ]]; then
@@ -519,14 +542,15 @@ if [[ -n "$TAG" ]]; then
 fi
 
 if [[ "$CLEANUP_ONLY" -eq 1 ]]; then
+  tag_cleanup_refusal "$TAG_SLUG" || exit 1
   APP_PROCESS_PATTERN="${APP_NAME}.app/Contents/MacOS/${BASE_APP_NAME}"
   /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
   if ! wait_for_app_exit "$APP_PROCESS_PATTERN"; then
     pkill -f "$APP_PROCESS_PATTERN" || true
   fi
   stop_daemon_for_socket "$HOME/Library/Application Support/term-mesh/term-meshd-dev-${TAG_SLUG}.sock"
-  rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG}.session"
   reclaim_tag_build "$TAG" "$TAG_SLUG" || exit $?
+  rm -f "${TAG_SESSION_ROOT}/${TAG_SLUG}.session"
   exit 0
 fi
 
