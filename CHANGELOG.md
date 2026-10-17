@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.275.0] - 2026-10-17
+
+### Fixed
+
+- A remote terminal pane no longer loses its screen when you disconnect and reconnect the relay. After a reconnect the pane could come back empty, or with its top lines cut off and the bottom of a full-screen program, such as the input box of a coding agent, pushed out of view. The program on the remote host was still running and still had its context; only what the pane showed was gone. When a reconnect ended the last viewer of a pane, the host gave the pane back its own size, and nothing told it this viewer's size again. The host kept drawing for its own size and the pane showed a different size, so a host taller than the pane pushed the pane's bottom lines out of view. After a reconnect the pane now sends its size to the host again, so the host draws at the pane's size and the whole screen is visible.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.274.0] - 2026-10-16
 
 ### Added
