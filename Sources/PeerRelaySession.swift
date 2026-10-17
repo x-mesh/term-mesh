@@ -594,6 +594,7 @@ actor RelayResizeCoalescer {
     private enum ResizeReason {
         case helper(pastInitialResize: Bool)
         case focusReassert
+        case sessionAdopted
     }
 
     private struct PendingResize {
@@ -685,9 +686,28 @@ actor RelayResizeCoalescer {
 
     /// R3: re-target this actor's normal (non-heal) resize forwarding at a
     /// session that replaced a retired one via a resume-heal reconnect.
+    ///
+    /// Also re-sends the last helper-observed size, unchanged or not. When the
+    /// retired connection was the host pane's last viewer, the host gave the
+    /// PTY back to its own pane on detach (`clearRemoteViewerPixelSize`), and
+    /// nothing else tells it this viewer's grid again: the attach carries the
+    /// host-echoed size, and the helper reports only changes. Without this
+    /// resend the host keeps drawing at its own size, and a taller host grid
+    /// puts the remote TUI's input box below this pane's last row.
+    ///
+    /// A queued resize already carries this geometry to the new session and
+    /// keeps its own authority rule (a helper's initial reconcile must stay
+    /// passive), so it is left alone. With no observed size there is nothing
+    /// truthful to send; the attach-time seed in `lastSize` is the host's
+    /// echo, not this pane.
     func adopt(session: PeerSession) {
         guard !isCancelled else { return }
         self.session = session
+        guard pending == nil, let size = lastHelperObservedSize else { return }
+        pending = PendingResize(
+            cols: size.cols, rows: size.rows, reason: .sessionAdopted
+        )
+        scheduleFlushIfNeeded()
     }
 
     /// The most recently known remote size, so `performResumeHeal` can
@@ -742,7 +762,7 @@ actor RelayResizeCoalescer {
         switch resize.reason {
         case .helper(let pastInitialResize):
             return pastInitialResize
-        case .focusReassert:
+        case .focusReassert, .sessionAdopted:
             return true
         }
     }
@@ -4673,6 +4693,13 @@ final class PeerRelaySession {
         // the gap and the withheld bytes — `reset()` below then discards
         // the buffer, which is correct only because the replay covers it.
         // Without a capture this is the plain current position, unchanged.
+        //
+        // The sum is 0 when this pane stopped exactly at host seq 0, and the
+        // wire reads 0 as "no resume". A macOS host replays the same bytes
+        // for both (seq 0 is its hub's origin). A Rust host hands a fresh
+        // attach only its newest 64 KiB, so only a surface that produced
+        // more than that while this pane saw none of it loses older bytes;
+        // telling the two apart needs a wire field, not a client rewrite.
         let resumeFromSeq = hostSupportsReplayRing
             ? (attachInitialSeq &+ (resumeTransitionGate.activeGapCapture()?.resumeWireSeq
                                         ?? resumeTransitionGate.currentWireSeq()))
