@@ -338,6 +338,8 @@ stage_remote_gui_fixture() {
   /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" "$archive"
   scp -q "$archive" "$REMOTE_FIXTURE_SSH_TARGET:$REMOTE_FIXTURE_ROOT/gui.zip"
   rm -f "$archive"
+  # allowAll: tests drive gui-control.sock over ssh, which is not a descendant of this
+  # nohup-launched app; the app and socket live only under this run's private 0700 root.
   ssh "$REMOTE_FIXTURE_SSH_TARGET" \
     "mkdir -p '$REMOTE_FIXTURE_ROOT/gui-bundle' '$REMOTE_FIXTURE_ROOT/gui-state'; \
      /usr/bin/ditto -x -k '$REMOTE_FIXTURE_ROOT/gui.zip' '$REMOTE_FIXTURE_ROOT/gui-bundle'; \
@@ -350,7 +352,7 @@ stage_remote_gui_fixture() {
        TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/term-meshd.sock' \
        TERMMESH_PEER_SERVER_PATH='$REMOTE_FIXTURE_ROOT/gui-peer.sock' \
        TERMMESH_SOCKET_PATH='$REMOTE_FIXTURE_ROOT/gui-control.sock' \
-       TERMMESH_ALLOW_SOCKET_OVERRIDE=1 TERMMESH_UI_TEST_MODE=1 \
+       TERMMESH_ALLOW_SOCKET_OVERRIDE=1 TERMMESH_UI_TEST_MODE=1 TERMMESH_SOCKET_MODE=allowAll \
        TERMMESH_E2E_STATE_DIR='$REMOTE_FIXTURE_ROOT/gui-state' \
        TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS='${TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS:-0}' \
        nohup '$REMOTE_FIXTURE_ROOT/gui.app/Contents/MacOS/term-mesh DEV' \
