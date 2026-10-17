@@ -954,6 +954,40 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
         XCTAssertEqual(result.seq, 8)
     }
 
+    /// A viewer whose resume point is host seq 0 sends `resumeFromSeq == 0`,
+    /// which the wire reads as "no resume". On this host that costs nothing:
+    /// seq 0 is the hub's origin, so an unevicted ring replays the same bytes
+    /// either way.
+    func testResumeFromHubOriginEqualsFreshReplayOnUnevictedRing() {
+        var replay = PeerTerminalReplayBuffer()
+        replay.push(Data("prompt$ ".utf8))
+        replay.push(Data("ls\r\n".utf8))
+        let tapSeq = UInt64(replay.totalBytes)
+
+        XCTAssertTrue(replay.isSafeForCompleteReplay)
+        XCTAssertEqual(
+            replay.exactBytes(from: 0, tapSeqAtCall: tapSeq),
+            replay.concatenatedBytes()
+        )
+    }
+
+    /// Once the ring has evicted, an exact resume from the origin is gone, so
+    /// both readings of a 0 end in the same viewport snapshot.
+    func testResumeFromHubOriginOnEvictedRingMatchesFreshSnapshot() {
+        var replay = PeerTerminalReplayBuffer()
+        let chunk = Data(repeating: 0x41, count: 16 * 1024)
+        for _ in 0..<5 { replay.push(chunk) }
+        let tapSeq = UInt64(5 * chunk.count)
+        let snapshot = Data("\u{1b}[2J\u{1b}[Hscreen".utf8)
+
+        XCTAssertFalse(replay.isSafeForCompleteReplay)
+        XCTAssertNil(replay.exactBytes(from: 0, tapSeqAtCall: tapSeq))
+        XCTAssertEqual(
+            replay.snapshotBytes(snapshot, capturedAt: tapSeq, tapSeqAtCall: tapSeq),
+            replay.freshInitialBytes(snapshot: snapshot, capturedAt: tapSeq, tapSeqAtCall: tapSeq)
+        )
+    }
+
     func testExactResumeReturnsOnlyUnseenTail() {
         var replay = PeerTerminalReplayBuffer()
         replay.push(Data("hello".utf8))
@@ -1252,6 +1286,124 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         XCTAssertEqual(claims, [false, true],
                        "the focus-regain resend must claim authority")
         await coalescer.cancel()
+    }
+
+    func testAdoptResendsLastHelperObservedSizeToReplacementSession() async throws {
+        let retired = ResizeColsCollector()
+        let replacement = ResizeColsCollector()
+        let coalescer = RelayResizeCoalescer(
+            session: makeSession(retired),
+            surfaceID: Data(repeating: 0xD0, count: 16),
+            initialCols: 95,
+            initialRows: 52,
+            authorityEligible: false,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 78, rows: 34)
+        await coalescer.flushNow()
+        await coalescer.adopt(session: makeSession(replacement))
+        await coalescer.flushNow()
+
+        let retiredCols = await retired.cols()
+        let cols = await replacement.cols()
+        let rows = await replacement.rows()
+        let claims = await replacement.claims()
+        XCTAssertEqual(retiredCols, [78], "the resend must not go to the retired session")
+        XCTAssertEqual(cols, [78],
+                       "the host reverted the PTY to its own size when the old session left; the replacement must hear this pane's size again")
+        XCTAssertEqual(rows, [34])
+        XCTAssertEqual(claims, [false], "an unfocused pane's resend stays passive")
+        await coalescer.cancel()
+    }
+
+    func testAdoptResendClaimsAuthorityOnlyForFocusedPane() async throws {
+        let replacement = ResizeColsCollector()
+        let coalescer = RelayResizeCoalescer(
+            session: makeSession(ResizeColsCollector()),
+            surfaceID: Data(repeating: 0xD1, count: 16),
+            initialCols: 95,
+            initialRows: 52,
+            authorityEligible: true,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 78, rows: 34)
+        await coalescer.flushNow()
+        await coalescer.adopt(session: makeSession(replacement))
+        await coalescer.flushNow()
+
+        let cols = await replacement.cols()
+        let claims = await replacement.claims()
+        XCTAssertEqual(cols, [78])
+        XCTAssertEqual(claims, [true], "the focused pane takes back the size it held before the drop")
+        await coalescer.cancel()
+    }
+
+    func testAdoptWithoutObservedSizeSendsNothing() async throws {
+        let replacement = ResizeColsCollector()
+        let coalescer = RelayResizeCoalescer(
+            session: makeSession(ResizeColsCollector()),
+            surfaceID: Data(repeating: 0xD2, count: 16),
+            initialCols: 95,
+            initialRows: 52,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.adopt(session: makeSession(replacement))
+        await coalescer.flushNow()
+
+        let cols = await replacement.cols()
+        XCTAssertEqual(cols, [], "the attach seed is the host's echo, not this pane's grid")
+        await coalescer.cancel()
+    }
+
+    func testAdoptLeavesQueuedHelperResizeAndItsPassiveClaimAlone() async throws {
+        let replacement = ResizeColsCollector()
+        let coalescer = RelayResizeCoalescer(
+            session: makeSession(ResizeColsCollector()),
+            surfaceID: Data(repeating: 0xD3, count: 16),
+            initialCols: 95,
+            initialRows: 52,
+            authorityEligible: true,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 78, rows: 34)
+        await coalescer.adopt(session: makeSession(replacement))
+        await coalescer.flushNow()
+
+        let cols = await replacement.cols()
+        let claims = await replacement.claims()
+        XCTAssertEqual(cols, [78], "the queued helper resize already carries this geometry; one write, not two")
+        XCTAssertEqual(claims, [false],
+                       "the helper's initial reconcile stays passive; the adopt must not turn it into a claim")
+        await coalescer.cancel()
+    }
+
+    func testAdoptAfterCancelSendsNothing() async throws {
+        let replacement = ResizeColsCollector()
+        let coalescer = RelayResizeCoalescer(
+            session: makeSession(ResizeColsCollector()),
+            surfaceID: Data(repeating: 0xD4, count: 16),
+            initialCols: 95,
+            initialRows: 52,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 78, rows: 34)
+        await coalescer.flushNow()
+        await coalescer.cancel()
+        await coalescer.adopt(session: makeSession(replacement))
+        await coalescer.flushNow()
+
+        let cols = await replacement.cols()
+        XCTAssertEqual(cols, [])
     }
 
     func testPendingResizeClaimsWhenFocusArrivesDuringDelayWithoutDuplicateReassert() async throws {
