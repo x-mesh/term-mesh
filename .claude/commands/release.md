@@ -31,18 +31,18 @@ Accepted forms:
      git diff --quiet --ignore-submodules HEAD && \
      test -z "$(git status --porcelain -- daemon Proto)" && \
      ./scripts/sync-submodules.sh && \
-     cd daemon && cargo test --workspace --no-fail-fast --locked'
+     cd daemon && cargo test --workspace --no-fail-fast --locked -- --test-threads=4'
    ```
 
-   The `test` and `git diff --quiet` checks run before any repository script and stop the chain: `HEAD` must equal the pinned SHA, no tracked file may differ, and `daemon` and `Proto` must have no untracked files. Without that the result does not describe the pinned SHA. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E.
+   The `test` and `git diff --quiet` checks run before any repository script and stop the chain: `HEAD` must equal the pinned SHA, no tracked file may differ, and `daemon` and `Proto` must have no untracked files. Without that the result does not describe the pinned SHA. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E. `--test-threads=4` is required: at the runner's default parallelism (its CPU count, 10) PTY tests with wall-clock deadlines fail even though they pass alone, and which ones fail changes from run to run. At 4 threads the whole workspace passed three times in a row. Do not raise it to make the suite faster.
 
    Report the pinned SHA with the total passed and failed counts. If cargo fails before running tests (compile error, lockfile mismatch), that is a defect: stop.
 
-   Any failing test stops the release until the user decides. Name every failing test with its panic message. Then rerun only those tests, three times each, on the same SHA. For each failing target use the `-p <crate> --bin <name>` or `--test <name>` part of the `error: test failed, to rerun pass` line cargo printed, plus `--locked`, then `-- <test names>`:
+   Any failing test stops the release until the user decides. Name every failing test with its panic message. Then rerun only those tests, three times each, on the same SHA. For each failing target use the `-p <crate> --bin <name>` or `--test <name>` part of the `error: test failed, to rerun pass` line cargo printed, plus `--locked`, then `-- --test-threads=1 <test names>` so they run one at a time, truly alone:
 
    ```bash
-   cargo test -p term-meshd --bin term-meshd --locked -- <test names>
-   cargo test -p term-meshd --test cas_integrity --locked -- <test name>
+   cargo test -p term-meshd --bin term-meshd --locked -- --test-threads=1 <test names>
+   cargo test -p term-meshd --test cas_integrity --locked -- --test-threads=1 <test name>
    ```
 
    Classify each test. A test is intermittent only if it passes in all three reruns and its full-run panic was a timeout (`... before timeout`, `did not ... within`). Everything else is a defect, including any test that fails even once alone, a test whose full-run panic was an assertion on state or data (interference between tests), and any case you cannot place. A defect is fixed in a separate PR, then plan again so the pinned SHA moves. The user may release with intermittent tests. Never rerun the whole suite until it goes green.
