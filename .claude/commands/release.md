@@ -38,11 +38,11 @@ Accepted forms:
 
    Report the pinned SHA with the total passed and failed counts. If cargo fails before running tests (compile error, lockfile mismatch), that is a defect: stop.
 
-   Any failing test stops the release until the user decides. Name every failing test with its panic message. Then rerun only those tests, three times each, on the same SHA. For each failing target use the `-p <crate> --bin <name>` or `--test <name>` part of the `error: test failed, to rerun pass` line cargo printed, plus `--locked`, then `-- <test names>`:
+   Any failing test stops the release until the user decides. Name every failing test with its panic message. Then rerun only those tests, three times each, on the same SHA. For each failing target use the `-p <crate> --bin <name>` or `--test <name>` part of the `error: test failed, to rerun pass` line cargo printed, plus `--locked`, then `-- --test-threads=1 <test names>` so they run one at a time, truly alone:
 
    ```bash
-   cargo test -p term-meshd --bin term-meshd --locked -- <test names>
-   cargo test -p term-meshd --test cas_integrity --locked -- <test name>
+   cargo test -p term-meshd --bin term-meshd --locked -- --test-threads=1 <test names>
+   cargo test -p term-meshd --test cas_integrity --locked -- --test-threads=1 <test name>
    ```
 
    Classify each test. A test is intermittent only if it passes in all three reruns and its full-run panic was a timeout (`... before timeout`, `did not ... within`). Everything else is a defect, including any test that fails even once alone, a test whose full-run panic was an assertion on state or data (interference between tests), and any case you cannot place. A defect is fixed in a separate PR, then plan again so the pinned SHA moves. The user may release with intermittent tests. Never rerun the whole suite until it goes green.
