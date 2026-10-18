@@ -22,7 +22,32 @@ Accepted forms:
 
 2. Use `latest_tag` and `git log <latest-tag>..origin/develop --no-merges` to draft one changelog section. Include only user-visible changes and contributor credits. The section must start with `## [X.Y.Z] - YYYY-MM-DD`. Write it to a temporary file.
 
-3. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
+3. Run the daemon test suite on the pinned develop SHA. A test that fails on `develop` blocks the release until it is understood: the relay E2E below exercises one path and does not cover the rest of the daemon. Run it on the same mac-sub checkout the E2E uses, detached at the pinned SHA, and finish it before the E2E starts. The runner takes one topology at a time.
+
+   ```bash
+   ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
+     git fetch origin && git checkout --detach <pinned-sha> && \
+     test "$(git rev-parse HEAD)" = "<pinned-sha>" && \
+     git diff --quiet --ignore-submodules HEAD && \
+     test -z "$(git status --porcelain -- daemon Proto)" && \
+     ./scripts/sync-submodules.sh && \
+     cd daemon && cargo test --workspace --no-fail-fast --locked'
+   ```
+
+   The `test` and `git diff --quiet` checks run before any repository script and stop the chain: `HEAD` must equal the pinned SHA, no tracked file may differ, and `daemon` and `Proto` must have no untracked files. Without that the result does not describe the pinned SHA. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E.
+
+   Report the pinned SHA with the total passed and failed counts. If cargo fails before running tests (compile error, lockfile mismatch), that is a defect: stop.
+
+   Any failing test stops the release until the user decides. Name every failing test with its panic message. Then rerun only those tests, three times each, on the same SHA. For each failing target use the `-p <crate> --bin <name>` or `--test <name>` part of the `error: test failed, to rerun pass` line cargo printed, plus `--locked`, then `-- <test names>`:
+
+   ```bash
+   cargo test -p term-meshd --bin term-meshd --locked -- <test names>
+   cargo test -p term-meshd --test cas_integrity --locked -- <test name>
+   ```
+
+   Classify each test. A test is intermittent only if it passes in all three reruns and its full-run panic was a timeout (`... before timeout`, `did not ... within`). Everything else is a defect, including any test that fails even once alone, a test whose full-run panic was an assertion on state or data (interference between tests), and any case you cannot place. A defect is fixed in a separate PR, then plan again so the pinned SHA moves. The user may release with intermittent tests. Never rerun the whole suite until it goes green.
+
+4. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
 
    ```bash
    ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
@@ -70,27 +95,27 @@ Accepted forms:
    The runner's checkout must be detached at the pinned SHA with `daemon` and `Proto` clean,
    or the fixture refuses to stage. The peer host needs the agent CLI already installed.
 
-4. Show the version, pinned develop SHA, changelog, relay receipt, and prepare effects: merge `develop→main`, create/push the release branch, and open the release PR. Ask one explicit confirmation. On approval:
+5. Show the version, pinned develop SHA, changelog, relay receipt, and prepare effects: merge `develop→main`, create/push the release branch, and open the release PR. Ask one explicit confirmation. On approval:
 
    ```bash
    python3 scripts/release.py prepare <version> --notes-file <temp-file> --relay-e2e-receipt <receipt-path> --yes --json
    ```
 
-5. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, develop resync, and cleanup. Ask one explicit confirmation. On approval:
+6. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, develop resync, and cleanup. Ask one explicit confirmation. On approval:
 
    ```bash
    python3 scripts/release.py publish <version> --yes --json
    ```
 
-6. On failure, report the JSON error and last completed receipt. Do not improvise raw Git recovery. Fix the stated blocker, then rerun:
+7. On failure, report the JSON error and last completed receipt. Do not improvise raw Git recovery. Fix the stated blocker, then rerun:
 
    ```bash
    python3 scripts/release.py resume <version> --yes --json
    ```
 
-7. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt.
+8. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt. The release summary must also state the step 3 daemon test result for the pinned SHA, or that the user waived it; `scripts/release.py` does not record it.
 
-8. `cleanup` runs last and reclaims the release checkouts under `~/.cache/term-mesh/release-worktrees` plus the local `chore/release-v*` branches. It is destructive: `git worktree remove --force` discards whatever is in the tree, and `git branch -D` is required because the squash merge leaves the branch unreachable from `main`.
+9. `cleanup` runs last and reclaims the release checkouts under `~/.cache/term-mesh/release-worktrees` plus the local `chore/release-v*` branches. It is destructive: `git worktree remove --force` discards whatever is in the tree, and `git branch -D` is required because the squash merge leaves the branch unreachable from `main`.
 
    It claims a version only when that version's own release is settled — the current one, or an older one whose tag shipped, whose lock is free, and whose receipt has `verify` completed. An abandoned or still-running release keeps its checkout, and a branch is deleted only when its tip still equals the commit its own `release_metadata` receipt recorded.
 
