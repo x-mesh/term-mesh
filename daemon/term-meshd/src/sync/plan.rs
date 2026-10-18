@@ -650,7 +650,13 @@ pub fn decode_entries(input: &[u8]) -> Result<Vec<ManifestEntry>, ManifestWireEr
 /// Must stay in step with [`encode_entries`]: kind(1) + executable(1) + mode(2)
 /// + length(8) + hash(32) + path len(4) + path + target len(4) + target.
 fn entry_encoded_len(entry: &ManifestEntry) -> usize {
-    1 + 1 + 2 + 8 + 32 + 4 + entry.relative_path.len() + 4
+    1 + 1
+        + 2
+        + 8
+        + 32
+        + 4
+        + entry.relative_path.len()
+        + 4
         + entry.symlink_target.as_deref().map_or(0, str::len)
 }
 
@@ -797,8 +803,16 @@ mod tests {
         let local = vec![file("b", 1, false)];
         let remote = vec![file("a", 1, false)];
         let plan = reconcile_bidirectional(&base, &local, &remote);
-        assert_eq!(plan.delete_remote, ["a"], "local deleted a → remote deletes a");
-        assert_eq!(plan.delete_local, ["b"], "remote deleted b → local deletes b");
+        assert_eq!(
+            plan.delete_remote,
+            ["a"],
+            "local deleted a → remote deletes a"
+        );
+        assert_eq!(
+            plan.delete_local,
+            ["b"],
+            "remote deleted b → local deletes b"
+        );
         assert!(plan.conflicts.is_empty() && plan.fetch.is_empty() && plan.push.is_empty());
     }
 
@@ -812,7 +826,10 @@ mod tests {
         let plan = reconcile_bidirectional(&[], &local, &remote);
 
         assert_eq!(
-            plan.converged.iter().map(|e| e.relative_path.as_str()).collect::<Vec<_>>(),
+            plan.converged
+                .iter()
+                .map(|e| e.relative_path.as_str())
+                .collect::<Vec<_>>(),
             ["shared"],
         );
         assert_eq!(plan.push.len(), 1, "the local-only file still pushes");
@@ -828,7 +845,11 @@ mod tests {
         let agreed = vec![file("shared", 1, false)];
         // Before: the path never reached the base, so the reconcile pushes it back.
         let without_base = reconcile_bidirectional(&[], &agreed, &[]);
-        assert_eq!(without_base.push.len(), 1, "no base ⇒ looks like an addition");
+        assert_eq!(
+            without_base.push.len(),
+            1,
+            "no base ⇒ looks like an addition"
+        );
         assert!(without_base.delete_local.is_empty());
 
         // After: the same delete against a base that recorded the agreement.
@@ -852,7 +873,11 @@ mod tests {
                 symlink_target: None,
             },
         ];
-        let paths = vec!["doomed".to_string(), "adir".to_string(), "never-existed".to_string()];
+        let paths = vec![
+            "doomed".to_string(),
+            "adir".to_string(),
+            "never-existed".to_string(),
+        ];
         let plan = build_delete_plan(ProjectId::from_bytes([7; 32]), [1; 16], &paths, &local);
 
         // The directory and the unknown path are skipped; only the file is planned.
@@ -1036,7 +1061,11 @@ mod tests {
             .map(|e| e.relative_path.as_str())
             .collect();
         // Both directories come first, parent before child, then the leaves.
-        assert_eq!(&paths[..2], &["dir", "dir/deep"], "dirs first, parent first");
+        assert_eq!(
+            &paths[..2],
+            &["dir", "dir/deep"],
+            "dirs first, parent first"
+        );
         let first_leaf = plan
             .entries
             .iter()
@@ -1121,7 +1150,11 @@ mod tests {
             &local,
         );
 
-        let f = plan.entries.iter().find(|e| e.relative_path == "f").unwrap();
+        let f = plan
+            .entries
+            .iter()
+            .find(|e| e.relative_path == "f")
+            .unwrap();
         assert_eq!(
             f.precondition,
             ApplyPrecondition::Present(PathFingerprint {
@@ -1132,7 +1165,11 @@ mod tests {
                 symlink_target: None,
             })
         );
-        let s = plan.entries.iter().find(|e| e.relative_path == "s").unwrap();
+        let s = plan
+            .entries
+            .iter()
+            .find(|e| e.relative_path == "s")
+            .unwrap();
         // The symlink precondition hashes the LOCAL (old) target, not the remote.
         assert_eq!(
             s.precondition,
@@ -1201,16 +1238,32 @@ mod tests {
         let remote = vec![file("a", 7, false), file("b", 2, true)];
         let diff = diff_manifests(&local, &remote);
         assert!(diff.delete.is_empty());
-        let paths: Vec<_> = diff.fetch.iter().map(|e| e.relative_path.as_str()).collect();
+        let paths: Vec<_> = diff
+            .fetch
+            .iter()
+            .map(|e| e.relative_path.as_str())
+            .collect();
         assert_eq!(paths, vec!["a", "b"]);
     }
 
     #[test]
     fn mixed_add_change_delete() {
-        let local = vec![file("keep", 1, false), file("drop", 2, false), file("change", 3, false)];
-        let remote = vec![file("keep", 1, false), file("change", 8, false), file("add", 4, false)];
+        let local = vec![
+            file("keep", 1, false),
+            file("drop", 2, false),
+            file("change", 3, false),
+        ];
+        let remote = vec![
+            file("keep", 1, false),
+            file("change", 8, false),
+            file("add", 4, false),
+        ];
         let diff = diff_manifests(&local, &remote);
-        let fetch: Vec<_> = diff.fetch.iter().map(|e| e.relative_path.as_str()).collect();
+        let fetch: Vec<_> = diff
+            .fetch
+            .iter()
+            .map(|e| e.relative_path.as_str())
+            .collect();
         assert_eq!(fetch, vec!["change", "add"]);
         assert_eq!(diff.delete, vec!["drop".to_string()]);
     }
@@ -1228,7 +1281,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_and_oversized() {
-        assert_eq!(decode_entries(&[0, 0, 0]), Err(ManifestWireError::Truncated));
+        assert_eq!(
+            decode_entries(&[0, 0, 0]),
+            Err(ManifestWireError::Truncated)
+        );
         // Claims 5 entries but carries none.
         assert_eq!(
             decode_entries(&[0, 0, 0, 5]),
@@ -1274,15 +1330,27 @@ mod tests {
     fn large_manifest_spans_many_batches_and_round_trips() {
         // Long paths force several 512 KiB batches well before MAX_ENTRIES.
         let entries: Vec<ManifestEntry> = (0..40_000)
-            .map(|i| file(&format!("deeply/nested/path/segment/file-{i:08}.dat"), (i % 251) as u8, i % 2 == 0))
+            .map(|i| {
+                file(
+                    &format!("deeply/nested/path/segment/file-{i:08}.dat"),
+                    (i % 251) as u8,
+                    i % 2 == 0,
+                )
+            })
             .collect();
         let batches = encode_manifest_batches(&entries);
-        assert!(batches.len() > 1, "a large manifest must page into >1 batch");
+        assert!(
+            batches.len() > 1,
+            "a large manifest must page into >1 batch"
+        );
         // Only the last batch is final.
         for (index, batch) in batches.iter().enumerate() {
             let expected = u8::from(index == batches.len() - 1);
             assert_eq!(batch[0], expected, "final flag wrong at batch {index}");
-            assert!(batch.len() <= MANIFEST_BATCH_BYTES + 4096, "batch {index} exceeds budget");
+            assert!(
+                batch.len() <= MANIFEST_BATCH_BYTES + 4096,
+                "batch {index} exceeds budget"
+            );
         }
         assert_eq!(reassemble(&batches), entries);
     }

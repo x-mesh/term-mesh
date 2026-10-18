@@ -86,7 +86,11 @@ async fn omitted_params_are_accepted_for_all_optional_handlers() {
 
     let stream = connect_when_ready(&sock).await;
     let mut reader = BufReader::new(stream);
-    for (id, method) in [(1, "task.list"), (2, "host.list"), (3, "orchestration.status")] {
+    for (id, method) in [
+        (1, "task.list"),
+        (2, "host.list"),
+        (3, "orchestration.status"),
+    ] {
         reader
             .get_mut()
             .write_all(

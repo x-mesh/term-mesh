@@ -2,9 +2,9 @@ mod apply;
 mod blob;
 mod bootstrap;
 mod cas;
-mod context_provider;
 mod conflict;
 mod conflict_scan;
+mod context_provider;
 mod crypto;
 mod fetch;
 mod gc;
@@ -37,12 +37,18 @@ mod trust_bootstrap;
 mod trust_recovery;
 
 #[allow(unused_imports)]
+pub use apply::{
+    ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
+    ApplyPlanEntry, ApplyPrecondition, ApplyStore, VisibleState, APPLY_SCHEMA_VERSION,
+};
+#[allow(unused_imports)]
 pub use blob::{chunk_count_for, put_plaintext, recv_object, send_object};
 #[allow(unused_imports)]
-pub use apply::{
-    APPLY_SCHEMA_VERSION,
-    ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
-    ApplyPlanEntry, ApplyPrecondition, ApplyStore, VisibleState,
+pub use bootstrap::{
+    bootstrap_two_daemons, default_project_apply_db_path, default_project_cas_dir,
+    default_project_dir, default_project_trust_db_path, default_sync_state_root,
+    ensure_device_identity, provision_daemon, run_bootstrap_trust, BootstrapError, BootstrapPeer,
+    DaemonBootstrapPaths, DaemonProvisioning,
 };
 #[allow(unused_imports)]
 pub use cas::{
@@ -53,13 +59,21 @@ pub use cas::{
 #[allow(unused_imports)]
 pub use conflict::{
     decode_conflict_set, encode_conflict_set, ConflictContent, ConflictError, ConflictKind,
-    ConflictPathOrigin, ConflictRecord,
-    ConflictResolution, ConflictSet, ConflictSide, ResolutionPrecondition, ResolvedConflict,
-    MAX_CONFLICT_CONTENT_BYTES, MAX_CONFLICT_COUNT, MAX_CONFLICT_PATH_BYTES,
-    MAX_CONFLICT_TOTAL_BYTES,
+    ConflictPathOrigin, ConflictRecord, ConflictResolution, ConflictSet, ConflictSide,
+    ResolutionPrecondition, ResolvedConflict, MAX_CONFLICT_CONTENT_BYTES, MAX_CONFLICT_COUNT,
+    MAX_CONFLICT_PATH_BYTES, MAX_CONFLICT_TOTAL_BYTES,
 };
 #[allow(unused_imports)]
+pub use conflict_scan::{
+    resolve_conflict, scan_conflicts, summarize_conflicts, ConflictScan, ConflictSummary,
+    ResolutionOutcome, Unclassified, UnclassifiedReason,
+};
+#[allow(unused_imports)]
+pub use context_provider::ProvisioningSyncContextProvider;
+#[allow(unused_imports)]
 pub use crypto::ProjectKey;
+#[allow(unused_imports)]
+pub use fetch::{apply_deletes, receive_push, respond_to_fetch, run_fetch_pull, run_push};
 #[allow(unused_imports)]
 pub use gc::{
     CasGc, DeviceStatus, GcCoordinator, GcEngine, GcError, GcReport, GcSnapshot, GcSnapshotLease,
@@ -74,25 +88,24 @@ pub use keychain::MacOsKeychain;
 #[allow(unused_imports)]
 pub use keychain::{
     daemon_keychain, generate_project_key, load_device_tls_identity, load_project_key,
-    persist_device_tls_identity, FileKeychain,
-    persist_project_key, DeviceTlsIdentity, KeychainBackend, KeychainError, KeychainItem,
-    KeychainProjectKeyProvider, KeychainProtection, PeerIdentityProvider, PresenceAction,
-    PresenceCapability, PresenceGrantContext, RandomSource, SystemRandom, UserPresenceAuthorizer,
+    persist_device_tls_identity, persist_project_key, DeviceTlsIdentity, FileKeychain,
+    KeychainBackend, KeychainError, KeychainItem, KeychainProjectKeyProvider, KeychainProtection,
+    PeerIdentityProvider, PresenceAction, PresenceCapability, PresenceGrantContext, RandomSource,
+    SystemRandom, UserPresenceAuthorizer,
 };
 #[allow(unused_imports)]
 pub use manifest::{
     assumed_file_mode, blank_directory_modes, mode_matches_executable, EntryKind, Manifest,
-    ManifestBuilder,
-    ManifestEntry, ManifestError, NO_MODE,
-};
-#[allow(unused_imports)]
-pub use conflict_scan::{
-    resolve_conflict, scan_conflicts, summarize_conflicts, ConflictScan, ConflictSummary,
-    ResolutionOutcome, Unclassified, UnclassifiedReason,
+    ManifestBuilder, ManifestEntry, ManifestError, NO_MODE,
 };
 pub use merge::{
     detect_path_conflicts, merge_file, MergeOutcome, PathChange, ThreeWayFile,
     MAX_PATH_CHANGE_COUNT, MAX_PATH_CHANGE_TOTAL_BYTES,
+};
+#[allow(unused_imports)]
+pub use network_runner::{
+    exchange_manifests, scan_project_entries, scan_project_entries_cancellable, NetworkSyncRunner,
+    PeerAddressResolver, SyncContext, SyncContextProvider,
 };
 #[allow(unused_imports)]
 pub use operation::{
@@ -107,8 +120,17 @@ pub use oplog::{
     TombstonePayload,
 };
 #[allow(unused_imports)]
-pub use path_sandbox::{
-    empty_directory_fingerprint, PathFingerprint, PathKind, PathSandboxError,
+pub use path_sandbox::{empty_directory_fingerprint, PathFingerprint, PathKind, PathSandboxError};
+#[allow(unused_imports)]
+pub use plan::{
+    build_apply_plan, build_delete_plan, build_directory_delete_plan, check_delete_guard,
+    decode_entries, decode_manifest_batch, diff_manifests, encode_entries, encode_manifest_batches,
+    reconcile_bidirectional, BidiPlan, ConflictPath, FetchEntry, ManifestDiff, ManifestWireError,
+};
+#[allow(unused_imports)]
+pub use provisioning::{
+    default_provisioning_db_path, LocalCoordinates, ProvisioningError, ProvisioningPeerResolver,
+    SyncProvisioningStore,
 };
 #[allow(unused_imports)]
 pub use reconcile::{
@@ -121,6 +143,8 @@ pub use registry::{
     default_registry_db_path, HeldProjectRoot, ProjectId, ProjectRecord, ProjectRegistry,
     RegistryError, PROJECT_ID_BYTES,
 };
+#[allow(unused_imports)]
+pub use responder::serve_project;
 #[allow(unused_imports)]
 pub use rotation::{
     unwrap_project_key, wrap_project_key, ControlPublishEvidence, KeyPersistEvidence,
@@ -139,25 +163,6 @@ pub use scanner::{
 #[allow(unused_imports)]
 pub use stream_router::{RoutedFrame, RouterError, StreamLane, StreamRouter, StreamRouterSender};
 #[allow(unused_imports)]
-pub use network_runner::{
-    exchange_manifests, scan_project_entries, scan_project_entries_cancellable, NetworkSyncRunner,
-    PeerAddressResolver, SyncContext, SyncContextProvider,
-};
-#[allow(unused_imports)]
-pub use fetch::{apply_deletes, receive_push, respond_to_fetch, run_fetch_pull, run_push};
-#[allow(unused_imports)]
-pub use provisioning::{
-    default_provisioning_db_path, LocalCoordinates, ProvisioningError, ProvisioningPeerResolver,
-    SyncProvisioningStore,
-};
-#[allow(unused_imports)]
-pub use plan::{
-    build_delete_plan, build_directory_delete_plan, check_delete_guard,
-    build_apply_plan, decode_entries, decode_manifest_batch, diff_manifests, encode_entries,
-    encode_manifest_batches, reconcile_bidirectional, BidiPlan, ConflictPath, FetchEntry,
-    ManifestDiff, ManifestWireError,
-};
-#[allow(unused_imports)]
 pub use sync_connection::{SyncConnection, SyncConnectionError};
 #[allow(unused_imports)]
 pub use transfer::{
@@ -172,17 +177,6 @@ pub use trust::{
 };
 #[allow(unused_imports)]
 pub use trust_bootstrap::{seed_trust_store, BootstrapDevice};
-#[allow(unused_imports)]
-pub use bootstrap::{
-    bootstrap_two_daemons, default_project_apply_db_path, default_project_cas_dir,
-    default_project_dir, default_project_trust_db_path, default_sync_state_root,
-    ensure_device_identity, provision_daemon, run_bootstrap_trust, BootstrapError, BootstrapPeer,
-    DaemonBootstrapPaths, DaemonProvisioning,
-};
-#[allow(unused_imports)]
-pub use context_provider::ProvisioningSyncContextProvider;
-#[allow(unused_imports)]
-pub use responder::serve_project;
 #[allow(unused_imports)]
 pub use trust_recovery::{
     authorize_revoke, device_secret_item, export_recovery, import_recovery, project_dek_item,

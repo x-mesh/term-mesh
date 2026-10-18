@@ -1132,7 +1132,10 @@ mod migration_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(scans, 1, "existing manifest_scan row preserved across rebuild");
+        assert_eq!(
+            scans, 1,
+            "existing manifest_scan row preserved across rebuild"
+        );
         // The widened CHECK now admits 'sync'.
         insert(&conn, 0x55, 0x66, "sync").unwrap();
         // Re-validating an already-v2 database is a no-op (no double migration).

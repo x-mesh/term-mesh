@@ -19,15 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sync_protocol::{
-    SyncHello, DIRECTORY_MODE_CAPABILITY, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1,
-};
+use sync_protocol::{SyncHello, DIRECTORY_MODE_CAPABILITY, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
 use super::{
-    build_apply_plan, decode_manifest_batch, encode_manifest_batches, reconcile_bidirectional,
-    apply_deletes, check_delete_guard, run_fetch_pull, run_push,
-    blank_directory_modes, scan_conflicts, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry,
-    ManifestBuilder,
+    apply_deletes, blank_directory_modes, build_apply_plan, check_delete_guard,
+    decode_manifest_batch, encode_manifest_batches, reconcile_bidirectional, run_fetch_pull,
+    run_push, scan_conflicts, ApplyStore, CasStore, DeviceTlsIdentity, FetchEntry, ManifestBuilder,
     ManifestEntry, ManifestScanner, ObjectDomain, ObjectType, OperationResult, OperationSpec,
     ProjectId, ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, StreamLane,
     SyncConnection, SyncEndpoint, SyncTransport, TrustStore,
@@ -153,11 +150,13 @@ pub async fn exchange_manifests(
 async fn recv_manifest(connection: &mut SyncConnection) -> Result<Vec<ManifestEntry>, String> {
     let mut entries = Vec::new();
     loop {
-        let payload =
-            tokio::time::timeout(EXCHANGE_TIMEOUT, connection.recv_lane(StreamLane::SyncOperation))
-                .await
-                .map_err(|_| "sync_exchange_failed".to_string())?
-                .ok_or_else(|| "sync_exchange_failed".to_string())?;
+        let payload = tokio::time::timeout(
+            EXCHANGE_TIMEOUT,
+            connection.recv_lane(StreamLane::SyncOperation),
+        )
+        .await
+        .map_err(|_| "sync_exchange_failed".to_string())?
+        .ok_or_else(|| "sync_exchange_failed".to_string())?;
         let (is_final, batch) =
             decode_manifest_batch(&payload).map_err(|_| "sync_exchange_failed".to_string())?;
         entries.extend(batch);
@@ -347,14 +346,20 @@ impl NetworkSyncRunner {
         // Built from `plan.fetch`, NOT `wanted`: a conflicting path must not be
         // applied. `build_apply_plan` iterates the entries it is given, so the
         // extra staged objects in `resolved` are simply unused here.
-        let apply_plan = build_apply_plan(project, operation_id, &plan.fetch, &resolved, local_entries);
+        let apply_plan =
+            build_apply_plan(project, operation_id, &plan.fetch, &resolved, local_entries);
         if !apply_plan.entries.is_empty() {
             let store = ctx
                 .apply_store
                 .lock()
                 .map_err(|_| "sync_apply_failed".to_string())?;
             store
-                .apply(spec.held_root.canonical_path(), &ctx.cas, domain, &apply_plan)
+                .apply(
+                    spec.held_root.canonical_path(),
+                    &ctx.cas,
+                    domain,
+                    &apply_plan,
+                )
                 .map_err(|_| "sync_apply_failed".to_string())?;
         }
         // DELETE (local): paths the peer removed and this side had not touched
@@ -535,7 +540,6 @@ fn apply_local_deletes(
         "sync_apply_failed",
     )
 }
-
 
 /// A pushed/fetched `FetchEntry` back to a `ManifestEntry` (identical fields) so
 /// it can seed the advanced base manifest.

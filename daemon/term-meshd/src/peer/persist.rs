@@ -139,7 +139,9 @@ struct ProjectPresentationFile {
 }
 
 pub fn load_project_presentations(path: &Path) -> Vec<PersistedProjectPresentation> {
-    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
     let file: ProjectPresentationFile = match serde_json::from_slice(&bytes) {
         Ok(file) => file,
         Err(error) => {
@@ -150,7 +152,9 @@ pub fn load_project_presentations(path: &Path) -> Vec<PersistedProjectPresentati
             return Vec::new();
         }
     };
-    if file.version != 1 { return Vec::new(); }
+    if file.version != 1 {
+        return Vec::new();
+    }
     let mut project_ids = HashSet::new();
     file.records
         .into_iter()
@@ -551,9 +555,7 @@ pub fn acquire_state_lock_shared(workspaces_path: &Path) -> std::io::Result<std:
 /// Exclusive lock. An error means a daemon still owns this state directory,
 /// so rewriting its files would be undone by that daemon's next save.
 #[cfg(unix)]
-pub fn try_acquire_state_lock_exclusive(
-    workspaces_path: &Path,
-) -> std::io::Result<std::fs::File> {
+pub fn try_acquire_state_lock_exclusive(workspaces_path: &Path) -> std::io::Result<std::fs::File> {
     let file = open_state_lock_file(&state_lock_path(workspaces_path))?;
     flock_nonblocking(&file, libc::LOCK_EX)?;
     Ok(file)
@@ -575,9 +577,7 @@ pub fn acquire_state_lock_shared(workspaces_path: &Path) -> std::io::Result<std:
 }
 
 #[cfg(not(unix))]
-pub fn try_acquire_state_lock_exclusive(
-    workspaces_path: &Path,
-) -> std::io::Result<std::fs::File> {
+pub fn try_acquire_state_lock_exclusive(workspaces_path: &Path) -> std::io::Result<std::fs::File> {
     acquire_state_lock_shared(workspaces_path)
 }
 

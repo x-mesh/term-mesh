@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use sync::{
-    assumed_file_mode, put_plaintext, scan_conflicts, CasError, CasLimits, CasStore, ConflictKind, ConflictPath,
-    ConflictSide, EntryKind, FetchEntry, KeyId, ObjectDomain, ObjectId, ObjectType, ProjectId,
-    ProjectKey, ProjectKeyMaterial, ProjectKeyProvider, UnclassifiedReason,
+    assumed_file_mode, put_plaintext, scan_conflicts, CasError, CasLimits, CasStore, ConflictKind,
+    ConflictPath, ConflictSide, EntryKind, FetchEntry, KeyId, ObjectDomain, ObjectId, ObjectType,
+    ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider, UnclassifiedReason,
 };
 
 const KEY_BYTES: [u8; 32] = [0x5c; 32];
@@ -27,7 +27,10 @@ struct FixedKeyProvider;
 
 impl ProjectKeyProvider for FixedKeyProvider {
     fn current_project_key(&self, _: ProjectId) -> Result<ProjectKeyMaterial, CasError> {
-        Ok(ProjectKeyMaterial { key_id: KEY_ID, key: ProjectKey::new(KEY_BYTES) })
+        Ok(ProjectKeyMaterial {
+            key_id: KEY_ID,
+            key: ProjectKey::new(KEY_BYTES),
+        })
     }
     fn project_key(&self, _: ProjectId, _: KeyId) -> Result<ProjectKey, CasError> {
         Ok(ProjectKey::new(KEY_BYTES))
@@ -59,7 +62,11 @@ impl Fixture {
             _temporary: temporary,
             root,
             cas,
-            domain: ObjectDomain { project_id: project, object_type: ObjectType::FILE, version: 1 },
+            domain: ObjectDomain {
+                project_id: project,
+                object_type: ObjectType::FILE,
+                version: 1,
+            },
             remote_objects: HashMap::new(),
             base_objects: BTreeMap::new(),
         }
@@ -145,7 +152,10 @@ fn a_file_both_sides_edited_is_classified_as_a_text_conflict() {
     // them (or a merge) without going back to the network.
     assert_eq!(record.base().unwrap().bytes(), b"shared start\n");
     assert_eq!(record.local().unwrap().bytes(), b"shared start\nmy line\n");
-    assert_eq!(record.remote().unwrap().bytes(), b"shared start\ntheir line\n");
+    assert_eq!(
+        record.remote().unwrap().bytes(),
+        b"shared start\ntheir line\n"
+    );
 }
 
 /// The case the base exists for. Deleting a file locally while the peer edits it
@@ -168,7 +178,9 @@ fn a_locally_deleted_file_the_peer_edited_is_a_delete_modify_conflict() {
     let record = scan.set.iter().next().unwrap();
     assert_eq!(
         record.kind(),
-        &ConflictKind::DeleteModify { deleted: ConflictSide::Local }
+        &ConflictKind::DeleteModify {
+            deleted: ConflictSide::Local
+        }
     );
     assert!(record.local().is_none(), "the local deletion is preserved");
     // Nothing was written back to the tree.
@@ -227,7 +239,10 @@ fn a_missing_base_with_both_sides_present_is_classified_as_add_add() {
     assert!(scan.unclassified.is_empty());
     let record = scan.set.iter().next().unwrap();
     assert_eq!(record.kind(), &ConflictKind::AddAddText);
-    assert!(record.base().is_none(), "no base is recorded, and none is claimed");
+    assert!(
+        record.base().is_none(),
+        "no base is recorded, and none is claimed"
+    );
     assert_eq!(record.local().unwrap().bytes(), b"mine\n");
     assert_eq!(record.remote().unwrap().bytes(), b"theirs\n");
 }
@@ -399,9 +414,18 @@ fn a_conflict_set_round_trips_through_the_codec() {
             .expect("conflict id survived the round trip");
         assert_eq!(same.kind(), original.kind());
         assert_eq!(same.paths(), original.paths());
-        assert_eq!(same.base().map(|c| c.bytes()), original.base().map(|c| c.bytes()));
-        assert_eq!(same.local().map(|c| c.bytes()), original.local().map(|c| c.bytes()));
-        assert_eq!(same.remote().map(|c| c.bytes()), original.remote().map(|c| c.bytes()));
+        assert_eq!(
+            same.base().map(|c| c.bytes()),
+            original.base().map(|c| c.bytes())
+        );
+        assert_eq!(
+            same.local().map(|c| c.bytes()),
+            original.local().map(|c| c.bytes())
+        );
+        assert_eq!(
+            same.remote().map(|c| c.bytes()),
+            original.remote().map(|c| c.bytes())
+        );
         // The precondition a resolution is checked against must also survive, or
         // every restored conflict would be unresolvable.
         assert_eq!(same.precondition(), original.precondition());
@@ -552,7 +576,9 @@ fn resolvable() -> Resolvable {
     store
         .save_base_objects(fixture.domain.project_id, &fixture.base_objects)
         .unwrap();
-    store.save_conflicts(fixture.domain.project_id, &scan.set).unwrap();
+    store
+        .save_conflicts(fixture.domain.project_id, &scan.set)
+        .unwrap();
 
     Resolvable {
         fixture,
@@ -621,8 +647,12 @@ fn a_local_resolution_is_pushed_on_the_next_reconcile_not_undone() {
     let (base, _) = {
         let store = r.store.lock().unwrap();
         (
-            store.load_base_manifest(r.fixture.domain.project_id).unwrap(),
-            store.load_base_objects(r.fixture.domain.project_id).unwrap(),
+            store
+                .load_base_manifest(r.fixture.domain.project_id)
+                .unwrap(),
+            store
+                .load_base_objects(r.fixture.domain.project_id)
+                .unwrap(),
         )
     };
     // The peer is unchanged; the local tree now holds the resolved content.
@@ -631,12 +661,21 @@ fn a_local_resolution_is_pushed_on_the_next_reconcile_not_undone() {
     let plan = reconcile_bidirectional(&base, &local, &remote);
 
     assert_eq!(
-        plan.push.iter().map(|e| e.relative_path.as_str()).collect::<Vec<_>>(),
+        plan.push
+            .iter()
+            .map(|e| e.relative_path.as_str())
+            .collect::<Vec<_>>(),
         ["notes.txt"],
         "the resolution must propagate to the peer",
     );
-    assert!(plan.fetch.is_empty(), "the peer's version must not come back");
-    assert!(plan.conflicts.is_empty(), "the conflict must not be raised again");
+    assert!(
+        plan.fetch.is_empty(),
+        "the peer's version must not come back"
+    );
+    assert!(
+        plan.conflicts.is_empty(),
+        "the conflict must not be raised again"
+    );
 }
 
 /// Choosing the peer's side needs no transfer at all: both trees already agree.
@@ -647,7 +686,9 @@ fn resolving_to_the_remote_side_converges_with_no_further_work() {
 
     let base = {
         let store = r.store.lock().unwrap();
-        store.load_base_manifest(r.fixture.domain.project_id).unwrap()
+        store
+            .load_base_manifest(r.fixture.domain.project_id)
+            .unwrap()
     };
     let local = vec![manifest("notes.txt", b"start\ntheirs\n")];
     let remote = vec![manifest("notes.txt", b"start\ntheirs\n")];

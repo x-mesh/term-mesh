@@ -866,10 +866,7 @@ impl Reducer {
             .task(&snapshot.task_id)?
             .ok_or_else(|| anyhow::anyhow!("task not found"))?;
         if !task.status.can_transition_to(&TaskStatus::ReviewReady) {
-            bail!(
-                "invalid task transition {:?} -> review_ready",
-                task.status
-            );
+            bail!("invalid task transition {:?} -> review_ready", task.status);
         }
         self.conn.execute(
             "INSERT OR IGNORE INTO review_snapshots(snapshot_id,task_id,attempt_id,base_sha,head_sha,diff_digest,summary,files_json,created_at_ms)
@@ -1365,10 +1362,7 @@ mod review_ready_transition_tests {
         // Rejected as a whole: `apply` is transactional, so neither the task nor
         // the snapshot row may survive a refused reduction.
         assert_eq!(status_of(&reducer, &task_id), TaskStatus::Merged);
-        assert!(reducer
-            .latest_review_snapshot(&task_id)
-            .unwrap()
-            .is_none());
+        assert!(reducer.latest_review_snapshot(&task_id).unwrap().is_none());
     }
 
     /// The other terminal states close the same door.
@@ -1384,7 +1378,10 @@ mod review_ready_transition_tests {
                 .apply(&snapshot_event(&task_id, &format!("snap-{index}"), "head"))
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("invalid task transition"), "{terminal}: {error}");
+            assert!(
+                error.contains("invalid task transition"),
+                "{terminal}: {error}"
+            );
         }
     }
 

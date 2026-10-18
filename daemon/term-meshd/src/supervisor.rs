@@ -114,8 +114,14 @@ mod tests {
         shutdown_supervised(&mut joinset, "test", Duration::from_millis(200)).await;
         let waited = began.elapsed();
 
-        assert!(waited >= Duration::from_millis(200), "returned before its budget: {waited:?}");
-        assert!(waited < Duration::from_secs(2), "held past its budget: {waited:?}");
+        assert!(
+            waited >= Duration::from_millis(200),
+            "returned before its budget: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "held past its budget: {waited:?}"
+        );
         assert!(joinset.is_empty(), "the drain must leave nothing behind");
     }
 

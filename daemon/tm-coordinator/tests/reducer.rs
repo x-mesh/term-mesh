@@ -433,7 +433,10 @@ fn leader_projects_round_trip_and_must_be_hosted_projects() {
             "live": true
         }),
     );
-    assert!(legacy.is_ok(), "omitted leader_projects must default to empty");
+    assert!(
+        legacy.is_ok(),
+        "omitted leader_projects must default to empty"
+    );
 }
 
 #[test]
@@ -728,8 +731,14 @@ fn reassignment_releases_previous_host_slot() {
 
     let hosts = api.handle("host.list", json!({})).unwrap();
     let rows = hosts["hosts"].as_array().unwrap();
-    let old = rows.iter().find(|host| host["host_id"] == "hst_slot1").unwrap();
-    let new = rows.iter().find(|host| host["host_id"] == "hst_slot2").unwrap();
+    let old = rows
+        .iter()
+        .find(|host| host["host_id"] == "hst_slot1")
+        .unwrap();
+    let new = rows
+        .iter()
+        .find(|host| host["host_id"] == "hst_slot2")
+        .unwrap();
     assert_eq!(old["used_slots"], 0);
     assert_eq!(new["used_slots"], 1);
 }
@@ -921,9 +930,7 @@ fn placing_an_already_placed_task_is_refused() {
     );
     assert!(second.is_err(), "a second placement must not be accepted");
 
-    let task = api
-        .handle("task.get", json!({"task_id": task_id}))
-        .unwrap();
+    let task = api.handle("task.get", json!({"task_id": task_id})).unwrap();
     assert_eq!(
         task["task"]["current_attempt_id"], first_attempt,
         "the original attempt must still own the task"
@@ -1035,10 +1042,7 @@ fn a_failed_reduction_leaves_no_event_behind() {
         "placing onto a missing task must fail"
     );
     assert!(
-        reducer
-            .event_by_request_id("place-torn")
-            .unwrap()
-            .is_none(),
+        reducer.event_by_request_id("place-torn").unwrap().is_none(),
         "a failed reduction must not leave its event row committed"
     );
     assert_eq!(
@@ -1064,8 +1068,14 @@ fn re_fencing_an_attempt_retires_its_previous_token() {
             json!({"request_id": "place", "task_id": task_id, "host_id": host}),
         )
         .unwrap();
-    let attempt_id = placed["event"]["payload"]["attempt_id"].as_str().unwrap().to_string();
-    let first_token = placed["event"]["payload"]["token"].as_str().unwrap().to_string();
+    let attempt_id = placed["event"]["payload"]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_token = placed["event"]["payload"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let refenced = api
         .handle(
@@ -1078,7 +1088,10 @@ fn re_fencing_an_attempt_retires_its_previous_token() {
             }),
         )
         .unwrap();
-    let second_token = refenced["event"]["payload"]["token"].as_str().unwrap().to_string();
+    let second_token = refenced["event"]["payload"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_ne!(first_token, second_token);
 
     assert!(
@@ -1111,12 +1124,13 @@ fn re_fencing_updates_the_token_that_task_get_reports() {
             json!({"request_id": "place", "task_id": task_id, "host_id": host}),
         )
         .unwrap();
-    let attempt_id = placed["event"]["payload"]["attempt_id"].as_str().unwrap().to_string();
+    let attempt_id = placed["event"]["payload"]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let token_from_task_get = |api: &Api| -> String {
-        let got = api
-            .handle("task.get", json!({"task_id": task_id}))
-            .unwrap();
+        let got = api.handle("task.get", json!({"task_id": task_id})).unwrap();
         got["attempts"]
             .as_array()
             .unwrap()
@@ -1130,7 +1144,10 @@ fn re_fencing_updates_the_token_that_task_get_reports() {
 
     // Placement already agrees — the regression is only visible after a
     // second fence.
-    let placed_token = placed["event"]["payload"]["token"].as_str().unwrap().to_string();
+    let placed_token = placed["event"]["payload"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(token_from_task_get(&api), placed_token);
 
     let refenced = api
@@ -1144,7 +1161,10 @@ fn re_fencing_updates_the_token_that_task_get_reports() {
             }),
         )
         .unwrap();
-    let current = refenced["event"]["payload"]["token"].as_str().unwrap().to_string();
+    let current = refenced["event"]["payload"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     assert_eq!(
         token_from_task_get(&api),
@@ -1189,8 +1209,12 @@ fn a_truncated_trailing_line_does_not_pass_as_an_event() {
     let event = IntentEvent::new("project_added", Some("one".to_string()), None, json!({}));
     log.append(&event).unwrap();
 
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-    file.write_all(b"{\"schema\":1,\"event_id\":\"evt_trunc\"").unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(b"{\"schema\":1,\"event_id\":\"evt_trunc\"")
+        .unwrap();
     drop(file);
 
     let result = log.read_all();

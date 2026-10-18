@@ -109,7 +109,10 @@ impl Host {
             command.env("TERMMESH_PEER_SURFACES", declared);
         }
         let child = command.spawn().expect("term-meshd did not start");
-        Daemon { child: Some(child), log: log_path }
+        Daemon {
+            child: Some(child),
+            log: log_path,
+        }
     }
 
     /// Block until the relay socket accepts a connection, as a client retrying
@@ -189,7 +192,10 @@ impl Host {
         let Ok(mut writer) = stream.try_clone() else {
             return false;
         };
-        if writer.write_all(b"{\"id\":1,\"method\":\"ping\"}\n").is_err() {
+        if writer
+            .write_all(b"{\"id\":1,\"method\":\"ping\"}\n")
+            .is_err()
+        {
             return false;
         }
         let mut reply = String::new();
@@ -271,7 +277,10 @@ fn a_journal_that_is_not_a_terminal_carries_no_colour_escapes() {
     host.await_ready(&daemon);
     daemon.stop();
     let journal = daemon.journal();
-    assert!(journal.contains("term-meshd starting"), "no journal written: {journal:?}");
+    assert!(
+        journal.contains("term-meshd starting"),
+        "no journal written: {journal:?}"
+    );
     assert!(
         !journal.contains('\u{1b}'),
         "journal carries ANSI escapes: {:?}",

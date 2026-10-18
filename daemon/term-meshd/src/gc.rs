@@ -224,7 +224,11 @@ pub fn team_member_worktree_paths(team_state: &serde_json::Value) -> HashSet<Pat
         .flatten()
         .filter_map(|team| team.get("agents").and_then(serde_json::Value::as_array))
         .flatten()
-        .filter_map(|agent| agent.get("worktree_path").and_then(serde_json::Value::as_str))
+        .filter_map(|agent| {
+            agent
+                .get("worktree_path")
+                .and_then(serde_json::Value::as_str)
+        })
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .collect()
@@ -1819,7 +1823,10 @@ mod tests {
         assert!(candidate.reclaimable());
 
         let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
-        assert_eq!(summary.removed, 1, "the planned removal must actually happen");
+        assert_eq!(
+            summary.removed, 1,
+            "the planned removal must actually happen"
+        );
         assert!(!target.exists());
         // Only the regenerable output goes; the checkout itself stays.
         assert!(checkout.exists());

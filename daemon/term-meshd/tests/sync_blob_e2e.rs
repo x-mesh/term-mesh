@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use sync::{
-    put_plaintext, recv_object, seed_trust_store, send_object, BootstrapDevice, CasError, CasLimits,
-    CasStore, DeviceTlsIdentity, KeyId, ObjectDomain, ObjectType, ProjectId, ProjectKey,
+    put_plaintext, recv_object, seed_trust_store, send_object, BootstrapDevice, CasError,
+    CasLimits, CasStore, DeviceTlsIdentity, KeyId, ObjectDomain, ObjectType, ProjectId, ProjectKey,
     ProjectKeyMaterial, ProjectKeyProvider, SyncConnection, SyncEndpoint, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
@@ -144,8 +144,20 @@ async fn encrypted_object_transfers_over_blob_lane_byte_identically() {
 
     // Transfer: source streams chunks while dest stages them.
     let (send_result, recv_result) = tokio::join!(
-        send_object(&conn_source, &cas_source, domain, object_id, plaintext.len() as u64),
-        recv_object(&mut conn_dest, &cas_dest, domain, object_id, plaintext.len() as u64),
+        send_object(
+            &conn_source,
+            &cas_source,
+            domain,
+            object_id,
+            plaintext.len() as u64
+        ),
+        recv_object(
+            &mut conn_dest,
+            &cas_dest,
+            domain,
+            object_id,
+            plaintext.len() as u64
+        ),
     );
     send_result.expect("send_object");
     recv_result.expect("recv_object");
@@ -156,5 +168,8 @@ async fn encrypted_object_transfers_over_blob_lane_byte_identically() {
         .copy_verified_plaintext(domain, object_id, &mut reproduced)
         .expect("copy_verified_plaintext on dest");
     assert_eq!(copied as usize, plaintext.len());
-    assert_eq!(reproduced, plaintext, "transferred object differs from source");
+    assert_eq!(
+        reproduced, plaintext,
+        "transferred object differs from source"
+    );
 }

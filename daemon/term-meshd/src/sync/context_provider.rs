@@ -124,7 +124,10 @@ mod tests {
             self.values
                 .lock()
                 .map_err(|_| KeychainError::Poisoned)?
-                .insert((item.service.clone(), item.account.clone()), secret.to_vec());
+                .insert(
+                    (item.service.clone(), item.account.clone()),
+                    secret.to_vec(),
+                );
             Ok(())
         }
         fn get(&self, item: &KeychainItem) -> Result<Zeroizing<Vec<u8>>, KeychainError> {
@@ -168,8 +171,16 @@ mod tests {
         };
         let dek = generate_project_key().unwrap();
         let roster = [
-            BootstrapDevice { device_id: device, certificate_hash: local_hash, epoch: 1 },
-            BootstrapDevice { device_id: [0x84; 32], certificate_hash: [0xcd; 32], epoch: 2 },
+            BootstrapDevice {
+                device_id: device,
+                certificate_hash: local_hash,
+                epoch: 1,
+            },
+            BootstrapDevice {
+                device_id: [0x84; 32],
+                certificate_hash: [0xcd; 32],
+                epoch: 2,
+            },
         ];
         run_bootstrap_trust(
             &*keychain,
@@ -177,7 +188,10 @@ mod tests {
             project,
             &recovery,
             &dek,
-            LocalCoordinates { device_id: device, roster_epoch: 1 },
+            LocalCoordinates {
+                device_id: device,
+                roster_epoch: 1,
+            },
             &roster,
             &[],
         )

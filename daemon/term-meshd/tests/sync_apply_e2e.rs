@@ -14,11 +14,10 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use sync::{
     build_apply_plan, chunk_count_for, diff_manifests, put_plaintext, recv_object,
-    scan_project_entries, CHUNK_SIZE,
-    seed_trust_store, send_object, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition,
-    ApplyStore, BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity, EntryKind, KeyId,
-    ObjectDomain, ObjectType, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider,
-    SyncConnection, SyncEndpoint, TrustStore,
+    scan_project_entries, seed_trust_store, send_object, ApplyAction, ApplyPlan, ApplyPlanEntry,
+    ApplyPrecondition, ApplyStore, BootstrapDevice, CasError, CasLimits, CasStore,
+    DeviceTlsIdentity, EntryKind, KeyId, ObjectDomain, ObjectType, ProjectId, ProjectKey,
+    ProjectKeyMaterial, ProjectKeyProvider, SyncConnection, SyncEndpoint, TrustStore, CHUNK_SIZE,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
@@ -75,14 +74,32 @@ async fn transferred_object_is_applied_to_the_destination_filesystem() {
     let project_id = ProjectId::from_bytes(project);
 
     let trust_a = Arc::new(
-        TrustStore::open(temporary.path().join("trust_a.sqlite3"), project_id, recovery.verifying_key().to_bytes()).unwrap(),
+        TrustStore::open(
+            temporary.path().join("trust_a.sqlite3"),
+            project_id,
+            recovery.verifying_key().to_bytes(),
+        )
+        .unwrap(),
     );
     let trust_b = Arc::new(
-        TrustStore::open(temporary.path().join("trust_b.sqlite3"), project_id, recovery.verifying_key().to_bytes()).unwrap(),
+        TrustStore::open(
+            temporary.path().join("trust_b.sqlite3"),
+            project_id,
+            recovery.verifying_key().to_bytes(),
+        )
+        .unwrap(),
     );
     let roster = [
-        BootstrapDevice { device_id: device_a, certificate_hash: identity_a.certificate_hash(), epoch: 1 },
-        BootstrapDevice { device_id: device_b, certificate_hash: identity_b.certificate_hash(), epoch: 2 },
+        BootstrapDevice {
+            device_id: device_a,
+            certificate_hash: identity_a.certificate_hash(),
+            epoch: 1,
+        },
+        BootstrapDevice {
+            device_id: device_b,
+            certificate_hash: identity_b.certificate_hash(),
+            epoch: 2,
+        },
     ];
     seed_trust_store(&trust_a, project_id, &recovery, &roster).unwrap();
     seed_trust_store(&trust_b, project_id, &recovery, &roster).unwrap();
@@ -105,12 +122,33 @@ async fn transferred_object_is_applied_to_the_destination_filesystem() {
     // Put the file's bytes into the source CAS.
     let cas_source = cas(&temporary.path().join("cas_source"));
     let cas_dest = cas(&temporary.path().join("cas_dest"));
-    let domain = ObjectDomain { project_id, object_type: ObjectType::FILE, version: 1 };
-    let object_id = put_plaintext(&cas_source, domain, &ProjectKey::new(KEY_BYTES), KEY_ID, &content).unwrap();
+    let domain = ObjectDomain {
+        project_id,
+        object_type: ObjectType::FILE,
+        version: 1,
+    };
+    let object_id = put_plaintext(
+        &cas_source,
+        domain,
+        &ProjectKey::new(KEY_BYTES),
+        KEY_ID,
+        &content,
+    )
+    .unwrap();
 
     // Connect and transfer the object source -> dest.
-    let server = SyncEndpoint::server(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), trust_a.clone(), &identity_a).unwrap();
-    let client = SyncEndpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), trust_b.clone(), &identity_b).unwrap();
+    let server = SyncEndpoint::server(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        trust_a.clone(),
+        &identity_a,
+    )
+    .unwrap();
+    let client = SyncEndpoint::client(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        trust_b.clone(),
+        &identity_b,
+    )
+    .unwrap();
     let address = server.local_addr().unwrap();
     let (accepted, connected) = tokio::join!(
         server.accept(hello(project, device_a, 2, 1)),
@@ -119,8 +157,20 @@ async fn transferred_object_is_applied_to_the_destination_filesystem() {
     let conn_source = SyncConnection::start(accepted.unwrap());
     let mut conn_dest = SyncConnection::start(connected.unwrap());
     let (send_result, recv_result) = tokio::join!(
-        send_object(&conn_source, &cas_source, domain, object_id, content.len() as u64),
-        recv_object(&mut conn_dest, &cas_dest, domain, object_id, content.len() as u64),
+        send_object(
+            &conn_source,
+            &cas_source,
+            domain,
+            object_id,
+            content.len() as u64
+        ),
+        recv_object(
+            &mut conn_dest,
+            &cas_dest,
+            domain,
+            object_id,
+            content.len() as u64
+        ),
     );
     send_result.expect("send_object");
     recv_result.expect("recv_object");
@@ -278,8 +328,14 @@ fn an_empty_file_round_trips_through_the_cas() {
         version: 1,
     };
 
-    let object_id = put_plaintext(&store, object_domain, &ProjectKey::new(KEY_BYTES), KEY_ID, b"")
-        .expect("an empty file must be storable");
+    let object_id = put_plaintext(
+        &store,
+        object_domain,
+        &ProjectKey::new(KEY_BYTES),
+        KEY_ID,
+        b"",
+    )
+    .expect("an empty file must be storable");
 
     let mut readback = Vec::new();
     store
@@ -296,9 +352,19 @@ fn an_empty_file_round_trips_through_the_cas() {
 /// incomplete. Anchoring the two together is what keeps an empty file syncable.
 #[test]
 fn the_wire_and_the_cas_agree_on_chunk_counts() {
-    for length in [0_u64, 1, 1024, CHUNK_SIZE as u64 - 1, CHUNK_SIZE as u64, CHUNK_SIZE as u64 + 1] {
+    for length in [
+        0_u64,
+        1,
+        1024,
+        CHUNK_SIZE as u64 - 1,
+        CHUNK_SIZE as u64,
+        CHUNK_SIZE as u64 + 1,
+    ] {
         let wire = chunk_count_for(length);
-        assert!(wire >= 1, "every object owns at least one chunk (len={length})");
+        assert!(
+            wire >= 1,
+            "every object owns at least one chunk (len={length})"
+        );
         // An empty object is the case the two used to disagree on.
         if length == 0 {
             assert_eq!(wire, 1, "an empty object still has one chunk");

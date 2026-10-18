@@ -68,7 +68,14 @@ fn observe_as_the_app_does(api: &Api, request_id: &str, host_id: &str) {
     .unwrap();
 }
 
-fn observe_with_slots(api: &Api, request_id: &str, host_id: &str, total: u32, used: u32, load: f64) {
+fn observe_with_slots(
+    api: &Api,
+    request_id: &str,
+    host_id: &str,
+    total: u32,
+    used: u32,
+    load: f64,
+) {
     api.handle(
         "host.observe",
         json!({
@@ -111,7 +118,10 @@ fn a_host_that_reported_no_capacity_number_is_still_placeable() {
     let (_project_id2, task_id2) = project_with_task(&api2, "auto2");
     observe_as_the_app_does(&api2, "obs-2", "hst_appreported");
     let automatic = api2
-        .handle("task.place", json!({"request_id": "p2", "task_id": task_id2}))
+        .handle(
+            "task.place",
+            json!({"request_id": "p2", "task_id": task_id2}),
+        )
         .unwrap();
     assert_eq!(placed_host(&automatic), "hst_appreported");
 }
@@ -125,7 +135,10 @@ fn a_host_that_reported_zero_free_slots_is_still_refused() {
     observe_with_slots(&api, "obs-full", "hst_full", 4, 4, 0.0);
 
     let automatic = api
-        .handle("task.place", json!({"request_id": "p1", "task_id": task_id}))
+        .handle(
+            "task.place",
+            json!({"request_id": "p1", "task_id": task_id}),
+        )
         .unwrap_err()
         .to_string();
     assert!(automatic.contains("no eligible host"), "{automatic}");
@@ -151,7 +164,10 @@ fn a_known_capacity_outranks_an_unknown_one() {
     observe_with_slots(&api, "obs-known", "hst_known", 4, 3, 0.9);
 
     let placed = api
-        .handle("task.place", json!({"request_id": "p1", "task_id": task_id}))
+        .handle(
+            "task.place",
+            json!({"request_id": "p1", "task_id": task_id}),
+        )
         .unwrap();
     assert_eq!(placed_host(&placed), "hst_known");
 }
@@ -166,7 +182,10 @@ fn unknown_hosts_are_used_when_nobody_reported_capacity() {
     observe_as_the_app_does(&api, "obs-b", "hst_bbbb");
 
     let placed = api
-        .handle("task.place", json!({"request_id": "p1", "task_id": task_id}))
+        .handle(
+            "task.place",
+            json!({"request_id": "p1", "task_id": task_id}),
+        )
         .unwrap();
     assert!(placed_host(&placed).starts_with("hst_"), "{placed}");
 }
@@ -185,7 +204,10 @@ fn host_list_reports_absent_capacity_as_absent_not_zero() {
         .iter()
         .find(|row| row["host_id"] == "hst_unknown")
         .unwrap();
-    let zero = rows.iter().find(|row| row["host_id"] == "hst_zero").unwrap();
+    let zero = rows
+        .iter()
+        .find(|row| row["host_id"] == "hst_zero")
+        .unwrap();
 
     assert!(
         unknown.get("total_slots").is_none(),
@@ -261,7 +283,10 @@ fn a_second_placement_does_not_reuse_a_host_it_just_filled() {
             }),
         )
         .unwrap();
-    let second_task = second["event"]["payload"]["task_id"].as_str().unwrap().to_string();
+    let second_task = second["event"]["payload"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let first_placed = api
         .handle(
@@ -309,7 +334,10 @@ fn identical_hosts_break_the_tie_the_same_way_every_time() {
             observe_with_slots(&api, "a", "hst_aaaa", 4, 1, 0.5);
         }
         let placed = api
-            .handle("task.place", json!({"request_id": "place", "task_id": task_id}))
+            .handle(
+                "task.place",
+                json!({"request_id": "place", "task_id": task_id}),
+            )
             .unwrap();
         winners.push(placed_host(&placed).to_string());
     }
