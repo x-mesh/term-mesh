@@ -27,22 +27,25 @@ Accepted forms:
    ```bash
    ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
      git fetch origin && git checkout --detach <pinned-sha> && \
+     test "$(git rev-parse HEAD)" = "<pinned-sha>" && \
+     git diff --quiet --ignore-submodules HEAD && \
+     test -z "$(git status --porcelain -- daemon Proto)" && \
      ./scripts/sync-submodules.sh && \
-     git rev-parse HEAD && git status --porcelain -- daemon Proto && \
      cd daemon && cargo test --workspace --no-fail-fast --locked'
    ```
 
-   `HEAD` must equal the pinned SHA and `git status` must print nothing for `daemon` and `Proto`; otherwise the result does not describe that SHA, so stop. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E.
+   The `test` and `git diff --quiet` checks run before any repository script and stop the chain: `HEAD` must equal the pinned SHA, no tracked file may differ, and `daemon` and `Proto` must have no untracked files. Without that the result does not describe the pinned SHA. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E.
 
    Report the pinned SHA with the total passed and failed counts. If cargo fails before running tests (compile error, lockfile mismatch), that is a defect: stop.
 
-   Any failing test stops the release until the user decides. Name every failing test with its panic message, then rerun only those tests on the same SHA, three times, using the `cargo test -p <crate> --bin|--test <target> ...` hint cargo prints on the `error: test failed, to rerun pass` line, followed by `-- <test names>`. Classify each one:
+   Any failing test stops the release until the user decides. Name every failing test with its panic message. Then rerun only those tests, three times each, on the same SHA. For each failing target use the `-p <crate> --bin <name>` or `--test <name>` part of the `error: test failed, to rerun pass` line cargo printed, plus `--locked`, then `-- <test names>`:
 
-   - Fails alone: a defect. Fix it in a separate PR and plan again so the pinned SHA moves.
-   - Passes alone and the panic is a timeout (`... before timeout`, `did not ... within`): report it as intermittent. The user may release with it.
-   - Passes alone but the panic is an assertion on state or data: this is interference between tests, which a timing excuse does not cover. Treat it as a defect and investigate before releasing.
+   ```bash
+   cargo test -p term-meshd --bin term-meshd --locked -- <test names>
+   cargo test -p term-meshd --test cas_integrity --locked -- <test name>
+   ```
 
-   Never rerun the whole suite until it goes green.
+   Classify each test. A test is intermittent only if it passes in all three reruns and its full-run panic was a timeout (`... before timeout`, `did not ... within`). Everything else is a defect, including any test that fails even once alone, a test whose full-run panic was an assertion on state or data (interference between tests), and any case you cannot place. A defect is fixed in a separate PR, then plan again so the pinned SHA moves. The user may release with intermittent tests. Never rerun the whole suite until it goes green.
 
 4. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
 
