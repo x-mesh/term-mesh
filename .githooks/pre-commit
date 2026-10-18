@@ -1,0 +1,21 @@
+#!/bin/sh
+# Blocks a commit that stages Rust files under daemon/ while the workspace is
+# not rustfmt-clean. Fix with: (cd daemon && cargo fmt --all)
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -q '^daemon/.*\.rs$'; then
+  exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-commit: cargo not found, skipping the rustfmt check" >&2
+  exit 0
+fi
+
+ROOT=$(git rev-parse --show-toplevel) || exit 1
+
+if ! (cd "$ROOT/daemon" && cargo fmt --all --check >/dev/null 2>&1); then
+  echo "pre-commit: daemon/ is not rustfmt-clean. Run: (cd daemon && cargo fmt --all)" >&2
+  exit 1
+fi
+
+exit 0
