@@ -2604,14 +2604,19 @@ fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
     // the terminal (OSC 52) to reach the viewer's clipboard. Codex decides that
     // from SSH_CONNECTION; without it, it writes this host's own clipboard and
     // reports success while the viewer keeps its old contents.
-    if std::env::var_os("SSH_CONNECTION").is_none() {
-        env.push((
-            "SSH_CONNECTION".to_string(),
-            REMOTE_PANE_SSH_CONNECTION.to_string(),
-        ));
-    }
+    env.extend(remote_pane_marker(std::env::var_os("SSH_CONNECTION").is_some()));
     env.extend(identity_environment(surface_id));
     env
+}
+
+/// An inherited value already marks the pane as remote, so it is left alone.
+fn remote_pane_marker(daemon_has_ssh_connection: bool) -> Option<(String, String)> {
+    (!daemon_has_ssh_connection).then(|| {
+        (
+            "SSH_CONNECTION".to_string(),
+            REMOTE_PANE_SSH_CONNECTION.to_string(),
+        )
+    })
 }
 
 const REMOTE_PANE_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
@@ -4501,17 +4506,15 @@ mod tests {
     }
 
     #[test]
-    fn pane_environment_marks_the_pane_as_remote_for_clipboard_routing() {
-        if std::env::var_os("SSH_CONNECTION").is_some() {
-            return;
-        }
-        let env = pane_environment(&[0xab, 0xcd]);
+    fn remote_pane_marker_is_added_only_when_the_daemon_has_none() {
         assert_eq!(
-            env.iter()
-                .find(|(name, _)| name == "SSH_CONNECTION")
-                .map(|(_, value)| value.as_str()),
-            Some(REMOTE_PANE_SSH_CONNECTION)
+            remote_pane_marker(false),
+            Some((
+                "SSH_CONNECTION".to_string(),
+                REMOTE_PANE_SSH_CONNECTION.to_string()
+            ))
         );
+        assert_eq!(remote_pane_marker(true), None);
     }
 
     #[test]
