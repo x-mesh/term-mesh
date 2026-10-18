@@ -800,8 +800,16 @@ macro_rules! delegate {
     };
 }
 
-delegate!(dl_open(name: *const c_char) -> *mut c_void, xDlOpen, std::ptr::null_mut());
-delegate!(dl_error(length: c_int, message: *mut c_char) -> (), xDlError, ());
+delegate!(
+    dl_open(name: *const c_char) -> *mut c_void,
+    xDlOpen,
+    std::ptr::null_mut()
+);
+delegate!(
+    dl_error(length: c_int, message: *mut c_char) -> (),
+    xDlError,
+    ()
+);
 unsafe extern "C" fn dl_sym(
     vfs: *mut ffi::sqlite3_vfs,
     handle: *mut c_void,
@@ -812,11 +820,39 @@ unsafe extern "C" fn dl_sym(
     unsafe { callback(context.base, handle, name) }
 }
 delegate!(dl_close(handle: *mut c_void) -> (), xDlClose, ());
-delegate!(randomness(length: c_int, output: *mut c_char) -> c_int, xRandomness, 0);
+delegate!(
+    randomness(length: c_int, output: *mut c_char) -> c_int,
+    xRandomness,
+    0
+);
 delegate!(sleep(microseconds: c_int) -> c_int, xSleep, 0);
-delegate!(current_time(value: *mut f64) -> c_int, xCurrentTime, ffi::SQLITE_ERROR);
-delegate!(last_error(length: c_int, message: *mut c_char) -> c_int, xGetLastError, 0);
-delegate!(current_time_i64(value: *mut ffi::sqlite3_int64) -> c_int, xCurrentTimeInt64, ffi::SQLITE_ERROR);
-delegate!(set_system_call(name: *const c_char, call: ffi::sqlite3_syscall_ptr) -> c_int, xSetSystemCall, ffi::SQLITE_NOTFOUND);
-delegate!(get_system_call(name: *const c_char) -> ffi::sqlite3_syscall_ptr, xGetSystemCall, None);
-delegate!(next_system_call(name: *const c_char) -> *const c_char, xNextSystemCall, std::ptr::null());
+delegate!(
+    current_time(value: *mut f64) -> c_int,
+    xCurrentTime,
+    ffi::SQLITE_ERROR
+);
+delegate!(
+    last_error(length: c_int, message: *mut c_char) -> c_int,
+    xGetLastError,
+    0
+);
+delegate!(
+    current_time_i64(value: *mut ffi::sqlite3_int64) -> c_int,
+    xCurrentTimeInt64,
+    ffi::SQLITE_ERROR
+);
+delegate!(
+    set_system_call(name: *const c_char, call: ffi::sqlite3_syscall_ptr) -> c_int,
+    xSetSystemCall,
+    ffi::SQLITE_NOTFOUND
+);
+delegate!(
+    get_system_call(name: *const c_char) -> ffi::sqlite3_syscall_ptr,
+    xGetSystemCall,
+    None
+);
+delegate!(
+    next_system_call(name: *const c_char) -> *const c_char,
+    xNextSystemCall,
+    std::ptr::null()
+);

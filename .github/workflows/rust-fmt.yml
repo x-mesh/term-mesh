@@ -1,0 +1,41 @@
+name: rust-fmt
+
+# Fails a change that leaves the daemon workspace not rustfmt-clean, so a later
+# `cargo fmt` never rewrites files nobody touched. The pre-commit hook in
+# .githooks runs the same check locally; this one cannot be bypassed with
+# --no-verify.
+#
+# `cargo fmt` resolves the workspace, and daemon/Cargo.toml patches vt100 with
+# ../vendor/vt100, so the checkout must include that directory.
+
+on:
+  pull_request:
+    paths:
+      - "daemon/**"
+      - "vendor/vt100/**"
+      - ".github/workflows/rust-fmt.yml"
+  push:
+    branches: [develop, main]
+    paths:
+      - "daemon/**"
+      - "vendor/vt100/**"
+      - ".github/workflows/rust-fmt.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-fmt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        working-directory: daemon
+        run: cargo fmt --all --check
