@@ -2591,6 +2591,13 @@ fn pane_path(requested_env: &[(String, String)]) -> Option<String> {
 }
 
 fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
+    pane_environment_for(surface_id, std::env::var_os("SSH_CONNECTION").is_some())
+}
+
+fn pane_environment_for(
+    surface_id: &[u8],
+    daemon_has_ssh_connection: bool,
+) -> Vec<(String, String)> {
     let mut env = vec![
         ("TERM".to_string(), resolve_term()),
         ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
@@ -2600,9 +2607,26 @@ fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
         ),
         ("COLORTERM".to_string(), "truecolor".to_string()),
     ];
+    // A pane's screen is shown on another machine, so a CLI must copy through
+    // the terminal (OSC 52) to reach the viewer's clipboard. Codex decides that
+    // from SSH_CONNECTION; without it, it writes this host's own clipboard and
+    // reports success while the viewer keeps its old contents.
+    env.extend(remote_pane_marker(daemon_has_ssh_connection));
     env.extend(identity_environment(surface_id));
     env
 }
+
+/// An inherited value already marks the pane as remote, so it is left alone.
+fn remote_pane_marker(daemon_has_ssh_connection: bool) -> Option<(String, String)> {
+    (!daemon_has_ssh_connection).then(|| {
+        (
+            "SSH_CONNECTION".to_string(),
+            REMOTE_PANE_SSH_CONNECTION.to_string(),
+        )
+    })
+}
+
+const REMOTE_PANE_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
 
 /// The terminal-agnostic slice of [`pane_environment`]: who this surface is
 /// and how to reach this host's daemon. Shared with agent surfaces, which
@@ -4486,6 +4510,29 @@ mod tests {
         assert!(!stdout
             .lines()
             .any(|line| line.starts_with("TERMMESH_LAUNCH_")));
+    }
+
+    #[test]
+    fn remote_pane_marker_is_added_only_when_the_daemon_has_none() {
+        assert_eq!(
+            remote_pane_marker(false),
+            Some((
+                "SSH_CONNECTION".to_string(),
+                REMOTE_PANE_SSH_CONNECTION.to_string()
+            ))
+        );
+        assert_eq!(remote_pane_marker(true), None);
+    }
+
+    #[test]
+    fn pane_environment_carries_the_marker_only_when_the_daemon_has_none() {
+        let has_marker = |env: &[(String, String)]| {
+            env.iter().any(|(name, value)| {
+                name == "SSH_CONNECTION" && value == REMOTE_PANE_SSH_CONNECTION
+            })
+        };
+        assert!(has_marker(&pane_environment_for(&[0xab], false)));
+        assert!(!has_marker(&pane_environment_for(&[0xab], true)));
     }
 
     #[test]
