@@ -2591,6 +2591,13 @@ fn pane_path(requested_env: &[(String, String)]) -> Option<String> {
 }
 
 fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
+    pane_environment_for(surface_id, std::env::var_os("SSH_CONNECTION").is_some())
+}
+
+fn pane_environment_for(
+    surface_id: &[u8],
+    daemon_has_ssh_connection: bool,
+) -> Vec<(String, String)> {
     let mut env = vec![
         ("TERM".to_string(), resolve_term()),
         ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
@@ -2604,7 +2611,7 @@ fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
     // the terminal (OSC 52) to reach the viewer's clipboard. Codex decides that
     // from SSH_CONNECTION; without it, it writes this host's own clipboard and
     // reports success while the viewer keeps its old contents.
-    env.extend(remote_pane_marker(std::env::var_os("SSH_CONNECTION").is_some()));
+    env.extend(remote_pane_marker(daemon_has_ssh_connection));
     env.extend(identity_environment(surface_id));
     env
 }
@@ -4515,6 +4522,17 @@ mod tests {
             ))
         );
         assert_eq!(remote_pane_marker(true), None);
+    }
+
+    #[test]
+    fn pane_environment_carries_the_marker_only_when_the_daemon_has_none() {
+        let has_marker = |env: &[(String, String)]| {
+            env.iter().any(|(name, value)| {
+                name == "SSH_CONNECTION" && value == REMOTE_PANE_SSH_CONNECTION
+            })
+        };
+        assert!(has_marker(&pane_environment_for(&[0xab], false)));
+        assert!(!has_marker(&pane_environment_for(&[0xab], true)));
     }
 
     #[test]
