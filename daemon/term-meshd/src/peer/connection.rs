@@ -4580,11 +4580,13 @@ mod team_call_allow_list_tests {
             };
             let signal = read("../../Sources/TeamEventWakeSignal.swift");
             let provider = read("../../Sources/GhosttyPaneSurfaceProvider.swift");
-            let declared = quoted(section(&signal, "static let method", "\n"));
+            let declared = quoted(section(&signal, "static let method", "\n"))
+                .into_iter()
+                .next()
+                .expect("TeamEventWakeSignal.method declaration not found");
             provider
-                .contains("TeamEventWakeSignal.shared.respond(params: params)")
-                .then(|| declared.into_iter().next())
-                .flatten()
+                .contains("TeamEventWakeSignal.shared.respond")
+                .then_some(declared)
         };
         served.extend(wake_method);
         assert!(
