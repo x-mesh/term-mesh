@@ -1,20 +1,40 @@
 #!/bin/sh
-# Blocks a commit that stages Rust files under daemon/ while the workspace is
-# not rustfmt-clean. Fix with: (cd daemon && cargo fmt --all)
+# Blocks a commit whose staged daemon/**/*.rs content is not rustfmt-clean.
+# It checks the staged blobs, not the working tree, because the index is what
+# the commit records. Fix with: (cd daemon && cargo fmt --all) && git add <files>
 
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -q '^daemon/.*\.rs$'; then
+EDITION=2021
+
+STAGED=$(git diff --cached --name-only -z --diff-filter=ACMR -- 'daemon/*.rs' | tr '\0' '\n') || {
+  echo "pre-commit: cannot list staged files" >&2
+  exit 1
+}
+
+if [ -z "$STAGED" ]; then
   exit 0
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "pre-commit: cargo not found, skipping the rustfmt check" >&2
+if ! command -v rustfmt >/dev/null 2>&1; then
+  echo "pre-commit: rustfmt not found, skipping the format check" >&2
   exit 0
 fi
 
-ROOT=$(git rev-parse --show-toplevel) || exit 1
+BAD=""
+while IFS= read -r FILE; do
+  # rustfmt exits 0 on a stdin diff, so a "Diff in" line is the failure signal.
+  OUT=$(git show ":$FILE" | rustfmt --check --color never --edition "$EDITION" 2>&1)
+  STATUS=$?
+  if [ "$STATUS" -ne 0 ] || printf '%s\n' "$OUT" | grep -q '^Diff in'; then
+    BAD="$BAD
+  $FILE"
+  fi
+done <<EOF_FILES
+$STAGED
+EOF_FILES
 
-if ! (cd "$ROOT/daemon" && cargo fmt --all --check >/dev/null 2>&1); then
-  echo "pre-commit: daemon/ is not rustfmt-clean. Run: (cd daemon && cargo fmt --all)" >&2
+if [ -n "$BAD" ]; then
+  echo "pre-commit: staged content is not rustfmt-clean:$BAD" >&2
+  echo "Run: (cd daemon && cargo fmt --all) && git add <files>" >&2
   exit 1
 fi
 
