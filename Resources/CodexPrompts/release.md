@@ -12,6 +12,8 @@ Use `scripts/release.py`; it owns ordering and durable receipts. Do not recreate
 - `status <version>`: run `python3 scripts/release.py status <version> --json`.
 - `resume <version>`: read status, obtain approval for the next remote phase, then run `python3 scripts/release.py resume <version> --yes --json`.
 
+Before prepare, run `cd daemon && cargo test --workspace --no-fail-fast --locked` on the mac-sub checkout detached at the pinned develop SHA, before the relay E2E. Any failing test stops the release until the user decides: rerun only the failed tests alone three times on the same SHA. One that passes alone every time is reported as intermittent, and the user may release with it; one that also fails alone is a defect to fix in a separate PR before planning again.
+
 Prepare mutates remote branches and opens a PR. Before it, show the pinned develop SHA, version, changelog, and effects. Then run:
 
 ```bash

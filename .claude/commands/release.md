@@ -22,7 +22,18 @@ Accepted forms:
 
 2. Use `latest_tag` and `git log <latest-tag>..origin/develop --no-merges` to draft one changelog section. Include only user-visible changes and contributor credits. The section must start with `## [X.Y.Z] - YYYY-MM-DD`. Write it to a temporary file.
 
-3. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
+3. Run the daemon test suite on the pinned develop SHA. A test that fails on `develop` blocks the release until it is understood: the relay E2E below exercises one path and does not cover the rest of the daemon. Run it on the same mac-sub checkout the E2E uses, detached at the pinned SHA, and finish it before the E2E starts. The runner takes one topology at a time.
+
+   ```bash
+   ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
+     git fetch origin && git checkout --detach <pinned-sha> && \
+     ./scripts/sync-submodules.sh && \
+     cd daemon && cargo test --workspace --no-fail-fast --locked'
+   ```
+
+   `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E. Report the total passed and failed counts. Any failure stops the release until the user decides. Name every failing test, then rerun just those tests alone on the same SHA (`cargo test -p <crate> --locked -- <test names>`, three times). A test that fails in the full run and passes alone every time is reported as intermittent, with its panic message; the user may release with it. A test that also fails alone is a defect: fix it in a separate PR and plan again so the pinned SHA moves. Never rerun the whole suite until it goes green.
+
+4. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
 
    ```bash
    ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
@@ -70,27 +81,27 @@ Accepted forms:
    The runner's checkout must be detached at the pinned SHA with `daemon` and `Proto` clean,
    or the fixture refuses to stage. The peer host needs the agent CLI already installed.
 
-4. Show the version, pinned develop SHA, changelog, relay receipt, and prepare effects: merge `develop→main`, create/push the release branch, and open the release PR. Ask one explicit confirmation. On approval:
+5. Show the version, pinned develop SHA, changelog, relay receipt, and prepare effects: merge `develop→main`, create/push the release branch, and open the release PR. Ask one explicit confirmation. On approval:
 
    ```bash
    python3 scripts/release.py prepare <version> --notes-file <temp-file> --relay-e2e-receipt <receipt-path> --yes --json
    ```
 
-5. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, develop resync, and cleanup. Ask one explicit confirmation. On approval:
+6. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, develop resync, and cleanup. Ask one explicit confirmation. On approval:
 
    ```bash
    python3 scripts/release.py publish <version> --yes --json
    ```
 
-6. On failure, report the JSON error and last completed receipt. Do not improvise raw Git recovery. Fix the stated blocker, then rerun:
+7. On failure, report the JSON error and last completed receipt. Do not improvise raw Git recovery. Fix the stated blocker, then rerun:
 
    ```bash
    python3 scripts/release.py resume <version> --yes --json
    ```
 
-7. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt.
+8. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt.
 
-8. `cleanup` runs last and reclaims the release checkouts under `~/.cache/term-mesh/release-worktrees` plus the local `chore/release-v*` branches. It is destructive: `git worktree remove --force` discards whatever is in the tree, and `git branch -D` is required because the squash merge leaves the branch unreachable from `main`.
+9. `cleanup` runs last and reclaims the release checkouts under `~/.cache/term-mesh/release-worktrees` plus the local `chore/release-v*` branches. It is destructive: `git worktree remove --force` discards whatever is in the tree, and `git branch -D` is required because the squash merge leaves the branch unreachable from `main`.
 
    It claims a version only when that version's own release is settled — the current one, or an older one whose tag shipped, whose lock is free, and whose receipt has `verify` completed. An abandoned or still-running release keeps its checkout, and a branch is deleted only when its tip still equals the commit its own `release_metadata` receipt recorded.
 
