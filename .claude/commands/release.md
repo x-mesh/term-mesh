@@ -28,10 +28,21 @@ Accepted forms:
    ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
      git fetch origin && git checkout --detach <pinned-sha> && \
      ./scripts/sync-submodules.sh && \
+     git rev-parse HEAD && git status --porcelain -- daemon Proto && \
      cd daemon && cargo test --workspace --no-fail-fast --locked'
    ```
 
-   `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E. Report the total passed and failed counts. Any failure stops the release until the user decides. Name every failing test, then rerun just those tests alone on the same SHA (`cargo test -p <crate> --locked -- <test names>`, three times). A test that fails in the full run and passes alone every time is reported as intermittent, with its panic message; the user may release with it. A test that also fails alone is a defect: fix it in a separate PR and plan again so the pinned SHA moves. Never rerun the whole suite until it goes green.
+   `HEAD` must equal the pinned SHA and `git status` must print nothing for `daemon` and `Proto`; otherwise the result does not describe that SHA, so stop. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E.
+
+   Report the pinned SHA with the total passed and failed counts. If cargo fails before running tests (compile error, lockfile mismatch), that is a defect: stop.
+
+   Any failing test stops the release until the user decides. Name every failing test with its panic message, then rerun only those tests on the same SHA, three times, using the `cargo test -p <crate> --bin|--test <target> ...` hint cargo prints on the `error: test failed, to rerun pass` line, followed by `-- <test names>`. Classify each one:
+
+   - Fails alone: a defect. Fix it in a separate PR and plan again so the pinned SHA moves.
+   - Passes alone and the panic is a timeout (`... before timeout`, `did not ... within`): report it as intermittent. The user may release with it.
+   - Passes alone but the panic is an assertion on state or data: this is interference between tests, which a timing excuse does not cover. Treat it as a defect and investigate before releasing.
+
+   Never rerun the whole suite until it goes green.
 
 4. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
 
@@ -99,7 +110,7 @@ Accepted forms:
    python3 scripts/release.py resume <version> --yes --json
    ```
 
-8. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt.
+8. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt. The release summary must also state the step 3 daemon test result for the pinned SHA, or that the user waived it; `scripts/release.py` does not record it.
 
 9. `cleanup` runs last and reclaims the release checkouts under `~/.cache/term-mesh/release-worktrees` plus the local `chore/release-v*` branches. It is destructive: `git worktree remove --force` discards whatever is in the tree, and `git branch -D` is required because the squash merge leaves the branch unreachable from `main`.
 
