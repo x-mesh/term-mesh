@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.276.0] - 2026-10-18
+
+### Fixed
+
+- Text you copy inside Codex in a remote pane now reaches your own Mac's clipboard. Before, Codex showed "copied" but only wrote the remote Mac's clipboard, so pasting on your Mac gave back the old text. Claude Code was not affected. Panes on a remote host now report that they are on a remote session, which makes Codex copy through the terminal. The fix runs on the remote host, so update `term-meshd` there; only panes opened after the update change.
+
+### Changed
+
+- The daemon's Rust source is now formatted with `rustfmt`. A commit hook and a CI check keep it that way, so later changes show only the lines that changed.
+- The release process now runs the whole daemon test suite on the release candidate before the relay checks.
+- A test that checks the leader-to-owner method list no longer fails on `team.events.wait`. A test of corrupted stored objects no longer fails about once in 190 runs, because it wrote a fixed byte that was sometimes already there.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.275.0] - 2026-10-17
 
 ### Fixed
