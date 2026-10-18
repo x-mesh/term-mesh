@@ -31,10 +31,10 @@ Accepted forms:
      git diff --quiet --ignore-submodules HEAD && \
      test -z "$(git status --porcelain -- daemon Proto)" && \
      ./scripts/sync-submodules.sh && \
-     cd daemon && cargo test --workspace --no-fail-fast --locked'
+     cd daemon && cargo test --workspace --no-fail-fast --locked -- --test-threads=4'
    ```
 
-   The `test` and `git diff --quiet` checks run before any repository script and stop the chain: `HEAD` must equal the pinned SHA, no tracked file may differ, and `daemon` and `Proto` must have no untracked files. Without that the result does not describe the pinned SHA. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E.
+   The `test` and `git diff --quiet` checks run before any repository script and stop the chain: `HEAD` must equal the pinned SHA, no tracked file may differ, and `daemon` and `Proto` must have no untracked files. Without that the result does not describe the pinned SHA. `--no-fail-fast` is required: without it cargo stops at the first failing crate and hides the failures in the crates after it. `--locked` keeps `Cargo.lock` unchanged so the checkout stays clean for the E2E. `--test-threads=4` is required: at the runner's default parallelism (its CPU count, 10) PTY tests with wall-clock deadlines fail even though they pass alone, and which ones fail changes from run to run. At 4 threads the whole workspace passed three times in a row. Do not raise it to make the suite faster.
 
    Report the pinned SHA with the total passed and failed counts. If cargo fails before running tests (compile error, lockfile mismatch), that is a defect: stop.
 
