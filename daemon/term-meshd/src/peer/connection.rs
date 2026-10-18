@@ -18,12 +18,12 @@ use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
     EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
     EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error,
-    GridSnapshot, Hello, HostStats, Pong, PtyData, ScrollbackChunk, SurfaceExited, SurfaceList,
-    Team, TeamCallResponse, TeamList, TeamMember, TerminateSurfaceError as WireTerminateError,
-    TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    RepairStaleProjectPresentationResponse, StaleProjectObservation, TerminateSurfaceResult,
-    UpsertProjectPresentationResponse, Workspace, WorkspaceList,
-    WorkspaceListChanged, WorkspaceMeta, WorkspaceUpdate,
+    GridSnapshot, Hello, HostStats, Pong, PtyData, RepairStaleProjectPresentationResponse,
+    ScrollbackChunk, StaleProjectObservation, SurfaceExited, SurfaceList, Team, TeamCallResponse,
+    TeamList, TeamMember, TerminateSurfaceError as WireTerminateError, TerminateSurfaceErrorCode,
+    TerminateSurfaceRequest, TerminateSurfaceResponse, TerminateSurfaceResult,
+    UpsertProjectPresentationResponse, Workspace, WorkspaceList, WorkspaceListChanged,
+    WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use sha2::{Digest, Sha256};
@@ -113,7 +113,10 @@ fn repair_stale_project_presentation(
         );
     }
     if request.request_id.len() != 16 {
-        return (refused("invalid_request", "request_id must be 16 bytes"), false);
+        return (
+            refused("invalid_request", "request_id must be 16 bytes"),
+            false,
+        );
     }
     if !lifecycle_request_ids.insert(request.request_id.clone()) {
         return (
@@ -126,14 +129,20 @@ fn repair_stale_project_presentation(
     }
     if request.project_id.is_empty() {
         return (
-            refused("invalid_request", "project_id is required; a name is not accepted"),
+            refused(
+                "invalid_request",
+                "project_id is required; a name is not accepted",
+            ),
             false,
         );
     }
 
     let Some(status) = host.project_presentation_status(&request.project_id) else {
         observations.remove(&request.project_id);
-        return (refused("not_found", "no manifest holds that project id"), false);
+        return (
+            refused("not_found", "no manifest holds that project id"),
+            false,
+        );
     };
     let observed = StaleProjectObservation {
         project_id: status.project_id.clone(),
@@ -170,7 +179,10 @@ fn repair_stale_project_presentation(
     if !request.apply {
         observations.insert(
             request.project_id.clone(),
-            StaleObservation { instance: status.instance, at: Instant::now() },
+            StaleObservation {
+                instance: status.instance,
+                at: Instant::now(),
+            },
         );
         return (
             RepairStaleProjectPresentationResponse {
@@ -187,7 +199,10 @@ fn repair_stale_project_presentation(
     let Some(earlier) = observations.get(&request.project_id) else {
         observations.insert(
             request.project_id.clone(),
-            StaleObservation { instance: status.instance, at: Instant::now() },
+            StaleObservation {
+                instance: status.instance,
+                at: Instant::now(),
+            },
         );
         return (
             answer(
@@ -203,16 +218,25 @@ fn repair_stale_project_presentation(
         // removing what was never observed.
         observations.insert(
             request.project_id.clone(),
-            StaleObservation { instance: status.instance, at: Instant::now() },
+            StaleObservation {
+                instance: status.instance,
+                at: Instant::now(),
+            },
         );
         return (
-            answer("record_changed", "the manifest changed since it was observed"),
+            answer(
+                "record_changed",
+                "the manifest changed since it was observed",
+            ),
             false,
         );
     }
     if earlier.at.elapsed() < STALE_RECHECK {
         return (
-            answer("recheck_too_soon", "the observation is not old enough to act on"),
+            answer(
+                "recheck_too_soon",
+                "the observation is not old enough to act on",
+            ),
             false,
         );
     }
@@ -247,7 +271,10 @@ fn repair_stale_project_presentation(
                 .first()
                 .map(|skip| skip.reason)
                 .unwrap_or("not_removed");
-            (answer(reason, "the host refused to remove that manifest"), false)
+            (
+                answer(reason, "the host refused to remove that manifest"),
+                false,
+            )
         }
         Err(code) => (answer(code, "the repair could not be written"), false),
     }
@@ -615,9 +642,10 @@ async fn reader_loop(
                     .filter_map(|surface| {
                         let info = surface.info();
                         let mut info = info;
-                        info.foreground_busy_known = peer_capabilities
-                            .has(capability::SURFACE_FOREGROUND_V1);
-                        info.attachable.then_some((surface.surface_id.clone(), info))
+                        info.foreground_busy_known =
+                            peer_capabilities.has(capability::SURFACE_FOREGROUND_V1);
+                        info.attachable
+                            .then_some((surface.surface_id.clone(), info))
                     })
                     .collect();
                 let project_owner_hex: HashSet<String> =
@@ -1131,9 +1159,10 @@ async fn reader_loop(
                 // has exited (e.g., the user typed `exit` in a previous
                 // attach). Unknown ids or respawn failures fall through
                 // to the "surface not found" reply below.
-                let Some(surface) = host.with_open_surface_admission(|| {
-                    manager.get_or_respawn(&req.surface_id)
-                }).flatten() else {
+                let Some(surface) = host
+                    .with_open_surface_admission(|| manager.get_or_respawn(&req.surface_id))
+                    .flatten()
+                else {
                     let reply = Envelope {
                         seq: next_seq(&seq_counter),
                         correlation_id: env.seq,
@@ -2071,13 +2100,24 @@ fn plan_surface_transcript_call(
     };
     let params: serde_json::Value = match serde_json::from_str(params_json) {
         Ok(v) => v,
-        Err(e) => return Err(refuse("invalid_params", format!("params are not JSON: {e}"))),
+        Err(e) => {
+            return Err(refuse(
+                "invalid_params",
+                format!("params are not JSON: {e}"),
+            ))
+        }
     };
     let Some(hex) = params.get("surface_id").and_then(serde_json::Value::as_str) else {
-        return Err(refuse("invalid_params", "surface_id is required".to_string()));
+        return Err(refuse(
+            "invalid_params",
+            "surface_id is required".to_string(),
+        ));
     };
     let Some(surface_id) = decode_hex(hex) else {
-        return Err(refuse("invalid_params", "surface_id is not hex".to_string()));
+        return Err(refuse(
+            "invalid_params",
+            "surface_id is not hex".to_string(),
+        ));
     };
     if !attached.contains_key(&surface_id) {
         return Err(refuse(
@@ -4504,11 +4544,7 @@ mod team_call_allow_list_tests {
         // `dispatchTeamDataCommandDirect`. Reading the set alone would call a
         // method served when it is merely routed to a switch that drops it,
         // so both halves are read and required to agree.
-        let data_set = quoted(section(
-            &source,
-            "static let teamDataCommands",
-            "\n    ]",
-        ));
+        let data_set = quoted(section(&source, "static let teamDataCommands", "\n    ]"));
         let data_cases = case_labels(section(
             &source,
             "private func dispatchTeamDataCommandDirect",
@@ -4532,6 +4568,27 @@ mod team_call_allow_list_tests {
 
         let mut served = data_cases;
         served.extend(ui_cases);
+
+        // The long-poll is answered on the reverse leader route before the
+        // dispatcher switches are reached, so it never appears in them. Count
+        // it only while that route still calls the owner-side signal.
+        let wake_method = {
+            let read = |path: &str| {
+                let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+                std::fs::read_to_string(&file)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", file.display()))
+            };
+            let signal = read("../../Sources/TeamEventWakeSignal.swift");
+            let provider = read("../../Sources/GhosttyPaneSurfaceProvider.swift");
+            let declared = quoted(section(&signal, "static let method", "\n"))
+                .into_iter()
+                .next()
+                .expect("TeamEventWakeSignal.method declaration not found");
+            provider
+                .contains("TeamEventWakeSignal.shared.respond")
+                .then_some(declared)
+        };
+        served.extend(wake_method);
         assert!(
             served.len() > 20,
             "parsed too little out of the dispatchers: {served:?}"
@@ -6062,7 +6119,10 @@ mod stale_repair_tests {
                 kind: SurfaceKind::Pty,
                 agent_cli: String::new(),
             };
-            let leader = self.host.ensure_surface(key, &spec).expect("leader surface");
+            let leader = self
+                .host
+                .ensure_surface(key, &spec)
+                .expect("leader surface");
             let team = peer_proto::v1::Team {
                 name: project_id.to_string(),
                 team_uuid: format!("uuid-{project_id}"),
@@ -6140,9 +6200,7 @@ mod stale_repair_tests {
     }
 
     fn capabilities() -> PeerCapabilities {
-        PeerCapabilities::from_hello(vec![
-            capability::PROJECT_PRESENTATION_REPAIR_V1.to_string(),
-        ])
+        PeerCapabilities::from_hello(vec![capability::PROJECT_PRESENTATION_REPAIR_V1.to_string()])
     }
 
     #[tokio::test]
@@ -6199,7 +6257,10 @@ mod stale_repair_tests {
         let straight_to_apply = fixture.call("gone", true);
         assert!(!straight_to_apply.ok);
         assert_eq!(straight_to_apply.error_code, "recheck_required");
-        assert_eq!(straight_to_apply.min_recheck_secs, STALE_RECHECK.as_secs() as u32);
+        assert_eq!(
+            straight_to_apply.min_recheck_secs,
+            STALE_RECHECK.as_secs() as u32
+        );
 
         // The refusal recorded the first look, but it is not old enough yet.
         let too_soon = fixture.call("gone", true);
@@ -6226,7 +6287,14 @@ mod stale_repair_tests {
         // A manifest can only be written behind a live leader, so a rewrite
         // means a second leader came and went.
         let second = fixture.publish_keyed("gone-again", "gone");
-        assert_eq!(fixture.host.project_presentation_status("gone").unwrap().revision, 2);
+        assert_eq!(
+            fixture
+                .host
+                .project_presentation_status("gone")
+                .unwrap()
+                .revision,
+            2
+        );
         fixture.kill("gone", &second).await;
 
         let response = fixture.call("gone", true);
@@ -6255,15 +6323,24 @@ mod stale_repair_tests {
         let observed = fixture.call("stale", false);
         assert!(observed.ok, "{observed:?}");
         let evidence = observed.observed.expect("evidence");
-        assert_eq!((evidence.live_surfaces, evidence.directory_present), (0, true));
-        assert!(!evidence.owned_by_requester, "the requester must not own this record");
+        assert_eq!(
+            (evidence.live_surfaces, evidence.directory_present),
+            (0, true)
+        );
+        assert!(
+            !evidence.owned_by_requester,
+            "the requester must not own this record"
+        );
         fixture.age_observation("stale");
 
         let response = fixture.call("stale", true);
 
         assert!(response.ok, "{response:?}");
         assert!(response.removed);
-        assert!(!response.backup_path.is_empty(), "a repair must leave a way back");
+        assert!(
+            !response.backup_path.is_empty(),
+            "a repair must leave a way back"
+        );
         assert_eq!(std::fs::metadata(&response.backup_path).is_ok(), true);
 
         let remaining: Vec<String> = fixture
@@ -6274,7 +6351,11 @@ mod stale_repair_tests {
             .collect();
         assert_eq!(remaining, vec!["keep".to_string()]);
         assert_eq!(fixture.host.list_workspaces().len(), workspaces_before);
-        assert_eq!(fixture.live_surfaces("keep"), 1, "an unrelated record must stay live");
+        assert_eq!(
+            fixture.live_surfaces("keep"),
+            1,
+            "an unrelated record must stay live"
+        );
         fixture.kill("keep", &keep).await;
     }
 
@@ -6300,7 +6381,10 @@ mod stale_repair_tests {
             .delete_project_presentation(&[GONE_OWNER.to_vec()], "gone")
             .expect("owner delete");
         let second = fixture.publish_keyed("gone-again", "gone");
-        let republished = fixture.host.project_presentation_status("gone").expect("republished");
+        let republished = fixture
+            .host
+            .project_presentation_status("gone")
+            .expect("republished");
         assert_eq!(republished.revision, 1, "the premise: the revision repeats");
         fixture.kill("gone", &second).await;
 

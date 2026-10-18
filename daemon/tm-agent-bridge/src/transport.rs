@@ -192,7 +192,10 @@ impl Transport for ProcessChild {
         };
         // A broken pipe says only that writing failed. What the caller needs
         // is why the child is gone, which is what failure_message answers.
-        if writeln!(stdin, "{line}").and_then(|_| stdin.flush()).is_err() {
+        if writeln!(stdin, "{line}")
+            .and_then(|_| stdin.flush())
+            .is_err()
+        {
             return Err(ChildExited(self.failure_message()));
         }
         Ok(())

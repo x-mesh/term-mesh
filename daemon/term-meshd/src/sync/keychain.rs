@@ -584,7 +584,8 @@ impl FileKeychain {
     }
 
     fn ensure_dir(&self) -> Result<(), KeychainError> {
-        std::fs::create_dir_all(&self.dir).map_err(|error| KeychainError::Platform(error.to_string()))?;
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|error| KeychainError::Platform(error.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -598,7 +599,8 @@ impl KeychainBackend for FileKeychain {
     fn put(&self, item: &KeychainItem, secret: &[u8]) -> Result<(), KeychainError> {
         self.ensure_dir()?;
         let path = self.item_path(item);
-        std::fs::write(&path, secret).map_err(|error| KeychainError::Platform(error.to_string()))?;
+        std::fs::write(&path, secret)
+            .map_err(|error| KeychainError::Platform(error.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -610,7 +612,9 @@ impl KeychainBackend for FileKeychain {
     fn get(&self, item: &KeychainItem) -> Result<Zeroizing<Vec<u8>>, KeychainError> {
         match std::fs::read(self.item_path(item)) {
             Ok(bytes) => Ok(Zeroizing::new(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(KeychainError::NotFound),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(KeychainError::NotFound)
+            }
             Err(error) => Err(KeychainError::Platform(error.to_string())),
         }
     }
@@ -770,9 +774,15 @@ mod tests {
         let provider = KeychainProjectKeyProvider::new(backend.clone());
         let project = ProjectId::from_bytes([7; 32]);
         // Current key resolves; the same key id resolves to the same bytes.
-        assert_eq!(provider.current_project_key(project).unwrap().key_id, key_id);
         assert_eq!(
-            provider.project_key(project, key_id).unwrap().expose_for_wrapping(),
+            provider.current_project_key(project).unwrap().key_id,
+            key_id
+        );
+        assert_eq!(
+            provider
+                .project_key(project, key_id)
+                .unwrap()
+                .expose_for_wrapping(),
             &key_bytes
         );
         // An unknown key id and an unprovisioned project both fail cleanly.

@@ -198,9 +198,8 @@ fn build_child_env(overrides: &[(String, String)]) -> io::Result<Vec<CString>> {
     merged
         .into_iter()
         .map(|(key, value)| {
-            CString::new(format!("{key}={value}")).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "env entry contains NUL")
-            })
+            CString::new(format!("{key}={value}"))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "env entry contains NUL"))
         })
         .collect()
 }

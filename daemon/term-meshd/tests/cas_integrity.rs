@@ -3,7 +3,7 @@ mod sync;
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::symlink;
 use std::sync::{Arc, RwLock};
 
@@ -688,9 +688,16 @@ fn chunk_count_overflow_and_live_bitflip_fail_closed() {
     let plaintext = b"detect live corruption";
     let id = ingest(&cas, domain, plaintext);
     let live = temp.path().join("live").join(format!("{id}.cas"));
-    let mut file = OpenOptions::new().write(true).open(live).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(live)
+        .unwrap();
     file.seek(SeekFrom::End(-1)).unwrap();
-    file.write_all(&[0]).unwrap();
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last).unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.write_all(&[!last[0]]).unwrap();
     file.sync_all().unwrap();
     assert!(matches!(
         cas.get_live(domain, id),

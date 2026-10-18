@@ -100,7 +100,10 @@ impl SyncProvisioningStore {
         &self,
         project_id: [u8; 32],
     ) -> Result<Option<LocalCoordinates>, ProvisioningError> {
-        let connection = self.connection.lock().map_err(|_| ProvisioningError::Storage)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ProvisioningError::Storage)?;
         let row = connection
             .query_row(
                 "SELECT device_id,roster_epoch FROM sync_local WHERE project_id=?1",
@@ -140,7 +143,10 @@ impl SyncProvisioningStore {
     /// A peer's reachable QUIC address, if one has been provisioned. A stored
     /// address that no longer parses is reported as corrupt, not silently None.
     pub fn peer_addr(&self, peer_id: &str) -> Result<Option<SocketAddr>, ProvisioningError> {
-        let connection = self.connection.lock().map_err(|_| ProvisioningError::Storage)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ProvisioningError::Storage)?;
         let addr = connection
             .query_row(
                 "SELECT addr FROM sync_peer_addr WHERE peer_id=?1",
@@ -151,7 +157,10 @@ impl SyncProvisioningStore {
             .map_err(|_| ProvisioningError::Storage)?;
         match addr {
             None => Ok(None),
-            Some(addr) => addr.parse().map(Some).map_err(|_| ProvisioningError::Corrupt),
+            Some(addr) => addr
+                .parse()
+                .map(Some)
+                .map_err(|_| ProvisioningError::Corrupt),
         }
     }
 }

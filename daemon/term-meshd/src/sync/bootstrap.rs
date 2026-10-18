@@ -122,7 +122,12 @@ pub fn provision_daemon(
     seed_trust_store(daemon.trust, project_id, recovery, roster)?;
 
     // 2. Keychain — this daemon's own TLS private key + the shared project DEK.
-    persist_device_tls_identity(daemon.keychain, project_bytes, daemon.device_id, daemon.identity)?;
+    persist_device_tls_identity(
+        daemon.keychain,
+        project_bytes,
+        daemon.device_id,
+        daemon.identity,
+    )?;
     persist_project_key(daemon.keychain, project_bytes, dek)?;
 
     // 3. Provisioning — this daemon's own coordinates + where its peers live.
@@ -402,7 +407,10 @@ mod tests {
             self.values
                 .lock()
                 .map_err(|_| KeychainError::Poisoned)?
-                .insert((item.service.clone(), item.account.clone()), secret.to_vec());
+                .insert(
+                    (item.service.clone(), item.account.clone()),
+                    secret.to_vec(),
+                );
             Ok(())
         }
 
@@ -425,13 +433,13 @@ mod tests {
         }
     }
 
-    fn open_trust(dir: &std::path::Path, name: &str, project: ProjectId, recovery: &SigningKey) -> TrustStore {
-        TrustStore::open(
-            dir.join(name),
-            project,
-            recovery.verifying_key().to_bytes(),
-        )
-        .unwrap()
+    fn open_trust(
+        dir: &std::path::Path,
+        name: &str,
+        project: ProjectId,
+        recovery: &SigningKey,
+    ) -> TrustStore {
+        TrustStore::open(dir.join(name), project, recovery.verifying_key().to_bytes()).unwrap()
     }
 
     #[test]
@@ -450,8 +458,16 @@ mod tests {
         let dek = generate_project_key().unwrap();
 
         let roster = [
-            BootstrapDevice { device_id: device_self, certificate_hash: identity_self.certificate_hash(), epoch: 1 },
-            BootstrapDevice { device_id: device_peer, certificate_hash: identity_peer.certificate_hash(), epoch: 2 },
+            BootstrapDevice {
+                device_id: device_self,
+                certificate_hash: identity_self.certificate_hash(),
+                epoch: 1,
+            },
+            BootstrapDevice {
+                device_id: device_peer,
+                certificate_hash: identity_peer.certificate_hash(),
+                epoch: 2,
+            },
         ];
         let addr: SocketAddr = "10.0.0.9:4433".parse().unwrap();
         provision_daemon(
@@ -486,7 +502,10 @@ mod tests {
         // Provisioning: own coordinates + the peer address book.
         assert_eq!(
             provisioning.local(*project.as_bytes()).unwrap(),
-            Some(LocalCoordinates { device_id: device_self, roster_epoch: 1 })
+            Some(LocalCoordinates {
+                device_id: device_self,
+                roster_epoch: 1
+            })
         );
         assert_eq!(provisioning.peer_addr("peer-b").unwrap(), Some(addr));
     }
@@ -534,8 +553,12 @@ mod tests {
 
         // Each trust store authorizes both certificates.
         for trust in [&trust_a, &trust_b] {
-            assert!(trust.authorize_transport_certificate(&identity_a.certificate_der).is_ok());
-            assert!(trust.authorize_transport_certificate(&identity_b.certificate_der).is_ok());
+            assert!(trust
+                .authorize_transport_certificate(&identity_a.certificate_der)
+                .is_ok());
+            assert!(trust
+                .authorize_transport_certificate(&identity_b.certificate_der)
+                .is_ok());
         }
 
         // Both keychains hold the same DEK the call returned.
@@ -551,8 +574,22 @@ mod tests {
         assert_eq!(prov_b.peer_addr("daemon-b").unwrap(), None);
 
         // Each records its own local coordinates at its own epoch.
-        assert_eq!(prov_a.local(*project.as_bytes()).unwrap().unwrap().roster_epoch, 1);
-        assert_eq!(prov_b.local(*project.as_bytes()).unwrap().unwrap().roster_epoch, 2);
+        assert_eq!(
+            prov_a
+                .local(*project.as_bytes())
+                .unwrap()
+                .unwrap()
+                .roster_epoch,
+            1
+        );
+        assert_eq!(
+            prov_b
+                .local(*project.as_bytes())
+                .unwrap()
+                .unwrap()
+                .roster_epoch,
+            2
+        );
     }
 
     #[test]
@@ -633,8 +670,16 @@ mod tests {
         let paths = temp_paths(dir.path());
         let dek = generate_project_key().unwrap();
         let roster = [
-            BootstrapDevice { device_id: local_device, certificate_hash: local_hash, epoch: 1 },
-            BootstrapDevice { device_id: peer_device, certificate_hash: peer_hash, epoch: 2 },
+            BootstrapDevice {
+                device_id: local_device,
+                certificate_hash: local_hash,
+                epoch: 1,
+            },
+            BootstrapDevice {
+                device_id: peer_device,
+                certificate_hash: peer_hash,
+                epoch: 2,
+            },
         ];
         let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
 
@@ -644,7 +689,10 @@ mod tests {
             project,
             &recovery,
             &dek,
-            LocalCoordinates { device_id: local_device, roster_epoch: 1 },
+            LocalCoordinates {
+                device_id: local_device,
+                roster_epoch: 1,
+            },
             &roster,
             &[("peer".to_string(), addr)],
         )
@@ -660,7 +708,9 @@ mod tests {
         );
         assert_eq!(prov.peer_addr("peer").unwrap(), Some(addr));
         assert_eq!(
-            load_project_key(&keychain, *project.as_bytes()).unwrap().key_id,
+            load_project_key(&keychain, *project.as_bytes())
+                .unwrap()
+                .key_id,
             dek.key_id
         );
         // The trust store opened at the standard per-project path.
@@ -680,14 +730,21 @@ mod tests {
         let dek = generate_project_key().unwrap();
         // Roster claims a WRONG cert hash for the local device — the daemon must
         // refuse rather than grant a certificate it cannot present.
-        let roster = [BootstrapDevice { device_id: local_device, certificate_hash: [0x00; 32], epoch: 1 }];
+        let roster = [BootstrapDevice {
+            device_id: local_device,
+            certificate_hash: [0x00; 32],
+            epoch: 1,
+        }];
         let result = run_bootstrap_trust(
             &keychain,
             &paths,
             project,
             &recovery,
             &dek,
-            LocalCoordinates { device_id: local_device, roster_epoch: 1 },
+            LocalCoordinates {
+                device_id: local_device,
+                roster_epoch: 1,
+            },
             &roster,
             &[],
         );

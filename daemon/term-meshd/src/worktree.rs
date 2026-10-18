@@ -461,10 +461,9 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
                                     Repository::open(&other_path)
                                         .ok()
                                         .and_then(|wt_repo| {
-                                            wt_repo
-                                                .head()
-                                                .ok()
-                                                .and_then(|head| head.shorthand().map(str::to_owned))
+                                            wt_repo.head().ok().and_then(|head| {
+                                                head.shorthand().map(str::to_owned)
+                                            })
                                         })
                                         .or_else(|| worktree_metadata_branch(&repo, remaining))
                                 });
@@ -1174,7 +1173,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(keep_path.join("user-work.txt"), "unsaved").unwrap();
-        repo.branch("team/x/executor-legacy-abc", &commit, false).unwrap();
+        repo.branch("team/x/executor-legacy-abc", &commit, false)
+            .unwrap();
 
         let error = rollback_legacy_renames(
             &repo,
@@ -1226,10 +1226,15 @@ mod tests {
         let names: Vec<String> = repo
             .branches(Some(git2::BranchType::Local))
             .unwrap()
-            .filter_map(|b| b.ok().and_then(|(b, _)| b.name().ok().flatten().map(str::to_owned)))
+            .filter_map(|b| {
+                b.ok()
+                    .and_then(|(b, _)| b.name().ok().flatten().map(str::to_owned))
+            })
             .collect();
         assert!(
-            !names.iter().any(|n| n.contains("-legacy-") || n == "team/x/executor/inst-1"),
+            !names
+                .iter()
+                .any(|n| n.contains("-legacy-") || n == "team/x/executor/inst-1"),
             "{names:?}"
         );
         drop(dir);
@@ -1464,7 +1469,10 @@ mod tests {
         std::fs::remove_dir_all(&second.path).unwrap();
         let repo = Repository::open(&repo_path).unwrap();
         std::fs::write(
-            repo.path().join("worktrees").join(&second.name).join("HEAD"),
+            repo.path()
+                .join("worktrees")
+                .join(&second.name)
+                .join("HEAD"),
             "ref: refs/heads/team/double-stale\n",
         )
         .unwrap();

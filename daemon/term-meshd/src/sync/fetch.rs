@@ -21,9 +21,9 @@ use tokio::time::{timeout, Duration};
 
 use super::{
     build_apply_plan, build_delete_plan, build_directory_delete_plan, check_delete_guard,
-    mode_matches_executable, put_plaintext, ApplyPlan, ApplyStore, CasStore,
-    EncryptedChunk, EntryKind, FetchEntry,
-    KeyId, ManifestEntry, ObjectDomain, ObjectId, ProjectId, ProjectKey, StreamLane, SyncConnection,
+    mode_matches_executable, put_plaintext, ApplyPlan, ApplyStore, CasStore, EncryptedChunk,
+    EntryKind, FetchEntry, KeyId, ManifestEntry, ObjectDomain, ObjectId, ProjectId, ProjectKey,
+    StreamLane, SyncConnection,
 };
 
 /// [`blank_directory_modes`](super::blank_directory_modes) for the fetch-entry
@@ -434,7 +434,8 @@ pub async fn respond_to_fetch(
         if entry.kind != EntryKind::File {
             continue;
         }
-        let content = std::fs::read(root.join(path)).map_err(|_| "fetch_read_failed".to_string())?;
+        let content =
+            std::fs::read(root.join(path)).map_err(|_| "fetch_read_failed".to_string())?;
         let object_id = put_plaintext(cas, domain, key, key_id, &content)?;
         sender
             .send(
@@ -498,15 +499,18 @@ pub async fn run_push(
     let sender = connection.sender();
     let mut pushed = HashMap::new();
     sender
-        .send(StreamLane::SyncOperation, encode_push_manifest(push, deletes))
+        .send(
+            StreamLane::SyncOperation,
+            encode_push_manifest(push, deletes),
+        )
         .await
         .map_err(|_| "push_send_failed".to_string())?;
     for entry in push {
         if entry.kind != EntryKind::File {
             continue; // dirs/symlinks carry no bytes; the manifest describes them
         }
-        let content =
-            std::fs::read(root.join(&entry.relative_path)).map_err(|_| "push_read_failed".to_string())?;
+        let content = std::fs::read(root.join(&entry.relative_path))
+            .map_err(|_| "push_read_failed".to_string())?;
         let object_id = put_plaintext(cas, domain, key, key_id, &content)?;
         pushed.insert(entry.relative_path.clone(), object_id);
         sender

@@ -440,7 +440,11 @@ mod tests {
         .unwrap();
         let agent_env = home.join(".config/term-mesh/agent-env");
         fs::create_dir_all(agent_env.parent().unwrap()).unwrap();
-        fs::write(&agent_env, "AGENT_ONLY=loaded\nORDER=agent\nprintf 'agent-noise\\n'\n").unwrap();
+        fs::write(
+            &agent_env,
+            "AGENT_ONLY=loaded\nORDER=agent\nprintf 'agent-noise\\n'\n",
+        )
+        .unwrap();
 
         let command = remote_command(
             home.join("project").to_str().unwrap(),
@@ -668,8 +672,17 @@ mod path_extra_tests {
     /// never what a trailing colon in a settings field was meant to say.
     #[test]
     fn empty_segments_are_dropped() {
-        assert_eq!(path_with_extra(Some("/opt/foo/bin::")), format!("{REMOTE_PATH}:/opt/foo/bin"));
-        assert_eq!(path_with_extra(Some(":/opt/foo/bin")), format!("{REMOTE_PATH}:/opt/foo/bin"));
-        assert_eq!(path_with_extra(Some(" /opt/foo/bin ")), format!("{REMOTE_PATH}:/opt/foo/bin"));
+        assert_eq!(
+            path_with_extra(Some("/opt/foo/bin::")),
+            format!("{REMOTE_PATH}:/opt/foo/bin")
+        );
+        assert_eq!(
+            path_with_extra(Some(":/opt/foo/bin")),
+            format!("{REMOTE_PATH}:/opt/foo/bin")
+        );
+        assert_eq!(
+            path_with_extra(Some(" /opt/foo/bin ")),
+            format!("{REMOTE_PATH}:/opt/foo/bin")
+        );
     }
 }

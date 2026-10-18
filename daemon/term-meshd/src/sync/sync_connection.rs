@@ -21,7 +21,9 @@ use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::{AuthenticatedConnection, StreamLane, StreamRouter, StreamRouterSender, TransportPeerSnapshot};
+use super::{
+    AuthenticatedConnection, StreamLane, StreamRouter, StreamRouterSender, TransportPeerSnapshot,
+};
 
 /// Upper bound on a single inbound message (1-byte lane tag + the largest lane
 /// message limit; the router caps outbound to the same via `send`).
@@ -139,7 +141,11 @@ impl SyncConnection {
     /// Enqueue one outbound message on `lane`. Awaits router back-pressure;
     /// errors only if the connection/pump has closed or the payload violates the
     /// lane's size bound.
-    pub async fn send(&self, lane: StreamLane, payload: Vec<u8>) -> Result<(), SyncConnectionError> {
+    pub async fn send(
+        &self,
+        lane: StreamLane,
+        payload: Vec<u8>,
+    ) -> Result<(), SyncConnectionError> {
         self.outbound
             .send(lane, payload)
             .await

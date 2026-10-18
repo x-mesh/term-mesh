@@ -166,9 +166,7 @@ impl RuntimeOwner {
         // Require two 500ms observations. The first empty read can race a
         // surface ensure that already authenticated but has not inserted into
         // the registry yet; a full grace interval lets that mutation land.
-        if state.managed
-            && state.ownerless_empty_checks >= 2
-            && !state.shutdown_committed {
+        if state.managed && state.ownerless_empty_checks >= 2 && !state.shutdown_committed {
             state.shutdown_committed = true;
             let _ = shutdown_tx.send(true);
         }
@@ -207,9 +205,7 @@ fn process_exists(pid: u32) -> bool {
 
 fn evaluate_runtime_owner(owner: &RuntimeOwner) {
     if let Some(host) = peer::layout::PeerHost::active_host() {
-        host.evaluate_surface_admission(|| {
-            owner.evaluate(host.has_live_attachable_surfaces())
-        });
+        host.evaluate_surface_admission(|| owner.evaluate(host.has_live_attachable_surfaces()));
     } else {
         owner.evaluate(false);
     }
@@ -1089,7 +1085,10 @@ fn mobile_session_resolver(
     std::sync::Arc::new(move |surface_id: &str| {
         let panes = pane_tracker.snapshot();
         let Some(info) = panes.get(surface_id) else {
-            note(surface_id, "no claude/codex process tagged with this panel".into());
+            note(
+                surface_id,
+                "no claude/codex process tagged with this panel".into(),
+            );
             return None;
         };
         let correlation: Vec<(String, String, i64, u32)> = panes
@@ -1161,7 +1160,10 @@ mod owner_tests {
         assert_eq!(named_key_bytes("escape", false), Some(b"\x1b".as_slice()));
         assert_eq!(named_key_bytes("tab", false), Some(b"\t".as_slice()));
         // DEL, which is what a terminal sends for Backspace by default.
-        assert_eq!(named_key_bytes("backspace", false), Some(b"\x7f".as_slice()));
+        assert_eq!(
+            named_key_bytes("backspace", false),
+            Some(b"\x7f".as_slice())
+        );
         assert_eq!(named_key_bytes("ctrl-c", true), Some(b"\x03".as_slice()));
         assert_eq!(named_key_bytes("up", false), Some(b"\x1b[A".as_slice()));
         assert_eq!(named_key_bytes("up", true), Some(b"\x1bOA".as_slice()));

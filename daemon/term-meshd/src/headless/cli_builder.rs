@@ -88,7 +88,8 @@ fn resolve_cli_path(cli_path: Option<&str>, env_key: &str, fallback: &str) -> St
 /// a six-agent team ran six over one repository and each grew past 60 GB.
 /// `--settings` outranks the user's settings for `enabledPlugins`. Mirrors
 /// `AgentSession.workerSettingsJSON` in the app.
-pub(crate) const WORKER_SETTINGS_JSON: &str = r#"{"enabledPlugins":{"mgrep@Mixedbread-Grep":false}}"#;
+pub(crate) const WORKER_SETTINGS_JSON: &str =
+    r#"{"enabledPlugins":{"mgrep@Mixedbread-Grep":false}}"#;
 
 /// Build the CLI command for a Claude Code agent in stream-json mode.
 ///
@@ -580,7 +581,9 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert!(claude_args.windows(2).any(|pair| pair == ["--effort", "high"]));
+        assert!(claude_args
+            .windows(2)
+            .any(|pair| pair == ["--effort", "high"]));
         assert!(kiro_args.windows(2).any(|pair| pair == ["--effort", "low"]));
     }
 

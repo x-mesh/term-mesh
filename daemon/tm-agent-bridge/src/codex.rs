@@ -27,8 +27,18 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// would not be safer — it would be the one CLI whose pane quietly stopped,
 /// which is the symptom this is fixing.
 const APPROVALS: &[(&str, &str, &str, &str)] = &[
-    ("item/fileChange/requestApproval", "decision", "accept", "decline"),
-    ("item/commandExecution/requestApproval", "decision", "accept", "decline"),
+    (
+        "item/fileChange/requestApproval",
+        "decision",
+        "accept",
+        "decline",
+    ),
+    (
+        "item/commandExecution/requestApproval",
+        "decision",
+        "accept",
+        "decline",
+    ),
     // Pre-v2 names. A current server never sends these; an older one sends
     // nothing else.
     ("applyPatchApproval", "decision", "approved", "denied"),
@@ -62,10 +72,8 @@ pub fn serve_request(obj: &Value) -> Option<Value> {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            let granted: Map<String, Value> = asked
-                .into_iter()
-                .filter(|(_, v)| !v.is_null())
-                .collect();
+            let granted: Map<String, Value> =
+                asked.into_iter().filter(|(_, v)| !v.is_null()).collect();
             Some(json!({"permissions": granted, "scope": "session"}))
         }
         // An MCP server asking the *user* something. We cannot ask, and
@@ -149,7 +157,10 @@ pub fn file_change(out: &mut Emitter, item: &Value) {
         fields.insert("file_path".into(), Value::String(path.clone()));
         fields.insert("kind".into(), Value::String(name.clone()));
         fields.insert("unified_diff".into(), Value::String(diff.clone()));
-        if let Some(move_path) = kind.and_then(|k| k.get("move_path")).and_then(Value::as_str) {
+        if let Some(move_path) = kind
+            .and_then(|k| k.get("move_path"))
+            .and_then(Value::as_str)
+        {
             fields.insert("move_path".into(), Value::String(move_path.to_string()));
         }
         if diff != raw {
@@ -369,9 +380,7 @@ impl<T: Transport> CodexBridge<T> {
                     if let Some(last) = usage.get("last") {
                         seen_usage = Some(last.clone());
                     }
-                    if let Some(window) =
-                        usage.get("modelContextWindow").and_then(Value::as_u64)
-                    {
+                    if let Some(window) = usage.get("modelContextWindow").and_then(Value::as_u64) {
                         if window > 0 {
                             seen_window = Some(window);
                         }
@@ -655,7 +664,9 @@ mod tests {
 
         for call in blocks(&sink, "tool_use") {
             assert!(call["input"].get("command").is_none());
-            assert!(call["input"]["file_path"].as_str().is_some_and(|p| !p.is_empty()));
+            assert!(call["input"]["file_path"]
+                .as_str()
+                .is_some_and(|p| !p.is_empty()));
         }
     }
 
@@ -682,7 +693,10 @@ mod tests {
                 {"path": "/repo/gone.py", "kind": {"type": "delete"}, "diff": ""}]}),
         );
 
-        assert_eq!(blocks(&sink, "tool_result")[0]["content"], "delete /repo/gone.py");
+        assert_eq!(
+            blocks(&sink, "tool_result")[0]["content"],
+            "delete /repo/gone.py"
+        );
     }
 
     #[test]
@@ -690,8 +704,14 @@ mod tests {
         let (mut out, sink) = captured();
 
         file_change(&mut out, &json!({"type": "fileChange", "id": "i"}));
-        file_change(&mut out, &json!({"type": "fileChange", "id": "i", "changes": "no"}));
-        file_change(&mut out, &json!({"type": "fileChange", "id": "i", "changes": [null]}));
+        file_change(
+            &mut out,
+            &json!({"type": "fileChange", "id": "i", "changes": "no"}),
+        );
+        file_change(
+            &mut out,
+            &json!({"type": "fileChange", "id": "i", "changes": [null]}),
+        );
 
         assert!(blocks(&sink, "tool_use").is_empty());
     }
@@ -707,7 +727,10 @@ mod tests {
                 {"path": "/repo/big.py", "kind": {"type": "add"}, "diff": huge}]}),
         );
 
-        assert_eq!(blocks(&sink, "tool_use")[0]["input"]["diff_truncated"], true);
+        assert_eq!(
+            blocks(&sink, "tool_use")[0]["input"]["diff_truncated"],
+            true
+        );
     }
 
     #[test]
@@ -764,7 +787,10 @@ mod tests {
 
     #[test]
     fn an_unknown_request_is_left_for_the_caller_to_refuse() {
-        assert_eq!(serve_request(&json!({"id": 1, "method": "who/knows"})), None);
+        assert_eq!(
+            serve_request(&json!({"id": 1, "method": "who/knows"})),
+            None
+        );
     }
 
     // ── thread start ───────────────────────────────────────────────────
@@ -879,7 +905,10 @@ mod tests {
         assert!(b.start());
 
         let sent = b.rpc.child.sent.lock().unwrap().clone();
-        let starts: Vec<&Value> = sent.iter().filter(|f| f["method"] == "thread/start").collect();
+        let starts: Vec<&Value> = sent
+            .iter()
+            .filter(|f| f["method"] == "thread/start")
+            .collect();
         assert_eq!(starts.len(), 2);
         assert!(starts[1]["params"].get("approvalPolicy").is_none());
         assert_eq!(b.thread_id.as_deref(), Some("thread-plain"));
@@ -921,7 +950,10 @@ mod tests {
 
         let result = last_result(&sink);
         assert_eq!(result["stop_reason"], "failed");
-        assert!(result["result"].as_str().unwrap().contains("AI_MESH_API_KEY"));
+        assert!(result["result"]
+            .as_str()
+            .unwrap()
+            .contains("AI_MESH_API_KEY"));
     }
 
     #[test]
@@ -995,7 +1027,10 @@ mod tests {
 
         let result = last_result(&sink);
         assert_eq!(result["stop_reason"], "rejected");
-        assert!(result["result"].as_str().unwrap().contains("unusable model"));
+        assert!(result["result"]
+            .as_str()
+            .unwrap()
+            .contains("unusable model"));
     }
 
     #[test]

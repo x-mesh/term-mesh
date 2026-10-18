@@ -81,7 +81,10 @@ impl TaskDiffError {
             }
             TaskDiffError::Git(message) => message.clone(),
             TaskDiffError::TimedOut(what) => {
-                format!("git {what} did not answer within {}s", GIT_TIMEOUT.as_secs())
+                format!(
+                    "git {what} did not answer within {}s",
+                    GIT_TIMEOUT.as_secs()
+                )
             }
         }
     }
@@ -106,9 +109,13 @@ pub async fn read(
     }
 
     let head_sha = git(path, &["rev-parse", "HEAD"], "rev-parse HEAD").await?;
-    let branch = git(path, &["rev-parse", "--abbrev-ref", "HEAD"], "rev-parse --abbrev-ref")
-        .await
-        .unwrap_or_default();
+    let branch = git(
+        path,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        "rev-parse --abbrev-ref",
+    )
+    .await
+    .unwrap_or_default();
 
     let base_sha = resolve_base(path, base_ref, &head_sha).await?;
 
@@ -117,7 +124,12 @@ pub async fn read(
     // base gained since the fork, as if this task had reverted it.
     let range = format!("{base_sha}..HEAD");
     let numstat = git(path, &["diff", "--numstat", &range], "diff --numstat").await?;
-    let name_status = git(path, &["diff", "--name-status", &range], "diff --name-status").await?;
+    let name_status = git(
+        path,
+        &["diff", "--name-status", &range],
+        "diff --name-status",
+    )
+    .await?;
     // Raw bytes, not the trimmed string the other reads return: the digest has
     // to cover exactly what `git diff` wrote, including its trailing newline.
     let raw = git_bytes(path, &["diff", &range], "diff").await?;
@@ -276,7 +288,11 @@ mod tests {
         assert_eq!(diff.branch, "feat/thing");
         assert!(diff.numstat.contains("a.txt"), "{}", diff.numstat);
         assert!(diff.name_status.starts_with('M'), "{}", diff.name_status);
-        assert!(diff.diff_digest.starts_with("sha256:"), "{}", diff.diff_digest);
+        assert!(
+            diff.diff_digest.starts_with("sha256:"),
+            "{}",
+            diff.diff_digest
+        );
         assert!(diff.patch.contains("+two"), "{}", diff.patch);
         assert!(!diff.truncated);
     }
@@ -324,7 +340,9 @@ mod tests {
         git_sync(path, &["add", "-A"]);
         git_sync(path, &["commit", "-qm", "only"]);
 
-        let diff = read(Some(path.to_str().unwrap()), None).await.expect("a diff");
+        let diff = read(Some(path.to_str().unwrap()), None)
+            .await
+            .expect("a diff");
         assert_eq!(diff.base_sha, EMPTY_TREE);
         assert!(diff.patch.contains("+one"), "{}", diff.patch);
     }
@@ -368,7 +386,10 @@ mod tests {
             .output()
             .expect("git");
         let refusal = String::from_utf8_lossy(&refusal.stderr).trim().to_string();
-        assert!(!refusal.is_empty(), "git produced no stderr to pass through");
+        assert!(
+            !refusal.is_empty(),
+            "git produced no stderr to pass through"
+        );
         assert_eq!(error.message(), refusal);
     }
 

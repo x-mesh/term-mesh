@@ -7,11 +7,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use sync::{
-    assumed_file_mode, empty_directory_fingerprint, encrypt_chunk, APPLY_SCHEMA_VERSION, ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
-    ApplyPlanEntry, ApplyPrecondition, ApplyStore, CasError, CasLimits, CasStore, HeadDecision,
-    KeyId, ObjectDomain, ObjectId, ObjectType, PathFingerprint, PathKind, ProjectId, ProjectKey,
-    ProjectKeyMaterial, ProjectKeyProvider, ReconcileError, ReconcileStore, TransportPeerSnapshot,
-    build_delete_plan, build_directory_delete_plan, EntryKind, ManifestEntry, NO_MODE,
+    assumed_file_mode, build_delete_plan, build_directory_delete_plan, empty_directory_fingerprint,
+    encrypt_chunk, ApplyAction, ApplyBoundary, ApplyCrashHook, ApplyError, ApplyIoPoint, ApplyPlan,
+    ApplyPlanEntry, ApplyPrecondition, ApplyStore, CasError, CasLimits, CasStore, EntryKind,
+    HeadDecision, KeyId, ManifestEntry, ObjectDomain, ObjectId, ObjectType, PathFingerprint,
+    PathKind, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider, ReconcileError,
+    ReconcileStore, TransportPeerSnapshot, APPLY_SCHEMA_VERSION, NO_MODE,
 };
 
 const KEY: [u8; 32] = [0x63; 32];
@@ -715,7 +716,11 @@ fn empty_directory_fingerprint_matches_a_real_one() {
     for mode in [0o700_u16, 0o750, 0o755, 0o600] {
         let name = format!("dir-{mode:o}");
         fs::create_dir(root.join(&name)).unwrap();
-        fs::set_permissions(root.join(&name), fs::Permissions::from_mode(u32::from(mode))).unwrap();
+        fs::set_permissions(
+            root.join(&name),
+            fs::Permissions::from_mode(u32::from(mode)),
+        )
+        .unwrap();
 
         let observed = ApplyStore::fingerprint_path(&root, project, &name)
             .unwrap()
@@ -726,7 +731,10 @@ fn empty_directory_fingerprint_matches_a_real_one() {
             "hand-built fingerprint drifted from the real one at mode {mode:o}"
         );
         // `precondition_matches` compares the digest too, not only the fields.
-        assert_eq!(observed.digest(), empty_directory_fingerprint(mode).digest());
+        assert_eq!(
+            observed.digest(),
+            empty_directory_fingerprint(mode).digest()
+        );
     }
 }
 
@@ -895,8 +903,7 @@ fn a_tracked_subtree_drains_but_a_directory_with_untracked_content_survives() {
     let modes =
         ApplyStore::directory_modes(&root, project, delete_paths.iter().map(String::as_str))
             .unwrap();
-    let directories =
-        build_directory_delete_plan(project, [48; 16], &delete_paths, &local, &modes);
+    let directories = build_directory_delete_plan(project, [48; 16], &delete_paths, &local, &modes);
     // `crufty` is planned: every TRACKED path inside it is going. Only the
     // fingerprint can see the artifact, which is the whole point.
     let planned: Vec<&str> = directories
@@ -909,7 +916,9 @@ fn a_tracked_subtree_drains_but_a_directory_with_untracked_content_survives() {
     // `crufty` refuses, and the batch is atomic, so nothing lands — including
     // the two `doomed` directories ordered before it.
     assert!(
-        store.apply(&root, &cas, object_domain, &directories).is_err(),
+        store
+            .apply(&root, &cas, object_domain, &directories)
+            .is_err(),
         "the batch must refuse rather than sweep crufty/build.o away"
     );
     assert!(
@@ -1156,10 +1165,12 @@ fn a_directory_gets_its_source_mode_after_its_children_land() {
 
     store.apply(&root, &cas, object_domain, &plan).unwrap();
 
-    let mode_of = |name: &str| {
-        fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777
-    };
-    assert_eq!(mode_of("wide"), 0o755, "a shared directory must not be narrowed");
+    let mode_of = |name: &str| fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode_of("wide"),
+        0o755,
+        "a shared directory must not be narrowed"
+    );
     assert_eq!(
         mode_of("locked"),
         0o500,
@@ -1204,7 +1215,11 @@ fn a_directory_without_a_reported_mode_is_installed_private() {
 
     store.apply(&root, &cas, domain(project), &plan).unwrap();
     assert_eq!(
-        fs::metadata(root.join("unknown-mode")).unwrap().permissions().mode() & 0o777,
+        fs::metadata(root.join("unknown-mode"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o700,
         "an unreported directory mode must not be widened to 0o755"
     );

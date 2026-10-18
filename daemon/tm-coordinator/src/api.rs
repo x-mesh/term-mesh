@@ -269,21 +269,25 @@ impl Api {
     fn status(&self) -> Result<Value> {
         let (hosts, suspect_host, fenced_zombie, watermark, pending_merge_count) =
             self.read(|reducer| {
-            let hosts = reducer.hosts()?;
-            // Existence, not a census — one row is enough to raise the badge,
-            // so stop the scan there rather than paying for every task on the
-            // board.
-            let suspect_host = !reducer.tasks(None, Some(TaskStatus::Suspect), 1)?.is_empty();
-            let fenced_zombie = !reducer
-                .tasks(None, Some(TaskStatus::Quarantined), 1)?
-                .is_empty();
-            Ok((
-                hosts,
-                suspect_host,
-                fenced_zombie,
-                reducer.watermark()?,
-                reducer.merge_queue(None, Some(MergeQueueStatus::Queued))?.len(),
-            ))
+                let hosts = reducer.hosts()?;
+                // Existence, not a census — one row is enough to raise the badge,
+                // so stop the scan there rather than paying for every task on the
+                // board.
+                let suspect_host = !reducer
+                    .tasks(None, Some(TaskStatus::Suspect), 1)?
+                    .is_empty();
+                let fenced_zombie = !reducer
+                    .tasks(None, Some(TaskStatus::Quarantined), 1)?
+                    .is_empty();
+                Ok((
+                    hosts,
+                    suspect_host,
+                    fenced_zombie,
+                    reducer.watermark()?,
+                    reducer
+                        .merge_queue(None, Some(MergeQueueStatus::Queued))?
+                        .len(),
+                ))
             })?;
         // The backend's own health, plus why this process could not use it.
         // Kept inside `mem_mesh` so everything about the log reads together.
@@ -797,10 +801,7 @@ impl Api {
                     .task(&p.task_id)?
                     .ok_or_else(|| anyhow::anyhow!("task not found"))?;
                 if !task.status.can_transition_to(&TaskStatus::ReviewReady) {
-                    bail!(
-                        "invalid task transition {:?} -> review_ready",
-                        task.status
-                    );
+                    bail!("invalid task transition {:?} -> review_ready", task.status);
                 }
                 let snapshot = ReviewSnapshot {
                     snapshot_id: ReviewSnapshotId::new_random(),
@@ -924,7 +925,9 @@ impl Api {
             status: Option<MergeQueueStatus>,
         }
         let p: Params = serde_json::from_value(params)?;
-        self.read(|reducer| Ok(json!({ "items": reducer.merge_queue(p.project_id.as_ref(), p.status)? })))
+        self.read(|reducer| {
+            Ok(json!({ "items": reducer.merge_queue(p.project_id.as_ref(), p.status)? }))
+        })
     }
 
     fn merge_queue_transition(&self, params: Value) -> Result<Value> {
@@ -1146,7 +1149,8 @@ mod pre_append_guard_tests {
         let token = placed["event"]["payload"]["token"].clone();
         let snapshot_id = api.handle("review.snapshot", json!({"request_id":"s1","task_id":task,"attempt_id":attempt,"fencing_token":token,"base_sha":"b","head_sha":"head","diff_digest":"sha256:aa"})).unwrap()["event"]["payload"]["snapshot_id"].clone();
         api.handle("approve", json!({"request_id":"a1","task_id":task,"attempt_id":attempt,"fencing_token":token,"reviewer":"rev","snapshot_id":snapshot_id,"head_sha":"head","diff_digest":"sha256:aa"})).unwrap();
-        let queue_id = api.handle("merge.queue", json!({})).unwrap()["items"][0]["queue_id"].clone();
+        let queue_id =
+            api.handle("merge.queue", json!({})).unwrap()["items"][0]["queue_id"].clone();
         api.handle(
             "merge.queue.transition",
             json!({"request_id": "run", "queue_id": queue_id, "status": "running"}),

@@ -40,7 +40,8 @@ pub fn validated_status(status: &str) -> Option<&'static str> {
     // template. Only the words right after the verdict are read, so a note
     // that mentions a path or another verdict still counts.
     let bare = |word: &str| word.trim_matches(|c| "|/,()[]".contains(c)).to_string();
-    let is_verdict = |word: &str| matches!(bare(word).as_str(), "DONE" | "BLOCKED" | "NEEDS_REVIEW");
+    let is_verdict =
+        |word: &str| matches!(bare(word).as_str(), "DONE" | "BLOCKED" | "NEEDS_REVIEW");
     let next = words.next();
     let after = words.next();
     let template = match next {
@@ -315,9 +316,18 @@ pub(crate) mod tests {
         assert_eq!(validated_status("NEEDS_REVIEW"), Some("review_ready"));
         assert_eq!(validated_status("DONE "), Some("completed"));
         assert_eq!(validated_status("DONE CARRY-1a2b"), Some("completed"));
-        assert_eq!(validated_status("BLOCKED\twaiting on the db"), Some("blocked"));
-        assert_eq!(validated_status("DONE wrote /tmp/out.txt"), Some("completed"));
-        assert_eq!(validated_status("DONE the BLOCKED test passes now"), Some("completed"));
+        assert_eq!(
+            validated_status("BLOCKED\twaiting on the db"),
+            Some("blocked")
+        );
+        assert_eq!(
+            validated_status("DONE wrote /tmp/out.txt"),
+            Some("completed")
+        );
+        assert_eq!(
+            validated_status("DONE the BLOCKED test passes now"),
+            Some("completed")
+        );
         for rejected in [
             "DONE|BLOCKED|NEEDS_REVIEW",
             "IN_PROGRESS",

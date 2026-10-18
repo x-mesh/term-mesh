@@ -474,12 +474,9 @@ fn rebind_missing_listener(
 /// Bind a fresh socket next to the target, then atomically replace only the
 /// pathname. The foreign listener keeps its already-open fd/connections, but
 /// every new client reaches the daemon that owns the lifetime lock.
-fn bind_and_replace_socket_path(
-    path: &Path,
-) -> anyhow::Result<(UnixListener, Option<(u64, u64)>)> {
+fn bind_and_replace_socket_path(path: &Path) -> anyhow::Result<(UnixListener, Option<(u64, u64)>)> {
     let mut nonce = [0u8; 8];
-    getrandom::getrandom(&mut nonce)
-        .map_err(|error| anyhow::anyhow!("rebind nonce: {error}"))?;
+    getrandom::getrandom(&mut nonce).map_err(|error| anyhow::anyhow!("rebind nonce: {error}"))?;
     // Keep the sibling name independent of the requested basename. A valid
     // Unix socket path can already sit near SUN_LEN; appending the original
     // name plus a suffix would make only the repair path fail to bind.
@@ -702,7 +699,9 @@ mod integration_tests {
             std::io::ErrorKind::TimedOut,
             std::io::ErrorKind::WouldBlock,
         ] {
-            assert!(!socket_error_allows_replacement(&std::io::Error::from(kind)));
+            assert!(!socket_error_allows_replacement(&std::io::Error::from(
+                kind
+            )));
         }
     }
 
@@ -731,9 +730,12 @@ mod integration_tests {
         drop(client);
         drop(accepted);
 
-        assert!(tokio::time::timeout(Duration::from_millis(100), foreign.accept())
-            .await
-            .is_err(), "foreign listener must receive no new connections");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), foreign.accept())
+                .await
+                .is_err(),
+            "foreign listener must receive no new connections"
+        );
     }
 
     #[tokio::test]
@@ -805,7 +807,9 @@ mod integration_tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let client = UnixStream::connect(&socket).await.expect("idle peer connects");
+        let client = UnixStream::connect(&socket)
+            .await
+            .expect("idle peer connects");
 
         shutdown_tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_millis(500), server)
@@ -926,7 +930,9 @@ mod integration_tests {
     /// declared surface is published for anyone, and an empty one is idle.
     #[tokio::test]
     async fn reaps_a_spawned_surface_once_nobody_is_attached() {
-        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _grace = ABANDONED_GRACE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let declared = b"declared-surface".to_vec();
@@ -973,7 +979,9 @@ mod integration_tests {
     /// the ordinary reap, so protection cannot outlive the project.
     #[tokio::test]
     async fn a_surface_named_by_a_project_manifest_outlives_its_publisher() {
-        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _grace = ABANDONED_GRACE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let leader = vec![0xA1; 16];
@@ -1035,31 +1043,46 @@ mod integration_tests {
             leader.clone(),
             crate::peer::surface::SpawnSpec {
                 title: "attached-project-leader".into(),
-                command: "/bin/cat".into(), args: vec![], cols: 80, rows: 24,
-                cwd: None, kind: crate::peer::surface::SurfaceKind::Pty,
+                command: "/bin/cat".into(),
+                args: vec![],
+                cols: 80,
+                rows: 24,
+                cwd: None,
+                kind: crate::peer::surface::SurfaceKind::Pty,
                 agent_cli: String::new(),
             },
         );
         let host = Arc::new(PeerHost::new(manager.clone()));
         let owner = vec![vec![0x72; 16]];
         let project = peer_proto::v1::Team {
-            name: "attached".into(), team_uuid: "uuid-attached".into(),
-            working_directory: "/tmp".into(), leader_surface_id: leader.clone(),
-            project_id: "team:uuid-attached".into(), ..Default::default()
+            name: "attached".into(),
+            team_uuid: "uuid-attached".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.clone(),
+            project_id: "team:uuid-attached".into(),
+            ..Default::default()
         };
-        assert_eq!(host.upsert_project_presentation(&owner, &project), Ok((1, true)));
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &project),
+            Ok((1, true))
+        );
         manager.note_attached(&leader);
         let released = host
             .delete_project_presentation_with_released(&owner, "team:uuid-attached")
             .unwrap()
             .unwrap();
         assert_eq!(released, vec![leader.clone()]);
-        assert!(manager.list().iter().all(|surface| surface.surface_id != leader));
+        assert!(manager
+            .list()
+            .iter()
+            .all(|surface| surface.surface_id != leader));
     }
 
     #[tokio::test]
     async fn manifest_replacement_reaps_only_surfaces_with_no_remaining_project_reference() {
-        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _grace = ABANDONED_GRACE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let first = vec![0xB1; 16];
@@ -1136,7 +1159,9 @@ mod integration_tests {
     /// grace — a dropped link, a restart — finds its pane still there.
     #[tokio::test]
     async fn a_reconnect_inside_the_grace_saves_the_surface() {
-        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _grace = ABANDONED_GRACE_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "300");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let sid = b"rejoined-surface".to_vec();

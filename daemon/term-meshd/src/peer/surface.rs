@@ -262,9 +262,7 @@ impl PtyBroadcastBatch {
         now: tokio::time::Instant,
         interactive: bool,
     ) -> PtyBroadcastBatchOutput {
-        let interactive_active = self
-            .interactive_until
-            .is_some_and(|until| now < until);
+        let interactive_active = self.interactive_until.is_some_and(|until| now < until);
         if interactive && !interactive_active {
             self.interactive_until = Some(now + INTERACTIVE_OUTPUT_EPOCH);
             self.interactive_immediate_bytes = 0;
@@ -273,17 +271,11 @@ impl PtyBroadcastBatch {
                 self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
             }
         }
-        if self
-            .interactive_until
-            .is_some_and(|until| now < until)
-            && self.interactive_bypass_active
+        if self.interactive_until.is_some_and(|until| now < until) && self.interactive_bypass_active
         {
-            let immediate_bytes = self
-                .pending
-                .as_ref()
-                .map_or(chunk.bytes.len(), |pending| {
-                    pending.bytes.len().saturating_add(chunk.bytes.len())
-                });
+            let immediate_bytes = self.pending.as_ref().map_or(chunk.bytes.len(), |pending| {
+                pending.bytes.len().saturating_add(chunk.bytes.len())
+            });
             if self
                 .interactive_immediate_bytes
                 .saturating_add(immediate_bytes)
@@ -344,9 +336,7 @@ impl PtyBroadcastBatch {
 
     fn flush_due_at(&mut self, now: tokio::time::Instant) -> PtyBroadcastBatchOutput {
         let flushed = self.pending.take();
-        self.deadline = flushed
-            .as_ref()
-            .map(|_| now + BROADCAST_BATCH_WINDOW);
+        self.deadline = flushed.as_ref().map(|_| now + BROADCAST_BATCH_WINDOW);
         flushed
             .map(PtyBroadcastBatchOutput::One)
             .unwrap_or(PtyBroadcastBatchOutput::None)
@@ -364,10 +354,7 @@ impl PtyBroadcastBatch {
     }
 }
 
-fn send_broadcast_batch_output(
-    tx: &broadcast::Sender<PtyChunk>,
-    output: PtyBroadcastBatchOutput,
-) {
+fn send_broadcast_batch_output(tx: &broadcast::Sender<PtyChunk>, output: PtyBroadcastBatchOutput) {
     match output {
         PtyBroadcastBatchOutput::None => {}
         PtyBroadcastBatchOutput::One(chunk) => {
@@ -803,15 +790,8 @@ fn process_start_time(pid: libc::pid_t) -> Option<u64> {
 fn process_start_time(pid: libc::pid_t) -> Option<u64> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        )
-    };
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
     if written != size || info.pbi_start_tvsec == 0 {
         return None;
     }
@@ -2451,13 +2431,17 @@ fn process_executable(pid: libc::pid_t) -> Option<String> {
             buffer.len() as u32,
         )
     };
-    if length <= 0 { return None; }
+    if length <= 0 {
+        return None;
+    }
     buffer.truncate(length as usize);
     String::from_utf8(buffer).ok()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_executable(_pid: libc::pid_t) -> Option<String> { None }
+fn process_executable(_pid: libc::pid_t) -> Option<String> {
+    None
+}
 
 /// The working directory of `pid`, or `None` when it cannot be determined.
 #[cfg(target_os = "linux")]
@@ -2591,6 +2575,13 @@ fn pane_path(requested_env: &[(String, String)]) -> Option<String> {
 }
 
 fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
+    pane_environment_for(surface_id, std::env::var_os("SSH_CONNECTION").is_some())
+}
+
+fn pane_environment_for(
+    surface_id: &[u8],
+    daemon_has_ssh_connection: bool,
+) -> Vec<(String, String)> {
     let mut env = vec![
         ("TERM".to_string(), resolve_term()),
         ("TERM_PROGRAM".to_string(), "ghostty".to_string()),
@@ -2600,9 +2591,26 @@ fn pane_environment(surface_id: &[u8]) -> Vec<(String, String)> {
         ),
         ("COLORTERM".to_string(), "truecolor".to_string()),
     ];
+    // A pane's screen is shown on another machine, so a CLI must copy through
+    // the terminal (OSC 52) to reach the viewer's clipboard. Codex decides that
+    // from SSH_CONNECTION; without it, it writes this host's own clipboard and
+    // reports success while the viewer keeps its old contents.
+    env.extend(remote_pane_marker(daemon_has_ssh_connection));
     env.extend(identity_environment(surface_id));
     env
 }
+
+/// An inherited value already marks the pane as remote, so it is left alone.
+fn remote_pane_marker(daemon_has_ssh_connection: bool) -> Option<(String, String)> {
+    (!daemon_has_ssh_connection).then(|| {
+        (
+            "SSH_CONNECTION".to_string(),
+            REMOTE_PANE_SSH_CONNECTION.to_string(),
+        )
+    })
+}
+
+const REMOTE_PANE_SSH_CONNECTION: &str = "127.0.0.1 0 127.0.0.1 0";
 
 /// The terminal-agnostic slice of [`pane_environment`]: who this surface is
 /// and how to reach this host's daemon. Shared with agent surfaces, which
@@ -3917,14 +3925,43 @@ mod tests {
         let mut batch = PtyBroadcastBatch::default();
         let now = tokio::time::Instant::now();
         assert_eq!(
-            batch_output(batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false)),
-            vec![PtyChunk { seq: 0, bytes: b"a".to_vec() }]
+            batch_output(batch.submit_at(
+                PtyChunk {
+                    seq: 0,
+                    bytes: b"a".to_vec()
+                },
+                now,
+                false
+            )),
+            vec![PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec()
+            }]
         );
-        assert!(batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false)).is_empty());
-        assert!(batch_output(batch.submit_at(PtyChunk { seq: 2, bytes: b"c".to_vec() }, now, false)).is_empty());
+        assert!(batch_output(batch.submit_at(
+            PtyChunk {
+                seq: 1,
+                bytes: b"b".to_vec()
+            },
+            now,
+            false
+        ))
+        .is_empty());
+        assert!(batch_output(batch.submit_at(
+            PtyChunk {
+                seq: 2,
+                bytes: b"c".to_vec()
+            },
+            now,
+            false
+        ))
+        .is_empty());
         assert_eq!(
             batch_output(batch.flush_due_at(now + BROADCAST_BATCH_WINDOW)),
-            vec![PtyChunk { seq: 1, bytes: b"bc".to_vec() }]
+            vec![PtyChunk {
+                seq: 1,
+                bytes: b"bc".to_vec()
+            }]
         );
     }
 
@@ -3932,13 +3969,37 @@ mod tests {
     fn pty_broadcast_batch_flushes_second_chunk_during_interactive_epoch() {
         let mut batch = PtyBroadcastBatch::default();
         let now = tokio::time::Instant::now();
-        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
-        assert!(batch
-            .submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false)
-            == PtyBroadcastBatchOutput::None);
+        let _ = batch.submit_at(
+            PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec(),
+            },
+            now,
+            false,
+        );
+        assert!(
+            batch.submit_at(
+                PtyChunk {
+                    seq: 1,
+                    bytes: b"b".to_vec()
+                },
+                now,
+                false
+            ) == PtyBroadcastBatchOutput::None
+        );
         assert_eq!(
-            batch_output(batch.submit_at(PtyChunk { seq: 2, bytes: b"c".to_vec() }, now, true)),
-            vec![PtyChunk { seq: 1, bytes: b"bc".to_vec() }]
+            batch_output(batch.submit_at(
+                PtyChunk {
+                    seq: 2,
+                    bytes: b"c".to_vec()
+                },
+                now,
+                true
+            )),
+            vec![PtyChunk {
+                seq: 1,
+                bytes: b"bc".to_vec()
+            }]
         );
     }
 
@@ -3946,13 +4007,40 @@ mod tests {
     fn pty_broadcast_batch_preserves_order_across_gap_during_interactive_epoch() {
         let mut batch = PtyBroadcastBatch::default();
         let now = tokio::time::Instant::now();
-        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
-        let _ = batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false);
+        let _ = batch.submit_at(
+            PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec(),
+            },
+            now,
+            false,
+        );
+        let _ = batch.submit_at(
+            PtyChunk {
+                seq: 1,
+                bytes: b"b".to_vec(),
+            },
+            now,
+            false,
+        );
         assert_eq!(
-            batch_output(batch.submit_at(PtyChunk { seq: 3, bytes: b"d".to_vec() }, now, true)),
+            batch_output(batch.submit_at(
+                PtyChunk {
+                    seq: 3,
+                    bytes: b"d".to_vec()
+                },
+                now,
+                true
+            )),
             vec![
-                PtyChunk { seq: 1, bytes: b"b".to_vec() },
-                PtyChunk { seq: 3, bytes: b"d".to_vec() },
+                PtyChunk {
+                    seq: 1,
+                    bytes: b"b".to_vec()
+                },
+                PtyChunk {
+                    seq: 3,
+                    bytes: b"d".to_vec()
+                },
             ]
         );
     }
@@ -3962,8 +4050,18 @@ mod tests {
         let mut batch = PtyBroadcastBatch::default();
         let now = tokio::time::Instant::now();
         assert_eq!(
-            batch_output(batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, true)),
-            vec![PtyChunk { seq: 0, bytes: b"a".to_vec() }]
+            batch_output(batch.submit_at(
+                PtyChunk {
+                    seq: 0,
+                    bytes: b"a".to_vec()
+                },
+                now,
+                true
+            )),
+            vec![PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec()
+            }]
         );
         let after_epoch = now + INTERACTIVE_OUTPUT_EPOCH + Duration::from_nanos(1);
         assert_eq!(
@@ -3971,13 +4069,34 @@ mod tests {
             Vec::<PtyChunk>::new()
         );
         assert_eq!(
-            batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, after_epoch, false)),
-            vec![PtyChunk { seq: 1, bytes: b"b".to_vec() }]
+            batch_output(batch.submit_at(
+                PtyChunk {
+                    seq: 1,
+                    bytes: b"b".to_vec()
+                },
+                after_epoch,
+                false
+            )),
+            vec![PtyChunk {
+                seq: 1,
+                bytes: b"b".to_vec()
+            }]
         );
-        assert!(batch_output(batch.submit_at(PtyChunk { seq: 2, bytes: b"c".to_vec() }, after_epoch, false)).is_empty());
+        assert!(batch_output(batch.submit_at(
+            PtyChunk {
+                seq: 2,
+                bytes: b"c".to_vec()
+            },
+            after_epoch,
+            false
+        ))
+        .is_empty());
         assert_eq!(
             batch_output(batch.flush_due_at(after_epoch + BROADCAST_BATCH_WINDOW)),
-            vec![PtyChunk { seq: 2, bytes: b"c".to_vec() }]
+            vec![PtyChunk {
+                seq: 2,
+                bytes: b"c".to_vec()
+            }]
         );
     }
 
@@ -3985,9 +4104,30 @@ mod tests {
     fn pty_broadcast_batch_keeps_size_limit_during_flood() {
         let mut batch = PtyBroadcastBatch::default();
         let now = tokio::time::Instant::now();
-        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
-        let _ = batch.submit_at(PtyChunk { seq: 1, bytes: vec![b'b'; BROADCAST_BATCH_MAX_BYTES - 1] }, now, false);
-        let output = batch.submit_at(PtyChunk { seq: BROADCAST_BATCH_MAX_BYTES as u64, bytes: vec![b'c'; 1] }, now, false);
+        let _ = batch.submit_at(
+            PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec(),
+            },
+            now,
+            false,
+        );
+        let _ = batch.submit_at(
+            PtyChunk {
+                seq: 1,
+                bytes: vec![b'b'; BROADCAST_BATCH_MAX_BYTES - 1],
+            },
+            now,
+            false,
+        );
+        let output = batch.submit_at(
+            PtyChunk {
+                seq: BROADCAST_BATCH_MAX_BYTES as u64,
+                bytes: vec![b'c'; 1],
+            },
+            now,
+            false,
+        );
         assert_eq!(batch_output(output).len(), 1);
         assert_eq!(batch_output(batch.flush_remaining()).len(), 0);
     }
@@ -3996,8 +4136,23 @@ mod tests {
     fn paste_does_not_open_interactive_output_epoch() {
         let mut batch = PtyBroadcastBatch::default();
         let now = tokio::time::Instant::now();
-        let _ = batch.submit_at(PtyChunk { seq: 0, bytes: b"a".to_vec() }, now, false);
-        assert!(batch_output(batch.submit_at(PtyChunk { seq: 1, bytes: b"b".to_vec() }, now, false)).is_empty());
+        let _ = batch.submit_at(
+            PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec(),
+            },
+            now,
+            false,
+        );
+        assert!(batch_output(batch.submit_at(
+            PtyChunk {
+                seq: 1,
+                bytes: b"b".to_vec()
+            },
+            now,
+            false
+        ))
+        .is_empty());
     }
 
     #[test]
@@ -4043,15 +4198,26 @@ mod tests {
             next_seq += chunk.bytes.len() as u64;
             output.extend(batch_output(batch.submit_at(chunk, now, true)));
         }
-        output.extend(batch_output(batch.flush_due_at(now + BROADCAST_BATCH_WINDOW)));
+        output.extend(batch_output(
+            batch.flush_due_at(now + BROADCAST_BATCH_WINDOW),
+        ));
 
-        assert!(output.len() <= 6, "flood produced too many frames: {}", output.len());
-        assert!(output.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
-        assert_eq!(output.iter().map(|chunk| chunk.bytes.len()).sum::<usize>(), 1 + small.len() + over_budget.len() + 8 * flood_chunk.len());
+        assert!(
+            output.len() <= 6,
+            "flood produced too many frames: {}",
+            output.len()
+        );
+        assert!(output
+            .iter()
+            .all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
+        assert_eq!(
+            output.iter().map(|chunk| chunk.bytes.len()).sum::<usize>(),
+            1 + small.len() + over_budget.len() + 8 * flood_chunk.len()
+        );
         assert_eq!(output.first().map(|chunk| chunk.seq), Some(0));
-        assert!(output.windows(2).all(|chunks| {
-            chunks[0].seq + chunks[0].bytes.len() as u64 == chunks[1].seq
-        }));
+        assert!(output
+            .windows(2)
+            .all(|chunks| { chunks[0].seq + chunks[0].bytes.len() as u64 == chunks[1].seq }));
     }
 
     #[test]
@@ -4076,9 +4242,20 @@ mod tests {
             true,
         ));
         let tail = batch_output(batch.flush_due_at(now + BROADCAST_BATCH_WINDOW));
-        assert!(output.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
-        assert!(tail.iter().all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
-        assert_eq!(output.iter().chain(tail.iter()).map(|chunk| chunk.bytes.len()).sum::<usize>(), BROADCAST_BATCH_MAX_BYTES + 1);
+        assert!(output
+            .iter()
+            .all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
+        assert!(tail
+            .iter()
+            .all(|chunk| chunk.bytes.len() <= BROADCAST_BATCH_MAX_BYTES));
+        assert_eq!(
+            output
+                .iter()
+                .chain(tail.iter())
+                .map(|chunk| chunk.bytes.len())
+                .sum::<usize>(),
+            BROADCAST_BATCH_MAX_BYTES + 1
+        );
     }
 
     #[test]
@@ -4157,9 +4334,7 @@ mod tests {
                 bytes: b"k".to_vec(),
             })
         );
-        assert!(batch
-            .interactive_until
-            .is_some_and(|until| until > now));
+        assert!(batch.interactive_until.is_some_and(|until| until > now));
     }
 
     #[tokio::test]
@@ -4203,7 +4378,8 @@ mod tests {
         let mut bytes = Vec::with_capacity(TOTAL_BYTES);
         let mut frames = 0;
         while bytes.len() < TOTAL_BYTES {
-            let chunk = match tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv()).await {
+            let chunk = match tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv()).await
+            {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => match forwarder.await.expect("forwarder task completes") {
                     Err(missed) => panic!(
@@ -4226,7 +4402,10 @@ mod tests {
         forwarder.abort();
         assert_eq!(bytes.len(), TOTAL_BYTES);
         assert!(bytes.iter().all(|byte| *byte == b'x'));
-        assert!(frames < 128, "{frames} frames exceed the outgoing queue budget");
+        assert!(
+            frames < 128,
+            "{frames} frames exceed the outgoing queue budget"
+        );
         surface.hangup();
     }
 
@@ -4486,6 +4665,29 @@ mod tests {
         assert!(!stdout
             .lines()
             .any(|line| line.starts_with("TERMMESH_LAUNCH_")));
+    }
+
+    #[test]
+    fn remote_pane_marker_is_added_only_when_the_daemon_has_none() {
+        assert_eq!(
+            remote_pane_marker(false),
+            Some((
+                "SSH_CONNECTION".to_string(),
+                REMOTE_PANE_SSH_CONNECTION.to_string()
+            ))
+        );
+        assert_eq!(remote_pane_marker(true), None);
+    }
+
+    #[test]
+    fn pane_environment_carries_the_marker_only_when_the_daemon_has_none() {
+        let has_marker = |env: &[(String, String)]| {
+            env.iter().any(|(name, value)| {
+                name == "SSH_CONNECTION" && value == REMOTE_PANE_SSH_CONNECTION
+            })
+        };
+        assert!(has_marker(&pane_environment_for(&[0xab], false)));
+        assert!(!has_marker(&pane_environment_for(&[0xab], true)));
     }
 
     #[test]
@@ -5352,7 +5554,11 @@ mod tests {
         // The ring holds the same bounded chunks — a reattach replays
         // legal frames, not the killer.
         let ring = surface.replay_snapshot();
-        assert_eq!(ring.len(), received.len() + 1, "preamble plus the split chunks");
+        assert_eq!(
+            ring.len(),
+            received.len() + 1,
+            "preamble plus the split chunks"
+        );
         assert_environment_preamble(&ring[0]);
         assert_eq!(&ring[1..], received.as_slice());
 

@@ -351,7 +351,11 @@ fn main() -> std::process::ExitCode {
     let cwd = args
         .cwd
         .clone()
-        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
         .unwrap_or_else(|| ".".to_string());
 
     let mut out = match Emitter::new(args.events.as_deref()) {
@@ -417,9 +421,8 @@ fn main() -> std::process::ExitCode {
     if !bridge.start() {
         // The emitter moved into the bridge, so the failure is reported
         // through a fresh one on the same streams.
-        let mut out = Emitter::new(args.events.as_deref()).unwrap_or_else(|_| {
-            Emitter::new(None).expect("stdout is always available")
-        });
+        let mut out = Emitter::new(args.events.as_deref())
+            .unwrap_or_else(|_| Emitter::new(None).expect("stdout is always available"));
         let failure = bridge.failure();
         let stop = if failure.is_some() {
             "environment_failed"
@@ -463,7 +466,11 @@ fn spawn_input_reader(fifo: Option<String>, wake: mpsc::Sender<Wake>) {
         let mut source: Box<dyn Read> = match fifo.as_deref() {
             // Holding both ends avoids EOF spinning when an external writer
             // closes and reopens.
-            Some(path) => match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+            Some(path) => match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
                 Ok(file) => Box::new(file),
                 Err(e) => {
                     log(&format!("cannot open fifo: {e}"));
@@ -505,9 +512,8 @@ fn consume(
     events: Option<&str>,
 ) -> u8 {
     let mut pending: Vec<u8> = Vec::new();
-    let mut out = Emitter::new(events).unwrap_or_else(|_| {
-        Emitter::new(None).expect("stdout is always available")
-    });
+    let mut out = Emitter::new(events)
+        .unwrap_or_else(|_| Emitter::new(None).expect("stdout is always available"));
 
     let exit_failure = |bridge: &dyn Bridge| -> String {
         bridge
@@ -629,11 +635,10 @@ mod tests {
     fn a_control_frame_is_distinct_from_existing_turn_frames() {
         assert_eq!(
             input_frame(
-                &json!({"type": "user", "message": {"content": "keep this turn"}})
-                    .to_string()
+                &json!({"type": "user", "message": {"content": "keep this turn"}}).to_string()
             )
-                .unwrap()
-                .into_turn(),
+            .unwrap()
+            .into_turn(),
             Some("keep this turn".to_string())
         );
         assert_eq!(
@@ -792,12 +797,8 @@ mod tests {
     #[test]
     fn an_acp_cli_reports_a_control_error() {
         let (bridge_out, _bridge_events) = captured();
-        let mut bridge = AcpBridge::new(
-            ScriptedChild::new(vec![]),
-            bridge_out,
-            "/tmp/project",
-            None,
-        );
+        let mut bridge =
+            AcpBridge::new(ScriptedChild::new(vec![]), bridge_out, "/tmp/project", None);
         let (mut feedback, feedback_events) = captured();
 
         assert!(take(

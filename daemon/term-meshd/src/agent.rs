@@ -2081,9 +2081,10 @@ impl AgentSessionManager {
     /// these as pinned — a live agent is still working in them.
     pub fn active_worktree_paths(&self) -> HashSet<PathBuf> {
         let inner = self.inner.lock().unwrap();
-        let Ok(mut stmt) = inner.db.prepare(
-            "SELECT worktree_path FROM agent_sessions WHERE status != 'terminated'",
-        ) else {
+        let Ok(mut stmt) = inner
+            .db
+            .prepare("SELECT worktree_path FROM agent_sessions WHERE status != 'terminated'")
+        else {
             return HashSet::new();
         };
         let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
