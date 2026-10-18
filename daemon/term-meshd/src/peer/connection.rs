@@ -4568,6 +4568,25 @@ mod team_call_allow_list_tests {
 
         let mut served = data_cases;
         served.extend(ui_cases);
+
+        // The long-poll is answered on the reverse leader route before the
+        // dispatcher switches are reached, so it never appears in them. Count
+        // it only while that route still calls the owner-side signal.
+        let wake_method = {
+            let read = |path: &str| {
+                let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+                std::fs::read_to_string(&file)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", file.display()))
+            };
+            let signal = read("../../Sources/TeamEventWakeSignal.swift");
+            let provider = read("../../Sources/GhosttyPaneSurfaceProvider.swift");
+            let declared = quoted(section(&signal, "static let method", "\n"));
+            provider
+                .contains("TeamEventWakeSignal.shared.respond(params: params)")
+                .then(|| declared.into_iter().next())
+                .flatten()
+        };
+        served.extend(wake_method);
         assert!(
             served.len() > 20,
             "parsed too little out of the dispatchers: {served:?}"
