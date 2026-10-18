@@ -802,8 +802,12 @@ impl ConflictKind {
             2 => Self::Binary,
             3 => Self::AddAddText,
             4 => Self::AddAddBinary,
-            5 => Self::DeleteModify { deleted: ConflictSide::Local },
-            6 => Self::DeleteModify { deleted: ConflictSide::Remote },
+            5 => Self::DeleteModify {
+                deleted: ConflictSide::Local,
+            },
+            6 => Self::DeleteModify {
+                deleted: ConflictSide::Remote,
+            },
             7 => Self::RenameCycle,
             8 => Self::ExecutableBit,
             9 => Self::CaseCollision,
@@ -891,8 +895,8 @@ pub fn decode_conflict_set(
         return Err(ConflictError::BudgetExceeded);
     }
     for _ in 0..count {
-        let kind = ConflictKind::from_tag(reader.u8()?)
-            .ok_or(ConflictError::InvalidConflictShape)?;
+        let kind =
+            ConflictKind::from_tag(reader.u8()?).ok_or(ConflictError::InvalidConflictShape)?;
         let path_count = reader.u32()? as usize;
         if path_count > MAX_CONFLICT_COUNT {
             return Err(ConflictError::BudgetExceeded);
@@ -911,7 +915,11 @@ pub fn decode_conflict_set(
             let target_path = reader.string()?;
             let side =
                 ConflictSide::from_tag(reader.u8()?).ok_or(ConflictError::InvalidConflictShape)?;
-            origins.push(ConflictPathOrigin { source_path, target_path, side });
+            origins.push(ConflictPathOrigin {
+                source_path,
+                target_path,
+                side,
+            });
         }
         let base = reader.content(domain)?;
         let local = reader.content(domain)?;

@@ -864,7 +864,11 @@ async fn terminal_submit_sends_text_and_return_as_one_turn() {
     assert_eq!(retry.json()["deduplicated"], true);
 
     let calls = app.calls();
-    assert_eq!(calls.len(), 2, "a failed turn is retried once, then deduplicated: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        2,
+        "a failed turn is retried once, then deduplicated: {calls:?}"
+    );
     for (method, params) in &calls {
         assert_eq!(method, "surface.send_turn");
         assert_eq!(params, &json!({ "surface_id": "pane-1", "text": "ls" }));
@@ -946,7 +950,10 @@ async fn requests_exist_only_for_leaders() {
     assert_eq!(leader.status, 200, "{}", leader.body);
     assert_eq!(leader.json()["count"], 1);
     assert_eq!(leader.json()["requests"][0]["id"], "req-9");
-    assert_eq!(leader.json()["requests"][0]["preview"], "reply to the review");
+    assert_eq!(
+        leader.json()["requests"][0]["preview"],
+        "reply to the review"
+    );
     assert_eq!(leader.json()["requests"][0]["wake_attempts"], 2);
     assert_eq!(
         app.calls()[0].1,
@@ -1279,7 +1286,9 @@ async fn agent_targets_take_turns_and_show_the_transcript() {
 fn mobile_page_keeps_chat_and_terminal_wired_for_chat_capable_targets() {
     let js = embedded_page_js();
     assert!(
-        js.contains("function isChat(t) { return !!t && t.chat_capable && state.mode === 'chat'; }"),
+        js.contains(
+            "function isChat(t) { return !!t && t.chat_capable && state.mode === 'chat'; }"
+        ),
         "native agents must not be permanently locked to Chat"
     );
     assert!(
@@ -1664,14 +1673,13 @@ async fn a_pane_running_a_cli_is_chat_capable_even_when_the_record_is_not() {
         "precondition: the record itself cannot claim chat"
     );
 
-    let resolver: http_mobile::SessionResolver =
-        Arc::new(|surface_id: &str| match surface_id {
-            "panel-1" => Some(http_mobile::PaneSession {
-                cli: "claude".into(),
-                session_id: Some("sess-abc".into()),
-            }),
-            _ => None,
-        });
+    let resolver: http_mobile::SessionResolver = Arc::new(|surface_id: &str| match surface_id {
+        "panel-1" => Some(http_mobile::PaneSession {
+            cli: "claude".into(),
+            session_id: Some("sess-abc".into()),
+        }),
+        _ => None,
+    });
     let with = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
     with.registry
         .lock()
@@ -1776,14 +1784,13 @@ async fn a_resolved_pane_accepts_a_chat_turn() {
     let dir = tempfile::tempdir().unwrap();
     let app = FakeApp::spawn(dir.path());
     app.reply("surface.send_turn", json!({ "submitted": true }));
-    let resolver: http_mobile::SessionResolver =
-        Arc::new(|surface_id: &str| match surface_id {
-            "panel-3" => Some(http_mobile::PaneSession {
-                cli: "claude".into(),
-                session_id: Some("sess-xyz".into()),
-            }),
-            _ => None,
-        });
+    let resolver: http_mobile::SessionResolver = Arc::new(|surface_id: &str| match surface_id {
+        "panel-3" => Some(http_mobile::PaneSession {
+            cli: "claude".into(),
+            session_id: Some("sess-xyz".into()),
+        }),
+        _ => None,
+    });
     let h = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
     h.registry
         .lock()
@@ -1876,9 +1883,11 @@ async fn listener_serving_reports_whether_the_bind_held() {
         allowed_logins: BTreeSet::new(),
     };
     let (_tx, rx) = watch::channel(false);
-    assert!(http_mobile::serve(config, remote::new_registry(), None, None, rx)
-        .await
-        .is_err());
+    assert!(
+        http_mobile::serve(config, remote::new_registry(), None, None, rx)
+            .await
+            .is_err()
+    );
     assert!(!remote::listener_serving());
 
     let config = MobileConfig {
@@ -1887,7 +1896,13 @@ async fn listener_serving_reports_whether_the_bind_held() {
         allowed_logins: BTreeSet::new(),
     };
     let (tx, rx) = watch::channel(false);
-    let task = tokio::spawn(http_mobile::serve(config, remote::new_registry(), None, None, rx));
+    let task = tokio::spawn(http_mobile::serve(
+        config,
+        remote::new_registry(),
+        None,
+        None,
+        rx,
+    ));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while !remote::listener_serving() {
         assert!(
@@ -2132,7 +2147,6 @@ async fn command_endpoint_reads_the_installed_codex_skill_runtime() {
     assert!(!r.body.contains(project.to_str().unwrap()));
 }
 
-
 #[test]
 fn claude_local_commands_become_notices_instead_of_turns() {
     let rows = vec![
@@ -2166,12 +2180,20 @@ fn only_a_terminal_catalog_offers_the_model_picker() {
     for (native, action) in [(false, Some("pick_model")), (true, None)] {
         let (items, _) =
             http_mobile::mobile_command_catalog("codex", temp.path(), temp.path(), native).unwrap();
-        let model = items.iter().find(|item| item.invocation == "/model").unwrap();
+        let model = items
+            .iter()
+            .find(|item| item.invocation == "/model")
+            .unwrap();
         assert_eq!(model.action, action, "native={native}");
     }
     let action_of = |cli: &str, invocation: &str| {
-        let (items, _) = http_mobile::mobile_command_catalog(cli, temp.path(), temp.path(), false).unwrap();
-        items.into_iter().find(|item| item.invocation == invocation).unwrap().action
+        let (items, _) =
+            http_mobile::mobile_command_catalog(cli, temp.path(), temp.path(), false).unwrap();
+        items
+            .into_iter()
+            .find(|item| item.invocation == invocation)
+            .unwrap()
+            .action
     };
     assert_eq!(action_of("claude", "/effort"), Some("pick_effort"));
     assert_eq!(action_of("claude", "/permissions"), Some("terminal"));
@@ -2185,7 +2207,10 @@ async fn a_custom_claude_id_goes_inline_and_never_into_a_draft() {
     let dir = tempfile::tempdir().unwrap();
     let app = FakeApp::spawn(dir.path());
     app.reply("surface.send_turn", json!({ "submitted": true }));
-    app.reply("surface.read_text", json!({ "text": "❯ Try \"write a test\"\n  Opus 5.5 high" }));
+    app.reply(
+        "surface.read_text",
+        json!({ "text": "❯ Try \"write a test\"\n  Opus 5.5 high" }),
+    );
     let resolver: http_mobile::SessionResolver = Arc::new(|_: &str| {
         Some(http_mobile::PaneSession {
             cli: "claude".into(),
@@ -2233,7 +2258,10 @@ async fn a_custom_claude_id_goes_inline_and_never_into_a_draft() {
     assert_eq!(turns(&app).len(), 1);
     assert_eq!(turns(&app)[0]["text"], "/model claude-opus-4-1");
 
-    app.reply("surface.read_text", json!({ "text": "❯ fix the parser\n  Opus 5.5 high" }));
+    app.reply(
+        "surface.read_text",
+        json!({ "text": "❯ fix the parser\n  Opus 5.5 high" }),
+    );
     let draft = post(
         &h,
         "/api/targets/panel-7/model",
@@ -2242,7 +2270,11 @@ async fn a_custom_claude_id_goes_inline_and_never_into_a_draft() {
     .await;
     assert_eq!(draft.status, 409, "{}", draft.body);
     assert_eq!(draft.json()["error"]["code"], "composer_not_empty");
-    assert_eq!(turns(&app).len(), 1, "a draft must not get /model appended to it");
+    assert_eq!(
+        turns(&app).len(),
+        1,
+        "a draft must not get /model appended to it"
+    );
 }
 
 #[tokio::test]
@@ -2279,7 +2311,12 @@ async fn a_model_change_holds_the_pane_and_releases_it_when_the_menu_never_opens
     let driving = {
         let h = h.clone();
         tokio::spawn(async move {
-            post(&h, "/api/targets/panel-8/model", json!({ "model": "GLM 5" })).await
+            post(
+                &h,
+                "/api/targets/panel-8/model",
+                json!({ "model": "GLM 5" }),
+            )
+            .await
         })
     };
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2302,7 +2339,11 @@ async fn a_model_change_holds_the_pane_and_releases_it_when_the_menu_never_opens
         json!({ "text": "hello", "mode": "chat", "request_id": "after-1" }),
     )
     .await;
-    assert_eq!(after.status, 200, "the lock is released once the change ends: {}", after.body);
+    assert_eq!(
+        after.status, 200,
+        "the lock is released once the change ends: {}",
+        after.body
+    );
 }
 
 #[tokio::test]
@@ -2329,7 +2370,9 @@ fn write_claude_question(surface: &str, id: &str, fingerprint: &str, state: &str
         .or_else(|_| std::env::var("TERMMESH_SOCKET"))
         .unwrap_or_else(|_| "/tmp/term-meshd.sock".into());
     let root = http_mobile::question_store::root_for_socket(&socket).unwrap();
-    let directory = http_mobile::question_store::prepare_surface(&root, surface, "session-mobile-http").unwrap();
+    let directory =
+        http_mobile::question_store::prepare_surface(&root, surface, "session-mobile-http")
+            .unwrap();
     let path = directory.join(format!("{id}.json"));
     http_mobile::question_store::atomic_write(
         &path,
@@ -2345,16 +2388,41 @@ async fn claude_questions_list_local_pending_records_and_require_normal_auth() {
     let dir = tempfile::tempdir().unwrap();
     let app = FakeApp::spawn(dir.path());
     let h = start_tailscale().await;
-    expose(&h, &app, "question-local-1", TargetKind::Pane, KeysPolicy::Safe).await;
-    h.registry.lock().await.upsert(EnableSpec {
-        surface_id: "question-local-1".into(), kind: TargetKind::Pane, app_socket: Some(app.path_str()),
-        agent_cli: "claude".into(), keys: KeysPolicy::Safe, ..EnableSpec::default()
-    }, remote::now_unix()).unwrap();
+    expose(
+        &h,
+        &app,
+        "question-local-1",
+        TargetKind::Pane,
+        KeysPolicy::Safe,
+    )
+    .await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "question-local-1".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                agent_cli: "claude".into(),
+                keys: KeysPolicy::Safe,
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
     write_claude_question("question-local-1", "question-1", "fp-local", "pending");
     let found = get(&h, "/api/targets/question-local-1/questions").await;
     assert_eq!(found.status, 200, "{}", found.body);
     assert_eq!(found.json()["question"]["id"], "question-1");
-    let denied = http(h.addr, "GET", "/api/targets/question-local-1/questions", &[], None).await;
+    let denied = http(
+        h.addr,
+        "GET",
+        "/api/targets/question-local-1/questions",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(denied.status, 403);
     assert_eq!(denied.error_code(), "login_required");
 }
@@ -2365,32 +2433,70 @@ async fn claude_question_answer_rejects_stale_screen_without_typing() {
     let app = FakeApp::spawn(dir.path());
     app.reply("surface.read_text", json!({ "text": "a different prompt" }));
     let h = start_tailscale().await;
-    h.registry.lock().await.upsert(EnableSpec {
-        surface_id: "question-stale-1".into(), kind: TargetKind::Pane, app_socket: Some(app.path_str()),
-        agent_cli: "claude".into(), keys: KeysPolicy::Safe, ..EnableSpec::default()
-    }, remote::now_unix()).unwrap();
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "question-stale-1".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                agent_cli: "claude".into(),
+                keys: KeysPolicy::Safe,
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
     write_claude_question("question-stale-1", "question-1", "fp-stale", "pending");
-    let fingerprint = post(&h, "/api/targets/question-stale-1/questions/question-1/answer", json!({
-        "fingerprint": "old-fingerprint", "answers": [{"question_index": 0, "selected": [1]}]
-    })).await;
+    let fingerprint = post(
+        &h,
+        "/api/targets/question-stale-1/questions/question-1/answer",
+        json!({
+            "fingerprint": "old-fingerprint", "answers": [{"question_index": 0, "selected": [1]}]
+        }),
+    )
+    .await;
     assert_eq!(fingerprint.status, 409, "{}", fingerprint.body);
     assert_eq!(fingerprint.error_code(), "prompt_gone");
-    assert!(app.calls().is_empty(), "a stale fingerprint must not read or type");
-    let reply = post(&h, "/api/targets/question-stale-1/questions/question-1/answer", json!({
-        "fingerprint": "fp-stale", "answers": [{"question_index": 0, "selected": [1]}]
-    })).await;
+    assert!(
+        app.calls().is_empty(),
+        "a stale fingerprint must not read or type"
+    );
+    let reply = post(
+        &h,
+        "/api/targets/question-stale-1/questions/question-1/answer",
+        json!({
+            "fingerprint": "fp-stale", "answers": [{"question_index": 0, "selected": [1]}]
+        }),
+    )
+    .await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert_eq!(reply.error_code(), "prompt_gone");
-    assert!(app.calls().iter().all(|(method, _)| method != "surface.send_text" && method != "surface.send_key"));
+    assert!(app
+        .calls()
+        .iter()
+        .all(|(method, _)| method != "surface.send_text" && method != "surface.send_key"));
 }
 
 #[tokio::test]
 async fn claude_questions_report_relay_as_unavailable() {
     let h = start_tailscale().await;
-    h.registry.lock().await.upsert(EnableSpec {
-        surface_id: "question-relay-1".into(), kind: TargetKind::Pane, agent_cli: "claude".into(),
-        remote_pane: true, keys: KeysPolicy::Safe, ..EnableSpec::default()
-    }, remote::now_unix()).unwrap();
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "question-relay-1".into(),
+                kind: TargetKind::Pane,
+                agent_cli: "claude".into(),
+                remote_pane: true,
+                keys: KeysPolicy::Safe,
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
     let reply = get(&h, "/api/targets/question-relay-1/questions").await;
     assert_eq!(reply.status, 409, "{}", reply.body);
     assert_eq!(reply.error_code(), "questions_unavailable");
@@ -2401,7 +2507,10 @@ async fn an_approval_question_is_read_and_answered_only_while_it_is_the_same_one
     let dir = tempfile::tempdir().unwrap();
     let app = FakeApp::spawn(dir.path());
     app.reply("surface.send_text", json!({ "ok": true }));
-    app.reply("surface.read_text", json!({ "text": CODEX_APPROVAL_SCREEN }));
+    app.reply(
+        "surface.read_text",
+        json!({ "text": CODEX_APPROVAL_SCREEN }),
+    );
     let resolver: http_mobile::SessionResolver = Arc::new(|_: &str| {
         Some(http_mobile::PaneSession {
             cli: "codex".into(),
@@ -2426,7 +2535,10 @@ async fn an_approval_question_is_read_and_answered_only_while_it_is_the_same_one
     let read = get(&h, "/api/targets/panel-9/prompt").await;
     assert_eq!(read.status, 200, "{}", read.body);
     let prompt = read.json()["prompt"].clone();
-    assert_eq!(prompt["question"], "Would you like to run the following command?");
+    assert_eq!(
+        prompt["question"],
+        "Would you like to run the following command?"
+    );
     assert_eq!(prompt["options"].as_array().unwrap().len(), 2);
     let fingerprint = prompt["fingerprint"].as_str().unwrap().to_string();
 
@@ -2459,7 +2571,10 @@ async fn an_approval_question_is_read_and_answered_only_while_it_is_the_same_one
         })
     };
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    app.reply("surface.read_text", json!({ "text": "✔ You approved codex\n› Ask Codex to do anything" }));
+    app.reply(
+        "surface.read_text",
+        json!({ "text": "✔ You approved codex\n› Ask Codex to do anything" }),
+    );
     let answered = answering.await.unwrap();
     assert_eq!(answered.status, 200, "{}", answered.body);
     let digits: Vec<_> = app
@@ -2484,13 +2599,23 @@ fn a_long_command_file_cut_inside_a_character_still_lists() {
         body.push('한');
     }
     std::fs::write(commands.join("tm.md"), &body).unwrap();
-    std::fs::write(commands.join("zz-after.md"), "---\ndescription: later\n---\n").unwrap();
+    std::fs::write(
+        commands.join("zz-after.md"),
+        "---\ndescription: later\n---\n",
+    )
+    .unwrap();
     let (items, warning) =
         http_mobile::mobile_command_catalog("claude", temp.path(), temp.path(), false).unwrap();
     assert_eq!(warning, None);
-    let tm = items.iter().find(|item| item.invocation == "/tm").expect("long file listed");
+    let tm = items
+        .iter()
+        .find(|item| item.invocation == "/tm")
+        .expect("long file listed");
     assert_eq!(tm.description, "팀 dispatch");
-    assert!(items.iter().any(|item| item.invocation == "/zz-after"), "later files still scanned");
+    assert!(
+        items.iter().any(|item| item.invocation == "/zz-after"),
+        "later files still scanned"
+    );
 }
 
 #[test]
@@ -2501,17 +2626,31 @@ fn a_claude_turn_is_open_from_its_prompt_to_its_turn_duration() {
     let answer = json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "done" }], "stop_reason": "end_turn" } });
     let hooks = json!({ "type": "system", "subtype": "stop_hook_summary" });
     let ended = json!({ "type": "system", "subtype": "turn_duration", "durationMs": 7876 });
-    let model = json!({ "type": "user", "message": { "content": "<command-name>/model</command-name>" } });
+    let model =
+        json!({ "type": "user", "message": { "content": "<command-name>/model</command-name>" } });
     let meta = json!({ "type": "user", "isMeta": true, "message": { "content": "Caveat" } });
     let interrupted = json!({ "type": "user", "message": { "content": [{ "type": "text", "text": "[Request interrupted by user]" }] } });
 
-    let open = |rows: &[&Value]| http_mobile::claude_turn_in_flight(&rows.iter().map(|r| (*r).clone()).collect::<Vec<_>>());
+    let open = |rows: &[&Value]| {
+        http_mobile::claude_turn_in_flight(&rows.iter().map(|r| (*r).clone()).collect::<Vec<_>>())
+    };
     assert_eq!(open(&[&prompt]), Some(true));
-    assert_eq!(open(&[&prompt, &tool_use, &tool_result]), Some(true), "a finished tool mid-turn is still the turn");
-    assert_eq!(open(&[&prompt, &tool_use, &tool_result, &answer]), Some(true), "an answer before turn_duration is still the turn");
+    assert_eq!(
+        open(&[&prompt, &tool_use, &tool_result]),
+        Some(true),
+        "a finished tool mid-turn is still the turn"
+    );
+    assert_eq!(
+        open(&[&prompt, &tool_use, &tool_result, &answer]),
+        Some(true),
+        "an answer before turn_duration is still the turn"
+    );
     assert_eq!(open(&[&prompt, &answer, &hooks, &ended]), Some(false));
-    assert_eq!(open(&[&prompt, &answer, &hooks, &ended, &model, &meta]), Some(false), "local commands open no turn");
+    assert_eq!(
+        open(&[&prompt, &answer, &hooks, &ended, &model, &meta]),
+        Some(false),
+        "local commands open no turn"
+    );
     assert_eq!(open(&[&prompt, &interrupted]), Some(false));
     assert_eq!(open(&[&tool_use]), None);
 }
-

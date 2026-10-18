@@ -221,8 +221,8 @@ fn content(
 use std::sync::Mutex;
 
 use super::{
-    put_plaintext, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition, ApplyStore,
-    assumed_file_mode, ConflictResolution, KeyId, ManifestEntry, ProjectKey,
+    assumed_file_mode, put_plaintext, ApplyAction, ApplyPlan, ApplyPlanEntry, ApplyPrecondition,
+    ApplyStore, ConflictResolution, KeyId, ManifestEntry, ProjectKey,
 };
 
 /// What a resolution changed.
@@ -319,8 +319,7 @@ pub fn resolve_conflict(
 
     if !entries.is_empty() {
         let mut operation_id = [0u8; 16];
-        getrandom::getrandom(&mut operation_id)
-            .map_err(|_| "conflict_apply_failed".to_string())?;
+        getrandom::getrandom(&mut operation_id).map_err(|_| "conflict_apply_failed".to_string())?;
         store
             .apply(
                 root,
@@ -386,13 +385,8 @@ fn rebase_onto_remote(
         let material = cas
             .current_project_key(project)
             .map_err(|_| "conflict_apply_failed".to_string())?;
-        let object_id = put_plaintext(
-            cas,
-            domain,
-            &material.key,
-            material.key_id,
-            content.bytes(),
-        )?;
+        let object_id =
+            put_plaintext(cas, domain, &material.key, material.key_id, content.bytes())?;
         objects.insert(path.clone(), object_id);
     }
     base.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));

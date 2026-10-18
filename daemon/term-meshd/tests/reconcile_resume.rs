@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use sync::{
-    assumed_file_mode, logical_transfer_fixture, BaselineCrashHook, BaselineInstallPhase, EntryKind, HeadDecision,
-    KeyId, ManifestBuilder, ManifestEntry, ManifestIndex, ManifestScanner, ObjectId, OplogStore,
-    OplogTrustError, OplogTrustProvider, ProjectId, ProjectKey, ReconcileError,
-    ReconcileOrchestrator, ReconcileStore, ResumeToken, ScanLimits, ScanObserver, StageId,
-    StreamRouter, SyncMode, TransferCheckpoint, TransferSession, TransportPeerSnapshot, WireTrace,
+    assumed_file_mode, logical_transfer_fixture, BaselineCrashHook, BaselineInstallPhase,
+    EntryKind, HeadDecision, KeyId, ManifestBuilder, ManifestEntry, ManifestIndex, ManifestScanner,
+    ObjectId, OplogStore, OplogTrustError, OplogTrustProvider, ProjectId, ProjectKey,
+    ReconcileError, ReconcileOrchestrator, ReconcileStore, ResumeToken, ScanLimits, ScanObserver,
+    StageId, StreamRouter, SyncMode, TransferCheckpoint, TransferSession, TransportPeerSnapshot,
+    WireTrace,
 };
 use sync_protocol::{
     CanonicalRecord, ControlFields, DeviceGrantPayload, DeviceRevokePayload, RecordKind,

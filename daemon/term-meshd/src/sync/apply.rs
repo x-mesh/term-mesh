@@ -219,7 +219,8 @@ impl ApplyStore {
             vfs.name(),
         )?;
         configure(&connection)?;
-        let user_version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        let user_version =
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
         if user_version == 0 {
             let tx = connection.unchecked_transaction()?;
             for (_, sql) in APPLY_SCHEMA {
@@ -399,11 +400,7 @@ impl ApplyStore {
     /// conflict the user has since resolved (or edited away) must not linger, and
     /// an unchanged one re-derives the same content-addressed id, so re-storing it
     /// is a no-op from the caller's perspective.
-    pub fn save_conflicts(
-        &self,
-        project: ProjectId,
-        set: &ConflictSet,
-    ) -> Result<(), ApplyError> {
+    pub fn save_conflicts(&self, project: ProjectId, set: &ConflictSet) -> Result<(), ApplyError> {
         let encoded = encode_conflict_set(set);
         let connection = self.connection.lock().map_err(|_| ApplyError::Poisoned)?;
         connection.execute(
@@ -656,7 +653,10 @@ impl ApplyStore {
                     hook.after_io(ApplyIoPoint::TempFsync)?;
                     sandbox.sync_temp_work(hook)?;
                 }
-                ApplyAction::Directory { executable: _, mode } => {
+                ApplyAction::Directory {
+                    executable: _,
+                    mode,
+                } => {
                     // Create with the owner bits forced on: this operation still
                     // has to write the leaves into it, and a source mode without
                     // owner-write or owner-search would lock us out of our own

@@ -28,12 +28,11 @@ use sync::{
     ensure_device_identity, exchange_manifests, generate_project_key, load_device_tls_identity,
     load_project_key, receive_push, respond_to_fetch, run_bootstrap_trust, scan_project_entries,
     serve_project, ApplyStore, BootstrapDevice, CasLimits, CasStore, ConflictKind,
-    DaemonBootstrapPaths,
-    KeychainBackend, KeychainError, KeychainItem, KeychainProjectKeyProvider, LocalCoordinates,
-    NetworkSyncRunner, ObjectDomain, ObjectId, ObjectType, OperationKind, OperationManager,
-    OperationStartParams, OperationState, ProjectId, ProjectRegistry, ProvisioningPeerResolver,
-    ProvisioningSyncContextProvider, SyncConnection, SyncContextProvider, SyncEndpoint,
-    SyncProvisioningStore, TrustStore,
+    DaemonBootstrapPaths, KeychainBackend, KeychainError, KeychainItem, KeychainProjectKeyProvider,
+    LocalCoordinates, NetworkSyncRunner, ObjectDomain, ObjectId, ObjectType, OperationKind,
+    OperationManager, OperationStartParams, OperationState, ProjectId, ProjectRegistry,
+    ProvisioningPeerResolver, ProvisioningSyncContextProvider, SyncConnection, SyncContextProvider,
+    SyncEndpoint, SyncProvisioningStore, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 use zeroize::Zeroizing;
@@ -50,7 +49,10 @@ impl KeychainBackend for MemoryKeychain {
         self.values
             .lock()
             .map_err(|_| KeychainError::Poisoned)?
-            .insert((item.service.clone(), item.account.clone()), secret.to_vec());
+            .insert(
+                (item.service.clone(), item.account.clone()),
+                secret.to_vec(),
+            );
         Ok(())
     }
     fn get(&self, item: &KeychainItem) -> Result<Zeroizing<Vec<u8>>, KeychainError> {
@@ -103,7 +105,11 @@ fn bootstrap_paths(state_root: &std::path::Path, project: ProjectId) -> DaemonBo
     }
 }
 
-fn project_cas(state_root: &std::path::Path, project: ProjectId, keychain: Arc<dyn KeychainBackend>) -> CasStore {
+fn project_cas(
+    state_root: &std::path::Path,
+    project: ProjectId,
+    keychain: Arc<dyn KeychainBackend>,
+) -> CasStore {
     let dir = state_root
         .join("projects")
         .join(hex::encode(project.as_bytes()))
@@ -156,8 +162,16 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
         .certificate_hash();
     let dek = generate_project_key().unwrap();
     let roster = [
-        BootstrapDevice { device_id: device_a, certificate_hash: hash_a, epoch: 1 },
-        BootstrapDevice { device_id: device_b, certificate_hash: hash_b, epoch: 2 },
+        BootstrapDevice {
+            device_id: device_a,
+            certificate_hash: hash_a,
+            epoch: 1,
+        },
+        BootstrapDevice {
+            device_id: device_b,
+            certificate_hash: hash_b,
+            epoch: 2,
+        },
     ];
 
     // ── Apply phase, peer (B) first — it does not dial, so it has no peers. ────
@@ -167,7 +181,10 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
         project,
         &recovery,
         &dek,
-        LocalCoordinates { device_id: device_b, roster_epoch: 2 },
+        LocalCoordinates {
+            device_id: device_b,
+            roster_epoch: 2,
+        },
         &roster,
         &[],
     )
@@ -200,7 +217,10 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
         project,
         &recovery,
         &dek,
-        LocalCoordinates { device_id: device_a, roster_epoch: 1 },
+        LocalCoordinates {
+            device_id: device_a,
+            roster_epoch: 1,
+        },
         &roster,
         &[("peer-b".to_string(), server_addr)],
     )
@@ -285,7 +305,9 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
 
     let mut finished = None;
     for _ in 0..150 {
-        let record = manager.status(&started.operation_id, &op_project_id).unwrap();
+        let record = manager
+            .status(&started.operation_id, &op_project_id)
+            .unwrap();
         if record.state.is_terminal() {
             finished = Some(record);
             break;
@@ -300,12 +322,18 @@ async fn bootstrap_then_sync_moves_a_file_from_peer_to_initiator() {
         record.error_code
     );
     let result = record.result.expect("succeeded operation carries a result");
-    assert_eq!(result.entries, 1, "expected exactly one file to fetch (extra.txt)");
+    assert_eq!(
+        result.entries, 1,
+        "expected exactly one file to fetch (extra.txt)"
+    );
 
     // The fetched file was applied to the initiator's tree, byte-identical.
     let applied = std::fs::read(local_root.path().join("extra.txt"))
         .expect("extra.txt applied to the initiator's project root");
-    assert_eq!(applied, b"only-on-the-peer", "applied file differs from the peer");
+    assert_eq!(
+        applied, b"only-on-the-peer",
+        "applied file differs from the peer"
+    );
 }
 
 /// As above, but the peer is served by the REAL daemon responder (`serve_project`)
@@ -350,8 +378,16 @@ async fn serve_project_responds_to_a_real_sync() {
         .certificate_hash();
     let dek = generate_project_key().unwrap();
     let roster = [
-        BootstrapDevice { device_id: device_a, certificate_hash: hash_a, epoch: 1 },
-        BootstrapDevice { device_id: device_b, certificate_hash: hash_b, epoch: 2 },
+        BootstrapDevice {
+            device_id: device_a,
+            certificate_hash: hash_a,
+            epoch: 1,
+        },
+        BootstrapDevice {
+            device_id: device_b,
+            certificate_hash: hash_b,
+            epoch: 2,
+        },
     ];
     run_bootstrap_trust(
         &*keychain_b,
@@ -359,7 +395,10 @@ async fn serve_project_responds_to_a_real_sync() {
         project,
         &recovery,
         &dek,
-        LocalCoordinates { device_id: device_b, roster_epoch: 2 },
+        LocalCoordinates {
+            device_id: device_b,
+            roster_epoch: 2,
+        },
         &roster,
         &[],
     )
@@ -397,7 +436,10 @@ async fn serve_project_responds_to_a_real_sync() {
         project,
         &recovery,
         &dek,
-        LocalCoordinates { device_id: device_a, roster_epoch: 1 },
+        LocalCoordinates {
+            device_id: device_a,
+            roster_epoch: 1,
+        },
         &roster,
         &[("peer-b".to_string(), server_addr)],
     )
@@ -431,7 +473,9 @@ async fn serve_project_responds_to_a_real_sync() {
 
     let mut finished = None;
     for _ in 0..150 {
-        let record = manager.status(&started.operation_id, &op_project_id).unwrap();
+        let record = manager
+            .status(&started.operation_id, &op_project_id)
+            .unwrap();
         if record.state.is_terminal() {
             finished = Some(record);
             break;
@@ -516,12 +560,24 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     let registry_b = Arc::new(ProjectRegistry::open(registry_b_state.join("registry.db")).unwrap());
     registry_b.add_with_id(peer_root.path(), project).unwrap();
 
-    let hash_a = ensure_device_identity(&*keychain_a, project, device_a).unwrap().certificate_hash();
-    let hash_b = ensure_device_identity(&*keychain_b, project, device_b).unwrap().certificate_hash();
+    let hash_a = ensure_device_identity(&*keychain_a, project, device_a)
+        .unwrap()
+        .certificate_hash();
+    let hash_b = ensure_device_identity(&*keychain_b, project, device_b)
+        .unwrap()
+        .certificate_hash();
     let dek = generate_project_key().unwrap();
     let roster = [
-        BootstrapDevice { device_id: device_a, certificate_hash: hash_a, epoch: 1 },
-        BootstrapDevice { device_id: device_b, certificate_hash: hash_b, epoch: 2 },
+        BootstrapDevice {
+            device_id: device_a,
+            certificate_hash: hash_a,
+            epoch: 1,
+        },
+        BootstrapDevice {
+            device_id: device_b,
+            certificate_hash: hash_b,
+            epoch: 2,
+        },
     ];
     run_bootstrap_trust(
         &*keychain_b,
@@ -529,14 +585,18 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
         project,
         &recovery,
         &dek,
-        LocalCoordinates { device_id: device_b, roster_epoch: 2 },
+        LocalCoordinates {
+            device_id: device_b,
+            roster_epoch: 2,
+        },
         &roster,
         &[],
     )
     .unwrap();
 
     let provisioning_b = Arc::new(SyncProvisioningStore::open(state_b.join("prov.db")).unwrap());
-    let provider_b = ProvisioningSyncContextProvider::new(keychain_b.clone(), provisioning_b, &state_b);
+    let provider_b =
+        ProvisioningSyncContextProvider::new(keychain_b.clone(), provisioning_b, &state_b);
     let context_b = provider_b.context_for(&op_project_id).unwrap();
     let root_b = registry_b.resolve_root(project).unwrap();
     let dek_b = load_project_key(&*keychain_b, project_bytes).unwrap();
@@ -548,7 +608,14 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     .unwrap();
     let server_addr = server.local_addr().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
-    let _server_task = tokio::spawn(serve_project(server, context_b, root_b, dek_b.key, dek_b.key_id, stop.clone()));
+    let _server_task = tokio::spawn(serve_project(
+        server,
+        context_b,
+        root_b,
+        dek_b.key,
+        dek_b.key_id,
+        stop.clone(),
+    ));
 
     run_bootstrap_trust(
         &*keychain_a,
@@ -556,18 +623,34 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
         project,
         &recovery,
         &dek,
-        LocalCoordinates { device_id: device_a, roster_epoch: 1 },
+        LocalCoordinates {
+            device_id: device_a,
+            roster_epoch: 1,
+        },
         &roster,
         &[("peer-b".to_string(), server_addr)],
     )
     .unwrap();
     let provisioning_a = Arc::new(SyncProvisioningStore::open(state_a.join("prov.db")).unwrap());
-    let provider = Arc::new(ProvisioningSyncContextProvider::new(keychain_a.clone(), provisioning_a.clone(), &state_a));
+    let provider = Arc::new(ProvisioningSyncContextProvider::new(
+        keychain_a.clone(),
+        provisioning_a.clone(),
+        &state_a,
+    ));
     let resolver = Arc::new(ProvisioningPeerResolver::new(provisioning_a));
-    let runner = NetworkSyncRunner::new(provider.clone(), resolver, tokio::runtime::Handle::current());
+    let runner = NetworkSyncRunner::new(
+        provider.clone(),
+        resolver,
+        tokio::runtime::Handle::current(),
+    );
 
     let ops_state = state_dir(temporary.path(), "sync-state");
-    let manager = OperationManager::open_with_sync_transport(ops_state.join("operations.db"), registry_a, Arc::new(runner)).unwrap();
+    let manager = OperationManager::open_with_sync_transport(
+        ops_state.join("operations.db"),
+        registry_a,
+        Arc::new(runner),
+    )
+    .unwrap();
 
     let started = manager
         .start(OperationStartParams {
@@ -581,7 +664,9 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
 
     let mut finished = None;
     for _ in 0..150 {
-        let record = manager.status(&started.operation_id, &op_project_id).unwrap();
+        let record = manager
+            .status(&started.operation_id, &op_project_id)
+            .unwrap();
         if record.state.is_terminal() {
             finished = Some(record);
             break;
@@ -589,13 +674,17 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let record = finished.expect("sync operation did not terminate in time");
-    assert_eq!(record.state, OperationState::Succeeded, "sync op failed: {:?}", record.error_code);
+    assert_eq!(
+        record.state,
+        OperationState::Succeeded,
+        "sync op failed: {:?}",
+        record.error_code
+    );
 
     // A fetched B's file; B applied A's pushed file — both trees converged.
     // Modes travelled with the content, in both directions.
-    let mode_of = |path: &std::path::Path| {
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-    };
+    let mode_of =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(
         mode_of(&peer_root.path().join("a-only.txt")),
         0o755,
@@ -612,12 +701,17 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
         "an owner-only file must not be widened by syncing it",
     );
 
-    let a_got_b = std::fs::read(local_root.path().join("b-only.txt")).expect("A fetched b-only.txt");
+    let a_got_b =
+        std::fs::read(local_root.path().join("b-only.txt")).expect("A fetched b-only.txt");
     assert_eq!(a_got_b, b"lives-on-B");
-    let b_got_a = std::fs::read(peer_root.path().join("a-only.txt")).expect("B received the pushed a-only.txt");
+    let b_got_a = std::fs::read(peer_root.path().join("a-only.txt"))
+        .expect("B received the pushed a-only.txt");
     assert_eq!(b_got_a, b"lives-on-A");
     // shared.txt untouched on both.
-    assert_eq!(std::fs::read(local_root.path().join("shared.txt")).unwrap(), b"same-content");
+    assert_eq!(
+        std::fs::read(local_root.path().join("shared.txt")).unwrap(),
+        b"same-content"
+    );
 
     // The base advanced to the converged state, and each base FILE carries the CAS
     // object it landed on — the anchor a later three-way merge reads to tell "I
@@ -631,8 +725,14 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
         )
     };
     let base_paths: Vec<&str> = base.iter().map(|e| e.relative_path.as_str()).collect();
-    assert!(base_paths.contains(&"a-only.txt"), "pushed path in base: {base_paths:?}");
-    assert!(base_paths.contains(&"b-only.txt"), "fetched path in base: {base_paths:?}");
+    assert!(
+        base_paths.contains(&"a-only.txt"),
+        "pushed path in base: {base_paths:?}"
+    );
+    assert!(
+        base_paths.contains(&"b-only.txt"),
+        "fetched path in base: {base_paths:?}"
+    );
     // `shared.txt` was identical on both sides, so the reconcile skipped it and it
     // never entered the base — which is exactly why every base path has an object.
     assert_eq!(
@@ -642,15 +742,26 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
     // Each recorded id is the content address of the agreed bytes, and the object
     // it names is really in CAS — so a later merge can read the base, not just
     // learn that one existed.
-    let domain = ObjectDomain { project_id: project, object_type: ObjectType::FILE, version: 1 };
-    for (path, expected) in [("a-only.txt", &b"lives-on-A"[..]), ("b-only.txt", &b"lives-on-B"[..])] {
+    let domain = ObjectDomain {
+        project_id: project,
+        object_type: ObjectType::FILE,
+        version: 1,
+    };
+    for (path, expected) in [
+        ("a-only.txt", &b"lives-on-A"[..]),
+        ("b-only.txt", &b"lives-on-B"[..]),
+    ] {
         assert_eq!(
             base_objects[path],
             ObjectId::for_plaintext(domain, expected),
             "base object for {path} does not address the agreed content",
         );
         assert!(
-            context_a.cas.get_live(domain, base_objects[path]).unwrap().is_some(),
+            context_a
+                .cas
+                .get_live(domain, base_objects[path])
+                .unwrap()
+                .is_some(),
             "base object for {path} missing from CAS",
         );
     }
@@ -673,7 +784,9 @@ async fn bidirectional_sync_converges_conflicts_and_propagates_deletes() {
         .unwrap();
     let mut finished = None;
     for _ in 0..150 {
-        let record = manager.status(&second.operation_id, &op_project_id).unwrap();
+        let record = manager
+            .status(&second.operation_id, &op_project_id)
+            .unwrap();
         if record.state.is_terminal() {
             finished = Some(record);
             break;

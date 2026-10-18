@@ -329,10 +329,7 @@ impl CasStore {
 
     /// This project's current DEK (key id + material) from the store's key
     /// provider — what an initiator needs to encrypt objects it pushes to a peer.
-    pub fn current_project_key(
-        &self,
-        project: ProjectId,
-    ) -> Result<ProjectKeyMaterial, CasError> {
+    pub fn current_project_key(&self, project: ProjectId) -> Result<ProjectKeyMaterial, CasError> {
         self.keys.current_project_key(project)
     }
 

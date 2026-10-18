@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use sync::{
-    assumed_file_mode, EntryKind, ManifestBuilder, ManifestEntry, ManifestError, ManifestScanner, ScanCheckpoint,
-    ScanError, ScanLimits, ScanObserver, ScanReason, NO_MODE,
+    assumed_file_mode, EntryKind, ManifestBuilder, ManifestEntry, ManifestError, ManifestScanner,
+    ScanCheckpoint, ScanError, ScanLimits, ScanObserver, ScanReason, NO_MODE,
 };
 
 #[test]
@@ -331,9 +331,18 @@ fn rescanning_one_held_descriptor_does_not_exhaust_it() {
 
     let held = fs::File::open(&root).unwrap();
     let scanner = ManifestScanner::new(ScanLimits::default()).unwrap();
-    let first = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
-    let second = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
-    let third = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
+    let first = scanner
+        .scan_descriptor(&held, ScanReason::Initial)
+        .unwrap()
+        .0;
+    let second = scanner
+        .scan_descriptor(&held, ScanReason::Initial)
+        .unwrap()
+        .0;
+    let third = scanner
+        .scan_descriptor(&held, ScanReason::Initial)
+        .unwrap()
+        .0;
 
     assert_eq!(first.entry_count, 3, "nested dir + two files");
     assert_eq!(first, second);
@@ -342,6 +351,9 @@ fn rescanning_one_held_descriptor_does_not_exhaust_it() {
     // A change between scans is still picked up — the descriptor is re-read, not
     // cached.
     fs::write(root.join("added.txt"), b"added\n").unwrap();
-    let fourth = scanner.scan_descriptor(&held, ScanReason::Initial).unwrap().0;
+    let fourth = scanner
+        .scan_descriptor(&held, ScanReason::Initial)
+        .unwrap()
+        .0;
     assert_eq!(fourth.entry_count, 4);
 }

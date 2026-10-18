@@ -1032,19 +1032,18 @@ fn open_session_owner(
     remote_socket: Option<&str>,
 ) -> Result<(RemotePeer, HostHandshake), PeerCliError> {
     let tunnel = RemotePeer::open(host, remote_socket)?;
-    let handshake =
-        connect_and_authenticate_with_owner(&tunnel.local_socket, false).map_err(handshake_error)?;
-    let Some(owner) =
-        session_owner_redirect(&tunnel.remote_socket, &handshake.session_host_socket)
-            .map(str::to_owned)
+    let handshake = connect_and_authenticate_with_owner(&tunnel.local_socket, false)
+        .map_err(handshake_error)?;
+    let Some(owner) = session_owner_redirect(&tunnel.remote_socket, &handshake.session_host_socket)
+        .map(str::to_owned)
     else {
         return Ok((tunnel, handshake));
     };
     drop(handshake);
     drop(tunnel);
     let tunnel = RemotePeer::open(host, Some(&owner))?;
-    let handshake =
-        connect_and_authenticate_with_owner(&tunnel.local_socket, false).map_err(handshake_error)?;
+    let handshake = connect_and_authenticate_with_owner(&tunnel.local_socket, false)
+        .map_err(handshake_error)?;
     Ok((tunnel, handshake))
 }
 
@@ -3082,9 +3081,15 @@ mod tests {
         assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains("tm-agent"));
         assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains("replay-capacity"));
         assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains(r#"\\\""#));
-        assert_eq!(public_error_context("SSH_SPAWN_FAILED"), "SSH could not be started");
+        assert_eq!(
+            public_error_context("SSH_SPAWN_FAILED"),
+            "SSH could not be started"
+        );
         assert_eq!(public_error_context("SSH_PROBE_FAILED"), "SSH probe failed");
-        assert_eq!(public_error_context("SSH_PROBE_TIMEOUT"), "SSH probe timed out");
+        assert_eq!(
+            public_error_context("SSH_PROBE_TIMEOUT"),
+            "SSH probe timed out"
+        );
     }
 
     #[test]

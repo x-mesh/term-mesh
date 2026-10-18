@@ -52,7 +52,10 @@ impl<T: Transport> AcpBridge<T> {
         match init.as_ref() {
             Some(reply) if reply.get("error").is_none() => {}
             _ => {
-                crate::log(&format!("acp initialize failed: {}", describe(init.as_ref())));
+                crate::log(&format!(
+                    "acp initialize failed: {}",
+                    describe(init.as_ref())
+                ));
                 return false;
             }
         }
@@ -70,7 +73,10 @@ impl<T: Transport> AcpBridge<T> {
             .and_then(Value::as_str)
             .map(str::to_string);
         if self.session.is_none() {
-            crate::log(&format!("acp session/new failed: {}", describe(new.as_ref())));
+            crate::log(&format!(
+                "acp session/new failed: {}",
+                describe(new.as_ref())
+            ));
             return false;
         }
 
@@ -191,11 +197,7 @@ impl<T: Transport> AcpBridge<T> {
                     let status = update.get("status").and_then(Value::as_str);
                     if matches!(status, Some("completed") | Some("failed")) {
                         let body = tool_output.remove(&cid).unwrap_or_default();
-                        out.tool_result(
-                            &clamp(&body, TEXT_LIMIT),
-                            status == Some("failed"),
-                            &cid,
-                        );
+                        out.tool_result(&clamp(&body, TEXT_LIMIT), status == Some("failed"), &cid);
                     }
                 }
                 _ => {}
@@ -349,7 +351,8 @@ mod tests {
         let child = ScriptedChild::new(vec![
             json!({"id": 1, "result": {}}),
             json!({"id": 2, "result": {"sessionId": "session-42"}}),
-        ]).with_environment_diagnostic(event.clone());
+        ])
+        .with_environment_diagnostic(event.clone());
         let mut bridge = AcpBridge::new(child, out, "/tmp/project", None);
 
         assert!(bridge.start());
@@ -435,13 +438,19 @@ mod tests {
         // This is why these rows used to close with nothing under them: the
         // content came on an earlier update than the one carrying the status.
         let (mut b, sink) = bridge(vec![
-            update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
                           "content": [{"type": "content",
-                                       "content": {"type": "text", "text": "part one "}}]})),
-            update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
-                          "content": [{"type": "text", "text": "part two"}]})),
-            update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
-                          "status": "completed"})),
+                                       "content": {"type": "text", "text": "part one "}}]}),
+            ),
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                          "content": [{"type": "text", "text": "part two"}]}),
+            ),
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                          "status": "completed"}),
+            ),
             json!({"id": 1, "result": {"stopReason": "end_turn"}}),
         ]);
 
@@ -456,9 +465,11 @@ mod tests {
     #[test]
     fn a_failed_tool_says_so() {
         let (mut b, sink) = bridge(vec![
-            update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
                           "content": [{"type": "text", "text": "no such file"}],
-                          "status": "failed"})),
+                          "status": "failed"}),
+            ),
             json!({"id": 1, "result": {"stopReason": "end_turn"}}),
         ]);
 

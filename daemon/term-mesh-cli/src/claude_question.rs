@@ -1,6 +1,6 @@
+use crate::question_store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::question_store;
 use std::env;
 use std::fs::{self, File};
 use std::io::Read;
@@ -121,8 +121,15 @@ fn write_record(path: &Path, record: &Record) -> Result<(), String> {
             .parent()
             .and_then(Path::parent)
             .ok_or_else(|| "invalid question root path".to_string())?,
-        parent.parent().and_then(Path::file_name).and_then(|name| name.to_str()).ok_or_else(|| "invalid question surface path".to_string())?,
-        parent.file_name().and_then(|name| name.to_str()).ok_or_else(|| "invalid question session path".to_string())?,
+        parent
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "invalid question surface path".to_string())?,
+        parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "invalid question session path".to_string())?,
     )?;
     question_store::atomic_write(
         path,
@@ -161,7 +168,10 @@ fn apply_hook(action: &str, raw: &str, surface: &str, socket: &str) -> Result<()
         "capture" => {
             let questions = parse_questions(&hook.tool_input)?;
             question_store::prepare_surface(&root, surface, &hook.session_id)?;
-            let path = root.join(surface).join(&hook.session_id).join(format!("{}.json", hook.tool_use_id));
+            let path = root
+                .join(surface)
+                .join(&hook.session_id)
+                .join(format!("{}.json", hook.tool_use_id));
             if let Ok(raw) = fs::read(&path) {
                 if let Ok(existing) = serde_json::from_slice::<Record>(&raw) {
                     if existing.state == "pending" {
@@ -227,11 +237,15 @@ mod tests {
         json!({
             "session_id": "session-1", "tool_name": "AskUserQuestion",
             "tool_use_id": id, "tool_input": { "questions": questions }
-        }).to_string()
+        })
+        .to_string()
     }
 
     fn read_record(socket: &str, id: &str) -> Record {
-        let path = question_store::root_for_socket(socket).unwrap().join("surface-1/session-1").join(format!("{id}.json"));
+        let path = question_store::root_for_socket(socket)
+            .unwrap()
+            .join("surface-1/session-1")
+            .join(format!("{id}.json"));
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
@@ -280,17 +294,53 @@ mod tests {
     fn a_new_capture_cancels_pending_and_writes_private_atomic_records() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("daemon.sock").display().to_string();
-        let one = payload("one", json!([{"question": "one", "options": [{"label": "yes"}]}]));
-        let two = payload("two", json!([{"question": "two", "options": [{"label": "yes"}]}]));
+        let one = payload(
+            "one",
+            json!([{"question": "one", "options": [{"label": "yes"}]}]),
+        );
+        let two = payload(
+            "two",
+            json!([{"question": "two", "options": [{"label": "yes"}]}]),
+        );
         apply_hook("capture", &one, "surface-1", &socket).unwrap();
         apply_hook("capture", &two, "surface-1", &socket).unwrap();
         assert_eq!(read_record(&socket, "one").state, "cancelled");
-        let directory = question_store::root_for_socket(&socket).unwrap().join("surface-1/session-1");
-        assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(directory.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(directory.parent().unwrap().parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(directory.join("two.json")).unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(fs::read_dir(directory).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        let directory = question_store::root_for_socket(&socket)
+            .unwrap()
+            .join("surface-1/session-1");
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(directory.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(directory.parent().unwrap().parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(directory.join("two.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(fs::read_dir(directory).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
     }
 
     #[test]
@@ -299,14 +349,18 @@ mod tests {
         let socket = temp.path().join("daemon.sock").display().to_string();
         assert!(apply_hook("capture", "not json", "surface-1", &socket).is_err());
         let oversized = "x".repeat(MAX_LABEL_BYTES + 1);
-        let invalid = payload("bad", json!([{"question": "q", "options": [{"label": oversized}]}]));
+        let invalid = payload(
+            "bad",
+            json!([{"question": "q", "options": [{"label": oversized}]}]),
+        );
         assert!(apply_hook("capture", &invalid, "surface-1", &socket).is_err());
         assert!(parse_questions(&json!({
             "questions": [{
                 "question": "q".repeat(MAX_QUESTION_BYTES + 1),
                 "options": [{"label": "ok", "description": "x".repeat(MAX_DESCRIPTION_BYTES + 1)}]
             }]
-        })).is_err());
+        }))
+        .is_err());
         assert!(!question_store::root_for_socket(&socket).unwrap().exists());
     }
 }

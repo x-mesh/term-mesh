@@ -116,9 +116,7 @@ impl WatcherHandle {
             // Remove gitignore rules for this base dir
             state.gitignore_patterns.retain(|r| r.base_dir != path);
         }
-        let _ = self
-            .command_tx
-            .try_send(WatcherCommand::Unwatch(path));
+        let _ = self.command_tx.try_send(WatcherCommand::Unwatch(path));
     }
 
     /// Enable/disable .gitignore-based filtering for file events.

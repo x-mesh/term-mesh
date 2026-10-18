@@ -15,11 +15,11 @@
 //! ~1-3ms per call for all commands.
 
 mod claude_question;
-#[path = "../../question_store.rs"]
-mod question_store;
 mod orchestrator;
 mod peer;
 mod prompts;
+#[path = "../../question_store.rs"]
+mod question_store;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
@@ -4762,11 +4762,8 @@ mod runbook_tests {
 
     #[test]
     fn task_unblock_forwards_optional_correction_without_changing_default() {
-        let with_correction = task_unblock_params(
-            "team-a",
-            "task-a",
-            Some("retry after fixing input"),
-        );
+        let with_correction =
+            task_unblock_params("team-a", "task-a", Some("retry after fixing input"));
         assert_eq!(with_correction["team_name"], "team-a");
         assert_eq!(with_correction["task_id"], "task-a");
         assert_eq!(with_correction["correction"], "retry after fixing input");
@@ -5075,7 +5072,9 @@ fn doctor_expected_uid_from(uid: u32, sudo_uid: Option<u32>) -> u32 {
 
 fn doctor_expected_uid() -> u32 {
     let uid = unsafe { libc::getuid() };
-    let sudo_uid = env::var("SUDO_UID").ok().and_then(|value| value.parse().ok());
+    let sudo_uid = env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse().ok());
     doctor_expected_uid_from(uid, sudo_uid)
 }
 
@@ -5172,7 +5171,9 @@ fn reports_claude_inbox(command: &Commands) -> bool {
 fn claude_config_dir() -> Option<PathBuf> {
     match env::var("CLAUDE_CONFIG_DIR") {
         Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
-        _ => env::var("HOME").ok().map(|home| PathBuf::from(home).join(".claude")),
+        _ => env::var("HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(".claude")),
     }
 }
 
@@ -5180,7 +5181,10 @@ fn claude_config_dir() -> Option<PathBuf> {
 /// its Bash children. `None` outside an interactive Claude session in a
 /// term-mesh pane. The transcript and pid are looked up by session id: the
 /// app confirms delivery from the transcript and detects `/clear` from the pid.
-fn claude_inbox_params(env_var: &dyn Fn(&str) -> Option<String>, config_dir: &Path) -> Option<Value> {
+fn claude_inbox_params(
+    env_var: &dyn Fn(&str) -> Option<String>,
+    config_dir: &Path,
+) -> Option<Value> {
     let get = |name: &str| env_var(name).filter(|value| !value.is_empty());
     let surface = get("TERMMESH_SURFACE_ID")?;
     let socket = get("CLAUDE_CODE_MESSAGING_SOCKET")?;
@@ -5206,9 +5210,19 @@ fn claude_inbox_params(env_var: &dyn Fn(&str) -> Option<String>, config_dir: &Pa
     if let Ok(sessions) = fs::read_dir(config_dir.join("sessions")) {
         for entry in sessions.flatten() {
             let path = entry.path();
-            let Some(pid) = path.file_stem().and_then(|stem| stem.to_str()).map(str::to_owned) else { continue };
-            let Ok(text) = fs::read_to_string(&path) else { continue };
-            let Ok(record) = serde_json::from_str::<Value>(&text) else { continue };
+            let Some(pid) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
             if record.get("sessionId").and_then(Value::as_str) == Some(session.as_str()) {
                 params["claude_pid"] = json!(pid);
                 break;
@@ -5221,8 +5235,12 @@ fn claude_inbox_params(env_var: &dyn Fn(&str) -> Option<String>, config_dir: &Pa
 /// Best effort and silent: the token is sent only to an app that says the
 /// leader inbox is on, and is never printed.
 fn report_claude_inbox(sock: &PathBuf) {
-    let Some(config_dir) = claude_config_dir() else { return };
-    let Some(params) = claude_inbox_params(&|name| env::var(name).ok(), &config_dir) else { return };
+    let Some(config_dir) = claude_config_dir() else {
+        return;
+    };
+    let Some(params) = claude_inbox_params(&|name| env::var(name).ok(), &config_dir) else {
+        return;
+    };
     let enabled = rpc_call_timeout(sock, "claude.inbox.status", json!({}), 2)
         .ok()
         .and_then(|response| response["result"]["leader_enabled"].as_bool())
@@ -5241,8 +5259,14 @@ mod claude_inbox_report_tests {
 
     fn claude_env() -> HashMap<&'static str, String> {
         HashMap::from([
-            ("TERMMESH_SURFACE_ID", "6216B81F-D848-4AB9-9222-0939A37E6753".to_string()),
-            ("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/cc-socks/4242.sock".to_string()),
+            (
+                "TERMMESH_SURFACE_ID",
+                "6216B81F-D848-4AB9-9222-0939A37E6753".to_string(),
+            ),
+            (
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                "/tmp/cc-socks/4242.sock".to_string(),
+            ),
             ("CLAUDE_CODE_MESSAGING_TOKEN", "t".repeat(64)),
             ("CLAUDE_CODE_SESSION_ID", SESSION.to_string()),
             ("CLAUDE_CODE_ENTRYPOINT", "cli".to_string()),
@@ -5260,8 +5284,16 @@ mod claude_inbox_report_tests {
         fs::create_dir_all(&project).unwrap();
         fs::write(project.join(format!("{SESSION}.jsonl")), "{}\n").unwrap();
         fs::create_dir_all(dir.path().join("sessions")).unwrap();
-        fs::write(dir.path().join("sessions/111.json"), r#"{"sessionId":"another"}"#).unwrap();
-        fs::write(dir.path().join("sessions/4242.json"), format!(r#"{{"sessionId":"{SESSION}"}}"#)).unwrap();
+        fs::write(
+            dir.path().join("sessions/111.json"),
+            r#"{"sessionId":"another"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("sessions/4242.json"),
+            format!(r#"{{"sessionId":"{SESSION}"}}"#),
+        )
+        .unwrap();
 
         let params = params(&claude_env(), dir.path()).unwrap();
         assert_eq!(params["socket_path"], "/tmp/cc-socks/4242.sock");
@@ -5270,7 +5302,10 @@ mod claude_inbox_report_tests {
         assert_eq!(params["claude_pid"], "4242");
         assert_eq!(
             params["transcript_path"],
-            project.join(format!("{SESSION}.jsonl")).to_string_lossy().as_ref()
+            project
+                .join(format!("{SESSION}.jsonl"))
+                .to_string_lossy()
+                .as_ref()
         );
     }
 
@@ -5303,8 +5338,12 @@ mod claude_inbox_report_tests {
     fn only_leader_side_commands_report() {
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
         assert!(reports_claude_inbox(&parse(&["tm-agent", "wait"])));
-        assert!(reports_claude_inbox(&parse(&["tm-agent", "create", "0", "--adopt"])));
-        assert!(reports_claude_inbox(&parse(&["tm-agent", "leader", "request", "take", "lr-1"])));
+        assert!(reports_claude_inbox(&parse(&[
+            "tm-agent", "create", "0", "--adopt"
+        ])));
+        assert!(reports_claude_inbox(&parse(&[
+            "tm-agent", "leader", "request", "take", "lr-1"
+        ])));
         assert!(!reports_claude_inbox(&parse(&["tm-agent", "create", "2"])));
         assert!(!reports_claude_inbox(&parse(&["tm-agent", "status"])));
     }
@@ -6235,8 +6274,7 @@ mod remote_leader_route_file_tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(
-            seen[0]["params"]["request_id_hex"],
-            seen[1]["params"]["request_id_hex"],
+            seen[0]["params"]["request_id_hex"], seen[1]["params"]["request_id_hex"],
             "route replacement must not mint a second delegation identity"
         );
         assert_eq!(seen[0]["params"]["target_peer_id_hex"], "ab".repeat(16));
@@ -6341,8 +6379,7 @@ fn remote_leader_rpc_call(
     let request_id_hex = remote_leader_request_id_hex();
     let mut route =
         remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
-    let proxy_params =
-        remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex)?;
+    let proxy_params = remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex)?;
 
     // A dropped local daemon response may be retried, but the opaque request
     // id stays fixed so the viewer returns its cached outcome and never
@@ -6372,7 +6409,13 @@ fn remote_leader_rpc_call(
         }
     };
     outer = retry_remote_leader_after_viewer_error(
-        sock, method, &params, &request_id_hex, deadline, &mut route, outer,
+        sock,
+        method,
+        &params,
+        &request_id_hex,
+        deadline,
+        &mut route,
+        outer,
     )?;
     let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
     if result.is_err() {
@@ -6398,8 +6441,8 @@ fn remote_leader_call_typed(
 ) -> Result<Value, RemoteLeaderCallError> {
     use RemoteLeaderCallError::Hop;
     let request_id_hex = remote_leader_request_id_hex();
-    let mut route = remote_leader_route()
-        .ok_or_else(|| Hop("invalid remote leader route".to_string()))?;
+    let mut route =
+        remote_leader_route().ok_or_else(|| Hop("invalid remote leader route".to_string()))?;
     let proxy_params =
         remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex).map_err(Hop)?;
     let deadline = Instant::now() + timeout;
@@ -6424,7 +6467,13 @@ fn remote_leader_call_typed(
         }
     };
     outer = retry_remote_leader_after_viewer_error(
-        sock, method, &params, &request_id_hex, deadline, &mut route, outer,
+        sock,
+        method,
+        &params,
+        &request_id_hex,
+        deadline,
+        &mut route,
+        outer,
     )
     .map_err(Hop)?;
     let result = decode_daemon_response(outer)
@@ -6480,14 +6529,9 @@ fn retry_remote_leader_after_viewer_error(
         if remaining.is_zero() {
             return Ok(response);
         }
-        *route = remote_leader_route_retry_candidate(
-            route,
-            &response,
-            remote_leader_route(),
-        )
-        .expect("viewer unavailability is retryable");
-        let refreshed =
-            remote_leader_proxy_params(route, method, params.clone(), request_id_hex)?;
+        *route = remote_leader_route_retry_candidate(route, &response, remote_leader_route())
+            .expect("viewer unavailability is retryable");
+        let refreshed = remote_leader_proxy_params(route, method, params.clone(), request_id_hex)?;
         response = match local_rpc_call_timeout_duration(
             sock,
             "peer.leader.call",
@@ -7671,14 +7715,23 @@ fn format_task_instruction(
     append_report_suffix(body.trim(), no_report)
 }
 
-fn append_team_checkout_topology(sock: &PathBuf, team: &str, task: &Value, lines: &mut Vec<String>) {
-    let Ok(status) = rpc_call(sock, "team.status", json!({ "team_name": team })) else { return };
+fn append_team_checkout_topology(
+    sock: &PathBuf,
+    team: &str,
+    task: &Value,
+    lines: &mut Vec<String>,
+) {
+    let Ok(status) = rpc_call(sock, "team.status", json!({ "team_name": team })) else {
+        return;
+    };
     let result = &status["result"];
     lines.extend(team_checkout_topology_lines(result, task));
 }
 
 fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
-    let Some(agents) = result["agents"].as_array() else { return Vec::new() };
+    let Some(agents) = result["agents"].as_array() else {
+        return Vec::new();
+    };
     let target_instance = task["agent_instance_id"].as_str();
     // `checkout_mode` is what the leader was briefed with, already resolved
     // by the app — including a deliberate "unknown" for a peer team whose
@@ -7692,7 +7745,9 @@ fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
         .or_else(|| result["worktree_mode"].as_str())
         .unwrap_or("unknown");
     let leader_path = result["working_directory"].as_str().unwrap_or("unknown");
-    let integration_target = result["integration_target_path"].as_str().unwrap_or(leader_path);
+    let integration_target = result["integration_target_path"]
+        .as_str()
+        .unwrap_or(leader_path);
     let mut lines = vec![
         String::new(),
         "## Team Checkout Topology".to_string(),
@@ -7709,8 +7764,13 @@ fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
             "PEER_CHECKOUT: name={} instance={} branch={} path={}",
             agent["name"].as_str().unwrap_or("unknown"),
             agent["agent_instance_id"].as_str().unwrap_or("unknown"),
-            agent["worktree_branch"].as_str().unwrap_or("shared-or-unknown"),
-            agent["worktree_path"].as_str().or_else(|| agent["working_directory"].as_str()).unwrap_or("unknown"),
+            agent["worktree_branch"]
+                .as_str()
+                .unwrap_or("shared-or-unknown"),
+            agent["worktree_path"]
+                .as_str()
+                .or_else(|| agent["working_directory"].as_str())
+                .unwrap_or("unknown"),
         ));
     }
     lines.push(match mode {
@@ -7767,9 +7827,12 @@ mod checkout_contract_tests {
             {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"},
             {"name":"reviewer","agent_instance_id":"b","worktree_path":"/wt/b","worktree_branch":"team/b"}
         ]});
-        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        let rendered =
+            team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
-        assert!(rendered.contains("PEER_CHECKOUT: name=reviewer instance=b branch=team/b path=/wt/b"));
+        assert!(
+            rendered.contains("PEER_CHECKOUT: name=reviewer instance=b branch=team/b path=/wt/b")
+        );
         assert!(!rendered.contains("PEER_CHECKOUT: name=executor instance=a"));
     }
 
@@ -7782,7 +7845,8 @@ mod checkout_contract_tests {
             {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"},
             {"name":"reviewer","agent_instance_id":"b","worktree_path":"/wt/b","worktree_branch":"team/b"}
         ]});
-        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        let rendered =
+            team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
         assert!(rendered.contains("owned and forbidden path lists are optional"));
         assert!(rendered.contains("never copy files out of a task branch instead of merging it"));
@@ -7795,7 +7859,8 @@ mod checkout_contract_tests {
         let status = json!({"worktree_mode":"isolated","working_directory":"/repo","integration_target_path":"/repo","agents": [
             {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"}
         ]});
-        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"b"})).join("\n");
+        let rendered =
+            team_checkout_topology_lines(&status, &json!({"agent_instance_id":"b"})).join("\n");
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
     }
 
@@ -7808,7 +7873,8 @@ mod checkout_contract_tests {
         let status = json!({"checkout_mode":"unknown","worktree_mode":"off","working_directory":"/repo","integration_target_path":"/repo","agents": [
             {"name":"executor","agent_instance_id":"a"}
         ]});
-        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"b"})).join("\n");
+        let rendered =
+            team_checkout_topology_lines(&status, &json!({"agent_instance_id":"b"})).join("\n");
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: unknown"));
         assert!(rendered.contains("Checkout isolation is unknown"));
     }
@@ -7819,7 +7885,8 @@ mod checkout_contract_tests {
             {"name":"a","agent_instance_id":"a","worktree_path":"/old/a"},
             {"name":"b","agent_instance_id":"b","worktree_path":"/old/b"}
         ]});
-        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        let rendered =
+            team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: unknown"));
         assert!(rendered.contains("Checkout isolation is unknown"));
     }
@@ -12053,7 +12120,11 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
 }
 
 /// One daemon RPC: the `result` value, or the transport/RPC error message.
-fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+fn cmd_daemon_rpc(
+    sock: &PathBuf,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     // Forced prune waits for each selected process group to stop.
     let response = if method == "peer.project_presentations.prune"
         && params["force"] == true
@@ -12079,7 +12150,11 @@ fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Re
 
 /// Print a daemon RPC result, or the error and a non-zero exit so scripts
 /// can trust the status. Returns the result for callers adding a summary.
-fn cmd_daemon_rpc_print(sock: &PathBuf, method: &str, params: serde_json::Value) -> serde_json::Value {
+fn cmd_daemon_rpc_print(
+    sock: &PathBuf,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
     match cmd_daemon_rpc(sock, method, params) {
         Ok(result) => {
             println!("{}", pretty(&result));
@@ -12110,10 +12185,7 @@ fn peer_state_files(scope: &str) -> Vec<(&'static str, std::path::PathBuf)> {
     let dir = peer_state_dir();
     let mut out = Vec::new();
     if scope == "projects" || scope == "all" {
-        out.push((
-            "projects",
-            dir.join("peer-project-presentations.json"),
-        ));
+        out.push(("projects", dir.join("peer-project-presentations.json")));
     }
     if scope == "workspaces" || scope == "all" {
         out.push(("workspaces", dir.join("peer-workspaces.json")));
@@ -14784,10 +14856,7 @@ fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec
                 for finding in reported {
                     let mut finding = finding.clone();
                     if let Some(object) = finding.as_object_mut() {
-                        object.insert(
-                            "socket".into(),
-                            Value::String(path.display().to_string()),
-                        );
+                        object.insert("socket".into(), Value::String(path.display().to_string()));
                     }
                     findings.push(if connected_ambiguity {
                         with_multiple_daemon_repair_withheld(finding)
@@ -14946,8 +15015,10 @@ fn cmd_daemon_doctor(json: bool) {
     if json {
         println!(
             "{}",
-            pretty(&json!({ "sockets": sockets, "complete": complete, "healthy": healthy,
-                            "findings": findings }))
+            pretty(
+                &json!({ "sockets": sockets, "complete": complete, "healthy": healthy,
+                            "findings": findings })
+            )
         );
     } else if healthy {
         println!("{}: no problems found.", terminal_safe(&sockets.join(", ")));
@@ -14968,11 +15039,14 @@ fn cmd_daemon_doctor(json: bool) {
             let project = text("project_id");
             if !project.is_empty() {
                 let team = text("team_name");
-                println!("  project {project}{}", if team.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (team {team})")
-                });
+                println!(
+                    "  project {project}{}",
+                    if team.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (team {team})")
+                    }
+                );
             }
             println!("  {}", text("detail"));
             if let Some(remedy) = human_remedy_line(finding) {
@@ -15627,7 +15701,6 @@ fn remote_surface_from(explicit: Option<&str>, env_value: Option<&str>) -> Resul
         })
 }
 
-
 /// The app socket that owns this pane. `TERMMESH_SOCKET_PATH` is what the app
 /// injects into every pane; `TERMMESH_SOCKET` counts only when it is an app
 /// socket (agent panes get it too, but daemon-spawned panes get the daemon's).
@@ -16192,7 +16265,10 @@ fn peer_state_report(daemon_socket: Option<&PathBuf>, live_sockets: usize) -> Va
         match (scope, parsed) {
             ("projects", Some(value)) => {
                 for record in value["records"].as_array().cloned().unwrap_or_default() {
-                    let project_id = record["project_id"].as_str().unwrap_or_default().to_string();
+                    let project_id = record["project_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
                     let working_directory = record["working_directory"]
                         .as_str()
                         .unwrap_or_default()
@@ -16337,7 +16413,10 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
         println!("alive sockets: {}", result["sockets"].as_u64().unwrap_or(0));
     }
 
-    println!("peer state: {}", peer_state["directory"].as_str().unwrap_or("?"));
+    println!(
+        "peer state: {}",
+        peer_state["directory"].as_str().unwrap_or("?")
+    );
     for file in peer_state["files"].as_array().cloned().unwrap_or_default() {
         let scope = file["scope"].as_str().unwrap_or("?");
         if !file["present"].as_bool().unwrap_or(false) {
@@ -16354,7 +16433,11 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
             file["records"].as_u64().unwrap_or(0)
         );
     }
-    for project in peer_state["projects"].as_array().cloned().unwrap_or_default() {
+    for project in peer_state["projects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
         let live = match project["live_surfaces"].as_u64() {
             Some(count) => format!("{count} live surface(s)"),
             None => "liveness unknown (no daemon)".to_string(),
@@ -16372,7 +16455,11 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
             }
         );
     }
-    for workspace in peer_state["workspaces"].as_array().cloned().unwrap_or_default() {
+    for workspace in peer_state["workspaces"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
         println!(
             "    workspace {}{}",
             workspace["name"].as_str().unwrap_or("?"),
@@ -18964,12 +19051,18 @@ impl OverlapCanaryAdmission {
         resource_health: Option<&str>,
     ) -> Self {
         let mut reasons = Vec::new();
-        if !delegated_overlap_resolution { reasons.push("delegated_overlap_not_resolved"); }
-        if !capability { reasons.push("capability_missing_or_stale"); }
+        if !delegated_overlap_resolution {
+            reasons.push("delegated_overlap_not_resolved");
+        }
+        if !capability {
+            reasons.push("capability_missing_or_stale");
+        }
         if effective_delegation != Some("delegated") {
             reasons.push("delegation_not_delegated");
         }
-        if route != "parallel" { reasons.push("route_not_parallel"); }
+        if route != "parallel" {
+            reasons.push("route_not_parallel");
+        }
         if suggested_route != Some("parallel") {
             reasons.push("suggested_route_not_parallel");
         }
@@ -18982,16 +19075,25 @@ impl OverlapCanaryAdmission {
         if ready_mutating_slices.map_or(true, |count| count < 2) {
             reasons.push("fewer_than_two_ready_mutating_slices");
         }
-        if !ownership_disjoint { reasons.push("worker_ownership_overlap"); }
-        if !leader_lane_disjoint { reasons.push("leader_lane_overlap"); }
+        if !ownership_disjoint {
+            reasons.push("worker_ownership_overlap");
+        }
+        if !leader_lane_disjoint {
+            reasons.push("leader_lane_overlap");
+        }
         if concurrent_write_overlap != Some(0) {
             reasons.push("concurrent_write_overlap");
         }
-        if !serial_integration { reasons.push("non_serial_integration"); }
+        if !serial_integration {
+            reasons.push("non_serial_integration");
+        }
         if resource_health.map(str::trim) != Some("passed") {
             reasons.push("resource_health_not_passed");
         }
-        Self { eligible: reasons.is_empty(), reasons }
+        Self {
+            eligible: reasons.is_empty(),
+            reasons,
+        }
     }
 }
 
@@ -19110,8 +19212,7 @@ struct LeaderParticipationControlSnapshot {
 impl LeaderParticipationControlSnapshot {
     fn overlap_canary_capability(&self) -> bool {
         self.overlap_canary_capability
-            && self.overlap_canary_capability_version
-                == Some(OVERLAP_CANARY_CAPABILITY_VERSION)
+            && self.overlap_canary_capability_version == Some(OVERLAP_CANARY_CAPABILITY_VERSION)
     }
 }
 
@@ -19154,9 +19255,7 @@ fn parse_leader_control_snapshot(
         Some(value) => Some(value.as_u64()?.clamp(1, 10) as u32),
         None => None,
     };
-    let delegation_effective = value["delegation_effective"]
-        .as_str()
-        .map(str::to_string);
+    let delegation_effective = value["delegation_effective"].as_str().map(str::to_string);
     let delegation_level = delegation_effective
         .clone()
         .or_else(|| value["delegation_configured"].as_str().map(str::to_string));
@@ -19188,8 +19287,7 @@ fn parse_leader_control_snapshot(
         max_parallel_workers,
         overlap_canary_capability: value["overlap_canary_capability"].as_bool() == Some(true),
         overlap_canary_capability_version: value["overlap_canary_capability_version"].as_u64(),
-        delegated_overlap_resolution: value["delegated_overlap_resolution"].as_bool()
-            == Some(true),
+        delegated_overlap_resolution: value["delegated_overlap_resolution"].as_bool() == Some(true),
         health_scope: value["health_scope"].as_str().map(str::to_string),
         leader_policy_version,
         leader_policy_digest,
@@ -19372,9 +19470,7 @@ fn leader_participation_health(
     for (record, turn_id) in records
         .iter()
         .filter(|record| record["event"].as_str() == Some("turn_start"))
-        .filter_map(|record| {
-            record["turn_id"].as_str().map(|turn_id| (record, turn_id))
-        })
+        .filter_map(|record| record["turn_id"].as_str().map(|turn_id| (record, turn_id)))
     {
         if !start_ids.insert(turn_id) {
             malformed_lines += 1;
@@ -19483,9 +19579,7 @@ fn apply_participation_health_scope(
 ) {
     if health_scope == Some("execution_host") {
         config.healthy = log_path
-            .map(|path| {
-                leader_participation_health(path, &config.project_id, pending_turn_id)
-            })
+            .map(|path| leader_participation_health(path, &config.project_id, pending_turn_id))
             .is_some_and(|health| health.passes_promotion_gate());
     }
 }
@@ -19566,10 +19660,14 @@ fn resolve_participation(
         let (mode, cohort) = match config.mode.as_str() {
             "shadow" => ("shadow", "shadow"),
             "canary" if config.percent == 0 => ("canary", "holdout"),
-            "canary" if !config.project_id.trim().is_empty()
-                && !config.session_id.trim().is_empty()
-                && stable_canary_bucket(&config.project_id, &config.session_id) < config.percent =>
-                ("canary", "canary"),
+            "canary"
+                if !config.project_id.trim().is_empty()
+                    && !config.session_id.trim().is_empty()
+                    && stable_canary_bucket(&config.project_id, &config.session_id)
+                        < config.percent =>
+            {
+                ("canary", "canary")
+            }
             "canary" => ("canary", "holdout"),
             _ => ("off", "static"),
         };
@@ -19747,7 +19845,9 @@ fn turn_route_record_with_policy_input(
         record["surface_id"] = json!(surface);
     }
     let suggestion = LeaderParticipationDirective::from_input(
-        task_shape, risk_reasons, available_workers,
+        task_shape,
+        risk_reasons,
+        available_workers,
         control.and_then(|snapshot| snapshot.delegation_effective.as_deref()),
         control.and_then(|snapshot| snapshot.max_parallel_workers),
     );
@@ -19848,19 +19948,36 @@ fn append_turn_record(path: &Path, record: &Value) -> Result<(), String> {
 fn rcollect_record(team: &str, via: &str, payload: &Value) -> Value {
     let mut task_ids = Vec::new();
     for path in ["/result/task/id", "/result/task_id"] {
-        if let Some(id) = payload.pointer(path).and_then(Value::as_str) { task_ids.push(id.to_string()); }
+        if let Some(id) = payload.pointer(path).and_then(Value::as_str) {
+            task_ids.push(id.to_string());
+        }
     }
     for path in ["/result/tasks", "/result/items", "/result/results"] {
-        if let Some(items) = payload.pointer(path).and_then(Value::as_array) { task_ids.extend(items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))); }
+        if let Some(items) = payload.pointer(path).and_then(Value::as_array) {
+            task_ids.extend(
+                items
+                    .iter()
+                    .filter_map(|item| item["id"].as_str().map(str::to_owned)),
+            );
+        }
     }
-    task_ids.sort(); task_ids.dedup();
+    task_ids.sort();
+    task_ids.dedup();
     let mut record = json!({"event":"task_collect","via":via,"task_ids":task_ids,"team":team,"ts":iso8601_utc_now()});
-    if let Some(session) = current_leader_session_id() { record["leader_session_id"] = json!(session); }
-    if let Some(turn_id) = turn_id_from_hook_state() { record["turn_id"] = json!(turn_id); }
+    if let Some(session) = current_leader_session_id() {
+        record["leader_session_id"] = json!(session);
+    }
+    if let Some(turn_id) = turn_id_from_hook_state() {
+        record["turn_id"] = json!(turn_id);
+    }
     record
 }
 
-fn append_rcollect(team: &str, via: &str, payload: &Value) { if let Ok(path) = turn_log_path() { let _ = append_turn_record(&path, &rcollect_record(team, via, payload)); } }
+fn append_rcollect(team: &str, via: &str, payload: &Value) {
+    if let Ok(path) = turn_log_path() {
+        let _ = append_turn_record(&path, &rcollect_record(team, via, payload));
+    }
+}
 
 /// `leader turn route` — record this turn's route and print what was written.
 ///
@@ -19915,8 +20032,7 @@ fn turn_id_from_hook_state() -> Option<String> {
 /// hook honours only this, not the bare marker: any route would otherwise end
 /// a delegated turn without a dispatch or a reason.
 fn no_dispatch_exemption(route: &str, no_dispatch_reason: Option<&str>) -> bool {
-    route.trim() == "direct"
-        && no_dispatch_reason.is_some_and(|reason| !reason.trim().is_empty())
+    route.trim() == "direct" && no_dispatch_reason.is_some_and(|reason| !reason.trim().is_empty())
 }
 
 fn mark_turn_route_stated(path: &Path, turn_id: &str, no_dispatch: bool) -> Result<(), String> {
@@ -19928,7 +20044,11 @@ fn mark_turn_route_stated(path: &Path, turn_id: &str, no_dispatch: bool) -> Resu
         return Err("turn id contains no safe marker characters".to_string());
     }
     let marker = path.with_file_name(format!(".turn-route-{key}"));
-    let contents: &[u8] = if no_dispatch { b"stated\nno_dispatch\n" } else { b"stated\n" };
+    let contents: &[u8] = if no_dispatch {
+        b"stated\nno_dispatch\n"
+    } else {
+        b"stated\n"
+    };
     fs::write(&marker, contents).map_err(|e| format!("write {}: {e}", marker.display()))?;
     #[cfg(unix)]
     {
@@ -20158,7 +20278,10 @@ fn run_leader_turn_route_with_evidence(
     if let Some(mode) = derived.checkout_mode.filter(|_| checkout_mode.is_none()) {
         record["derived_checkout_mode"] = json!(mode);
     }
-    if let Some(workers) = derived.available_workers.filter(|_| available_workers.is_none()) {
+    if let Some(workers) = derived
+        .available_workers
+        .filter(|_| available_workers.is_none())
+    {
         record["derived_available_workers"] = json!(workers);
     }
     if let Some(route) = remote_leader_route() {
@@ -20173,7 +20296,11 @@ fn run_leader_turn_route_with_evidence(
     if let Some(reason) = no_dispatch_reason.filter(|reason| !reason.trim().is_empty()) {
         record["no_dispatch_reason"] = json!(reason.trim());
     }
-    mark_turn_route_stated(&path, turn_id, no_dispatch_exemption(route, no_dispatch_reason))?;
+    mark_turn_route_stated(
+        &path,
+        turn_id,
+        no_dispatch_exemption(route, no_dispatch_reason),
+    )?;
     // The marker and the log line are a small two-phase local transaction. A
     // failed append must not let Stop report a route that never reached the
     // durable measurement stream.
@@ -20232,8 +20359,21 @@ fn run_leader_turn_route(
     wave_id: Option<&str>,
 ) -> Result<Value, String> {
     run_leader_turn_route_with_evidence(
-        team_resolution, turn_id, route, task_shape, available_workers,
-        risk_reasons, wave_id, None, None, false, false, None, false, None, None,
+        team_resolution,
+        turn_id,
+        route,
+        task_shape,
+        available_workers,
+        risk_reasons,
+        wave_id,
+        None,
+        None,
+        false,
+        false,
+        None,
+        false,
+        None,
+        None,
     )
 }
 
@@ -20268,7 +20408,11 @@ mod leader_turn_record_tests {
     #[test]
     fn evaluator_matches_observable_dispatch_contract() {
         let parallel = LeaderParticipationDirective::from_input(
-            Some("multi_unit"), &[], Some(8), Some("delegated"), Some(5)
+            Some("multi_unit"),
+            &[],
+            Some(8),
+            Some("delegated"),
+            Some(5),
         );
         assert_eq!(parallel.participation, "coordinator");
         assert_eq!(parallel.route, "parallel");
@@ -20294,14 +20438,22 @@ mod leader_turn_record_tests {
         );
 
         let unknown = LeaderParticipationDirective::from_input(
-            Some("multi_unit"), &[], None, Some("delegated"), Some(10)
+            Some("multi_unit"),
+            &[],
+            None,
+            Some("delegated"),
+            Some(10),
         );
         assert_eq!(unknown.participation, "hands_on");
         assert_eq!(unknown.route, "direct");
         assert_eq!(unknown.reasons, ["unsupported_input"]);
 
         let delegated = LeaderParticipationDirective::from_input(
-            None, &[], Some(12), Some("delegated"), Some(7)
+            None,
+            &[],
+            Some(12),
+            Some("delegated"),
+            Some(7),
         );
         assert_eq!(delegated.route, "parallel");
         assert_eq!(delegated.reasons, ["delegated_max_capacity"]);
@@ -20311,47 +20463,292 @@ mod leader_turn_record_tests {
         );
 
         let serial = LeaderParticipationDirective::from_input(
-            Some("single_unit"), &[], Some(12), Some("delegated"), Some(10)
+            Some("single_unit"),
+            &[],
+            Some(12),
+            Some("delegated"),
+            Some(10),
         );
         assert_eq!(serial.route, "delegated");
         assert_eq!(serial.reasons, ["delegated_serial_work"]);
         assert_eq!(serial.dispatch_bounds, "exactly one implementation worker");
 
         let one_worker = LeaderParticipationDirective::from_input(
-            Some("multi_unit"), &[], Some(1), Some("delegated"), Some(10)
+            Some("multi_unit"),
+            &[],
+            Some(1),
+            Some("delegated"),
+            Some(10),
         );
         assert_eq!(one_worker.route, "delegated");
         assert_eq!(one_worker.reasons, ["delegated_serial_work"]);
-        assert_eq!(one_worker.dispatch_bounds, "exactly one implementation worker");
+        assert_eq!(
+            one_worker.dispatch_bounds,
+            "exactly one implementation worker"
+        );
     }
 
     #[test]
     fn overlap_canary_requires_every_positive_admission_fact() {
         let eligible = OverlapCanaryAdmission::evaluate(
-            true, true, Some("delegated"), "parallel", Some("parallel"),
-            Some("isolated"), Some(2), true, true, Some(0), true, Some("passed"),
+            true,
+            true,
+            Some("delegated"),
+            "parallel",
+            Some("parallel"),
+            Some("isolated"),
+            Some(2),
+            true,
+            true,
+            Some(0),
+            true,
+            Some("passed"),
         );
-        assert!(eligible.eligible, "all positive evidence must admit overlap");
+        assert!(
+            eligible.eligible,
+            "all positive evidence must admit overlap"
+        );
 
-        let cases: &[(&str, bool, bool, Option<&str>, &str, Option<&str>, Option<&str>, Option<u32>, bool, bool, Option<u32>, bool, Option<&str>)] = &[
-            ("resolution", false, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
-            ("capability", true, false, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
-            ("delegation", true, true, Some("guarded"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
-            ("route", true, true, Some("delegated"), "direct", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
-            ("suggested_route", true, true, Some("delegated"), "parallel", Some("direct"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
-            ("route_deviation", true, true, Some("delegated"), "parallel", Some("probe"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
-            ("checkout", true, true, Some("delegated"), "parallel", Some("parallel"), Some("shared"), Some(2), true, true, Some(0), true, Some("passed")),
-            ("ready_units", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(1), true, true, Some(0), true, Some("passed")),
-            ("ownership", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), false, true, Some(0), true, Some("passed")),
-            ("leader_lane", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, false, Some(0), true, Some("passed")),
-            ("write_overlap", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(1), true, Some("passed")),
-            ("integration", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), false, Some("passed")),
-            ("resources", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("failed")),
+        let cases: &[(
+            &str,
+            bool,
+            bool,
+            Option<&str>,
+            &str,
+            Option<&str>,
+            Option<&str>,
+            Option<u32>,
+            bool,
+            bool,
+            Option<u32>,
+            bool,
+            Option<&str>,
+        )] = &[
+            (
+                "resolution",
+                false,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "capability",
+                true,
+                false,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "delegation",
+                true,
+                true,
+                Some("guarded"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "route",
+                true,
+                true,
+                Some("delegated"),
+                "direct",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "suggested_route",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("direct"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "route_deviation",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("probe"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "checkout",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("shared"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "ready_units",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(1),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "ownership",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                false,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "leader_lane",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                false,
+                Some(0),
+                true,
+                Some("passed"),
+            ),
+            (
+                "write_overlap",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(1),
+                true,
+                Some("passed"),
+            ),
+            (
+                "integration",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                false,
+                Some("passed"),
+            ),
+            (
+                "resources",
+                true,
+                true,
+                Some("delegated"),
+                "parallel",
+                Some("parallel"),
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("failed"),
+            ),
         ];
-        for &(name, resolution, capability, delegation, route, suggested_route, checkout, ready, ownership, lane, overlap, serial, resources) in cases {
+        for &(
+            name,
+            resolution,
+            capability,
+            delegation,
+            route,
+            suggested_route,
+            checkout,
+            ready,
+            ownership,
+            lane,
+            overlap,
+            serial,
+            resources,
+        ) in cases
+        {
             let admission = OverlapCanaryAdmission::evaluate(
-                resolution, capability, delegation, route, suggested_route, checkout, ready, ownership, lane,
-                overlap, serial, resources,
+                resolution,
+                capability,
+                delegation,
+                route,
+                suggested_route,
+                checkout,
+                ready,
+                ownership,
+                lane,
+                overlap,
+                serial,
+                resources,
             );
             assert!(!admission.eligible, "{name} must fail closed");
         }
@@ -20413,9 +20810,8 @@ mod leader_turn_record_tests {
     fn leader_policy_identity_is_optional_in_control_snapshot_and_route_record() {
         let value = control_snapshot_value();
         let data = serde_json::to_vec(&value).expect("serialize control snapshot");
-        let without_identity =
-            parse_leader_control_snapshot(&data, "project-a", "session-a")
-                .expect("valid control snapshot without policy identity");
+        let without_identity = parse_leader_control_snapshot(&data, "project-a", "session-a")
+            .expect("valid control snapshot without policy identity");
         let absent = turn_route_record_with_policy_input(
             "turn-identity-absent",
             "direct",
@@ -20436,11 +20832,13 @@ mod leader_turn_record_tests {
         value_with_identity["leader_policy_version"] = json!(14);
         value_with_identity["leader_policy_digest"] = json!("digest-14");
         let data = serde_json::to_vec(&value_with_identity).expect("serialize control snapshot");
-        let with_identity =
-            parse_leader_control_snapshot(&data, "project-a", "session-a")
-                .expect("valid control snapshot with policy identity");
+        let with_identity = parse_leader_control_snapshot(&data, "project-a", "session-a")
+            .expect("valid control snapshot with policy identity");
         assert_eq!(with_identity.leader_policy_version, Some(14));
-        assert_eq!(with_identity.leader_policy_digest.as_deref(), Some("digest-14"));
+        assert_eq!(
+            with_identity.leader_policy_digest.as_deref(),
+            Some("digest-14")
+        );
 
         let present = turn_route_record_with_policy_input(
             "turn-identity-present",
@@ -20467,12 +20865,10 @@ mod leader_turn_record_tests {
         let path = dir.path().join("control.json");
         let data = serde_json::to_vec(&control_snapshot_value()).expect("serialize snapshot");
         fs::write(&path, data).expect("write snapshot");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
-            .expect("set permissive mode");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set permissive mode");
         assert!(read_leader_control_snapshot(&path, "project-a", "session-a").is_none());
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .expect("set owner-only mode");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set owner-only mode");
         assert!(read_leader_control_snapshot(&path, "project-a", "session-a").is_some());
     }
 
@@ -20487,8 +20883,11 @@ mod leader_turn_record_tests {
         control["project_id"] = json!("project-a");
         control["session_id"] = json!("session-a");
         control["available_workers"] = json!(2);
-        fs::write(&control_path, serde_json::to_vec(&control).expect("serialize control"))
-            .expect("write control");
+        fs::write(
+            &control_path,
+            serde_json::to_vec(&control).expect("serialize control"),
+        )
+        .expect("write control");
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&control_path, fs::Permissions::from_mode(0o600))
             .expect("set control mode");
@@ -20514,17 +20913,18 @@ mod leader_turn_record_tests {
             env::remove_var(key);
         }
         env::set_var("HOME", &home);
-        env::set_var(
-            "TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE",
-            &control_path,
-        );
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE", &control_path);
         env::set_var("TERMMESH_LEADER_PARTICIPATION_KILL_SWITCH", "false");
 
         let team = TeamNameResolution {
             name: "project-a".to_string(),
             source: TeamNameSource::Explicit,
         };
-        for (session, expected_overlap) in [(Some("session-a"), true), (None, false), (Some("   "), false)] {
+        for (session, expected_overlap) in [
+            (Some("session-a"), true),
+            (None, false),
+            (Some("   "), false),
+        ] {
             match session {
                 Some(value) => env::set_var("TERMMESH_LEADER_SESSION_ID", value),
                 None => env::remove_var("TERMMESH_LEADER_SESSION_ID"),
@@ -20675,7 +21075,10 @@ mod leader_turn_record_tests {
         killed.kill_switch = true;
         cases.push(killed);
         for config in cases {
-            assert!(resolve_participation(&config, true).applied, "config was {config:?}");
+            assert!(
+                resolve_participation(&config, true).applied,
+                "config was {config:?}"
+            );
         }
         assert!(!resolve_participation(&eligible, false).applied);
 
@@ -20705,21 +21108,33 @@ mod leader_turn_record_tests {
         }
 
         let cases: &[(&str, fn(&mut LeaderParticipationCanaryConfig))] = &[
-            ("nondelegated", |config: &mut LeaderParticipationCanaryConfig| {
-                config.delegation_effective = Some("leaderFirst".to_string());
-            }),
-            ("unsupported", |config: &mut LeaderParticipationCanaryConfig| {
-                config.supported = false;
-            }),
-            ("unhealthy", |config: &mut LeaderParticipationCanaryConfig| {
-                config.healthy = false;
-            }),
+            (
+                "nondelegated",
+                |config: &mut LeaderParticipationCanaryConfig| {
+                    config.delegation_effective = Some("leaderFirst".to_string());
+                },
+            ),
+            (
+                "unsupported",
+                |config: &mut LeaderParticipationCanaryConfig| {
+                    config.supported = false;
+                },
+            ),
+            (
+                "unhealthy",
+                |config: &mut LeaderParticipationCanaryConfig| {
+                    config.healthy = false;
+                },
+            ),
             ("killed", |config: &mut LeaderParticipationCanaryConfig| {
                 config.kill_switch = true;
             }),
-            ("missing signal", |config: &mut LeaderParticipationCanaryConfig| {
-                config.delegated_overlap_resolution = false;
-            }),
+            (
+                "missing signal",
+                |config: &mut LeaderParticipationCanaryConfig| {
+                    config.delegated_overlap_resolution = false;
+                },
+            ),
         ];
         for (name, mutate) in cases {
             let mut boundary = config.clone();
@@ -20964,8 +21379,11 @@ mod leader_turn_record_tests {
             "team": "p"
         }))
         .expect("serialize duplicate start");
-        fs::write(&path, duplicate_start.clone() + "\n" + &duplicate_start + "\n")
-            .expect("write turns");
+        fs::write(
+            &path,
+            duplicate_start.clone() + "\n" + &duplicate_start + "\n",
+        )
+        .expect("write turns");
 
         let health = leader_participation_health(&path, "p", Some("pending"));
 
@@ -20988,9 +21406,7 @@ mod leader_turn_record_tests {
         config.project_id = "p".to_string();
         config.healthy = false;
 
-        apply_participation_health_scope(
-            &mut config, Some("execution_host"), Some(&path), None,
-        );
+        apply_participation_health_scope(&mut config, Some("execution_host"), Some(&path), None);
 
         assert!(config.healthy);
         assert!(resolve_participation(&config, true).applied);
@@ -21046,7 +21462,10 @@ mod leader_turn_record_tests {
         .expect("write passing turns");
         let mut passing = base.clone();
         apply_participation_health_scope(
-            &mut passing, Some("execution_host"), Some(&passing_path), None,
+            &mut passing,
+            Some("execution_host"),
+            Some(&passing_path),
+            None,
         );
         assert!(resolve_participation(&passing, true).delegated_overlap_resolution);
 
@@ -21054,7 +21473,10 @@ mod leader_turn_record_tests {
         fs::write(&malformed_path, "{not-json}\n").expect("write malformed turns");
         let mut malformed = base.clone();
         apply_participation_health_scope(
-            &mut malformed, Some("execution_host"), Some(&malformed_path), None,
+            &mut malformed,
+            Some("execution_host"),
+            Some(&malformed_path),
+            None,
         );
         assert!(!resolve_participation(&malformed, true).delegated_overlap_resolution);
 
@@ -21145,7 +21567,13 @@ mod leader_turn_record_tests {
     #[test]
     fn leader_turn_health_cli_requires_project() {
         let parsed = Cli::try_parse_from([
-            "tm-agent", "leader", "turn", "health", "--project", "p", "--json",
+            "tm-agent",
+            "leader",
+            "turn",
+            "health",
+            "--project",
+            "p",
+            "--json",
         ])
         .unwrap();
         assert!(matches!(
@@ -21427,7 +21855,10 @@ mod leader_turn_record_tests {
 
     #[test]
     fn only_a_direct_route_with_a_reason_marks_the_no_dispatch_exemption() {
-        assert!(no_dispatch_exemption("direct", Some("question only; nothing to implement")));
+        assert!(no_dispatch_exemption(
+            "direct",
+            Some("question only; nothing to implement")
+        ));
         assert!(!no_dispatch_exemption("direct", Some("   ")));
         assert!(!no_dispatch_exemption("direct", None));
         assert!(!no_dispatch_exemption("parallel", Some("a reason")));
@@ -22792,7 +23223,9 @@ fn parse_wait_task_arguments(
         .filter(|s| !s.is_empty())
         .collect();
     if ids.is_empty() {
-        return Err("--tasks names no task ids; pass a comma-separated list or omit the flag".to_string());
+        return Err(
+            "--tasks names no task ids; pass a comma-separated list or omit the flag".to_string(),
+        );
     }
     Ok(Some(ids))
 }
@@ -22806,7 +23239,11 @@ fn wait_settled_count(
 ) -> u64 {
     tracked
         .iter()
-        .filter(|id| statuses.get(*id).is_some_and(|status| wait_task_settled(status)))
+        .filter(|id| {
+            statuses
+                .get(*id)
+                .is_some_and(|status| wait_task_settled(status))
+        })
         .count() as u64
 }
 
@@ -22860,7 +23297,11 @@ fn wait_report_outcome<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'sta
             _ => {}
         }
     }
-    if failed { "failed" } else { "completed" }
+    if failed {
+        "failed"
+    } else {
+        "completed"
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -22914,7 +23355,10 @@ enum OwnerWakeStep {
 fn owner_wake_unsupported(error: &RemoteLeaderCallError) -> bool {
     match error {
         RemoteLeaderCallError::Owner(error) => {
-            matches!(error.code.as_deref(), Some("method_not_allowed" | "invalid_method"))
+            matches!(
+                error.code.as_deref(),
+                Some("method_not_allowed" | "invalid_method")
+            )
         }
         RemoteLeaderCallError::Hop(message) => {
             *message == format!("method_not_allowed: {OWNER_WAKE_METHOD}")
@@ -22946,7 +23390,10 @@ fn owner_wake_step(
     else {
         return OwnerWakeStep::Retry;
     };
-    let cursor = OwnerWakeCursor { epoch: epoch.to_string(), revision };
+    let cursor = OwnerWakeCursor {
+        epoch: epoch.to_string(),
+        revision,
+    };
     match prev {
         Some(prev) if result["changed"].as_bool() == Some(true) || *prev != cursor => {
             OwnerWakeStep::Wake(cursor)
@@ -23074,7 +23521,10 @@ mod owner_wake_tests {
     use super::*;
 
     fn cursor(epoch: &str, revision: u64) -> OwnerWakeCursor {
-        OwnerWakeCursor { epoch: epoch.to_string(), revision }
+        OwnerWakeCursor {
+            epoch: epoch.to_string(),
+            revision,
+        }
     }
 
     const INTERVAL: Duration = Duration::from_secs(30);
@@ -23193,7 +23643,10 @@ mod owner_wake_tests {
     #[test]
     fn owner_wake_loop_sends_wake_on_a_higher_revision() {
         let (events, calls, _) = run_loop(vec![answer("e1", 3, false), answer("e1", 4, true)]);
-        assert_eq!(events, vec![json!({"kind": "owner_wake", "epoch": "e1", "revision": 4})]);
+        assert_eq!(
+            events,
+            vec![json!({"kind": "owner_wake", "epoch": "e1", "revision": 4})]
+        );
         assert_eq!(calls[1]["since"], json!({"epoch": "e1", "revision": 3}));
         assert_eq!(calls[2]["since"], json!({"epoch": "e1", "revision": 4}));
     }
@@ -23213,25 +23666,36 @@ mod owner_wake_tests {
             |_| {},
         );
         assert_eq!(calls, 1);
-        assert_eq!(recv_push_or_interval(&rx, Duration::from_secs(5)), PushWait::Closed);
+        assert_eq!(
+            recv_push_or_interval(&rx, Duration::from_secs(5)),
+            PushWait::Closed
+        );
     }
 
     #[test]
     fn recv_push_or_interval_reports_closed_after_the_sender_drops() {
         let (tx, rx) = std::sync::mpsc::channel();
-        assert_eq!(recv_push_or_interval(&rx, Duration::from_millis(20)), PushWait::Elapsed);
+        assert_eq!(
+            recv_push_or_interval(&rx, Duration::from_millis(20)),
+            PushWait::Elapsed
+        );
         tx.send(json!({"kind": "owner_wake"})).unwrap();
         assert_eq!(
             recv_push_or_interval(&rx, Duration::from_secs(5)),
             PushWait::Event(json!({"kind": "owner_wake"}))
         );
         drop(tx);
-        assert_eq!(recv_push_or_interval(&rx, Duration::from_secs(5)), PushWait::Closed);
+        assert_eq!(
+            recv_push_or_interval(&rx, Duration::from_secs(5)),
+            PushWait::Closed
+        );
     }
 
     #[test]
     fn owner_wake_loop_gives_up_after_consecutive_retries() {
-        let failures = (0..10).map(|_| hop_error("authorized peer viewer is not connected")).collect();
+        let failures = (0..10)
+            .map(|_| hop_error("authorized peer viewer is not connected"))
+            .collect();
         let (events, calls, sleeps) = run_loop(failures);
         assert!(events.is_empty());
         assert_eq!(calls.len(), OWNER_WAKE_MAX_CONSECUTIVE_RETRIES as usize);
@@ -23251,7 +23715,11 @@ mod owner_wake_tests {
             failure(),
             failure(),
         ]);
-        assert_eq!(calls.len(), 6, "the loop must still be polling after the fifth answer");
+        assert_eq!(
+            calls.len(),
+            6,
+            "the loop must still be polling after the fifth answer"
+        );
     }
 
     #[test]
@@ -23264,13 +23732,20 @@ mod owner_wake_tests {
             failure(),
             failure(),
         ]);
-        assert_eq!(calls.len(), 6, "a busy answer reached the owner, so it is not a failure in a row");
+        assert_eq!(
+            calls.len(),
+            6,
+            "a busy answer reached the owner, so it is not a failure in a row"
+        );
     }
 
     #[test]
     fn owner_wake_loop_backs_off_on_busy_without_moving_the_cursor() {
-        let (events, calls, sleeps) =
-            run_loop(vec![answer("e1", 3, false), busy(Some(2500)), answer("e1", 3, false)]);
+        let (events, calls, sleeps) = run_loop(vec![
+            answer("e1", 3, false),
+            busy(Some(2500)),
+            answer("e1", 3, false),
+        ]);
         assert!(events.is_empty());
         assert!(sleeps.contains(&Duration::from_millis(2500)));
         assert_eq!(calls[2]["since"], json!({"epoch": "e1", "revision": 3}));
@@ -23301,13 +23776,18 @@ mod owner_wake_tests {
             owner_wake_pause(Some(start), start + Duration::from_millis(400)),
             Duration::from_millis(600)
         );
-        assert_eq!(owner_wake_pause(Some(start), start + Duration::from_secs(8)), Duration::ZERO);
+        assert_eq!(
+            owner_wake_pause(Some(start), start + Duration::from_secs(8)),
+            Duration::ZERO
+        );
     }
 
     #[test]
     fn owner_wake_transport_outlives_the_owner_hold() {
         assert!(remote_leader_timeout(OWNER_WAKE_METHOD, OWNER_WAKE_HOLD) > OWNER_WAKE_HOLD);
-        assert!(peer_proto::team_leader::scoped_method_allowed(OWNER_WAKE_METHOD));
+        assert!(peer_proto::team_leader::scoped_method_allowed(
+            OWNER_WAKE_METHOD
+        ));
         assert_eq!(
             remote_leader_rpc_policy(true, OWNER_WAKE_METHOD),
             RemoteLeaderRpcPolicy::Proxy
@@ -23347,7 +23827,11 @@ fn wait_pending_tasks(
 ) -> Vec<String> {
     let mut pending: Vec<String> = tracked
         .iter()
-        .filter(|id| !statuses.get(*id).is_some_and(|status| wait_task_settled(status)))
+        .filter(|id| {
+            !statuses
+                .get(*id)
+                .is_some_and(|status| wait_task_settled(status))
+        })
         .cloned()
         .collect();
     pending.sort();
@@ -23380,7 +23864,17 @@ fn run_wait(
             .unwrap_or_default();
         let wait_id = wait_id();
         let turn_id = turn_id_from_hook_state();
-        append_wait_record(team, &wait_id, "start", None, &task_ids, mode, timeout, wait_leader_session.as_deref(), turn_id.as_deref());
+        append_wait_record(
+            team,
+            &wait_id,
+            "start",
+            None,
+            &task_ids,
+            mode,
+            timeout,
+            wait_leader_session.as_deref(),
+            turn_id.as_deref(),
+        );
         Some((wait_id, task_ids, wait_leader_session, turn_id))
     } else {
         None
@@ -23388,7 +23882,17 @@ fn run_wait(
     macro_rules! finish_wait {
         ($outcome:expr) => {{
             if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
-                append_wait_record(team, wait_id, "end", Some($outcome), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                append_wait_record(
+                    team,
+                    wait_id,
+                    "end",
+                    Some($outcome),
+                    task_ids,
+                    mode,
+                    timeout,
+                    leader_session_id.as_deref(),
+                    turn_id.as_deref(),
+                );
             }
             return;
         }};
@@ -23405,7 +23909,17 @@ fn run_wait(
             Err(error) => {
                 eprintln!("wait: could not inspect team '{team}': {error}");
                 if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
-                    append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                    append_wait_record(
+                        team,
+                        wait_id,
+                        "end",
+                        Some("error"),
+                        task_ids,
+                        mode,
+                        timeout,
+                        leader_session_id.as_deref(),
+                        turn_id.as_deref(),
+                    );
                 }
                 process::exit(1);
             }
@@ -23468,7 +23982,17 @@ fn run_wait(
                 "wait: mode '{mode}' has no task or correlation to track; plain broadcast replies cannot be matched. Use 'tm-agent warmup' for ping/pong healthchecks, 'tm-agent fan-out' for tracked work, or pass --tasks <ids>."
             );
             if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
-                append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                append_wait_record(
+                    team,
+                    wait_id,
+                    "end",
+                    Some("error"),
+                    task_ids,
+                    mode,
+                    timeout,
+                    leader_session_id.as_deref(),
+                    turn_id.as_deref(),
+                );
             }
             process::exit(1);
         }
@@ -23493,7 +24017,11 @@ fn run_wait(
         WaitPushSource::Disabled => None,
         WaitPushSource::RemoteOwnerWake => {
             eprintln!("wait: remote leader — waking on owner events (long-poll)");
-            Some(spawn_remote_owner_wake(sock.clone(), team.to_string(), interval))
+            Some(spawn_remote_owner_wake(
+                sock.clone(),
+                team.to_string(),
+                interval,
+            ))
         }
         // events.subscribe lives on the daemon socket, not the app socket.
         // Resolve it here so the caller's app `sock` is not misrouted.
@@ -23797,7 +24325,9 @@ fn run_wait(
                         );
                         println!("{}", pretty(&filtered));
                     }
-                    finish_wait!(wait_report_outcome(tracked_statuses.values().map(String::as_str)));
+                    finish_wait!(wait_report_outcome(
+                        tracked_statuses.values().map(String::as_str)
+                    ));
                 }
             }
             "msg" => {
@@ -23931,7 +24461,17 @@ fn run_wait(
             _ => {
                 eprintln!("Unknown wait mode: {mode}");
                 if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
-                    append_wait_record(team, wait_id, "end", Some("error"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+                    append_wait_record(
+                        team,
+                        wait_id,
+                        "end",
+                        Some("error"),
+                        task_ids,
+                        mode,
+                        timeout,
+                        leader_session_id.as_deref(),
+                        turn_id.as_deref(),
+                    );
                 }
                 process::exit(1);
             }
@@ -23979,15 +24519,35 @@ fn run_wait(
         println!("{}", pretty(&r));
     }
     if let Some((wait_id, task_ids, leader_session_id, turn_id)) = &wait_log {
-        append_wait_record(team, wait_id, "end", Some("timeout"), task_ids, mode, timeout, leader_session_id.as_deref(), turn_id.as_deref());
+        append_wait_record(
+            team,
+            wait_id,
+            "end",
+            Some("timeout"),
+            task_ids,
+            mode,
+            timeout,
+            leader_session_id.as_deref(),
+            turn_id.as_deref(),
+        );
     }
     process::exit(1);
 }
 
 fn wait_id() -> String {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let pid = process::id() as u128;
-    format!("{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}", (nanos >> 96) as u32, (nanos >> 80) as u16, ((nanos >> 68) as u16) & 0x0fff, ((nanos >> 56) as u16) & 0x0fff, (nanos ^ pid) & 0xffffffffffff)
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (nanos >> 96) as u32,
+        (nanos >> 80) as u16,
+        ((nanos >> 68) as u16) & 0x0fff,
+        ((nanos >> 56) as u16) & 0x0fff,
+        (nanos ^ pid) & 0xffffffffffff
+    )
 }
 
 fn wait_outcome_for_status(status: &str) -> &'static str {
@@ -24001,12 +24561,28 @@ fn wait_outcome_for_status(status: &str) -> &'static str {
     }
 }
 
-fn append_wait_record(team: &str, wait_id: &str, phase: &str, outcome: Option<&str>, task_ids: &[String], mode: &str, timeout: u32, leader_session_id: Option<&str>, turn_id: Option<&str>) {
+fn append_wait_record(
+    team: &str,
+    wait_id: &str,
+    phase: &str,
+    outcome: Option<&str>,
+    task_ids: &[String],
+    mode: &str,
+    timeout: u32,
+    leader_session_id: Option<&str>,
+    turn_id: Option<&str>,
+) {
     let Ok(path) = turn_log_path() else { return };
     let mut record = json!({"event":"leader_wait","phase":phase,"wait_id":wait_id,"task_ids":task_ids,"mode":mode,"timeout_s":timeout,"team":team,"ts":iso8601_utc_now()});
-    if let Some(outcome) = outcome { record["outcome"] = json!(outcome); }
-    if let Some(session) = leader_session_id { record["leader_session_id"] = json!(session); }
-    if let Some(turn_id) = turn_id { record["turn_id"] = json!(turn_id); }
+    if let Some(outcome) = outcome {
+        record["outcome"] = json!(outcome);
+    }
+    if let Some(session) = leader_session_id {
+        record["leader_session_id"] = json!(session);
+    }
+    if let Some(turn_id) = turn_id {
+        record["turn_id"] = json!(turn_id);
+    }
     let _ = append_turn_record(&path, &record);
 }
 
@@ -24039,10 +24615,16 @@ mod wait_task_scope_tests {
     #[test]
     fn given_but_empty_task_arguments_are_rejected() {
         for tasks in ["", ",", " , ,"] {
-            assert!(parse_wait_task_arguments(Some(tasks), None).is_err(), "{tasks:?}");
+            assert!(
+                parse_wait_task_arguments(Some(tasks), None).is_err(),
+                "{tasks:?}"
+            );
         }
         for task in ["", "  "] {
-            assert!(parse_wait_task_arguments(None, Some(task)).is_err(), "{task:?}");
+            assert!(
+                parse_wait_task_arguments(None, Some(task)).is_err(),
+                "{task:?}"
+            );
         }
     }
 
@@ -24059,12 +24641,12 @@ mod wait_task_scope_tests {
         assert_eq!(parse_wait_task_arguments(None, None), Ok(None));
         assert_eq!(
             parse_wait_task_arguments(Some(" a, b ,,"), None),
-            Ok(Some(std::collections::HashSet::from(["a".to_string(), "b".to_string()])))
+            Ok(Some(std::collections::HashSet::from([
+                "a".to_string(),
+                "b".to_string()
+            ])))
         );
-        assert_eq!(
-            parse_wait_task_arguments(None, Some("a")),
-            Ok(None)
-        );
+        assert_eq!(parse_wait_task_arguments(None, Some("a")), Ok(None));
     }
 
     #[test]
@@ -24083,7 +24665,13 @@ mod wait_any_scope_tests {
 
     #[test]
     fn failed_and_cancelled_tasks_settle_a_tracked_wait() {
-        for status in ["completed", "review_ready", "blocked", "failed", "cancelled"] {
+        for status in [
+            "completed",
+            "review_ready",
+            "blocked",
+            "failed",
+            "cancelled",
+        ] {
             assert!(wait_task_settled(status), "{status}");
         }
         // `abandoned` is not a TaskStatus the daemon accepts; it was a stale
@@ -24137,7 +24725,10 @@ mod wait_any_scope_tests {
     fn blocked_outranks_failed_outranks_completed() {
         assert_eq!(wait_report_outcome(["completed", "completed"]), "completed");
         assert_eq!(wait_report_outcome(["completed", "failed"]), "failed");
-        assert_eq!(wait_report_outcome(["failed", "blocked", "completed"]), "blocked");
+        assert_eq!(
+            wait_report_outcome(["failed", "blocked", "completed"]),
+            "blocked"
+        );
         assert_eq!(wait_report_outcome(std::iter::empty::<&str>()), "completed");
     }
 
@@ -24153,7 +24744,10 @@ mod wait_any_scope_tests {
             ("running".to_string(), "in_progress".to_string()),
         ]);
         assert_eq!(wait_settled_count(&tracked, &statuses), 1);
-        assert_eq!(wait_pending_tasks(&tracked, &statuses), vec!["running", "unseen"]);
+        assert_eq!(
+            wait_pending_tasks(&tracked, &statuses),
+            vec!["running", "unseen"]
+        );
 
         statuses.insert("running".to_string(), "failed".to_string());
         assert_eq!(wait_settled_count(&tracked, &statuses), 2);
@@ -24173,7 +24767,10 @@ mod wait_any_scope_tests {
             ("done".to_string(), "failed".to_string()),
             ("running".to_string(), "in_progress".to_string()),
         ]);
-        assert_eq!(wait_pending_tasks(&tracked, &statuses), vec!["running", "unseen"]);
+        assert_eq!(
+            wait_pending_tasks(&tracked, &statuses),
+            vec!["running", "unseen"]
+        );
     }
 }
 
@@ -25637,7 +26234,10 @@ mod watcher_spec_tests {
                     (key, value)
                 })
                 .collect();
-            Self { saved, _guard: guard }
+            Self {
+                saved,
+                _guard: guard,
+            }
         }
     }
     impl Drop for SocketDiscoveryEnv {
@@ -25669,7 +26269,6 @@ mod watcher_spec_tests {
             candidates.last(),
             Some(&PathBuf::from("/tmp/term-meshd.sock"))
         );
-
     }
 
     /// An explicitly exported socket must still win over every default, and
@@ -25700,7 +26299,6 @@ mod watcher_spec_tests {
             1,
             "the same socket must be probed once, however many names point at it"
         );
-
     }
 
     /// The value systemd reads from `peer.env` is invisible to a login shell,
@@ -25753,7 +26351,10 @@ mod watcher_spec_tests {
                 PathBuf::from("/old.sock"),
                 DoctorSocketOutcome::Unsupported("unknown method".into()),
             ),
-            (PathBuf::from("/new.sock"), DoctorSocketOutcome::Report(vec![])),
+            (
+                PathBuf::from("/new.sock"),
+                DoctorSocketOutcome::Report(vec![]),
+            ),
             (
                 PathBuf::from("/failed.sock"),
                 DoctorSocketOutcome::RpcFailed("timeout".into()),
@@ -26556,11 +27157,7 @@ mod auto_watch_tests {
         });
 
         assert_eq!(
-            remote_leader_route_retry_candidate(
-                &current,
-                &unavailable,
-                Some(refreshed.clone()),
-            ),
+            remote_leader_route_retry_candidate(&current, &unavailable, Some(refreshed.clone()),),
             Some(refreshed),
         );
         assert_eq!(
@@ -27014,11 +27611,24 @@ mod rcollect_tests {
     use super::*;
     #[test]
     fn rcollect_shape_and_evidence_events_are_ignored_by_health() {
-        let record = rcollect_record("p", "collect", &json!({"result":{"tasks":[{"id":"b"},{"id":"a"}]}}));
-        assert_eq!(record["event"], "task_collect"); assert_eq!(record["task_ids"], json!(["a","b"]));
-        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("turns.log");
-        fs::write(&path, b"{\"event\":\"leader_wait\"}\n{\"event\":\"task_collect\"}\n").unwrap();
-        assert_eq!(leader_participation_health(&path, "p", None).malformed_lines, 0);
+        let record = rcollect_record(
+            "p",
+            "collect",
+            &json!({"result":{"tasks":[{"id":"b"},{"id":"a"}]}}),
+        );
+        assert_eq!(record["event"], "task_collect");
+        assert_eq!(record["task_ids"], json!(["a", "b"]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.log");
+        fs::write(
+            &path,
+            b"{\"event\":\"leader_wait\"}\n{\"event\":\"task_collect\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            leader_participation_health(&path, "p", None).malformed_lines,
+            0
+        );
     }
 }
 
@@ -27041,12 +27651,8 @@ mod rroute_tests {
 
     #[test]
     fn rroute_omitted_flags_are_filled_from_recorded_facts() {
-        let evidence = derive_route_evidence(
-            None,
-            None,
-            || Some(3),
-            || Some("isolated".to_string()),
-        );
+        let evidence =
+            derive_route_evidence(None, None, || Some(3), || Some("isolated".to_string()));
         assert_eq!(evidence.checkout_mode.as_deref(), Some("isolated"));
         assert_eq!(evidence.available_workers, Some(3));
         assert_eq!(evidence.derived, vec!["checkout_mode", "available_workers"]);
@@ -27061,11 +27667,17 @@ mod rroute_tests {
     #[test]
     fn rroute_reads_only_a_recorded_layout_of_this_team() {
         let status = json!({"team_name": "mine", "checkout_mode": " isolated "});
-        assert_eq!(checkout_mode_from_team_status(&status, "mine").as_deref(), Some("isolated"));
+        assert_eq!(
+            checkout_mode_from_team_status(&status, "mine").as_deref(),
+            Some("isolated")
+        );
         assert_eq!(checkout_mode_from_team_status(&status, "other"), None);
         for mode in ["shared", "off"] {
             let status = json!({"team_name": "mine", "checkout_mode": mode});
-            assert_eq!(checkout_mode_from_team_status(&status, "mine").as_deref(), Some(mode));
+            assert_eq!(
+                checkout_mode_from_team_status(&status, "mine").as_deref(),
+                Some(mode)
+            );
         }
         for status in [
             json!({"team_name": "mine", "checkout_mode": "unknown"}),
@@ -27073,16 +27685,32 @@ mod rroute_tests {
             json!({"team_name": "mine", "worktree_mode": "isolated"}),
             json!({"team_name": "mine", "checkout_mode": 1}),
         ] {
-            assert_eq!(checkout_mode_from_team_status(&status, "mine"), None, "{status}");
+            assert_eq!(
+                checkout_mode_from_team_status(&status, "mine"),
+                None,
+                "{status}"
+            );
         }
     }
 
     #[test]
     fn rroute_reads_the_roster_count_from_the_control_payload() {
-        assert_eq!(available_workers_from_control(&json!({"available_workers": 2})), Some(2));
-        assert_eq!(available_workers_from_control(&json!({"available_workers": 0})), Some(0));
+        assert_eq!(
+            available_workers_from_control(&json!({"available_workers": 2})),
+            Some(2)
+        );
+        assert_eq!(
+            available_workers_from_control(&json!({"available_workers": 0})),
+            Some(0)
+        );
         assert_eq!(available_workers_from_control(&json!({})), None);
-        assert_eq!(available_workers_from_control(&json!({"available_workers": "2"})), None);
-        assert_eq!(available_workers_from_control(&json!({"available_workers": -1})), None);
+        assert_eq!(
+            available_workers_from_control(&json!({"available_workers": "2"})),
+            None
+        );
+        assert_eq!(
+            available_workers_from_control(&json!({"available_workers": -1})),
+            None
+        );
     }
 }

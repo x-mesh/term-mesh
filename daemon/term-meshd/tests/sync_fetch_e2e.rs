@@ -14,9 +14,9 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use sync::{
     build_apply_plan, diff_manifests, respond_to_fetch, run_fetch_pull, scan_project_entries,
-    seed_trust_store, ApplyStore, BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity,
-    KeyId, ObjectDomain, ObjectType, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider,
-    SyncConnection, SyncEndpoint, TrustStore,
+    seed_trust_store, ApplyStore, BootstrapDevice, CasError, CasLimits, CasStore,
+    DeviceTlsIdentity, KeyId, ObjectDomain, ObjectType, ProjectId, ProjectKey, ProjectKeyMaterial,
+    ProjectKeyProvider, SyncConnection, SyncEndpoint, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
@@ -72,11 +72,33 @@ async fn fetch_pulls_and_applies_a_missing_file() {
     let identity_b = DeviceTlsIdentity::generate().unwrap();
     let project_id = ProjectId::from_bytes(project);
 
-    let trust_a = Arc::new(TrustStore::open(temporary.path().join("trust_a.sqlite3"), project_id, recovery.verifying_key().to_bytes()).unwrap());
-    let trust_b = Arc::new(TrustStore::open(temporary.path().join("trust_b.sqlite3"), project_id, recovery.verifying_key().to_bytes()).unwrap());
+    let trust_a = Arc::new(
+        TrustStore::open(
+            temporary.path().join("trust_a.sqlite3"),
+            project_id,
+            recovery.verifying_key().to_bytes(),
+        )
+        .unwrap(),
+    );
+    let trust_b = Arc::new(
+        TrustStore::open(
+            temporary.path().join("trust_b.sqlite3"),
+            project_id,
+            recovery.verifying_key().to_bytes(),
+        )
+        .unwrap(),
+    );
     let roster = [
-        BootstrapDevice { device_id: device_a, certificate_hash: identity_a.certificate_hash(), epoch: 1 },
-        BootstrapDevice { device_id: device_b, certificate_hash: identity_b.certificate_hash(), epoch: 2 },
+        BootstrapDevice {
+            device_id: device_a,
+            certificate_hash: identity_a.certificate_hash(),
+            epoch: 1,
+        },
+        BootstrapDevice {
+            device_id: device_b,
+            certificate_hash: identity_b.certificate_hash(),
+            epoch: 2,
+        },
     ];
     seed_trust_store(&trust_a, project_id, &recovery, &roster).unwrap();
     seed_trust_store(&trust_b, project_id, &recovery, &roster).unwrap();
@@ -95,11 +117,25 @@ async fn fetch_pulls_and_applies_a_missing_file() {
 
     let cas_source = cas_store(&temporary.path().join("cas_source"));
     let cas_dest = cas_store(&temporary.path().join("cas_dest"));
-    let domain = ObjectDomain { project_id, object_type: ObjectType::FILE, version: 1 };
+    let domain = ObjectDomain {
+        project_id,
+        object_type: ObjectType::FILE,
+        version: 1,
+    };
 
     // Authenticated connection.
-    let server = SyncEndpoint::server(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), trust_a.clone(), &identity_a).unwrap();
-    let client = SyncEndpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), trust_b.clone(), &identity_b).unwrap();
+    let server = SyncEndpoint::server(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        trust_a.clone(),
+        &identity_a,
+    )
+    .unwrap();
+    let client = SyncEndpoint::client(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        trust_b.clone(),
+        &identity_b,
+    )
+    .unwrap();
     let address = server.local_addr().unwrap();
     let (accepted, connected) = tokio::join!(
         server.accept(hello(project, device_a, 2, 1)),
@@ -128,9 +164,12 @@ async fn fetch_pulls_and_applies_a_missing_file() {
     assert!(resolved.contains_key("extra.txt"));
 
     // Apply the fetched object to B's filesystem.
-    let apply_store = ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap();
+    let apply_store =
+        ApplyStore::open(state_dir(temporary.path(), "apply-state").join("apply.db")).unwrap();
     let plan = build_apply_plan(project_id, [9; 16], &diff.fetch, &resolved, &dest_entries);
-    apply_store.apply(dest_root.path(), &cas_dest, domain, &plan).expect("apply");
+    apply_store
+        .apply(dest_root.path(), &cas_dest, domain, &plan)
+        .expect("apply");
 
     let applied = std::fs::read(dest_root.path().join("extra.txt")).expect("applied file exists");
     assert_eq!(applied, content, "applied file differs from peer");

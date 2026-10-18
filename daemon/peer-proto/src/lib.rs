@@ -831,7 +831,10 @@ mod tests {
         assert!(capability::SUPPORTED.contains(&capability::SURFACE_AGENT_V1));
         assert_eq!(capability::TEAM_ROUTE_FILE_V1, "team.route-file.v1");
         assert!(capability::SUPPORTED.contains(&capability::TEAM_ROUTE_FILE_V1));
-        assert_eq!(capability::supported_vec().len(), capability::SUPPORTED.len());
+        assert_eq!(
+            capability::supported_vec().len(),
+            capability::SUPPORTED.len()
+        );
 
         let unique: std::collections::HashSet<&str> =
             capability::SUPPORTED.iter().copied().collect();
@@ -844,10 +847,7 @@ mod tests {
 
     #[test]
     fn supported_capabilities_advertise_ensure_env_host_support() {
-        assert_eq!(
-            capability::SURFACE_ENSURE_ENV_V1,
-            "surface.ensure-env.v1"
-        );
+        assert_eq!(capability::SURFACE_ENSURE_ENV_V1, "surface.ensure-env.v1");
         assert!(
             capability::SUPPORTED.contains(&capability::SURFACE_ENSURE_ENV_V1),
             "new daemons must advertise that EnsureSurfaceRequest.env is applied"

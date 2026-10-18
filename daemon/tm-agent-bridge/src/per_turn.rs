@@ -62,7 +62,13 @@ pub struct PerTurnBridge {
 }
 
 impl PerTurnBridge {
-    pub fn new(cli: PerTurnCli, cwd: &str, model: Option<String>, out: Emitter, exe: Option<String>) -> Self {
+    pub fn new(
+        cli: PerTurnCli,
+        cwd: &str,
+        model: Option<String>,
+        out: Emitter,
+        exe: Option<String>,
+    ) -> Self {
         Self {
             cli,
             exe,
@@ -313,8 +319,7 @@ impl PerTurnBridge {
             } else {
                 said
             };
-            self.out
-                .result(&body, &format!("exit_{code}"), None, true);
+            self.out.result(&body, &format!("exit_{code}"), None, true);
         } else if said.trim().is_empty() {
             self.out
                 .result("the turn ended without an answer", "empty", None, true);
@@ -636,7 +641,10 @@ mod tests {
 
     fn bridge(cli: PerTurnCli) -> (PerTurnBridge, Arc<Mutex<Vec<Value>>>) {
         let (out, sink) = captured();
-        (PerTurnBridge::new(cli, "/tmp/project", None, out, None), sink)
+        (
+            PerTurnBridge::new(cli, "/tmp/project", None, out, None),
+            sink,
+        )
     }
 
     fn last_result(sink: &Arc<Mutex<Vec<Value>>>) -> Value {
@@ -773,7 +781,11 @@ Created conversation 22222222-2222-4222-8222-222222222222\n";
     fn a_log_that_is_not_ours_alone_is_not_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conversation.log");
-        std::fs::write(&path, "Created conversation 33333333-3333-4333-8333-333333333333").unwrap();
+        std::fs::write(
+            &path,
+            "Created conversation 33333333-3333-4333-8333-333333333333",
+        )
+        .unwrap();
         // As `ensure_agy_log` creates it — the default here is whatever umask
         // says, which on a normal account is already group-readable.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -787,7 +799,10 @@ Created conversation 22222222-2222-4222-8222-222222222222\n";
 
         let link = dir.path().join("link.log");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(read_private_file(&link).is_none(), "O_NOFOLLOW refuses a symlink");
+        assert!(
+            read_private_file(&link).is_none(),
+            "O_NOFOLLOW refuses a symlink"
+        );
     }
 
     #[test]
@@ -807,10 +822,7 @@ Created conversation 22222222-2222-4222-8222-222222222222\n";
 
     fn bridge_with(cli: PerTurnCli, exe: String) -> (PerTurnBridge, Arc<Mutex<Vec<Value>>>) {
         let (out, sink) = captured();
-        (
-            PerTurnBridge::new(cli, "/tmp", None, out, Some(exe)),
-            sink,
-        )
+        (PerTurnBridge::new(cli, "/tmp", None, out, Some(exe)), sink)
     }
 
     #[test]
@@ -852,7 +864,13 @@ echo done"#;
         b.turn("hi", Some(Duration::from_secs(10)));
 
         let events = sink.lock().unwrap();
-        assert_eq!(events.iter().filter(|e| e["subtype"] == "environment").count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["subtype"] == "environment")
+                .count(),
+            1
+        );
         let result = events.iter().find(|e| e["type"] == "result").unwrap();
         assert_eq!(result["result"], "done");
     }
@@ -893,6 +911,9 @@ echo done"#;
         // The tempdir guard is deliberately released so the id survives
         // between turns, which makes dropping the bridge the only cleanup.
         drop(b);
-        assert!(!log.exists(), "every agy session would otherwise leave one behind");
+        assert!(
+            !log.exists(),
+            "every agy session would otherwise leave one behind"
+        );
     }
 }

@@ -116,21 +116,30 @@ async fn s0_two_daemons_bootstrap_trust_and_round_trip_lane_messages() {
 
     // client → server on the control lane.
     let ping = b"s0-control-ping".to_vec();
-    client_conn.send(StreamLane::Control, ping.clone()).await.unwrap();
+    client_conn
+        .send(StreamLane::Control, ping.clone())
+        .await
+        .unwrap();
     let (lane, payload) = recv_one(&mut server_conn).await;
     assert_eq!(lane, StreamLane::Control);
     assert_eq!(payload, ping);
 
     // server → client on the control lane (both directions through the pump).
     let pong = b"s0-control-pong".to_vec();
-    server_conn.send(StreamLane::Control, pong.clone()).await.unwrap();
+    server_conn
+        .send(StreamLane::Control, pong.clone())
+        .await
+        .unwrap();
     let (lane, payload) = recv_one(&mut client_conn).await;
     assert_eq!(lane, StreamLane::Control);
     assert_eq!(payload, pong);
 
     // A different lane demuxes independently and preserves its tag.
     let op = b"s0-sync-operation-frame".to_vec();
-    client_conn.send(StreamLane::SyncOperation, op.clone()).await.unwrap();
+    client_conn
+        .send(StreamLane::SyncOperation, op.clone())
+        .await
+        .unwrap();
     let (lane, payload) = recv_one(&mut server_conn).await;
     assert_eq!(lane, StreamLane::SyncOperation);
     assert_eq!(payload, op);
@@ -143,8 +152,14 @@ async fn s0_two_daemons_bootstrap_trust_and_round_trip_lane_messages() {
     // are what let bulk transfer and control share one connection.
     let blob = b"s0-blob-chunk".to_vec();
     let ctrl = b"s0-syncop-after-blob".to_vec();
-    client_conn.send(StreamLane::Blob, blob.clone()).await.unwrap();
-    client_conn.send(StreamLane::SyncOperation, ctrl.clone()).await.unwrap();
+    client_conn
+        .send(StreamLane::Blob, blob.clone())
+        .await
+        .unwrap();
+    client_conn
+        .send(StreamLane::SyncOperation, ctrl.clone())
+        .await
+        .unwrap();
     let got_ctrl = tokio::time::timeout(
         Duration::from_secs(5),
         server_conn.recv_lane(StreamLane::SyncOperation),

@@ -546,7 +546,10 @@ mod tests {
         );
         // Anything not shaped like a UUID is refused rather than guessed at:
         // a wrong id would open somebody else's transcript.
-        assert_eq!(rollout_session_id(Path::new("/x/rollout-2026-06-02.jsonl")), None);
+        assert_eq!(
+            rollout_session_id(Path::new("/x/rollout-2026-06-02.jsonl")),
+            None
+        );
         assert_eq!(rollout_session_id(Path::new("/x/rollout.jsonl")), None);
         assert_eq!(
             rollout_session_id(Path::new(

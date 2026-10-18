@@ -1186,7 +1186,10 @@ impl HeadlessManager {
     }
 
     /// Create a headless team: register team metadata and spawn all agents.
-    pub async fn create_team(&mut self, mut params: TeamCreateParams) -> Result<HeadlessTeam, String> {
+    pub async fn create_team(
+        &mut self,
+        mut params: TeamCreateParams,
+    ) -> Result<HeadlessTeam, String> {
         normalize_team_efforts(&mut params)?;
         if self.teams.contains_key(&params.team_name) {
             return Err(format!("team_name_in_use: {}", params.team_name));
@@ -1207,10 +1210,14 @@ impl HeadlessManager {
         for spec in &params.agents {
             meta::validate_agent_name(&spec.name)?;
             if let Some(path) = spec.working_directory.as_deref() {
-                let metadata = std::fs::metadata(path)
-                    .map_err(|error| format!("invalid agent working_directory for {}: {error}", spec.name))?;
+                let metadata = std::fs::metadata(path).map_err(|error| {
+                    format!("invalid agent working_directory for {}: {error}", spec.name)
+                })?;
                 if !metadata.is_dir() {
-                    return Err(format!("invalid agent working_directory for {}: not a directory", spec.name));
+                    return Err(format!(
+                        "invalid agent working_directory for {}: not a directory",
+                        spec.name
+                    ));
                 }
             }
         }
@@ -1378,7 +1385,9 @@ impl HeadlessManager {
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
                 effort: spec.effort.clone(),
-                working_directory: spec.working_directory.clone()
+                working_directory: spec
+                    .working_directory
+                    .clone()
                     .unwrap_or_else(|| params.working_directory.clone()),
                 cli_path: spec.cli_path.clone(),
                 app_socket_path: params.app_socket_path.clone(),
@@ -3162,7 +3171,9 @@ impl HeadlessManager {
                 cli: m.cli.clone(),
                 model: m.model.clone(),
                 effort: m.effort.clone(),
-                working_directory: m.working_directory.clone()
+                working_directory: m
+                    .working_directory
+                    .clone()
                     .unwrap_or_else(|| team_meta.working_directory.clone()),
                 cli_path: m.cli_path_at_create.clone(),
                 app_socket_path: params.app_socket_path.clone(),
@@ -3958,20 +3969,47 @@ mod tests {
         let mut mgr = HeadlessManager::new();
         let team = mgr.create_team(params).await.unwrap();
         let listed = mgr.list(Some("per-agent-cwd")).await;
-        assert_eq!(listed.iter().map(|row| row.working_directory.as_str()).collect::<std::collections::HashSet<_>>(),
-                   std::collections::HashSet::from([a.to_str().unwrap(), b.to_str().unwrap()]));
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| row.working_directory.as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([a.to_str().unwrap(), b.to_str().unwrap()])
+        );
         let uuid = team.team_uuid.clone();
-        assert_eq!(test_read_agent_meta(&uuid, "a").unwrap().working_directory.as_deref(), a.to_str());
-        assert_eq!(test_read_agent_meta(&uuid, "b").unwrap().working_directory.as_deref(), b.to_str());
+        assert_eq!(
+            test_read_agent_meta(&uuid, "a")
+                .unwrap()
+                .working_directory
+                .as_deref(),
+            a.to_str()
+        );
+        assert_eq!(
+            test_read_agent_meta(&uuid, "b")
+                .unwrap()
+                .working_directory
+                .as_deref(),
+            b.to_str()
+        );
         let _ = mgr.destroy_team("per-agent-cwd").await.unwrap();
-        let resumed = mgr.resume_team(ResumeTeamParams {
-            team_uuid: uuid, team_name_override: Some("per-agent-cwd-2".into()),
-            app_socket_path: None, leader_session_id: String::new(),
-            accept_branch_drift: false,
-        }).await.unwrap();
+        let resumed = mgr
+            .resume_team(ResumeTeamParams {
+                team_uuid: uuid,
+                team_name_override: Some("per-agent-cwd-2".into()),
+                app_socket_path: None,
+                leader_session_id: String::new(),
+                accept_branch_drift: false,
+            })
+            .await
+            .unwrap();
         let listed = mgr.list(Some(&resumed.team.name)).await;
-        assert_eq!(listed.iter().map(|row| row.working_directory.as_str()).collect::<std::collections::HashSet<_>>(),
-                   std::collections::HashSet::from([a.to_str().unwrap(), b.to_str().unwrap()]));
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| row.working_directory.as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([a.to_str().unwrap(), b.to_str().unwrap()])
+        );
         let _ = mgr.destroy_team(&resumed.team.name).await;
     }
 
@@ -4445,9 +4483,12 @@ mod tests {
         params.worktree_path = None;
         params.worktree_branch = None;
 
-        mgr.archive_pane_team(params).expect("archive isolated pane team");
+        mgr.archive_pane_team(params)
+            .expect("archive isolated pane team");
         let resumed = mgr
-            .resume_pane(ResumePaneParams { team_uuid: team_uuid.into() })
+            .resume_pane(ResumePaneParams {
+                team_uuid: team_uuid.into(),
+            })
             .expect("resume isolated pane team");
 
         assert_eq!(resumed.worktree_mode.as_deref(), Some("isolated"));

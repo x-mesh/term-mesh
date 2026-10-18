@@ -17,11 +17,11 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use sync::{
     exchange_manifests, receive_push, respond_to_fetch, scan_project_entries, seed_trust_store,
-    ApplyStore,
-    BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity, KeyId, NetworkSyncRunner,
-    ObjectDomain, ObjectType, OperationKind, OperationManager, OperationStartParams, OperationState,
-    PeerAddressResolver, ProjectId, ProjectKey, ProjectKeyMaterial, ProjectKeyProvider,
-    ProjectRegistry, SyncConnection, SyncContext, SyncContextProvider, SyncEndpoint, TrustStore,
+    ApplyStore, BootstrapDevice, CasError, CasLimits, CasStore, DeviceTlsIdentity, KeyId,
+    NetworkSyncRunner, ObjectDomain, ObjectType, OperationKind, OperationManager,
+    OperationStartParams, OperationState, PeerAddressResolver, ProjectId, ProjectKey,
+    ProjectKeyMaterial, ProjectKeyProvider, ProjectRegistry, SyncConnection, SyncContext,
+    SyncContextProvider, SyncEndpoint, TrustStore,
 };
 use sync_protocol::{SyncHello, PROJECT_SYNC_CAPABILITY, PROTOCOL_V1};
 
@@ -264,11 +264,17 @@ async fn sync_operation_exchanges_manifests_and_finds_the_diff() {
     let result = record.result.expect("succeeded operation carries a result");
     // The diff must be exactly one fetch: the peer's `extra.txt`. `shared.txt`
     // is byte-identical on both sides and must not appear.
-    assert_eq!(result.entries, 1, "expected exactly one file to fetch (extra.txt)");
+    assert_eq!(
+        result.entries, 1,
+        "expected exactly one file to fetch (extra.txt)"
+    );
 
     // S2 last mile: the fetched file was applied to the initiator's working
     // tree, so `extra.txt` now exists on the local root with the peer's bytes.
     let applied = std::fs::read(local_root.path().join("extra.txt"))
         .expect("extra.txt applied to the initiator's project root");
-    assert_eq!(applied, b"only-on-the-peer", "applied file differs from the peer");
+    assert_eq!(
+        applied, b"only-on-the-peer",
+        "applied file differs from the peer"
+    );
 }

@@ -263,7 +263,10 @@ fn harden_parent_directory(parent: &Path) -> Result<()> {
     }
     let meta = std::fs::metadata(parent)?;
     if !meta.is_dir() {
-        anyhow::bail!("coordinator socket parent {} is not a directory", parent.display());
+        anyhow::bail!(
+            "coordinator socket parent {} is not a directory",
+            parent.display()
+        );
     }
     let owner_uid = unsafe { libc::geteuid() };
     let mode = meta.mode();

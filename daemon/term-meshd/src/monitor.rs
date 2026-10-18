@@ -611,7 +611,13 @@ impl MonitorHandle {
     /// nothing to check a later signal against. The caller is told so it can
     /// drop its own record and offer the pid again.
     pub fn track_pid(&self, pid: u32) -> bool {
-        if self.tracked_pids.lock().unwrap().iter().any(|t| t.pid == pid) {
+        if self
+            .tracked_pids
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.pid == pid)
+        {
             return true;
         }
         // Read the identity with the lock released: this is a syscall, and
@@ -893,7 +899,10 @@ mod tests {
 
     #[test]
     fn monitor_handle_resume_all_stopped() {
-        let handle = test_handle(Vec::new(), HashMap::from([(99999u32, 1u64), (99998u32, 2u64)]));
+        let handle = test_handle(
+            Vec::new(),
+            HashMap::from([(99999u32, 1u64), (99998u32, 2u64)]),
+        );
         assert_eq!(handle.stopped_pids.lock().unwrap().len(), 2);
 
         // The pids are gone, so every checked signal refuses — the set is

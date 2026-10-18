@@ -482,13 +482,20 @@ async fn router_latency_artifact_has_no_wall_clock_gate() {
             .await
             .unwrap();
         let frame = router.next().await.unwrap();
-        assert_eq!(frame.payload().len(), 1024, "router must forward the full payload");
+        assert_eq!(
+            frame.payload().len(),
+            1024,
+            "router must forward the full payload"
+        );
         drained += 1;
     }
     // Functional assertion: every enqueued frame routed through. The latency
     // artifact below is written for offline analysis only — deliberately NOT
     // gated on wall-clock time (would be flaky under CI load).
-    assert_eq!(drained, 128, "all frames must route through the bounded router");
+    assert_eq!(
+        drained, 128,
+        "all frames must route through the bounded router"
+    );
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

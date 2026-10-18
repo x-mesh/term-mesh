@@ -86,7 +86,11 @@ fn rlog_stdin_bytes(label: &str, bytes: &[u8]) {
         return;
     }
     let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    rlog(&format!("{label}: {} bytes [{}]", bytes.len(), hex.join(" ")));
+    rlog(&format!(
+        "{label}: {} bytes [{}]",
+        bytes.len(),
+        hex.join(" ")
+    ));
 }
 
 fn rlog(msg: &str) {
@@ -535,9 +539,7 @@ fn is_terminal_csi_response(seq: &[u8]) -> bool {
         // scope anyway. Digits and semicolons only, matching the `R` and `n`
         // cases, which accept the same vanishingly small risk of swallowing
         // a user who types the sequence by hand.
-        b't' => {
-            body.contains(&b';') && body.iter().all(|b| b.is_ascii_digit() || *b == b';')
-        }
+        b't' => body.contains(&b';') && body.iter().all(|b| b.is_ascii_digit() || *b == b';'),
         _ => false,
     }
 }
