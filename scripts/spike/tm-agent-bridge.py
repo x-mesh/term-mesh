@@ -1155,7 +1155,6 @@ class CodexBridge:
         # their deltas glued `STATUS:` onto the end of the commentary line,
         # where the header parser, which reads line starts, never found it.
         open_message: list[str] = []
-        streamed = [False]
         failed_because: list[str] = []
         # `thread/tokenUsage/updated` lands before `turn/completed`, so the
         # figures are held here until the turn is reported.
@@ -1200,7 +1199,6 @@ class CodexBridge:
             if m == "item/agentMessage/delta":
                 chunk = p.get("delta") or ""
                 if chunk:
-                    streamed[0] = True
                     open_message.append(chunk)
                     self.out.delta(chunk)
                 return
@@ -1209,11 +1207,12 @@ class CodexBridge:
                 kind = item.get("type") or item.get("itemType")
                 if kind in ("agentMessage", "assistant_message", "message"):
                     # Already drawn delta by delta; the completed item is the
-                    # same text arriving whole.
-                    if streamed[0]:
-                        if open_message:
-                            said.append("".join(open_message))
-                            open_message.clear()
+                    # same text arriving whole. Streaming is decided per
+                    # message: one turn can stream its commentary and send the
+                    # answer only whole.
+                    if open_message:
+                        said.append("".join(open_message))
+                        open_message.clear()
                         self.out.block_done()
                         return
                     body = item.get("text") or item.get("content") or ""

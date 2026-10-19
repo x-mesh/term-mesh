@@ -349,7 +349,6 @@ impl<T: Transport> CodexBridge<T> {
         // their deltas glued `STATUS:` onto the end of the commentary line,
         // where the header parser, which reads line starts, never found it.
         let mut open_message = String::new();
-        let mut streamed = false;
         let mut errors: Vec<TurnError> = Vec::new();
         // `thread/tokenUsage/updated` lands before `turn/completed`, so the
         // figures are held here until the turn is reported.
@@ -424,7 +423,6 @@ impl<T: Transport> CodexBridge<T> {
             if method == "item/agentMessage/delta" {
                 if let Some(chunk) = p.get("delta").and_then(Value::as_str) {
                     if !chunk.is_empty() {
-                        streamed = true;
                         open_message.push_str(chunk);
                         out.delta(chunk, false);
                     }
@@ -442,11 +440,11 @@ impl<T: Transport> CodexBridge<T> {
                 match kind {
                     "agentMessage" | "assistant_message" | "message" => {
                         // Already drawn delta by delta; the completed item is
-                        // the same text arriving whole.
-                        if streamed {
-                            if !open_message.is_empty() {
-                                said.push(std::mem::take(&mut open_message));
-                            }
+                        // the same text arriving whole. Streaming is decided
+                        // per message: one turn can stream its commentary and
+                        // send the answer only whole.
+                        if !open_message.is_empty() {
+                            said.push(std::mem::take(&mut open_message));
                             out.block_done();
                             return;
                         }
@@ -958,6 +956,26 @@ mod tests {
                 "exitCode": 0, "aggregatedOutput": "hi"}}}),
             json!({"method": "item/agentMessage/delta", "params": {"delta": "STATUS: DONE\n"}}),
             json!({"method": "item/agentMessage/delta", "params": {"delta": "FILES: none"}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage",
+                                       "text": "STATUS: DONE\nFILES: none"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("review it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        assert_eq!(result["result"], "Reviewing.\nSTATUS: DONE\nFILES: none");
+    }
+
+    #[test]
+    fn a_whole_message_after_a_streamed_one_is_kept() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "item/agentMessage/delta", "params": {"delta": "Reviewing."}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "Reviewing."}}}),
             json!({"method": "item/completed",
                    "params": {"item": {"type": "agentMessage",
                                        "text": "STATUS: DONE\nFILES: none"}}}),

@@ -842,6 +842,23 @@ class MessageBoundaryTests(unittest.TestCase):
 
         self.assertEqual(self.last_result(out)["result"], "Reviewing.\n" + self.HEADER)
 
+    def test_codex_whole_message_after_a_streamed_one_is_kept(self):
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+             "params": {"delta": "Reviewing."}},
+            {"jsonrpc": "2.0", "method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "Reviewing."}}},
+            {"jsonrpc": "2.0", "method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": self.HEADER}}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {"status": "completed"}}},
+        ])
+
+        bridge.turn("review it", timeout=2)
+
+        self.assertEqual(self.last_result(out)["result"], "Reviewing.\n" + self.HEADER)
+
     def test_acp_text_on_either_side_of_a_tool_call_stays_on_separate_lines(self):
         bridge, _, out = acp_bridge([
             {"jsonrpc": "2.0", "method": "session/update", "params": {
