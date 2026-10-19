@@ -1270,6 +1270,8 @@ actor AcceptedUnixConnection {
     private let writeTimeoutSeconds: TimeInterval
     private var relayTransport = RelayTransportSnapshot()
 
+    var hasPendingRead: Bool { readSource != nil }
+
     init(
         fd: Int32,
         maxPendingWrites: Int = 8,
@@ -1291,8 +1293,10 @@ actor AcceptedUnixConnection {
     /// EOF. Matches PeerSession.readFrame's "keep reading until a frame
     /// decodes" loop.
     func read() async throws -> Data {
+        try Task.checkCancellation()
         if holder.isClosed { return Data() }
         while !holder.isClosed {
+            try Task.checkCancellation()
             // Try a non-blocking read first. If bytes are already sitting
             // in the kernel, skip the DispatchSource round-trip.
             var buffer = [UInt8](repeating: 0, count: 16 * 1024)
@@ -1303,7 +1307,7 @@ actor AcceptedUnixConnection {
                 return Data(buffer.prefix(n))
             }
             if n == 0 {
-                holder.close()
+                close()
                 return Data() // EOF
             }
             if errno == EAGAIN || errno == EWOULDBLOCK {
@@ -1319,24 +1323,36 @@ actor AcceptedUnixConnection {
     }
 
     private func waitForReadable() async throws {
+        try Task.checkCancellation()
+        guard !holder.isClosed else { return }
         let fd = self.holder.fd
         let queue = self.queue
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-            let resumed = AtomicFlag()
-            source.setEventHandler {
-                if resumed.setOnce() {
-                    source.cancel()
-                    cont.resume()
-                }
-            }
-            source.setCancelHandler {
-                if resumed.setOnce() {
-                    cont.resume()
-                }
-            }
-            source.resume()
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        let resumed = AtomicFlag()
+        readSource = source
+        defer {
+            source.cancel()
+            if readSource === source { readSource = nil }
         }
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                source.setEventHandler {
+                    if resumed.setOnce() {
+                        source.cancel()
+                        cont.resume()
+                    }
+                }
+                source.setCancelHandler {
+                    if resumed.setOnce() {
+                        cont.resume()
+                    }
+                }
+                source.resume()
+            }
+        }, onCancel: {
+            source.cancel()
+        })
+        try Task.checkCancellation()
     }
 
     private func waitForWritable(until deadline: TimeInterval) async throws {
@@ -1456,7 +1472,7 @@ actor AcceptedUnixConnection {
                 PeerServerDiagnostics.record(
                     "write-timeout fd=\(holder.fd) bytes=\(bytes.count) eagain=\(relayTransport.eagainCount)"
                 )
-                holder.close()
+                close()
                 throw PeerServerError.writeTimedOut
             }
             let n = bytes.withUnsafeBytes { bp -> Int in
@@ -1481,7 +1497,7 @@ actor AcceptedUnixConnection {
                     PeerServerDiagnostics.record(
                         "write-timeout fd=\(holder.fd) bytes=\(bytes.count) eagain=\(relayTransport.eagainCount)"
                     )
-                    holder.close()
+                    close()
                     throw PeerServerError.writeTimedOut
                 }
                 let elapsed = DispatchTime.now().uptimeNanoseconds &- waitStart
@@ -1501,6 +1517,7 @@ actor AcceptedUnixConnection {
     func relayTransportSnapshot() -> RelayTransportSnapshot { relayTransport }
 
     func close() {
+        readSource?.cancel()
         holder.close()
         writeSource?.cancel()
         // A closed fd makes every queued frame obsolete. Wake all bounded
@@ -2826,8 +2843,8 @@ actor PeerServerSession {
         _ req: Termmesh_Peer_V1_AttachSurface,
         correlationID: UInt64
     ) async throws {
-        if let surface = await provider.listSurfaces().first(where: { $0.surfaceID == req.surfaceID }),
-           surface.surfaceType == "agent", !hasClientCapability(PeerCapability.agentPresentationV1) {
+        let surface = await provider.listSurfaces().first(where: { $0.surfaceID == req.surfaceID })
+        if surface?.surfaceType == "agent", !hasClientCapability(PeerCapability.agentPresentationV1) {
             try await sendEnvelopeWithCorrelation(correlationID) { inner in
                 var result = Termmesh_Peer_V1_AttachResult()
                 result.surfaceID = req.surfaceID
@@ -2913,9 +2930,50 @@ actor PeerServerSession {
         let surfaceID = req.surfaceID
         let relayTask: Task<Void, Never> = Task { [weak self] in
             guard let self else { return }
-            await self.pumpByteStream(surfaceID: surfaceID, attachment: attachment)
+            if surface?.surfaceType == "agent" {
+                await self.pumpModelStream(surfaceID: surfaceID, attachment: attachment)
+            } else {
+                await self.pumpByteStream(surfaceID: surfaceID, attachment: attachment)
+            }
         }
         relayTasks[surfaceID] = relayTask
+    }
+
+    // Model streams coalesce pending states upstream; unlike PTY taps, they
+    // can wait for the socket without blocking the agent or losing a frame.
+    private func pumpModelStream(surfaceID: Data, attachment: PeerSurfaceAttachment) async {
+        var wireSeq: UInt64 = 0
+        var lastTapEnd: UInt64?
+        var producerFinished = false
+        var sendSucceeded = true
+        do {
+            for await chunk in attachment.byteStream {
+                try Task.checkCancellation()
+                guard !chunk.bytes.isEmpty else { continue }
+                if let lastTapEnd, chunk.seq > lastTapEnd {
+                    wireSeq &+= chunk.seq - lastTapEnd
+                }
+                let startSeq = wireSeq
+                wireSeq &+= UInt64(chunk.bytes.count)
+                lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
+                try await sendEnvelope { env in
+                    var data = Termmesh_Peer_V1_PtyData()
+                    data.surfaceID = surfaceID
+                    data.byteSeq = startSeq
+                    data.payload = chunk.bytes
+                    env.ptyData = data
+                }
+            }
+            producerFinished = true
+        } catch {
+            sendSucceeded = false
+            PeerServerDiagnostics.record(
+                "model-write-error surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) error=\(String(describing: error))"
+            )
+        }
+        await finishByteStream(
+            surfaceID: surfaceID, producerFinished: producerFinished, sendSucceeded: sendSucceeded
+        )
     }
 
     /// The producer only computes sequence offsets and admits chunks to its
@@ -3244,30 +3302,36 @@ actor PeerServerSession {
                     "pty-writer-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
                 )
             }
-            // Only a cancellation (client detach, goodbye, session end) is
-            // an expected stop. A failed send, an aborted producer (resync
-            // capture failure, crossing chunk) and a finished producer (a
-            // raw-drain overflow finishes every stream of the pane) all leave
-            // the attachment unable to carry output.
-            if !Task.isCancelled {
-                await detachSurface(id: surfaceID)
-                // A connection left open with nothing attached looks healthy
-                // to the viewer: heartbeats still answer, so it never learns
-                // the output stopped and never reattaches. Closing it turns
-                // the silent freeze into an EOF the viewer recovers from. A
-                // connection that also carries the workspace-list
-                // subscription or a leader call is left alone: closing it
-                // would take those down with the pane.
-                if attachments.isEmpty && !workspaceListSubscribed && pendingLeaderCalls.isEmpty {
-                    PeerServerDiagnostics.record(
-                        "transport-close reason=attachment-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) producer_finished=\(producerFinished) send_ok=\(sendSucceeded)"
-                    )
-                    await connection.close()
-                }
-            }
+            await finishByteStream(
+                surfaceID: surfaceID, producerFinished: producerFinished, sendSucceeded: sendSucceeded
+            )
         }, onCancel: {
             Task { await queue.abort() }
         })
+    }
+
+    private func finishByteStream(surfaceID: Data, producerFinished: Bool, sendSucceeded: Bool) async {
+        // Only a cancellation (client detach, goodbye, session end) is
+        // an expected stop. A failed send, an aborted producer (resync
+        // capture failure, crossing chunk) and a finished producer (a
+        // raw-drain overflow finishes every stream of the pane) all leave
+        // the attachment unable to carry output.
+        if !Task.isCancelled {
+            await detachSurface(id: surfaceID)
+            // A connection left open with nothing attached looks healthy
+            // to the viewer: heartbeats still answer, so it never learns
+            // the output stopped and never reattaches. Closing it turns
+            // the silent freeze into an EOF the viewer recovers from. A
+            // connection that also carries the workspace-list
+            // subscription or a leader call is left alone: closing it
+            // would take those down with the pane.
+            if attachments.isEmpty && !workspaceListSubscribed && pendingLeaderCalls.isEmpty {
+                PeerServerDiagnostics.record(
+                    "transport-close reason=attachment-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) producer_finished=\(producerFinished) send_ok=\(sendSucceeded)"
+                )
+                await connection.close()
+            }
+        }
     }
 
     private func detachSurface(id: Data) async {

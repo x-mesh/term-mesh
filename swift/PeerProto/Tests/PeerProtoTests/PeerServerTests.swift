@@ -138,7 +138,98 @@ private actor GapResyncTestProvider: PeerSurfaceProvider {
     }
 }
 
+private actor NativeBurstProvider: PeerSurfaceProvider {
+    let surfaceID = Data(repeating: 0xD6, count: 16)
+    let chunkSize = 43_750
+    let chunkCount = 96
+    private(set) var produced = 0
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = surfaceID
+        surface.surfaceType = "agent"
+        surface.attachable = true
+        return [surface]
+    }
+
+    func attach(surfaceID: Data, clientCols: UInt32, clientRows: UInt32,
+                resumeFromSeq: UInt64) async -> PeerSurfaceAttachment? {
+        guard surfaceID == self.surfaceID else { return nil }
+        return PeerSurfaceAttachment(
+            byteStream: AsyncStream(unfolding: { await self.nextChunk() }),
+            input: { _ in }
+        )
+    }
+
+    private func nextChunk() -> PtyTapChunk? {
+        guard produced < chunkCount else { return nil }
+        let chunk = PtyTapChunk(bytes: Data(repeating: UInt8(produced), count: chunkSize),
+                                seq: 1024 + UInt64(produced * chunkSize))
+        produced += 1
+        return chunk
+    }
+}
+
 final class PeerServerTests: XCTestCase {
+    func testNativeSnapshotLargerThanQueueSurvivesStalledViewer() async throws {
+        let provider = NativeBurstProvider()
+        let socket = "/tmp/tm-native-burst-\(UUID().uuidString.prefix(8)).sock"
+        let server = PeerServer(socketPath: socket, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let transport = try await UnixSocketTransport.connect(socketPath: socket)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        let surfaceID = await provider.surfaceID
+        _ = try await session.attachSurface(id: surfaceID, mode: .readOnly, cols: 1, rows: 1)
+        let timeout = Task {
+            try await Task.sleep(nanoseconds: 10_000_000_000)
+            await transport.close()
+        }
+        defer { timeout.cancel() }
+
+        try await Task.sleep(nanoseconds: 150_000_000)
+        let producedWhileStalled = await provider.produced
+        let chunkCount = await provider.chunkCount
+        let chunkSize = await provider.chunkSize
+        XCTAssertLessThan(producedWhileStalled, chunkCount, "socket pressure must suspend model production")
+        var received = Data()
+        while received.count < chunkCount * chunkSize {
+            let message = try await session.receiveNextMessage()
+            if case .ptyData(let receivedID, let seq, let bytes) = message {
+                XCTAssertEqual(receivedID, surfaceID)
+                XCTAssertEqual(seq, UInt64(received.count))
+                received.append(bytes)
+            }
+        }
+        let expected = (0..<chunkCount).reduce(into: Data()) { bytes, index in
+            bytes.append(Data(repeating: UInt8(index), count: chunkSize))
+        }
+        XCTAssertEqual(received, expected)
+        await transport.close()
+    }
+
+    func testServerInitiatedCloseReclaimsSessionSlotsBeyondCapacity() async throws {
+        let socket = "/tmp/tm-close-slots-\(UUID().uuidString.prefix(8)).sock"
+        let server = PeerServer(socketPath: socket, provider: StaticSurfaceProvider(surfaces: []))
+        try await server.start()
+        defer { Task { await server.stop() } }
+        for _ in 0..<70 {
+            let transport = try await UnixSocketTransport.connect(socketPath: socket)
+            let session = PeerSession(transport: transport)
+            _ = try await session.handshake()
+            let sessions = await server.activeSessions
+            let hostSession = try XCTUnwrap(sessions.first)
+            await hostSession.close()
+            let deadline = Date().addingTimeInterval(2)
+            while !(await server.activeSessions.isEmpty) && Date() < deadline {
+                await Task.yield()
+            }
+            let remaining = await server.activeSessions.count
+            await transport.close()
+            guard remaining == 0 else { return XCTFail("server close retained \(remaining) session slot(s)") }
+        }
+    }
     func testLiveAgentNegotiationAndReadOnlyInputAreEnforcedByHost() async throws {
         let provider = LivePresentationTestProvider()
         let socket = "/tmp/tm-live-gate-\(UUID().uuidString.prefix(8)).sock"
