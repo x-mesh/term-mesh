@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.276.2] - 2026-10-19
+
+### Fixed
+
+- Remote native agent panes now keep large transcript snapshots while reconnecting. The host sends each model update only after the viewer receives the previous one, and releases the connection slot when a viewer disconnects. Repeated reconnects no longer exhaust the peer connection limit.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.276.1] - 2026-10-19
 
 ### Fixed
