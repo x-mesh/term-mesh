@@ -377,6 +377,8 @@ enum RemoteLiveProjectFixture {
     private static var staleRevisionRefusal = false
     private static var staleIncarnationRefusal = false
     private static var savedBoardVisibility: Bool?
+    private static var snapshotBytes = 0
+    private static var activeServerSessions = 0
     // Hold the closed window's manager, as SwiftUI does for the primary scene.
     private static var retainedViewerManager: TabManager?
 
@@ -392,6 +394,8 @@ enum RemoteLiveProjectFixture {
             identityRefusal = false
             staleRevisionRefusal = false
             staleIncarnationRefusal = false
+            snapshotBytes = min(8 * 1024 * 1024, max(0, params["snapshot_bytes"] as? Int ?? 0))
+            activeServerSessions = 0
             savedBoardVisibility = ReviewBoardSettings.isVisible
             retainedViewerManager = (params["viewer_window_id"] as? String)
                 .flatMap(UUID.init(uuidString:))
@@ -417,6 +421,13 @@ enum RemoteLiveProjectFixture {
                         session?.consume(bytes)
                     })
                     session.appendLocalNotice("before attach worker-\(index)")
+                    if index == 0 {
+                        for offset in stride(from: 0, to: snapshotBytes, by: 1024) {
+                            session.appendLocalNotice(
+                                "snapshot-\(offset):" + String(repeating: "s", count: min(1024, snapshotBytes - offset))
+                            )
+                        }
+                    }
                     members.append(.init(id: "worker-\(index)@\(name)", name: "worker-\(index)",
                         teamName: name, cli: "claude", launchCommand: "", model: "fixture",
                         agentType: "executor", color: "green", instructions: "",
@@ -435,7 +446,11 @@ enum RemoteLiveProjectFixture {
                 }
                 let path = "/tmp/tm-live-fixture-\(UUID().uuidString.prefix(8)).sock"
                 let provider = GhosttyPaneSurfaceProvider()
-                let listener = PeerServer(socketPath: path, provider: provider)
+                var config = PeerServerConfig()
+                config.onActiveSessionCountChange = { count in
+                    Task { @MainActor in activeServerSessions = count }
+                }
+                let listener = PeerServer(socketPath: path, provider: provider, config: config)
                 server = listener
                 do {
                     try await listener.start()
@@ -614,6 +629,8 @@ enum RemoteLiveProjectFixture {
             "source_panels": source?.panels.count ?? 0,
             "viewer_panels": viewer?.panels.count ?? 0,
             "matching_transcripts": matching, "input_echoes": echoes,
+            "snapshot_bytes": snapshotBytes, "server_active_sessions": activeServerSessions,
+            "server_socket": host?.activeSockPath ?? "",
             "viewer_id": viewer?.id.uuidString ?? "",
             "viewer_window_id": windowID(of: viewer),
             "source_id": source?.id.uuidString ?? "",
