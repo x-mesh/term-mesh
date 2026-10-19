@@ -67,7 +67,7 @@ def main() -> int:
                 call("reconnect")
                 current = wait(
                     lambda status: ready(status)
-                    and status["viewer_agent_ids"] != previous["viewer_agent_ids"]
+                    and set(status["viewer_agent_ids"]).isdisjoint(previous["viewer_agent_ids"])
                     and status["server_active_sessions"] <= baseline,
                     f"reconnect {cycle + 1} with reclaimed server sessions",
                 )
