@@ -102,6 +102,9 @@ impl<T: Transport> AcpBridge<T> {
         out.turn_begins();
 
         let mut said = String::new();
+        // ACP marks no message boundary except the tool call between two, and
+        // the header the app reads has to start a line of the result.
+        let mut after_tool = false;
         // A tool's output can arrive across several updates, before the one
         // that reports its status.
         let mut tool_output: HashMap<String, String> = HashMap::new();
@@ -150,10 +153,17 @@ impl<T: Transport> AcpBridge<T> {
                         .and_then(|c| c.get("text"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    if after_tool && !chunk.is_empty() && !said.is_empty() {
+                        said.push('\n');
+                    }
+                    if !chunk.is_empty() {
+                        after_tool = false;
+                    }
                     said.push_str(chunk);
                     out.delta(chunk, false);
                 }
                 "tool_call" => {
+                    after_tool = true;
                     let name = update
                         .get("title")
                         .and_then(Value::as_str)
@@ -490,5 +500,53 @@ mod tests {
         b.turn("do work", Some(Duration::from_secs(2)));
 
         assert_eq!(last_result(&sink)["stop_reason"], "process_exited");
+    }
+
+    /// Text on either side of a tool call is two messages. Joined as one, the
+    /// header that opens the second lands mid-line, where the app, which reads
+    /// line starts, never finds it and the task it answers stays open.
+    #[test]
+    fn text_on_either_side_of_a_tool_call_stays_on_separate_lines() {
+        let (mut b, sink) = bridge(vec![
+            update(json!({"sessionUpdate": "agent_message_chunk",
+                          "content": {"type": "text", "text": "Checking."}})),
+            update(json!({"sessionUpdate": "tool_call", "toolCallId": "t1",
+                          "title": "shell", "rawInput": {"command": "echo hi"}})),
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                          "status": "completed",
+                          "content": [{"type": "text", "text": "hi"}]}),
+            ),
+            update(json!({"sessionUpdate": "agent_message_chunk",
+                          "content": {"type": "text", "text": "STATUS: DONE\nFILES: none"}})),
+            json!({"id": 1, "result": {"stopReason": "end_turn"}}),
+        ]);
+
+        b.turn("do work", Some(Duration::from_secs(2)));
+
+        assert_eq!(
+            last_result(&sink)["result"],
+            "Checking.\nSTATUS: DONE\nFILES: none"
+        );
+        // The app splits a turn's messages by block, so the open text block
+        // has to close before the tool row, not after the turn.
+        let kinds: Vec<String> = sink
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e["type"].as_str() {
+                Some("stream_event") => e["event"]["type"].as_str().map(str::to_string),
+                Some("assistant") => e["message"]["content"][0]["type"]
+                    .as_str()
+                    .map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        let stop = kinds
+            .iter()
+            .position(|k| k == "content_block_stop")
+            .expect("a stop");
+        let tool = kinds.iter().position(|k| k == "tool_use").expect("a tool");
+        assert!(stop < tool, "{kinds:?}");
     }
 }

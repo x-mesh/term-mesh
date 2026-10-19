@@ -465,10 +465,8 @@ fn stale_precondition_and_unicode_case_collisions_mutate_nothing() {
             },
         ],
     };
-    assert!(matches!(
-        store.apply(&root, &cas, object_domain, &collision),
-        Err(ApplyError::Sandbox(_))
-    ));
+    let result = store.apply(&root, &cas, object_domain, &collision);
+    assert!(matches!(result, Err(ApplyError::Sandbox(_))), "{result:?}");
     assert!(store.visible_state(project).unwrap().is_none());
 }
 

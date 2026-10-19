@@ -344,7 +344,11 @@ impl<T: Transport> CodexBridge<T> {
         out.turn_begins();
 
         let mut said: Vec<String> = Vec::new();
-        let mut streamed = false;
+        // Deltas of the message still being streamed. codex sends a turn's
+        // commentary and its final answer as separate messages; concatenating
+        // their deltas glued `STATUS:` onto the end of the commentary line,
+        // where the header parser, which reads line starts, never found it.
+        let mut open_message = String::new();
         let mut errors: Vec<TurnError> = Vec::new();
         // `thread/tokenUsage/updated` lands before `turn/completed`, so the
         // figures are held here until the turn is reported.
@@ -419,8 +423,7 @@ impl<T: Transport> CodexBridge<T> {
             if method == "item/agentMessage/delta" {
                 if let Some(chunk) = p.get("delta").and_then(Value::as_str) {
                     if !chunk.is_empty() {
-                        streamed = true;
-                        said.push(chunk.to_string());
+                        open_message.push_str(chunk);
                         out.delta(chunk, false);
                     }
                 }
@@ -437,8 +440,11 @@ impl<T: Transport> CodexBridge<T> {
                 match kind {
                     "agentMessage" | "assistant_message" | "message" => {
                         // Already drawn delta by delta; the completed item is
-                        // the same text arriving whole.
-                        if streamed {
+                        // the same text arriving whole. Streaming is decided
+                        // per message: one turn can stream its commentary and
+                        // send the answer only whole.
+                        if !open_message.is_empty() {
+                            said.push(std::mem::take(&mut open_message));
                             out.block_done();
                             return;
                         }
@@ -512,11 +518,10 @@ impl<T: Transport> CodexBridge<T> {
         let done = rpc.pump(None, timeout, Some(&mut notify), Some("turn/completed"));
         out.block_done();
 
-        let final_text = if streamed {
-            said.concat()
-        } else {
-            said.join("\n")
-        };
+        if !open_message.is_empty() {
+            said.push(open_message);
+        }
+        let final_text = said.join("\n");
 
         // A failed turn already said why — twice, as the `error` notification
         // and again in the completed turn. Measured against a peer whose login
@@ -934,6 +939,73 @@ mod tests {
         assert_eq!(result["result"], "SMOKE_OK");
         assert_eq!(result["stop_reason"], "end_turn");
         assert_eq!(result["is_error"], false);
+    }
+
+    /// Measured on a live codex turn: a commentary message, a command, then
+    /// the final answer. The header the app reads line by line has to start a
+    /// line of the result, or the task it answers is never closed.
+    #[test]
+    fn streamed_messages_stay_on_separate_lines() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "item/agentMessage/delta", "params": {"delta": "Reviewing."}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "Reviewing."}}}),
+            json!({"method": "item/completed", "params": {"item": {
+                "type": "commandExecution", "id": "c1", "command": "echo hi",
+                "exitCode": 0, "aggregatedOutput": "hi"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"delta": "STATUS: DONE\n"}}),
+            json!({"method": "item/agentMessage/delta", "params": {"delta": "FILES: none"}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage",
+                                       "text": "STATUS: DONE\nFILES: none"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("review it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        assert_eq!(result["result"], "Reviewing.\nSTATUS: DONE\nFILES: none");
+    }
+
+    #[test]
+    fn a_whole_message_after_a_streamed_one_is_kept() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "item/agentMessage/delta", "params": {"delta": "Reviewing."}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "Reviewing."}}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage",
+                                       "text": "STATUS: DONE\nFILES: none"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("review it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        assert_eq!(result["result"], "Reviewing.\nSTATUS: DONE\nFILES: none");
+    }
+
+    #[test]
+    fn whole_messages_stay_on_separate_lines() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "Reviewing."}}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage",
+                                       "text": "STATUS: DONE\nFILES: none"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("review it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        assert_eq!(result["result"], "Reviewing.\nSTATUS: DONE\nFILES: none");
     }
 
     #[test]
