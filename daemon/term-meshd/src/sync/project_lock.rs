@@ -6,8 +6,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const PROJECT_LOCK_DIR: &str = ".term-mesh-project-locks";
+const SPAWNED_CHILD_HOLD: Duration = Duration::from_millis(100);
 
 pub(crate) struct ProjectLease {
     _file: File,
@@ -113,19 +115,27 @@ pub(crate) fn acquire_project_file_lease_at(
         file.sync_all()?;
         lock_dir.sync_all()?;
     }
-    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // A child this process is spawning holds a copy of every descriptor,
+    // `O_CLOEXEC` ones included, until it execs, and with it the flock of a
+    // lease the parent already released. Measured on macOS: 1 in 100 to 150
+    // acquisitions of a free lease failed while other threads spawned
+    // processes, and every one of them succeeded within 2ms.
+    let deadline = Instant::now() + SPAWNED_CHILD_HOLD;
+    loop {
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(ProjectLease { _file: file });
+        }
         let error = io::Error::last_os_error();
-        return Err(
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK)
-                || error.raw_os_error() == Some(libc::EAGAIN)
-            {
-                ProjectLockError::Busy
-            } else {
-                ProjectLockError::Io(error)
-            },
-        );
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+            && error.raw_os_error() != Some(libc::EAGAIN)
+        {
+            return Err(ProjectLockError::Io(error));
+        }
+        if Instant::now() >= deadline {
+            return Err(ProjectLockError::Busy);
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    Ok(ProjectLease { _file: file })
 }
 
 fn open_directory_at(parent_fd: libc::c_int, name: &CString) -> Result<File, ProjectLockError> {
@@ -140,4 +150,57 @@ fn open_directory_at(parent_fd: libc::c_int, name: &CString) -> Result<File, Pro
         return Err(ProjectLockError::Io(io::Error::last_os_error()));
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn a_child_being_spawned_does_not_make_a_free_lease_busy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = File::open(temporary.path()).unwrap();
+        let project = ProjectId::from_bytes([7; 32]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/usr/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+
+        let busy = (0..3000)
+            .filter(|_| {
+                matches!(
+                    acquire_project_file_lease_at(&parent, project),
+                    Err(ProjectLockError::Busy)
+                )
+            })
+            .count();
+
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(busy, 0);
+    }
+
+    #[test]
+    fn a_held_lease_is_still_busy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = File::open(temporary.path()).unwrap();
+        let project = ProjectId::from_bytes([8; 32]);
+        let _held = acquire_project_file_lease_at(&parent, project).unwrap();
+
+        assert!(matches!(
+            acquire_project_file_lease_at(&parent, project),
+            Err(ProjectLockError::Busy)
+        ));
+    }
 }
