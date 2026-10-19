@@ -497,6 +497,10 @@ class Emitter:
         A caller with `fields` must not also send `command`: the reader tries
         that key first, so a `command` present at all hides the path behind it.
         """
+        # A tool call ends the message before it. ACP has no message-completed
+        # event, so left open, the text after the tool grew the same block and
+        # the app saw one message where the agent wrote two.
+        self.block_done()
         body = dict(fields) if fields is not None else {"command": headline}
         block = {"type": "tool_use", "name": name, "input": body}
         if call_id:
@@ -1146,6 +1150,11 @@ class CodexBridge:
         self.out.sent(text)
         self.out.turn_begins()
         said: list[str] = []
+        # Deltas of the message still being streamed. codex sends a turn's
+        # commentary and its final answer as separate messages; concatenating
+        # their deltas glued `STATUS:` onto the end of the commentary line,
+        # where the header parser, which reads line starts, never found it.
+        open_message: list[str] = []
         streamed = [False]
         failed_because: list[str] = []
         # `thread/tokenUsage/updated` lands before `turn/completed`, so the
@@ -1192,7 +1201,7 @@ class CodexBridge:
                 chunk = p.get("delta") or ""
                 if chunk:
                     streamed[0] = True
-                    said.append(chunk)
+                    open_message.append(chunk)
                     self.out.delta(chunk)
                 return
             if m == "item/completed":
@@ -1202,6 +1211,9 @@ class CodexBridge:
                     # Already drawn delta by delta; the completed item is the
                     # same text arriving whole.
                     if streamed[0]:
+                        if open_message:
+                            said.append("".join(open_message))
+                            open_message.clear()
                         self.out.block_done()
                         return
                     body = item.get("text") or item.get("content") or ""
@@ -1253,7 +1265,9 @@ class CodexBridge:
         done = self.rpc.pump(until_id=None, timeout=timeout,
                              on_notify=notify, until_method="turn/completed")
         self.out.block_done()
-        final = ("" if streamed[0] else "\n").join(said)
+        if open_message:
+            said.append("".join(open_message))
+        final = "\n".join(said)
         # A failed turn already said why — twice, as the `error` notification
         # and again in the completed turn. Measured against a peer whose login
         # shell never exported the provider's API key: codex reported
@@ -1389,6 +1403,7 @@ class AcpBridge:
         self.out.sent(text)
         self.out.turn_begins()
         said: list[str] = []
+        after_tool = [False]
 
         def notify(o: dict) -> None:
             if o.get("method") != "session/update":
@@ -1399,9 +1414,16 @@ class AcpBridge:
                 # These were always chunks. Joining them and showing the result
                 # at the end threw away the one thing they were good for.
                 chunk = (u.get("content") or {}).get("text", "")
+                # ACP marks no message boundary except the tool call between
+                # two, and the header the app reads has to start a line.
+                if after_tool[0] and chunk and said:
+                    said.append("\n")
+                if chunk:
+                    after_tool[0] = False
                 said.append(chunk)
                 self.out.delta(chunk)
             elif kind == "tool_call":
+                after_tool[0] = True
                 # `str(dict)` is a python repr, and a python repr is what this
                 # row has been drawing where a path belongs. Hand the object
                 # over and let the reader pick its own field out of it.

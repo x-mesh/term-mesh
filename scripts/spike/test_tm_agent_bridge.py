@@ -372,7 +372,10 @@ def codex_bridge(frames=()) -> tuple:
     bridge.child = child
     bridge.out = emitter
     bridge.cwd = "/tmp/project"
-    bridge.model = None
+    # The constructor's defaults: without `effort` every codex turn here died
+    # on an AttributeError before reaching what the test meant to check.
+    bridge.model = BRIDGE.CONTROL_FIELD_MISSING
+    bridge.effort = BRIDGE.CONTROL_FIELD_MISSING
     bridge.thread_id = "thread-1"
     bridge.rpc = BRIDGE.JsonRpc(child, emitter, on_request=bridge._serve_request)
     return bridge, child, emitter
@@ -800,6 +803,72 @@ class TimeoutTests(unittest.TestCase):
         self.assertIsNotNone(child.returncode)
         self.assertTrue(child.stdin.closed)
         self.assertTrue(child.stdout.closed)
+
+
+class MessageBoundaryTests(unittest.TestCase):
+    """A turn's messages stay on separate lines of its result.
+
+    Measured on a live codex turn: a commentary message, a command, then the
+    final answer. Glued together, `STATUS:` landed mid-line, where the app,
+    which reads line starts, never found it and the task stayed open.
+    """
+
+    HEADER = "STATUS: DONE\nFILES: none"
+
+    def last_result(self, out) -> dict:
+        return [e for e in out.events if e.get("type") == "result"][-1]
+
+    def test_codex_streamed_messages_stay_on_separate_lines(self):
+        bridge, _, out = codex_bridge([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+             "params": {"delta": "Reviewing."}},
+            {"jsonrpc": "2.0", "method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "Reviewing."}}},
+            {"jsonrpc": "2.0", "method": "item/completed", "params": {"item": {
+                "type": "commandExecution", "id": "c1", "command": "echo hi",
+                "exitCode": 0, "aggregatedOutput": "hi"}}},
+            {"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+             "params": {"delta": "STATUS: DONE\n"}},
+            {"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+             "params": {"delta": "FILES: none"}},
+            {"jsonrpc": "2.0", "method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": self.HEADER}}},
+            {"jsonrpc": "2.0", "method": "turn/completed",
+             "params": {"threadId": "thread-1", "turn": {"status": "completed"}}},
+        ])
+
+        bridge.turn("review it", timeout=2)
+
+        self.assertEqual(self.last_result(out)["result"], "Reviewing.\n" + self.HEADER)
+
+    def test_acp_text_on_either_side_of_a_tool_call_stays_on_separate_lines(self):
+        bridge, _, out = acp_bridge([
+            {"jsonrpc": "2.0", "method": "session/update", "params": {
+                "update": {"sessionUpdate": "agent_message_chunk",
+                           "content": {"text": "Checking."}}}},
+            {"jsonrpc": "2.0", "method": "session/update", "params": {
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "t1",
+                           "title": "shell", "rawInput": {"command": "echo hi"}}}},
+            {"jsonrpc": "2.0", "method": "session/update", "params": {
+                "update": {"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                           "status": "completed",
+                           "content": [{"type": "text", "text": "hi"}]}}},
+            {"jsonrpc": "2.0", "method": "session/update", "params": {
+                "update": {"sessionUpdate": "agent_message_chunk",
+                           "content": {"text": self.HEADER}}}},
+            {"jsonrpc": "2.0", "id": 1, "result": {"stopReason": "end_turn"}},
+        ])
+
+        bridge.turn("do work", timeout=2)
+
+        self.assertEqual(self.last_result(out)["result"], "Checking.\n" + self.HEADER)
+        # The app splits a turn's messages by block, so the open text block
+        # has to close before the tool row.
+        kinds = [e["event"]["type"] if e.get("type") == "stream_event"
+                 else e["message"]["content"][0]["type"]
+                 for e in out.events if e.get("type") in ("stream_event", "assistant")]
+        self.assertLess(kinds.index("content_block_stop"), kinds.index("tool_use"), kinds)
 
 
 class ClampTests(unittest.TestCase):
