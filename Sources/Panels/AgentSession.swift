@@ -3607,7 +3607,17 @@ final class AgentSession {
         }
         openTools.removeAll()
         let spoken = saidThisTurn.joined(separator: "\n")
-        let final = o["result"] as? String ?? spoken
+        // claude's `result` is the turn's last message only. A header written
+        // before a final tool call left the task open while the footer, which
+        // reads every message, showed it as the verdict.
+        let final: String
+        if let reported = o["result"] as? String,
+           AgentPipeCompletion.explicitStatus(in: reported) != nil
+            || AgentPipeCompletion.explicitStatus(in: spoken) == nil {
+            final = reported
+        } else {
+            final = spoken
+        }
         if failed {
             let activityDetail = final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? (reason.isEmpty ? "the agent reported a failed turn" : "the agent reported: \(reason)")

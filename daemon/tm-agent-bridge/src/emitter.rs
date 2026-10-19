@@ -90,6 +90,10 @@ impl Emitter {
     }
 
     fn tool_block(&mut self, name: &str, input: Value, call_id: &str) {
+        // A tool call ends the message before it. ACP has no message-completed
+        // event, so left open, the text after the tool grew the same block and
+        // the app saw one message where the agent wrote two.
+        self.block_done();
         let mut block = Map::new();
         block.insert("type".into(), Value::String("tool_use".into()));
         block.insert("name".into(), Value::String(name.to_string()));

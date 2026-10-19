@@ -3021,6 +3021,46 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(seen, ["e82188a0", "e82188a0", nil])
     }
 
+    /// Measured on claude: `result` is the turn's last message only, so a
+    /// header written before a final tool call never reached the task board
+    /// while the footer, which reads every message, showed it as the verdict.
+    func testAHeaderInAnEarlierMessageOfTheTurnStillAnswersTheTask() throws {
+        var finals: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { final, _, _ in finals.append(final) }
+        s.beginTurnForTesting(taskId: "4fd11ee6")
+        s.ingestForTesting(assistantSaid("STATUS: DONE\nFILES: none"))
+        s.ingestForTesting(assistantSaid("Double-checked."))
+        s.ingestForTesting(resultSaying("Double-checked."))
+        XCTAssertNil(s.pendingTaskIdForTesting)
+        XCTAssertEqual(finals, ["STATUS: DONE\nFILES: none\nDouble-checked."])
+    }
+
+    /// What the codex bridge emitted for the reviewer incident: each message
+    /// its own block, but a `result` that glued them, putting `STATUS:` in the
+    /// middle of a line. The blocks still say where the header starts.
+    func testABridgedTurnWhoseResultGluedTheHeaderStillAnswersTheTask() throws {
+        var finals: [String] = []
+        let s = AgentSession()
+        s.onTurnEnd = { final, _, _ in finals.append(final) }
+        s.beginTurnForTesting(taskId: "4fd11ee6")
+        s.ingestForTesting(blockStart(0, "text"))
+        s.ingestForTesting(delta(0, "Checking the workspace."))
+        s.ingestForTesting(blockStop(0))
+        s.ingestForTesting(event(["type": "assistant", "message": ["content": [
+            ["type": "tool_use", "id": "c1", "name": "shell",
+             "input": ["command": "echo hi"]]]]]))
+        s.ingestForTesting(event(["type": "user", "message": ["content": [
+            ["type": "tool_result", "tool_use_id": "c1", "content": "hi",
+             "is_error": false]]]]))
+        s.ingestForTesting(blockStart(0, "text"))
+        s.ingestForTesting(delta(0, "STATUS: DONE\nFILES: none"))
+        s.ingestForTesting(blockStop(0))
+        s.ingestForTesting(resultSaying("Checking the workspace.STATUS: DONE\nFILES: none"))
+        XCTAssertNil(s.pendingTaskIdForTesting)
+        XCTAssertEqual(finals, ["Checking the workspace.\nSTATUS: DONE\nFILES: none"])
+    }
+
     // MARK: - A task the worker finishes in a turn of its own
 
     private func assistantSaid(_ text: String) -> String {
