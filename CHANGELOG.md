@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.276.1] - 2026-10-19
+
+### Fixed
+
+- A team task now closes when the worker answers with `STATUS: DONE` in a turn that has more than one message. Before, if the worker wrote a short note, ran a tool, and then wrote its `STATUS:` header, the task stayed open: `tm-agent wait` kept waiting, and the task moved to blocked after 10 minutes. The footer still showed the verdict. The bridge for Codex, Kiro, and Gemini joined the messages on either side of a tool call into one line, so the header was not at the start of a line, where term-mesh looks for it. Claude Code reported only its last message, so a header written before a final tool call was not read. Each message now starts on its own line, and a Claude turn is read whole when its last message has no header.
+
+- Applying a synced project no longer fails now and then with a "busy" project lock when nothing else holds the lock. While the daemon started another process, such as a terminal or an agent, the new process briefly held a copy of the lock that the daemon had already released. The daemon now waits up to 100ms for that copy to go away before it reports the project as busy.
+
+### Changed
+
+- The release process now runs the daemon test suite with four test threads, because timed terminal tests failed at the runner's default parallelism.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.276.0] - 2026-10-18
 
 ### Fixed
