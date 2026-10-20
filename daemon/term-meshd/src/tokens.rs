@@ -482,9 +482,44 @@ impl UsageTracker {
             .collect()
     }
 
+    /// The session a running Claude process names for itself, or None when it
+    /// has not written one or the record belongs to an earlier process that
+    /// held the same pid.
+    pub fn session_for_pid(&self, pid: u32, proc_start: i64) -> Option<String> {
+        let sessions_dir = self
+            .state
+            .lock()
+            .unwrap()
+            .claude_projects_dir
+            .parent()?
+            .join("sessions");
+        claude_session_for_pid(&sessions_dir, pid, proc_start)
+    }
+
     /// Both public views come from one walk so they can never disagree about
     /// which session a panel is running.
     fn correlate_panels(&self, panes: &[(String, String, i64, u32)]) -> PanelCorrelation {
+        self.correlate_panels_with(panes, &|pid, proc_start| {
+            self.session_for_pid(pid, proc_start)
+        })
+    }
+
+    /// A process's own record wins over inference. Directory and start-time
+    /// pairing is the fallback for a CLI that wrote none, and it cannot tell
+    /// apart a resumed (`-c`) session, which began before its process did, or
+    /// a `/clear`, which starts a new session in the same process.
+    fn correlate_panels_with(
+        &self,
+        panes: &[(String, String, i64, u32)],
+        pinned_session: &dyn Fn(u32, i64) -> Option<String>,
+    ) -> PanelCorrelation {
+        // Resolved before the lock: the lookup reads files.
+        let pinned: HashMap<&str, String> = panes
+            .iter()
+            .filter_map(|(panel_id, _, proc_start, pid)| {
+                pinned_session(*pid, *proc_start).map(|sid| (panel_id.as_str(), sid))
+            })
+            .collect();
         const MAX_DIFF: i64 = 300;
         // A CLI opens its session after it starts, so a session that began
         // before the process did belongs to an earlier run in the same
@@ -501,7 +536,12 @@ impl UsageTracker {
         // (started_at, session_id, tokens) per cwd, sorted by (started_at, session_id).
         let mut sessions_by_cwd: HashMap<&str, Vec<(i64, &str, (u64, u64, u64, u64))>> =
             HashMap::new();
+        let claimed: std::collections::HashSet<&str> =
+            pinned.values().map(String::as_str).collect();
         for s in state.sessions.values() {
+            if claimed.contains(s.session_id.as_str()) {
+                continue;
+            }
             let Some(&started) = state.session_started_at.get(&s.session_id) else {
                 continue;
             };
@@ -527,6 +567,9 @@ impl UsageTracker {
         // Group panes by cwd.
         let mut panes_by_cwd: HashMap<&str, Vec<(&str, i64, u32)>> = HashMap::new();
         for (panel_id, cwd, proc_start, pid) in panes {
+            if pinned.contains_key(panel_id.as_str()) {
+                continue;
+            }
             panes_by_cwd.entry(cwd.as_str()).or_default().push((
                 panel_id.as_str(),
                 *proc_start,
@@ -534,7 +577,25 @@ impl UsageTracker {
             ));
         }
 
-        let mut by_panel = HashMap::new();
+        let mut by_panel: PanelCorrelation = pinned
+            .iter()
+            .map(|(&panel_id, sid)| {
+                // A session with no assistant line yet has booked nothing.
+                let tokens = state
+                    .sessions
+                    .get(sid)
+                    .map(|s| {
+                        (
+                            s.input_tokens,
+                            s.output_tokens,
+                            s.cache_read_tokens,
+                            s.cache_write_tokens,
+                        )
+                    })
+                    .unwrap_or_default();
+                (panel_id.to_string(), (sid.clone(), tokens))
+            })
+            .collect();
         for (cwd, mut cwd_panes) in panes_by_cwd {
             let Some(cwd_sessions) = sessions_by_cwd.get(cwd) else {
                 continue;
@@ -694,6 +755,45 @@ fn record_session_start(state: &mut TrackerState, entry: &JsonlLine) {
 /// Parse an ISO-8601 UTC timestamp ("YYYY-MM-DDTHH:MM:SS(.sss)Z") to Unix
 /// seconds. Sub-second precision and the trailing 'Z' are ignored. Returns
 /// None if the prefix does not match the expected fixed-width layout.
+/// What `~/.claude/sessions/<pid>.json` says the process `pid` is running.
+///
+/// Claude Code rewrites the file when the process starts a new session
+/// (`/clear`). A record can outlive its process, so a reused pid can meet a
+/// stale one. `procStart` (UTC, second-granular) must match the
+/// live process's start or the record is ignored.
+fn claude_session_for_pid(sessions_dir: &Path, pid: u32, proc_start: i64) -> Option<String> {
+    const START_TOLERANCE_SECS: i64 = 2;
+    let raw = std::fs::read_to_string(sessions_dir.join(format!("{pid}.json"))).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if record.get("pid")?.as_u64()? != u64::from(pid) {
+        return None;
+    }
+    let started = ctime_utc_to_unix(record.get("procStart")?.as_str()?)?;
+    if (started - proc_start).abs() > START_TOLERANCE_SECS {
+        return None;
+    }
+    let session_id = record.get("sessionId")?.as_str()?;
+    (!session_id.is_empty()).then(|| session_id.to_string())
+}
+
+/// `Tue Oct 20 08:19:36 2026` (UTC) → Unix seconds.
+fn ctime_utc_to_unix(s: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = s.split_whitespace();
+    let _weekday = parts.next()?;
+    let month_name = parts.next()?;
+    let month = MONTHS.iter().position(|m| *m == month_name)? + 1;
+    let day: u32 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let year: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || time.len() != 8 {
+        return None;
+    }
+    iso8601_to_unix(&format!("{year:04}-{month:02}-{day:02}T{time}"))
+}
+
 pub(crate) fn iso8601_to_unix(s: &str) -> Option<i64> {
     if s.len() < 19 {
         return None;
@@ -1578,5 +1678,132 @@ mod tests {
     #[test]
     fn parse_empty_string_returns_error() {
         assert!(serde_json::from_str::<JsonlLine>("").is_err());
+    }
+
+    /// Two Claude panes in one directory, the earlier one resumed with `-c`:
+    /// its session began an hour before its process. Pairing by start time
+    /// gives the later pane nothing.
+    fn resumed_and_fresh_in_one_cwd() -> (UsageTracker, Vec<(String, String, i64, u32)>) {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        let resumed = assistant_entry(
+            "sessResumed",
+            Some("/cwd/shared"),
+            Some("2026-05-13T00:00:00.000Z"),
+            usage(100, 50, 0, 0),
+        );
+        let fresh = assistant_entry(
+            "sessFresh",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:09:25.000Z"),
+            usage(7, 3, 0, 0),
+        );
+        for entry in [&resumed, &fresh] {
+            record_session_start(&mut state, entry);
+            process_line(&mut state, entry, &path);
+        }
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let panes = vec![
+            (
+                "panelResumed".to_string(),
+                "/cwd/shared".to_string(),
+                base,
+                10_u32,
+            ),
+            (
+                "panelFresh".to_string(),
+                "/cwd/shared".to_string(),
+                base + 564,
+                20_u32,
+            ),
+        ];
+        (tracker, panes)
+    }
+
+    #[test]
+    fn start_time_pairing_alone_loses_the_pane_after_a_resumed_one() {
+        let (tracker, panes) = resumed_and_fresh_in_one_cwd();
+        let sessions = tracker.correlate_panels_with(&panes, &|_, _| None);
+        assert!(!sessions.contains_key("panelFresh"));
+    }
+
+    #[test]
+    fn a_process_record_places_both_panes() {
+        let (tracker, panes) = resumed_and_fresh_in_one_cwd();
+        let sessions = tracker.correlate_panels_with(&panes, &|pid, _| match pid {
+            10 => Some("sessResumed".to_string()),
+            20 => Some("sessFresh".to_string()),
+            _ => None,
+        });
+        assert_eq!(sessions["panelResumed"].0, "sessResumed");
+        assert_eq!(sessions["panelResumed"].1 .0, 100);
+        assert_eq!(sessions["panelFresh"].0, "sessFresh");
+        assert_eq!(sessions["panelFresh"].1 .0, 7);
+    }
+
+    /// Pinning one pane takes it and its session out of the pairing, so the
+    /// pane without a record pairs with what is left.
+    #[test]
+    fn a_pinned_pane_leaves_the_pairing_to_the_others() {
+        let (tracker, panes) = resumed_and_fresh_in_one_cwd();
+        let sessions = tracker.correlate_panels_with(&panes, &|pid, _| {
+            (pid == 10).then(|| "sessResumed".to_string())
+        });
+        assert_eq!(sessions["panelFresh"].0, "sessFresh");
+    }
+
+    /// A `/clear` names a session with no assistant line yet.
+    #[test]
+    fn a_pinned_session_without_usage_books_zero() {
+        let (tracker, panes) = resumed_and_fresh_in_one_cwd();
+        let sessions = tracker.correlate_panels_with(&panes, &|pid, _| {
+            (pid == 20).then(|| "sessCleared".to_string())
+        });
+        assert_eq!(
+            sessions["panelFresh"],
+            ("sessCleared".to_string(), (0, 0, 0, 0))
+        );
+    }
+
+    fn write_pid_record(dir: &Path, pid: u32, session: &str, proc_start: &str) {
+        std::fs::write(
+            dir.join(format!("{pid}.json")),
+            format!(
+                r#"{{"pid":{pid},"sessionId":"{session}","cwd":"/cwd","procStart":"{proc_start}","kind":"interactive"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pid_record_names_the_session_of_the_live_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_pid_record(dir.path(), 4242, "sess-live", "Tue Oct 20 08:19:36 2026");
+        let start = iso8601_to_unix("2026-10-20T08:19:36Z").unwrap();
+        assert_eq!(
+            claude_session_for_pid(dir.path(), 4242, start + 1).as_deref(),
+            Some("sess-live")
+        );
+    }
+
+    #[test]
+    fn pid_record_of_an_earlier_process_is_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_pid_record(dir.path(), 4242, "sess-old", "Mon Oct 19 08:19:36 2026");
+        let start = iso8601_to_unix("2026-10-20T08:19:36Z").unwrap();
+        assert_eq!(claude_session_for_pid(dir.path(), 4242, start), None);
+        assert_eq!(claude_session_for_pid(dir.path(), 4243, start), None);
+    }
+
+    #[test]
+    fn ctime_with_a_padded_single_digit_day_parses() {
+        assert_eq!(
+            ctime_utc_to_unix("Sun Oct  4 11:45:23 2026"),
+            iso8601_to_unix("2026-10-04T11:45:23Z")
+        );
+        assert_eq!(ctime_utc_to_unix("Sun Oct 4 11:45 2026"), None);
     }
 }
