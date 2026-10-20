@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.276.3] - 2026-10-20
+
+### Fixed
+
+- Mobile remote control now finds the conversation of a Claude or Codex pane that you expose with the phone icon in the pane header. Before, the daemon matched panes to sessions by directory and start time. When another pane in the same directory had resumed an older session with `claude -c`, or a pane had started a new session with `/clear`, the phone could not show that pane's conversation. A Claude pane and a Codex pane in the same directory could also take each other's session. The daemon now uses the session that each Claude process records for itself and the rollout file that a Codex process holds open, and it falls back to the old matching only when neither is available. A Codex pane connected to the shared Codex app server still uses the old matching, so a Codex session resumed there can still go unmatched.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.276.2] - 2026-10-19
 
 ### Fixed
