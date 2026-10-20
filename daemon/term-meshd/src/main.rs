@@ -18,6 +18,7 @@ mod monitor;
 mod pane_tracker;
 mod paste_cleanup;
 mod peer;
+mod proc_files;
 mod remote;
 mod shutdown;
 mod socket;
@@ -1091,8 +1092,12 @@ fn mobile_session_resolver(
             );
             return None;
         };
+        // One CLI's sessions pair only with that CLI's panes, as the token
+        // broadcasts already do. A Codex pane in the same directory would
+        // otherwise take a Claude session's slot, and the reverse.
         let correlation: Vec<(String, String, i64, u32)> = panes
             .iter()
+            .filter(|(_, pane)| pane.cli == info.cli)
             .map(|(panel_id, pane)| {
                 (
                     panel_id.clone(),
@@ -1102,26 +1107,41 @@ fn mobile_session_resolver(
                 )
             })
             .collect();
-        let session_id = match info.cli.as_str() {
-            "claude" => usage_tracker
-                .sessions_by_panel(&correlation)
-                .remove(surface_id),
-            "codex" => codex
-                .as_ref()
-                .and_then(|c| c.sessions_by_panel(&correlation).ok())
-                .and_then(|mut m| m.remove(surface_id)),
+        // The process's own record first; the cwd/start-time pairing only
+        // when the CLI has not named its session.
+        let by_pid = match info.cli.as_str() {
+            "claude" => usage_tracker.session_for_pid(info.pid, info.proc_start_unix),
+            "codex" => codex.as_ref().and_then(|c| c.session_for_pid(info.pid)),
             other => {
                 note(surface_id, format!("unsupported cli {other:?}"));
                 return None;
             }
         };
+        let (session_id, source) = match by_pid {
+            Some(session_id) => (Some(session_id), "pid"),
+            None => {
+                let inferred = match info.cli.as_str() {
+                    "claude" => usage_tracker
+                        .sessions_by_panel(&correlation)
+                        .remove(surface_id),
+                    _ => codex
+                        .as_ref()
+                        .and_then(|c| c.sessions_by_panel(&correlation).ok())
+                        .and_then(|mut m| m.remove(surface_id)),
+                };
+                (inferred, "cwd+start")
+            }
+        };
         match &session_id {
             Some(session_id) => note(
                 surface_id,
-                format!("resolved {} session {session_id}", info.cli),
+                format!("resolved {} session {session_id} via {source}", info.cli),
             ),
             None => {
-                let same_cwd = panes.values().filter(|p| p.cwd == info.cwd).count();
+                let same_cwd = panes
+                    .values()
+                    .filter(|p| p.cli == info.cli && p.cwd == info.cwd)
+                    .count();
                 let nearest_gap = (info.cli == "claude")
                     .then(|| {
                         usage_tracker

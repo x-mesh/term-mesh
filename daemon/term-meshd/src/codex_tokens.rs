@@ -163,20 +163,54 @@ impl CodexUsageTracker {
             .collect())
     }
 
+    /// The session a running Codex process is writing, named by the rollout
+    /// file it holds open.
+    pub fn session_for_pid(&self, pid: u32) -> Option<String> {
+        self.rollout_for_pid(pid)
+            .and_then(|rollout| rollout_session_id(&rollout))
+    }
+
+    fn rollout_for_pid(&self, pid: u32) -> Option<PathBuf> {
+        open_rollout(&self.sessions_dir, crate::proc_files::open_file_paths(pid))
+    }
+
     /// Both public views come from one walk so they can never disagree about
     /// which session a panel is running.
     fn correlate_panels(
         &self,
         panes: &[(String, String, i64, u32)],
     ) -> anyhow::Result<PanelCorrelation> {
+        self.correlate_panels_with(panes, &|pid| self.rollout_for_pid(pid))
+    }
+
+    /// The rollout a process holds open wins over inference. Directory and
+    /// start-time pairing is the fallback, and it cannot place a resumed
+    /// session, whose rollout began before its process did.
+    fn correlate_panels_with(
+        &self,
+        panes: &[(String, String, i64, u32)],
+        pinned_rollout: &dyn Fn(u32) -> Option<PathBuf>,
+    ) -> anyhow::Result<PanelCorrelation> {
         self.scan()?;
+        // Resolved before the lock: the lookup asks the kernel per descriptor.
+        let pinned: HashMap<&str, PathBuf> = panes
+            .iter()
+            .filter_map(|(panel_id, _, _, pid)| {
+                pinned_rollout(*pid).map(|rollout| (panel_id.as_str(), rollout))
+            })
+            .collect();
         const MAX_DIFF: i64 = 300;
         let state = self.state.lock().unwrap();
 
         // (started_at, rollout_path, tokens) grouped by cwd.
         let mut sessions_by_cwd: HashMap<&str, Vec<(i64, &Path, (u64, u64, u64, u64))>> =
             HashMap::new();
+        let claimed: std::collections::HashSet<&Path> =
+            pinned.values().map(PathBuf::as_path).collect();
         for (path, s) in &state.sessions {
+            if claimed.contains(path.as_path()) {
+                continue;
+            }
             sessions_by_cwd.entry(s.cwd.as_str()).or_default().push((
                 s.started_at,
                 path.as_path(),
@@ -190,6 +224,9 @@ impl CodexUsageTracker {
         // Group panes by cwd.
         let mut panes_by_cwd: HashMap<&str, Vec<(&str, i64, u32)>> = HashMap::new();
         for (panel_id, cwd, proc_start, pid) in panes {
+            if pinned.contains_key(panel_id.as_str()) {
+                continue;
+            }
             panes_by_cwd.entry(cwd.as_str()).or_default().push((
                 panel_id.as_str(),
                 *proc_start,
@@ -197,7 +234,18 @@ impl CodexUsageTracker {
             ));
         }
 
-        let mut by_panel = HashMap::new();
+        let mut by_panel: PanelCorrelation = pinned
+            .iter()
+            .map(|(&panel_id, rollout)| {
+                // A rollout with no token_count event yet has booked nothing.
+                let tokens = state
+                    .sessions
+                    .get(rollout)
+                    .map(|s| (s.input, s.output, s.cache_read, 0))
+                    .unwrap_or_default();
+                (panel_id.to_string(), (rollout.clone(), tokens))
+            })
+            .collect();
         for (cwd, mut cwd_panes) in panes_by_cwd {
             let Some(cwd_sessions) = sessions_by_cwd.get(cwd) else {
                 continue;
@@ -225,6 +273,22 @@ impl CodexUsageTracker {
         }
         Ok(by_panel)
     }
+}
+
+/// The one rollout under `sessions_dir` among a process's open files. None
+/// when there is none or several: an app-server hosting more than one thread
+/// does not say which belongs to the pane.
+fn open_rollout(sessions_dir: &Path, open_files: Vec<PathBuf>) -> Option<PathBuf> {
+    let mut rollouts = open_files.into_iter().filter(|path| {
+        path.starts_with(sessions_dir)
+            && path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-"))
+    });
+    let first = rollouts.next()?;
+    rollouts.all(|other| other == first).then_some(first)
 }
 
 /// The session UUID a rollout file name ends with.
@@ -568,5 +632,54 @@ mod tests {
         };
         let panes = vec![("p".to_string(), "/c".to_string(), 1000_i64, 1_u32)];
         assert!(tracker.snapshot_by_panel(&panes).unwrap().is_empty());
+    }
+
+    /// A resumed session's rollout began hours before the process writing it,
+    /// so only the open file places it.
+    #[test]
+    fn an_open_rollout_places_a_resumed_session() {
+        let dir = TempDir::new().unwrap();
+        let resumed = write_rollout(
+            dir.path(),
+            "rollout-2026-01-01T01-00-00-01a1525b-1392-7872-bffb-7f7478c7f76e.jsonl",
+            "/proj",
+            "2026-01-01T01:00:00.000Z",
+            (500, 0, 0, 0),
+        );
+        let tracker = CodexUsageTracker {
+            sessions_dir: dir.path().to_path_buf(),
+            state: Arc::new(Mutex::new(CodexState::default())),
+        };
+        let base = iso8601_to_unix("2026-01-01T08:00:00.000Z").unwrap();
+        let panes = vec![("panel1".to_string(), "/proj".to_string(), base, 100_u32)];
+
+        assert!(tracker
+            .correlate_panels_with(&panes, &|_| None)
+            .unwrap()
+            .is_empty());
+        let by_panel = tracker
+            .correlate_panels_with(&panes, &|pid| (pid == 100).then(|| resumed.clone()))
+            .unwrap();
+        assert_eq!(by_panel["panel1"], (resumed, (500, 0, 0, 0)));
+    }
+
+    #[test]
+    fn open_rollout_needs_exactly_one_session_file() {
+        let sessions = Path::new("/home/u/.codex/sessions");
+        let a = sessions.join("2026/01/01/rollout-a.jsonl");
+        let b = sessions.join("2026/01/01/rollout-b.jsonl");
+        let unrelated = PathBuf::from("/tmp/rollout-c.jsonl");
+        let log = sessions.join("2026/01/01/notes.jsonl");
+
+        assert_eq!(
+            open_rollout(sessions, vec![unrelated.clone(), a.clone(), log]),
+            Some(a.clone())
+        );
+        assert_eq!(
+            open_rollout(sessions, vec![a.clone(), a.clone()]),
+            Some(a.clone())
+        );
+        assert_eq!(open_rollout(sessions, vec![a, b]), None);
+        assert_eq!(open_rollout(sessions, vec![unrelated]), None);
     }
 }
