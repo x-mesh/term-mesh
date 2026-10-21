@@ -138,6 +138,7 @@ trait Bridge {
     fn start(&mut self) -> bool;
     fn turn(&mut self, text: &str, timeout: Option<Duration>);
     fn apply_control(&mut self, control: &ControlFrame) -> Result<(), &'static str>;
+    fn apply_turn_cwd(&mut self, cwd: Option<&str>) -> Result<(), &'static str>;
     fn alive(&self) -> bool;
     /// Why the session ended, if the transport knows.
     fn failure(&self) -> Option<String>;
@@ -154,6 +155,10 @@ impl<T: Transport> Bridge for CodexBridge<T> {
     }
     fn apply_control(&mut self, control: &ControlFrame) -> Result<(), &'static str> {
         CodexBridge::apply_control(self, control);
+        Ok(())
+    }
+    fn apply_turn_cwd(&mut self, cwd: Option<&str>) -> Result<(), &'static str> {
+        CodexBridge::apply_turn_cwd(self, cwd);
         Ok(())
     }
     fn alive(&self) -> bool {
@@ -177,6 +182,12 @@ impl Bridge for PerTurnBridge {
     fn apply_control(&mut self, _control: &ControlFrame) -> Result<(), &'static str> {
         Err("model and effort control frames are only supported by codex")
     }
+    fn apply_turn_cwd(&mut self, cwd: Option<&str>) -> Result<(), &'static str> {
+        match cwd {
+            None => Ok(()),
+            Some(_) => Err("per-turn cwd is only supported by codex"),
+        }
+    }
     fn alive(&self) -> bool {
         // Cursor and agy use a fresh child for every turn, so the bridge that
         // waits between them is never the thing that died.
@@ -199,6 +210,12 @@ impl<T: Transport> Bridge for AcpBridge<T> {
     }
     fn apply_control(&mut self, _control: &ControlFrame) -> Result<(), &'static str> {
         Err("model and effort control frames are only supported by codex")
+    }
+    fn apply_turn_cwd(&mut self, cwd: Option<&str>) -> Result<(), &'static str> {
+        match cwd {
+            None => Ok(()),
+            Some(_) => Err("per-turn cwd is only supported by codex"),
+        }
     }
     fn alive(&self) -> bool {
         self.rpc.child.alive()
@@ -304,9 +321,14 @@ struct ControlFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InputFrame {
-    Turn(String),
+    Turn {
+        text: String,
+        cwd: Option<Option<String>>,
+    },
     Control(ControlFrame),
 }
+
+const MAX_TURN_CWD_BYTES: usize = 4096;
 
 fn optional_control_string(
     object: &serde_json::Map<String, Value>,
@@ -326,16 +348,56 @@ fn optional_control_string(
     }
 }
 
+/// The task directory a turn envelope names in its own top-level `cwd`.
+///
+/// Absent inherits whatever the session last used, a string names the
+/// directory, and an explicit null returns to the directory the bridge
+/// started in.
+///
+/// Only that typed field counts. Text inside the prompt, such as a
+/// `WORKTREE_PATH:` line, is the agent's to read, never the bridge's to obey.
+fn envelope_cwd(object: &serde_json::Map<String, Value>) -> Result<Option<Option<String>>, String> {
+    let cwd = match object.get("cwd") {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(Some(None)),
+        Some(Value::String(cwd)) => cwd,
+        Some(_) => return Err("turn cwd must be a string".to_string()),
+    };
+    if cwd.is_empty() || cwd.trim().is_empty() {
+        return Err("turn cwd must not be empty".to_string());
+    }
+    if cwd.len() > MAX_TURN_CWD_BYTES {
+        return Err(format!("turn cwd exceeds {MAX_TURN_CWD_BYTES} bytes"));
+    }
+    if !cwd.starts_with('/') {
+        return Err("turn cwd must be an absolute path".to_string());
+    }
+    if cwd.chars().any(char::is_control) {
+        return Err("turn cwd must not contain control characters".to_string());
+    }
+    Ok(Some(Some(cwd.clone())))
+}
+
 /// Keep the existing text shapes untouched and reserve an explicit type for
 /// session controls so a prompt can never be mistaken for configuration.
 fn input_frame(line: &str) -> Result<InputFrame, String> {
     let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line.trim()) else {
-        return Ok(InputFrame::Turn(turn_text(line)));
+        return Ok(InputFrame::Turn {
+            text: turn_text(line),
+            cwd: None,
+        });
     };
-    if object.contains_key("message")
-        || object.get("type").and_then(Value::as_str) != Some("control")
-    {
-        return Ok(InputFrame::Turn(turn_text(line)));
+    if object.contains_key("message") {
+        return Ok(InputFrame::Turn {
+            text: turn_text(line),
+            cwd: envelope_cwd(&object)?,
+        });
+    }
+    if object.get("type").and_then(Value::as_str) != Some("control") {
+        return Ok(InputFrame::Turn {
+            text: turn_text(line),
+            cwd: None,
+        });
     }
 
     let model = optional_control_string(&object, "model", false)?;
@@ -575,9 +637,15 @@ fn consume(
 /// the caller does not report it twice.
 fn take(bridge: &mut dyn Bridge, line: &str, timeout: Option<Duration>, out: &mut Emitter) -> bool {
     match input_frame(line) {
-        Ok(InputFrame::Turn(text)) => {
+        Ok(InputFrame::Turn { text, cwd }) => {
             if text.is_empty() {
                 return false;
+            }
+            if let Some(cwd) = cwd {
+                if let Err(message) = bridge.apply_turn_cwd(cwd.as_deref()) {
+                    out.result(message, "unsupported_cwd", None, true);
+                    return true;
+                }
             }
             bridge.turn(&text, timeout);
             bridge.failure().is_some()
@@ -590,7 +658,12 @@ fn take(bridge: &mut dyn Bridge, line: &str, timeout: Option<Duration>, out: &mu
             }
         },
         Err(message) => {
-            out.result(&message, "invalid_control", None, true);
+            let stop = if message.starts_with("turn cwd") {
+                "invalid_cwd"
+            } else {
+                "invalid_control"
+            };
+            out.result(&message, stop, None, true);
             true
         }
     }
@@ -774,6 +847,220 @@ mod tests {
         assert!(feedback_events.lock().unwrap().is_empty());
     }
 
+    fn user_envelope(text: &str, cwd: Option<Value>) -> String {
+        let mut frame = json!({"type": "user", "message": {"role": "user", "content": text}});
+        if let Some(cwd) = cwd {
+            frame["cwd"] = cwd;
+        }
+        frame.to_string()
+    }
+
+    fn scripted_codex(turns: usize) -> CodexBridge<ScriptedChild> {
+        let mut frames = Vec::new();
+        for id in 1..=turns {
+            frames.push(json!({"id": id, "result": {}}));
+            frames.push(
+                json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
+            );
+        }
+        let (bridge_out, _bridge_events) = captured();
+        let mut bridge =
+            CodexBridge::new(ScriptedChild::new(frames), bridge_out, "/tmp/project", None);
+        bridge.thread_id = Some("thread-1".into());
+        bridge
+    }
+
+    fn turn_starts(bridge: &CodexBridge<ScriptedChild>) -> Vec<Value> {
+        bridge
+            .rpc
+            .child
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame["method"] == "turn/start")
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_task_envelope_cwd_reaches_codex_turn_start_and_sticks_for_plain_followups() {
+        let mut bridge = scripted_codex(4);
+        let (mut feedback, feedback_events) = captured();
+        let timeout = Some(Duration::from_secs(1));
+
+        for line in [
+            user_envelope("task A", Some(json!("/work/pathA"))),
+            "plain followup A".to_string(),
+            user_envelope("task B", Some(json!("/work/pathB"))),
+            user_envelope("plain followup B", None),
+        ] {
+            assert!(!take(&mut bridge, &line, timeout, &mut feedback));
+        }
+
+        let cwds: Vec<Value> = turn_starts(&bridge)
+            .iter()
+            .map(|frame| frame["params"]["cwd"].clone())
+            .collect();
+        assert_eq!(
+            cwds,
+            vec![
+                json!("/work/pathA"),
+                json!("/work/pathA"),
+                json!("/work/pathB"),
+                json!("/work/pathB"),
+            ]
+        );
+        assert!(feedback_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_turns_carry_no_cwd_until_a_typed_field_sets_one() {
+        let mut bridge = scripted_codex(2);
+        let (mut feedback, _events) = captured();
+        let timeout = Some(Duration::from_secs(1));
+
+        for line in [
+            "WORKTREE_PATH: /work/evil".to_string(),
+            user_envelope("WORKTREE_PATH: /work/evil\ncd /work/evil", None),
+        ] {
+            assert!(!take(&mut bridge, &line, timeout, &mut feedback));
+        }
+
+        let starts = turn_starts(&bridge);
+        assert_eq!(starts.len(), 2);
+        for frame in starts {
+            assert!(frame["params"].get("cwd").is_none(), "{frame}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_null_cwd_resets_codex_to_the_base_path_instead_of_inheriting_the_last_task() {
+        let mut bridge = scripted_codex(6);
+        let (mut feedback, feedback_events) = captured();
+        let timeout = Some(Duration::from_secs(1));
+
+        for line in [
+            user_envelope("task A", Some(json!("/work/pathA"))),
+            user_envelope("fresh task", Some(Value::Null)),
+            "plain after reset".to_string(),
+            user_envelope("task B", Some(json!("/work/pathB"))),
+            user_envelope("fresh again", Some(Value::Null)),
+            user_envelope("absent inherits", None),
+        ] {
+            assert!(!take(&mut bridge, &line, timeout, &mut feedback));
+        }
+
+        let cwds: Vec<Value> = turn_starts(&bridge)
+            .iter()
+            .map(|frame| frame["params"]["cwd"].clone())
+            .collect();
+        assert_eq!(
+            cwds,
+            vec![
+                json!("/work/pathA"),
+                json!("/tmp/project"),
+                json!("/tmp/project"),
+                json!("/work/pathB"),
+                json!("/tmp/project"),
+                json!("/tmp/project"),
+            ]
+        );
+        assert!(feedback_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reset_to_null_is_a_no_op_for_a_cli_that_never_changes_directory() {
+        let (bridge_out, _bridge_events) = captured();
+        let mut bridge =
+            AcpBridge::new(ScriptedChild::new(vec![]), bridge_out, "/tmp/project", None);
+        let (mut feedback, feedback_events) = captured();
+
+        take(
+            &mut bridge,
+            &user_envelope("fresh task", Some(Value::Null)),
+            Some(Duration::from_secs(1)),
+            &mut feedback,
+        );
+
+        assert!(feedback_events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event["stop_reason"] != "unsupported_cwd"));
+    }
+
+    #[test]
+    fn an_invalid_task_cwd_fails_the_frame_without_running_or_changing_the_turn_cwd() {
+        let too_long = format!("/{}", "a".repeat(5000));
+        let invalid = [
+            json!(""),
+            json!("   "),
+            json!("relative/path"),
+            json!("/work/with\u{0}nul"),
+            json!("/work/with\nnewline"),
+            json!(42),
+            json!(["/work/pathA"]),
+            json!(too_long),
+        ];
+        let mut bridge = scripted_codex(2);
+        let (mut feedback, feedback_events) = captured();
+        let timeout = Some(Duration::from_secs(1));
+
+        assert!(!take(
+            &mut bridge,
+            &user_envelope("task A", Some(json!("/work/pathA"))),
+            timeout,
+            &mut feedback
+        ));
+        for cwd in invalid {
+            assert!(
+                take(
+                    &mut bridge,
+                    &user_envelope("must not run", Some(cwd.clone())),
+                    timeout,
+                    &mut feedback
+                ),
+                "{cwd} must be rejected"
+            );
+        }
+        assert!(!take(&mut bridge, "plain followup", timeout, &mut feedback));
+
+        let cwds: Vec<Value> = turn_starts(&bridge)
+            .iter()
+            .map(|frame| frame["params"]["cwd"].clone())
+            .collect();
+        assert_eq!(cwds, vec![json!("/work/pathA"), json!("/work/pathA")]);
+        let events = feedback_events.lock().unwrap();
+        assert_eq!(events.len(), 8);
+        for event in events.iter() {
+            assert_eq!(event["type"], "result");
+            assert_eq!(event["stop_reason"], "invalid_cwd");
+            assert_eq!(event["is_error"], true);
+        }
+    }
+
+    #[test]
+    fn a_cli_without_per_turn_cwd_support_reports_it_instead_of_running_in_the_wrong_directory() {
+        let (bridge_out, _bridge_events) = captured();
+        let mut bridge =
+            AcpBridge::new(ScriptedChild::new(vec![]), bridge_out, "/tmp/project", None);
+        let (mut feedback, feedback_events) = captured();
+
+        assert!(take(
+            &mut bridge,
+            &user_envelope("task A", Some(json!("/work/pathA"))),
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+
+        let events = feedback_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["stop_reason"], "unsupported_cwd");
+        assert_eq!(events[0]["is_error"], true);
+        assert!(bridge.rpc.child.sent.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn an_unsupported_cli_reports_a_control_error() {
         let (bridge_out, _bridge_events) = captured();
@@ -901,7 +1188,7 @@ impl InputFrame {
     #[cfg(test)]
     fn into_turn(self) -> Option<String> {
         match self {
-            Self::Turn(text) => Some(text),
+            Self::Turn { text, .. } => Some(text),
             Self::Control(_) => None,
         }
     }

@@ -3848,6 +3848,843 @@ final class AgentSessionTests: XCTestCase {
         s.stop()
     }
 
+    private func continuationSession(
+        team: String, instance: String, deadline: TimeInterval = 10 * 60,
+        turnTaskIds: @escaping (String?) -> Void = { _ in },
+        lost: @escaping (String) -> Void = { _ in }
+    ) -> AgentSession {
+        let s = AgentSession(pendingTaskStatusDeadline: deadline)
+        s.onTurnEnd = { final, _, taskId in
+            turnTaskIds(taskId)
+            AutoReplyEmit.settleNativeTurn(
+                teamName: team, agentName: "executor", agentInstanceId: instance,
+                final: final, taskId: taskId, store: .shared)
+        }
+        s.onTaskCorrelationLost = { taskId, loss in
+            lost(taskId)
+            AutoReplyEmit.blockUnsettledTask(
+                teamName: team, agentName: "executor", agentInstanceId: instance,
+                taskId: taskId, reason: loss.reason, store: .shared)
+        }
+        return s
+    }
+
+    private func header(_ status: String) -> String {
+        "STATUS: \(status)\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a"
+    }
+
+    func testAnExplicitBlockedTaskIsClosedByTheWorkersOwnLaterDone() throws {
+        let team = "continue-blocked-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var turnTaskIds: [String?] = []
+        let s = continuationSession(team: team, instance: "inst-1", turnTaskIds: { turnTaskIds.append($0) })
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nrun the full suite", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
+
+        s.ingestForTesting(assistantSaid("Retrying after the block."))
+        s.ingestForTesting(resultSaying(header("DONE")))
+
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+        XCTAssertEqual(turnTaskIds.compactMap { $0 }, [task.id, task.id])
+        s.stop()
+    }
+
+    func testAReviewReadyTaskIsClosedByTheWorkersOwnLaterDone() throws {
+        let team = "continue-review-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let s = continuationSession(team: team, instance: "inst-1")
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nrun the full suite", from: .leader)
+        s.ingestForTesting(resultSaying(header("NEEDS_REVIEW")))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "review_ready")
+
+        s.ingestForTesting(assistantSaid("Reviewed my own work."))
+        s.ingestForTesting(resultSaying(header("DONE")))
+
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+        s.stop()
+    }
+
+    func testAParkedTaskStaysParkedThroughAnotherBlockedAndIsStillClosedByDone() throws {
+        let team = "continue-twice-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let s = continuationSession(team: team, instance: "inst-1")
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        s.ingestForTesting(assistantSaid("Tried again."))
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
+
+        s.ingestForTesting(assistantSaid("Now it works."))
+        s.ingestForTesting(resultSaying(header("DONE")))
+
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+        s.stop()
+    }
+
+    func testAFinishedTaskIsNeverReopenedByALaterTurnOfTheWorker() throws {
+        let team = "continue-finished-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var turnTaskIds: [String?] = []
+        let s = continuationSession(team: team, instance: "inst-1", turnTaskIds: { turnTaskIds.append($0) })
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        s.ingestForTesting(assistantSaid("Done now."))
+        s.ingestForTesting(resultSaying(header("DONE")))
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+
+        s.ingestForTesting(assistantSaid("Unrelated chatter."))
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+
+        XCTAssertEqual(turnTaskIds, [task.id, task.id, nil],
+                       "a turn after the verdict answers no task")
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+        s.stop()
+    }
+
+    func testAPlainLeaderOrPersonTurnNeverClosesAParkedTask() throws {
+        for speaker in [AgentSession.Speaker.leader, .person] {
+            let team = "continue-plain-\(UUID().uuidString)"
+            let store = TeamDataStore.shared
+            let task = try boardTask(team: team, instance: "inst-1")
+            defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+            var turnTaskIds: [String?] = []
+            let s = continuationSession(team: team, instance: "inst-1", turnTaskIds: { turnTaskIds.append($0) })
+            s.startRemote { _ in }
+
+            try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+            s.ingestForTesting(resultSaying(header("BLOCKED")))
+            try s.send("how is it going?", from: speaker)
+            s.ingestForTesting(resultSaying(header("DONE")))
+
+            XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked",
+                           "\(speaker)")
+            XCTAssertEqual(turnTaskIds.count, 2, "\(speaker)")
+            XCTAssertNil(turnTaskIds.last ?? nil, "\(speaker)")
+            s.stop()
+        }
+    }
+
+    func testABackgroundDoneAfterAQuestionNeverClosesTheParkedTask() throws {
+        for speaker in [AgentSession.Speaker.leader, .person] {
+            let team = "continue-question-\(UUID().uuidString)"
+            let store = TeamDataStore.shared
+            let task = try boardTask(team: team, instance: "inst-1")
+            defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+            var turnTaskIds: [String?] = []
+            let s = continuationSession(team: team, instance: "inst-1", turnTaskIds: { turnTaskIds.append($0) })
+            s.startRemote { _ in }
+
+            try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+            s.ingestForTesting(resultSaying(header("BLOCKED")))
+            try s.send("run the linter in the background", from: speaker)
+            XCTAssertNil(s.parkedTaskIdForTesting, "\(speaker)")
+            s.ingestForTesting(resultSaying("Started it in the background."))
+            s.ingestForTesting(assistantSaid("The linter finished."))
+            s.ingestForTesting(resultSaying(header("DONE")))
+
+            XCTAssertEqual(turnTaskIds.count, 3, "\(speaker)")
+            XCTAssertNil(turnTaskIds.last ?? nil, "\(speaker)")
+            XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked", "\(speaker)")
+            s.stop()
+        }
+    }
+
+    func testAPersonJoiningAContinuationTurnDropsTheParkedTask() throws {
+        let team = "continue-join-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var turnTaskIds: [String?] = []
+        let s = continuationSession(team: team, instance: "inst-1", turnTaskIds: { turnTaskIds.append($0) })
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        s.ingestForTesting(assistantSaid("Working on something."))
+        try s.send("also, what time is it?", from: .person)
+        XCTAssertNil(s.parkedTaskIdForTesting)
+        s.ingestForTesting(resultSaying(header("DONE")))
+
+        XCTAssertNil(turnTaskIds.last ?? nil)
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
+        s.stop()
+    }
+
+    func testAReplayWindowDropsTheParkedTask() async throws {
+        let team = "continue-replay-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var turnTaskIds: [String?] = []
+        let s = continuationSession(team: team, instance: "inst-1", turnTaskIds: { turnTaskIds.append($0) })
+        s.startRemote { _ in }
+        let history = Data((resultSaying(header("DONE")) + "\n").utf8)
+
+        try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        XCTAssertEqual(s.parkedTaskIdForTesting, task.id)
+        expectReplay(s, bytes: UInt64(history.count), .init(taskId: "c0c0c0c0", turnWasInFlight: false))
+        XCTAssertNil(s.parkedTaskIdForTesting)
+        s.consume(history)
+        let replayed = await waitUntil { self.turnEndedCount(s) == 2 }
+
+        XCTAssertTrue(replayed)
+        XCTAssertEqual(turnTaskIds.count, 1, "the replayed DONE must not reach onTurnEnd")
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
+        s.stop()
+    }
+
+    func testANewTaskIdDispatchLetsGoOfTheParkedTask() throws {
+        let team = "continue-newtask-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let first = try boardTask(team: team, instance: "inst-1")
+        let second = try XCTUnwrap(store.createTask(
+            teamName: team, title: "other", assignee: "executor", assigneeInstanceId: "inst-1"))
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let s = continuationSession(team: team, instance: "inst-1")
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(first.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        try s.send("TASK_ID: \(second.id)\nother work", from: .leader)
+        XCTAssertEqual(s.pendingTaskIdForTesting, second.id)
+        XCTAssertNil(s.parkedTaskIdForTesting)
+        s.ingestForTesting(resultSaying(header("DONE")))
+        s.ingestForTesting(assistantSaid("Unrelated."))
+        s.ingestForTesting(resultSaying(header("DONE")))
+
+        XCTAssertEqual(store.getTask(teamName: team, taskId: second.id)?.status, "completed")
+        XCTAssertEqual(store.getTask(teamName: team, taskId: first.id)?.status, "blocked")
+        s.stop()
+    }
+
+    func testAParkedTaskIsNotBlockedAgainByTheStatusDeadline() async throws {
+        let team = "continue-deadline-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var lost: [String] = []
+        let s = continuationSession(
+            team: team, instance: "inst-1", deadline: 0.05, lost: { lost.append($0) })
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying("STATUS: BLOCKED\nNEXT: need a key\n\nthe key is missing"))
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertTrue(lost.isEmpty)
+        let parked = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(parked.status, "blocked")
+        XCTAssertFalse(parked.blockedReason?.hasPrefix("No explicit STATUS") == true)
+        s.stop()
+    }
+
+    func testAVerdictlessTurnOnAParkedTaskTouchesNothing() throws {
+        let team = "continue-silent-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var turnTaskIds: [String?] = []
+        let s = continuationSession(team: team, instance: "inst-1", turnTaskIds: { turnTaskIds.append($0) })
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        let progressBefore = store.getMessages(teamName: team, type: "progress").count
+        s.ingestForTesting(assistantSaid("Thinking out loud."))
+        s.ingestForTesting(resultSaying("Still looking at it."))
+
+        XCTAssertEqual(turnTaskIds.count, 2)
+        XCTAssertNil(turnTaskIds.last ?? nil)
+        XCTAssertEqual(store.getMessages(teamName: team, type: "progress").count, progressBefore)
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
+        XCTAssertEqual(s.parkedTaskIdForTesting, task.id)
+        s.stop()
+    }
+
+    func testStoppingTheSessionDropsTheParkedTask() throws {
+        let team = "continue-stop-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let s = continuationSession(team: team, instance: "inst-1")
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+        s.ingestForTesting(resultSaying(header("BLOCKED")))
+        XCTAssertEqual(s.parkedTaskIdForTesting, task.id)
+        s.stop()
+
+        XCTAssertNil(s.parkedTaskIdForTesting)
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "blocked")
+    }
+
+    // MARK: - #817 the working directory travels with the turn
+
+    private func frames(_ sink: RemoteSinkRecorder) throws -> [[String: Any]] {
+        try sink.all.map { payload in
+            XCTAssertEqual(payload.last, 0x0A)
+            return try XCTUnwrap(try JSONSerialization.jsonObject(
+                with: payload.dropLast()) as? [String: Any])
+        }
+    }
+
+    private func frame(_ sink: RemoteSinkRecorder, _ index: Int) throws -> [String: Any] {
+        let all = try frames(sink)
+        return try XCTUnwrap(all.indices.contains(index) ? all[index] : nil,
+                             "frame \(index) was never sent; the sink holds \(all.count)")
+    }
+
+    private func capsule(task: String, worktree: String?, goal: String = "do the thing") -> String {
+        var lines = ["## Task Capsule", "TASK_ID: \(task)", "TASK_TITLE: t", "TASK_STATUS: assigned",
+                     "PROTOCOL: TM-PROTOCOL-v1"]
+        if let worktree {
+            lines += ["WORKTREE_PATH: \(worktree)", "WORKTREE_BRANCH: tm/x/\(task)",
+                      "WORKDIR_INSTRUCTION: Run commands from this worktree: cd \(worktree)"]
+        }
+        lines += ["", "[GOAL]", goal, "[/GOAL]"]
+        return lines.joined(separator: "\n")
+    }
+
+    func testTheDefaultUserFrameCarriesNoWorkingDirectory() throws {
+        let data = try AgentSession.encode(text: "hello")
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: data.dropLast()) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["type", "message"])
+        let withCwd = try AgentSession.encode(text: "hello", cwd: "/work/a")
+        let framed = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: withCwd.dropLast()) as? [String: Any])
+        XCTAssertEqual(Set(framed.keys), ["type", "message", "cwd"])
+        XCTAssertEqual(framed["cwd"] as? String, "/work/a")
+        XCTAssertEqual((framed["message"] as? [String: Any])?["content"] as? String, "hello")
+    }
+
+    func testACodexSessionSendsTheTaskWorktreeAsTheTurnsCwd() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.workingDirectoryForTask = { ["aaaa1111": "/wt/a"][$0] }
+        s.startRemote(cli: "codex") { sink.record($0) }
+
+        try s.send(capsule(task: "aaaa1111", worktree: "/wt/a"), from: .leader)
+
+        let sent = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(sent)
+        XCTAssertEqual(try frame(sink, 0)["cwd"] as? String, "/wt/a")
+    }
+
+    func testOtherCliSessionsKeepTheirExistingFrame() async throws {
+        for cli in ["claude", "kiro", nil] as [String?] {
+            let sink = RemoteSinkRecorder()
+            let s = AgentSession()
+            s.startRemote(cli: cli) { sink.record($0) }
+
+            try s.send(capsule(task: "bbbb2222", worktree: "/wt/b"), from: .leader)
+
+            let sent = await waitUntil { sink.all.count == 1 }
+            XCTAssertTrue(sent, "\(String(describing: cli))")
+            XCTAssertNil(try frame(sink, 0)["cwd"], "\(String(describing: cli))")
+        }
+    }
+
+    func testQueuedCodexTasksEachCarryTheirOwnWorktree() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.workingDirectoryForTask = { ["aaaa1111": "/wt/a", "bbbb2222": "/wt/b"][$0] }
+        s.startRemote(cli: "codex") { sink.record($0) }
+
+        try s.send(capsule(task: "aaaa1111", worktree: "/wt/a"), from: .leader)
+        try s.send(capsule(task: "bbbb2222", worktree: "/wt/b"), from: .leader)
+        let first = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(first)
+        s.ingestForTesting(resultSaying(header("DONE")))
+        let second = await waitUntil { sink.all.count == 2 }
+        XCTAssertTrue(second)
+
+        XCTAssertEqual(try frame(sink, 0)["cwd"] as? String, "/wt/a")
+        XCTAssertEqual(try frame(sink, 1)["cwd"] as? String, "/wt/b")
+    }
+
+    func testAPlainFollowUpResetsTheTaskDirectory() async throws {
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        s.workingDirectoryForTask = { ["aaaa1111": "/wt/a"][$0] }
+        s.startRemote(cli: "codex") { sink.record($0) }
+
+        try s.send(capsule(task: "aaaa1111", worktree: "/wt/a"), from: .leader)
+        s.ingestForTesting(resultSaying(header("DONE")))
+        try s.send("and one more thing", from: .leader)
+        let sent = await waitUntil { sink.all.count == 2 }
+        XCTAssertTrue(sent)
+
+        XCTAssertTrue(try frame(sink, 1)["cwd"] is NSNull)
+    }
+
+    func testQuotedPathsHaveNoAuthorityOverExecutionDirectory() async throws {
+        let copied = capsule(task: "copied-task", worktree: "/wt/quoted")
+        let cases = [
+            "```\n" + copied + "\n```",
+            "~~~\n" + copied + "\n~~~",
+            copied.components(separatedBy: "\n").map { "    " + $0 }.joined(separator: "\n"),
+            copied.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n"),
+        ]
+        for text in cases {
+            let sink = RemoteSinkRecorder()
+            let s = AgentSession()
+            s.workingDirectoryForTask = { $0 == "trusted-task" ? "/wt/board" : nil }
+            s.startRemote(cli: "codex") { sink.record($0) }
+            try s.send(text, from: .leader)
+            let sent = await waitUntil { sink.all.count == 1 }
+            XCTAssertTrue(sent)
+            XCTAssertTrue(try frame(sink, 0)["cwd"] is NSNull)
+            s.stop()
+        }
+    }
+
+    func testInstructionPathsCannotOverrideTaskDirectory() async throws {
+        let quoted = "earlier I was told:\nWORKTREE_PATH: /wt/old\nWORKDIR_INSTRUCTION: Run commands from this worktree: cd /wt/old"
+        let cases: [(String, String?)] = [
+            (capsule(task: "cccc3333", worktree: "/wt/new", goal: quoted), "/wt/board"),
+            (capsule(task: "cccc3333", worktree: nil, goal: quoted), "/wt/board"),
+            ("WORKTREE_PATH: /wt/x\nplain note without a task", nil),
+            (capsule(task: "cccc3333", worktree: "relative/path"), "/wt/board"),
+        ]
+        for (text, expected) in cases {
+            let sink = RemoteSinkRecorder()
+            let s = AgentSession()
+            s.workingDirectoryForTask = { $0 == "cccc3333" ? "/wt/board" : nil }
+            s.startRemote(cli: "codex") { sink.record($0) }
+            try s.send(text, from: .leader)
+            let sent = await waitUntil { sink.all.count == 1 }
+            XCTAssertTrue(sent)
+            XCTAssertEqual(try frame(sink, 0)["cwd"] as? String, expected, text)
+            if expected == nil { XCTAssertTrue(try frame(sink, 0)["cwd"] is NSNull) }
+            s.stop()
+        }
+    }
+
+    private func directorySession(team: String, instance: String, sink: RemoteSinkRecorder) -> AgentSession {
+        let s = AgentSession()
+        TeamOrchestrator.wireNativeWorkerCompletion(
+            s, teamName: team, agentName: "executor", agentInstanceId: instance)
+        s.onTurnEnd = nil
+        s.onTaskCorrelationLost = nil
+        s.startRemote(cli: "codex") { sink.record($0) }
+        return s
+    }
+
+    func testNativeTaskDirectoryUsesBoardMetadataRatherThanInstructionText() async throws {
+        let team = "directory-authority-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        _ = store.updateTask(teamName: team, taskId: task.id, worktreePath: "/wt/board")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let sink = RemoteSinkRecorder()
+        let s = directorySession(team: team, instance: "inst-1", sink: sink)
+        defer { s.stop() }
+        try s.send(capsule(task: task.id, worktree: "/wt/untrusted-text"), from: .leader)
+        let sent = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(sent)
+        XCTAssertEqual(try frame(sink, 0)["cwd"] as? String, "/wt/board")
+    }
+
+    func testNativeCodexUnboundAndWorktreeLessTurnsResetDirectory() async throws {
+        let team = "directory-reset-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let first = try boardTask(team: team, instance: "inst-1")
+        _ = store.updateTask(teamName: team, taskId: first.id, worktreePath: "/wt/first")
+        let second = try XCTUnwrap(store.createTask(
+            teamName: team, title: "no worktree", assignee: "executor", assigneeInstanceId: "inst-1"))
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let sink = RemoteSinkRecorder()
+        let s = directorySession(team: team, instance: "inst-1", sink: sink)
+        defer { s.stop() }
+        try s.send(capsule(task: first.id, worktree: "/wt/first"), from: .leader)
+        s.ingestForTesting(resultSaying(header("DONE")))
+        try s.send(capsule(task: second.id, worktree: nil), from: .leader)
+        s.ingestForTesting(resultSaying(header("DONE")))
+        try s.send("unrelated question", from: .leader)
+        s.ingestForTesting(resultSaying(header("DONE")))
+        try s.send(capsule(task: first.id, worktree: "/wt/untrusted-person"), from: .person)
+        let sent = await waitUntil { sink.all.count == 4 }
+        XCTAssertTrue(sent)
+        XCTAssertEqual(try frame(sink, 0)["cwd"] as? String, "/wt/first")
+        for index in 1...3 {
+            XCTAssertTrue(try frame(sink, index)["cwd"] is NSNull, "turn \(index) must reset cwd")
+        }
+    }
+
+    func testNativeTaskDirectoryRejectsWrongInstanceAndTerminalTasks() async throws {
+        let team = "directory-identity-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-2")
+        _ = store.updateTask(teamName: team, taskId: task.id, worktreePath: "/wt/other")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        for terminal in [false, true] {
+            if terminal { _ = store.updateTask(teamName: team, taskId: task.id, status: "completed") }
+            let sink = RemoteSinkRecorder()
+            let s = directorySession(team: team, instance: terminal ? "inst-2" : "inst-1", sink: sink)
+            try s.send(capsule(task: task.id, worktree: "/wt/other"), from: .leader)
+            let sent = await waitUntil { sink.all.count == 1 }
+            XCTAssertTrue(sent)
+            XCTAssertTrue(try frame(sink, 0)["cwd"] is NSNull)
+            s.stop()
+        }
+    }
+
+    func testNativeReportRoutingDoesNotOverwriteReassignedOrCompletedTasks() throws {
+        for reassigned in [true, false] {
+            let team = "report-owner-\(UUID().uuidString)"
+            let store = TeamDataStore.shared
+            store.registerTeam(team, agents: [
+                .init(name: "executor", instanceId: "inst-1"),
+                .init(name: "executor", instanceId: "inst-2"),
+            ])
+            let task = try XCTUnwrap(store.createTask(
+                teamName: team, title: "report ownership", assignee: "executor", assigneeInstanceId: "inst-1"))
+            _ = store.updateTask(teamName: team, taskId: task.id, status: "in_progress")
+            defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+            var reportTaskIds: [String?] = []
+            let s = AgentSession()
+            TeamOrchestrator.wireNativeWorkerCompletion(
+                s, teamName: team, agentName: "executor", agentInstanceId: "inst-1",
+                report: { taskId, _ in reportTaskIds.append(taskId) })
+            s.startRemote { _ in }
+            try s.send("TASK_ID: \(task.id)\nwork", from: .leader)
+            s.ingestForTesting(resultSaying(header("BLOCKED")))
+            if reassigned {
+                let updated = try XCTUnwrap(store.updateTask(
+                    teamName: team, taskId: task.id, assignee: "executor", assigneeInstanceId: "inst-2"))
+                XCTAssertEqual(updated.assigneeInstanceId, "inst-2")
+            } else {
+                _ = store.updateTask(teamName: team, taskId: task.id, status: "completed")
+            }
+            s.ingestForTesting(assistantSaid("An old continuation finished."))
+            s.ingestForTesting(resultSaying(header("DONE")))
+            XCTAssertEqual(reportTaskIds, [task.id, nil], "stale reports must update only the worker alias")
+            XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status,
+                           reassigned ? "blocked" : "completed")
+            s.stop()
+        }
+    }
+
+    // MARK: - #818 tool failure health
+
+    private let scriptFailure = "Script failed\nWall time 0.0 seconds\nScript error:\nSyntaxError: Invalid or unexpected token"
+
+    private func toolUse(_ id: String, name: String = "Bash") -> String {
+        event(["type": "assistant", "message": ["content": [
+            ["type": "tool_use", "id": id, "name": name, "input": ["command": "run \(id)"]]]]])
+    }
+
+    private func toolResult(_ id: String, _ content: String, failed: Bool) -> String {
+        event(["type": "user", "message": ["content": [
+            ["type": "tool_result", "tool_use_id": id, "content": content, "is_error": failed]]]])
+    }
+
+    private func failTool(_ s: AgentSession, _ id: String, name: String = "Bash", body: String? = nil) {
+        s.ingestForTesting(toolUse(id, name: name))
+        s.ingestForTesting(toolResult(id, body ?? scriptFailure, failed: true))
+    }
+
+    private func passTool(_ s: AgentSession, _ id: String) {
+        s.ingestForTesting(toolUse(id))
+        s.ingestForTesting(toolResult(id, "ok", failed: false))
+    }
+
+    private func health(_ s: AgentSession) -> [String: Any] { s.toolFailureSummary }
+
+    func testToolFailureSummaryCountsAConsecutiveStreakAndFlagsAttentionAtThree() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "f1")
+        failTool(s, "f2", name: "exec")
+        var summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 2)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 2)
+        XCTAssertEqual(summary["consecutive"] as? Int, 2)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+
+        failTool(s, "f3", name: "exec")
+        summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 3)
+        XCTAssertEqual(summary["consecutive"] as? Int, 3)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, true)
+        XCTAssertEqual(summary["last_tool"] as? String, "exec")
+        XCTAssertEqual(summary["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
+    }
+
+    func testASelfStartedTurnKeepsItsFailuresAfterCompletion() {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        failTool(s, "self1")
+        failTool(s, "self2")
+        failTool(s, "self3")
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 3)
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn", "is_error": false]))
+        XCTAssertEqual(health(s)["turn_failures"] as? Int, 3)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 3)
+        XCTAssertEqual(health(s)["needs_attention"] as? Bool, true)
+    }
+
+    func testASelfStartedTurnDoesNotInheritThePreviousStreak() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("first turn", from: .person)
+        failTool(s, "written1")
+        failTool(s, "written2")
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn", "is_error": false]))
+        failTool(s, "self1")
+        XCTAssertEqual(health(s)["total"] as? Int, 3)
+        XCTAssertEqual(health(s)["turn_failures"] as? Int, 1)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 1)
+        XCTAssertEqual(health(s)["needs_attention"] as? Bool, false)
+    }
+
+    func testASuccessResetsTheStreakButNotTheTurnOrSessionCounts() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "f1")
+        failTool(s, "f2")
+        passTool(s, "ok1")
+        failTool(s, "f3")
+
+        let summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 3)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 3)
+        XCTAssertEqual(summary["consecutive"] as? Int, 1)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+    }
+
+    func testANewTurnResetsTheTurnAndStreakCountsButKeepsTheSessionTotal() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("first", from: .person)
+        failTool(s, "f1")
+        failTool(s, "f2")
+        failTool(s, "f3")
+        s.ingestForTesting(resultSaying("giving up"))
+        XCTAssertEqual(health(s)["turn_failures"] as? Int, 3, "the latest turn stays visible after it ends")
+
+        try s.send("second", from: .person)
+
+        let summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 3)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 0)
+        XCTAssertEqual(summary["consecutive"] as? Int, 0)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+    }
+
+    func testARepeatedToolResultIsCountedOnce() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "dup")
+        s.ingestForTesting(toolResult("dup", scriptFailure, failed: true))
+        s.ingestForTesting(toolUse("dup"))
+        s.ingestForTesting(toolResult("dup", scriptFailure, failed: true))
+
+        XCTAssertEqual(health(s)["total"] as? Int, 1)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 1)
+    }
+
+    func testACancelledToolIsNotAFailure() throws {
+        let s = AgentSession()
+        s.startRemote(interruptible: true) { _ in }
+        try s.send("long job", from: .person)
+        s.ingestForTesting(toolUse("c1"))
+
+        s.interrupt()
+        s.ingestForTesting(toolResult("c1", "interrupted by user", failed: true))
+
+        XCTAssertEqual(health(s)["total"] as? Int, 0)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 0)
+        XCTAssertNil(health(s)["last_error"])
+        XCTAssertNil(health(s)["last_tool"])
+
+        s.ingestForTesting(resultSaying("stopped"))
+        try s.send("again", from: .person)
+        failTool(s, "real")
+        XCTAssertEqual(health(s)["total"] as? Int, 1, "a genuine failure after the stop still counts")
+    }
+
+    func testFailureCountsSurviveTranscriptPruning() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+        failTool(s, "f1")
+        failTool(s, "f2")
+
+        for index in 0..<2_100 { s.appendLocalNotice("filler \(index)") }
+
+        let summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 2)
+        XCTAssertEqual(summary["consecutive"] as? Int, 2)
+        XCTAssertEqual(summary["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
+    }
+
+    func testReplayedFailuresAreNotCounted() async throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        let history = Data((toolUse("old") + "\n" + toolResult("old", scriptFailure, failed: true) + "\n"
+            + resultSaying("earlier turn") + "\n").utf8)
+
+        expectReplay(s, bytes: UInt64(history.count), .init(taskId: "c0c0c0c0", turnWasInFlight: false))
+        s.consume(history)
+        let replayed = await waitUntil { self.turnEndedCount(s) == 1 }
+
+        XCTAssertTrue(replayed)
+        XCTAssertEqual(health(s)["total"] as? Int, 0)
+
+        try s.send("live", from: .person)
+        failTool(s, "live1")
+        XCTAssertEqual(health(s)["total"] as? Int, 1, "a live failure after the replay window still counts")
+    }
+
+    func testTheRealCodexWrapperShapeSummarizesTheScriptErrorNotTheOutputLabel() throws {
+        let wrapper = "Script failed\nWall time 0.0 seconds\nOutput:\nScript error:\nSyntaxError: Invalid or unexpected token"
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "w1", name: "exec", body: wrapper)
+
+        XCTAssertEqual(health(s)["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
+        let row = try XCTUnwrap(s.visibleTranscriptText().components(separatedBy: "\n").first {
+            $0.hasPrefix("exec ")
+        })
+        XCTAssertTrue(row.hasSuffix("failed: SyntaxError: Invalid or unexpected token"), row)
+    }
+
+    func testAnOutputLineThatCarriesTextIsStillAUsefulErrorLine() {
+        XCTAssertEqual(
+            AgentSession.usefulErrorLine(in: "Output: permission denied\nexit 1"),
+            "Output: permission denied")
+        XCTAssertEqual(AgentSession.usefulErrorLine(in: "Output:\n\n"), "Output:")
+    }
+
+    func testTheLastToolNameIsBoundedAndRedactedButNormalNamesSurvive() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "n1", name: "exec")
+        XCTAssertEqual(health(s)["last_tool"] as? String, "exec")
+
+        failTool(s, "n2", name: "API_KEY=fixturesecret")
+        let redacted = try XCTUnwrap(health(s)["last_tool"] as? String)
+        XCTAssertFalse(redacted.contains("fixturesecret"), redacted)
+
+        failTool(s, "n3", name: "tool_" + String(repeating: "z", count: 10_500))
+        let bounded = try XCTUnwrap(health(s)["last_tool"] as? String)
+        XCTAssertLessThanOrEqual(bounded.utf8.count, 200, "\(bounded.utf8.count)")
+        XCTAssertTrue(bounded.hasPrefix("tool_"), bounded)
+
+        let transcript = s.visibleTranscriptText()
+        XCTAssertFalse(transcript.contains("fixturesecret"))
+        XCTAssertFalse(transcript.contains(String(repeating: "z", count: 1_000)))
+    }
+
+    func testNothingFailedMeansNoLastFields() {
+        let summary = AgentSession().toolFailureSummary
+        XCTAssertEqual(summary["total"] as? Int, 0)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 0)
+        XCTAssertEqual(summary["consecutive"] as? Int, 0)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+        XCTAssertNil(summary["last_error"])
+        XCTAssertNil(summary["last_tool"])
+    }
+
+    func testTheVisibleTranscriptShowsABoundedRedactedErrorOnAFailedToolRow() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        failTool(s, "f1", body: "Error: push rejected for \(token)\n" + String(repeating: "x", count: 5_000))
+
+        let text = s.visibleTranscriptText()
+        let row = try XCTUnwrap(text.components(separatedBy: "\n").first { $0.hasPrefix("Bash ") })
+
+        XCTAssertTrue(row.contains("Error: push rejected"), row)
+        XCTAssertFalse(row.contains(token), row)
+        XCTAssertLessThan(row.utf8.count, 400, row)
+    }
+
+    func testARepeatedFailureWarningAppearsOnlyAtTheThresholdAndSuggestsRecovery() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+        failTool(s, "f1")
+        failTool(s, "f2")
+        XCTAssertFalse(s.visibleTranscriptText().contains("consecutive tool failures"))
+
+        failTool(s, "f3")
+        let text = s.visibleTranscriptText()
+        let warning = try XCTUnwrap(text.components(separatedBy: "\n").first {
+            $0.contains("consecutive tool failures")
+        })
+
+        XCTAssertTrue(warning.hasPrefix("! "), warning)
+        XCTAssertTrue(warning.contains("3"), warning)
+        XCTAssertTrue(warning.contains("SyntaxError: Invalid or unexpected token"), warning)
+        XCTAssertTrue(warning.lowercased().contains("interrupt") || warning.lowercased().contains("restart"), warning)
+        XCTAssertLessThan(warning.utf8.count, 600, warning)
+
+        passTool(s, "ok")
+        XCTAssertFalse(s.visibleTranscriptText().contains("consecutive tool failures"))
+    }
+
+    func testToolFailuresDoNotChangeATaskBoundTurnsStatedVerdict() throws {
+        let team = "health-verdict-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var ends: [AgentSession.TurnEnd] = []
+        let s = AgentSession()
+        s.onTurnEnd = { final, end, taskId in
+            ends.append(end)
+            AutoReplyEmit.settleNativeTurn(
+                teamName: team, agentName: "executor", agentInstanceId: "inst-1",
+                final: final, taskId: taskId, store: .shared)
+        }
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nrun the suite", from: .leader)
+        failTool(s, "f1")
+        failTool(s, "f2")
+        failTool(s, "f3")
+        s.ingestForTesting(assistantSaid("All set.\n\nSTATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a"))
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn"]))
+
+        XCTAssertEqual(ends.count, 1)
+        XCTAssertEqual(ends.last?.verdict?.status, "DONE")
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+        XCTAssertEqual(health(s)["needs_attention"] as? Bool, true)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 3)
+        s.stop()
+    }
+
     func testTheStatusDeadlineNeverFiresWhileATurnIsRunning() async throws {
         var lost: [String] = []
         let s = AgentSession(pendingTaskStatusDeadline: 0.05)
