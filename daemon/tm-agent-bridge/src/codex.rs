@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
@@ -186,6 +187,121 @@ pub fn file_change(out: &mut Emitter, item: &Value) {
     }
 }
 
+/// What the leader sees of a tool call is only what is drawn here, so a
+/// finished call is never dropped: it gets its id, a bounded body, and a
+/// verdict taken from the fields codex states for that kind of item.
+fn tool_item(out: &mut Emitter, kind: &str, item: &Value) {
+    let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+    let text_of = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
+    let qualified = |name: &str| match item.get("namespace").and_then(Value::as_str) {
+        Some(namespace) if !namespace.is_empty() => format!("{namespace}.{name}"),
+        _ => name.to_string(),
+    };
+
+    let mut fields = Map::new();
+    let (name, body, failed) = match kind {
+        "functionCallOutput" => {
+            let body = function_output_text(item.get("output"));
+            let failed = script_failed(&body);
+            (qualified(text_of("name")), body, failed)
+        }
+        "dynamicToolCall" => {
+            let status = text_of("status");
+            let failed =
+                status == "failed" || item.get("success").and_then(Value::as_bool) == Some(false);
+            let body = item
+                .get("contentItems")
+                .and_then(Value::as_array)
+                .map(|parts| input_text(parts, "inputText"))
+                .unwrap_or_default();
+            insert_arguments(&mut fields, item);
+            (qualified(text_of("tool")), body, failed)
+        }
+        _ => {
+            let result = item.get("result").filter(|r| !r.is_null());
+            let error = item
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let flagged = result
+                .and_then(|r| r.get("isError"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let failed = text_of("status") == "failed" || !error.is_empty() || flagged;
+            let streamed = result
+                .and_then(|r| r.get("content"))
+                .and_then(Value::as_array)
+                .map(|parts| input_text(parts, "text"))
+                .unwrap_or_default();
+            let body = if error.is_empty() {
+                streamed
+            } else {
+                error.to_string()
+            };
+            insert_arguments(&mut fields, item);
+            (
+                format!("mcp__{}__{}", text_of("server"), text_of("tool")),
+                body,
+                failed,
+            )
+        }
+    };
+
+    out.tool_fields(&name, fields, id);
+    let body = if body.is_empty() && failed {
+        format!("{name} failed")
+    } else {
+        body
+    };
+    out.tool_result(&clamp(&body, TEXT_LIMIT), failed, id);
+}
+
+fn insert_arguments(fields: &mut Map<String, Value>, item: &Value) {
+    if let Some(arguments) = item.get("arguments").filter(|a| !a.is_null()) {
+        let raw = serde_json::to_string(arguments).unwrap_or_default();
+        fields.insert("arguments".into(), Value::String(clamp(&raw, TEXT_LIMIT)));
+    }
+}
+
+fn input_text(parts: &[Value], kind: &str) -> String {
+    parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some(kind))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn function_output_text(output: Option<&Value>) -> String {
+    match output {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => {
+            let mut joined = String::new();
+            for text in parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+            {
+                if !joined.is_empty() && !joined.ends_with('\n') {
+                    joined.push('\n');
+                }
+                joined.push_str(text);
+            }
+            joined
+        }
+        _ => String::new(),
+    }
+}
+
+/// `functionCallOutput` carries no status, so a failed script is recognised
+/// only by the exec wrapper's own framing: a first line of `Script failed`
+/// and a line of `Script error:`. Those words quoted in a log or a file the
+/// agent printed lack that shape and must not turn a good call into a failure.
+fn script_failed(body: &str) -> bool {
+    body.lines().next() == Some("Script failed") && body.lines().any(|line| line == "Script error:")
+}
+
 /// Whether an `error` notification was the end of the turn or one attempt
 /// failing along the way.
 #[derive(Debug, Clone)]
@@ -361,6 +477,7 @@ impl<T: Transport> CodexBridge<T> {
         // figures are held here until the turn is reported.
         let mut seen_usage: Option<Value> = None;
         let mut seen_window: Option<u64> = None;
+        let mut drawn_tools: HashSet<String> = HashSet::new();
 
         let mut params = json!({
             "threadId": thread_id.clone().unwrap_or_default(),
@@ -482,7 +599,11 @@ impl<T: Transport> CodexBridge<T> {
                             .get("exitCode")
                             .or_else(|| item.get("exit_code"))
                             .and_then(Value::as_i64)
-                            .is_some_and(|c| c != 0);
+                            .is_some_and(|c| c != 0)
+                            || matches!(
+                                item.get("status").and_then(Value::as_str),
+                                Some("failed") | Some("declined")
+                            );
                         let output = item
                             .get("aggregatedOutput")
                             .or_else(|| item.get("output"))
@@ -491,6 +612,12 @@ impl<T: Transport> CodexBridge<T> {
                         out.tool_result(&clamp(output, TEXT_LIMIT), failed, cid);
                     }
                     "fileChange" | "file_change" => file_change(out, &item),
+                    "functionCallOutput" | "dynamicToolCall" | "mcpToolCall" => {
+                        let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                        if id.is_empty() || drawn_tools.insert(id.to_string()) {
+                            tool_item(out, kind, &item);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1164,5 +1291,220 @@ mod tests {
         let result = &blocks(&sink, "tool_result")[0];
         assert_eq!(result["content"], "no such file");
         assert_eq!(result["is_error"], true);
+    }
+
+    // ── tool items the bridge used to drop ─────────────────────────────
+
+    const SCRIPT_FAILED: &str = "Script failed\nWall time 0.0 seconds\nOutput:\n";
+    const SYNTAX_ERROR: &str = "Script error:\nSyntaxError: Invalid or unexpected token";
+
+    fn run_items(items: Vec<Value>) -> Arc<Mutex<Vec<Value>>> {
+        let mut frames = vec![json!({"id": 1, "result": {}})];
+        for item in items {
+            frames.push(json!({"method": "item/completed", "params": {"item": item}}));
+        }
+        frames
+            .push(json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}));
+        let (mut b, sink) = bridge(frames);
+        b.turn("run it", Some(Duration::from_secs(2)));
+        sink
+    }
+
+    fn function_output(id: &str, output: Value) -> Value {
+        json!({"type": "functionCallOutput", "id": id, "name": "exec",
+               "namespace": "functions", "output": output})
+    }
+
+    fn only_pair(sink: &Arc<Mutex<Vec<Value>>>) -> (Value, Value) {
+        let calls = blocks(sink, "tool_use");
+        let results = blocks(sink, "tool_result");
+        assert_eq!(calls.len(), 1, "one tool_use expected: {calls:?}");
+        assert_eq!(results.len(), 1, "one tool_result expected: {results:?}");
+        (calls[0].clone(), results[0].clone())
+    }
+
+    #[test]
+    fn a_function_call_that_failed_to_parse_keeps_its_id_text_and_failure() {
+        for output in [
+            json!([
+                {"type": "input_text", "text": SCRIPT_FAILED},
+                {"type": "input_text", "text": SYNTAX_ERROR},
+            ]),
+            json!(format!("{SCRIPT_FAILED}{SYNTAX_ERROR}")),
+        ] {
+            let sink = run_items(vec![function_output("fco-1", output)]);
+
+            let (call, result) = only_pair(&sink);
+            assert_eq!(call["id"], "fco-1");
+            assert_eq!(call["name"], "functions.exec");
+            assert_eq!(result["tool_use_id"], "fco-1");
+            assert_eq!(result["is_error"], true);
+            let body = result["content"].as_str().unwrap();
+            assert!(
+                body.contains("SyntaxError: Invalid or unexpected token"),
+                "{body}"
+            );
+            assert!(body.contains("Script failed"), "{body}");
+        }
+    }
+
+    #[test]
+    fn function_output_that_merely_mentions_an_error_is_not_a_failure() {
+        for text in [
+            "grep result: SyntaxError: Invalid or unexpected token\nin fixtures/a.js",
+            "The log said Script failed earlier but this run is fine",
+            "Script failed\nWall time 0.0 seconds\nOutput:\nno framing line follows",
+            "note\nScript failed\nScript error:\nquoted from a log",
+            "",
+        ] {
+            let sink = run_items(vec![function_output("fco-2", json!(text))]);
+
+            let (call, result) = only_pair(&sink);
+            assert_eq!(call["id"], "fco-2");
+            assert_eq!(result["tool_use_id"], "fco-2");
+            assert_eq!(result["is_error"], false, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_dynamic_tool_call_is_failed_by_its_status_or_its_success_flag() {
+        let item = |id: &str, status: &str, success: Value| {
+            json!({"type": "dynamicToolCall", "id": id, "tool": "lookup",
+                   "namespace": null, "arguments": {"q": "x"}, "status": status,
+                   "success": success,
+                   "contentItems": [{"type": "inputText", "text": format!("out {id}")}]})
+        };
+        let sink = run_items(vec![
+            item("d-failed", "failed", Value::Null),
+            item("d-unsuccessful", "completed", json!(false)),
+            item("d-ok", "completed", json!(true)),
+        ]);
+
+        let calls = blocks(&sink, "tool_use");
+        let results = blocks(&sink, "tool_result");
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(results.len(), 3, "{results:?}");
+        assert_eq!(calls[0]["name"], "lookup");
+        let verdicts: Vec<(String, bool, String)> = results
+            .iter()
+            .map(|r| {
+                (
+                    r["tool_use_id"].as_str().unwrap().to_string(),
+                    r["is_error"].as_bool().unwrap(),
+                    r["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("d-failed".to_string(), true, "out d-failed".to_string()),
+                (
+                    "d-unsuccessful".to_string(),
+                    true,
+                    "out d-unsuccessful".to_string()
+                ),
+                ("d-ok".to_string(), false, "out d-ok".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_mcp_call_fails_on_status_error_object_or_is_error_result() {
+        let call = |id: &str, status: &str, error: Value, result: Value| {
+            json!({"type": "mcpToolCall", "id": id, "server": "srv", "tool": "fetch",
+                   "arguments": {"url": "u"}, "status": status, "error": error,
+                   "result": result})
+        };
+        let sink = run_items(vec![
+            call(
+                "m-error",
+                "failed",
+                json!({"message": "mcp boom"}),
+                Value::Null,
+            ),
+            call(
+                "m-is-error",
+                "completed",
+                Value::Null,
+                json!({"content": [{"type": "text", "text": "tool said no"}], "isError": true}),
+            ),
+            call(
+                "m-ok",
+                "completed",
+                Value::Null,
+                json!({"content": [{"type": "text", "text": "fine"}]}),
+            ),
+        ]);
+
+        let calls = blocks(&sink, "tool_use");
+        let results = blocks(&sink, "tool_result");
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(results.len(), 3, "{results:?}");
+        assert_eq!(calls[0]["name"], "mcp__srv__fetch");
+        let verdicts: Vec<(String, bool, String)> = results
+            .iter()
+            .map(|r| {
+                (
+                    r["tool_use_id"].as_str().unwrap().to_string(),
+                    r["is_error"].as_bool().unwrap(),
+                    r["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("m-error".to_string(), true, "mcp boom".to_string()),
+                ("m-is-error".to_string(), true, "tool said no".to_string()),
+                ("m-ok".to_string(), false, "fine".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_command_that_failed_or_was_declined_fails_even_without_an_exit_code() {
+        let command = |id: &str, status: &str, exit: Value| {
+            json!({"type": "commandExecution", "id": id, "command": "x", "status": status,
+                   "exitCode": exit, "aggregatedOutput": format!("out {id}")})
+        };
+        let sink = run_items(vec![
+            command("c-failed", "failed", Value::Null),
+            command("c-declined", "declined", Value::Null),
+            command("c-done", "completed", Value::Null),
+            command("c-zero", "completed", json!(0)),
+            command("c-nonzero", "completed", json!(2)),
+        ]);
+
+        let flags: Vec<(String, bool)> = blocks(&sink, "tool_result")
+            .iter()
+            .map(|r| {
+                (
+                    r["tool_use_id"].as_str().unwrap().to_string(),
+                    r["is_error"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("c-failed".to_string(), true),
+                ("c-declined".to_string(), true),
+                ("c-done".to_string(), false),
+                ("c-zero".to_string(), false),
+                ("c-nonzero".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_output_is_bounded_and_a_repeated_notification_draws_one_pair() {
+        let huge = format!("{SCRIPT_FAILED}Script error:\n{}", "x".repeat(50_000));
+        let repeated = function_output("fco-big", json!(huge));
+        let sink = run_items(vec![repeated.clone(), repeated]);
+
+        let (_call, result) = only_pair(&sink);
+        assert_eq!(result["is_error"], true);
+        assert!(result["content"].as_str().unwrap().chars().count() <= TEXT_LIMIT + 64);
     }
 }
