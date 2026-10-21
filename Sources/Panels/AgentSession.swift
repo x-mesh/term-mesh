@@ -1856,6 +1856,7 @@ final class AgentSession {
         /// measured, so their panes do not offer a button that might do
         /// something else.
         var interruptible = false
+        var bridgeCLI: String?
     }
 
     /// Every worker session term-mesh launches turns these plugins off.
@@ -1947,7 +1948,8 @@ final class AgentSession {
                       workingDirectory: workingDirectory,
                       environment: environment,
                       loadsAccountEnvironment: loadsAccountEnvironment,
-                      protectedEnvironmentKeys: protectedEnvironmentKeys)
+                      protectedEnvironmentKeys: protectedEnvironmentKeys,
+                      bridgeCLI: cli)
     }
 
     /// Command run by a local native pane's login shell. The shell supplies
@@ -2070,7 +2072,8 @@ final class AgentSession {
             executable: "/usr/bin/env",
             arguments: AgentPipeTransport.bridgeInterpreter(for: bridgePath) + args,
             workingDirectory: FileManager.default.temporaryDirectory.path,
-            environment: env
+            environment: env,
+            bridgeCLI: cli
         )
     }
 
@@ -2204,6 +2207,7 @@ final class AgentSession {
 
     func start(_ launch: Launch) {
         guard process == nil, remoteSink == nil else { return }
+        hostedCLI = launch.bridgeCLI
         liveGeneration = UUID()
         stderrDiagnostic = nil
         streamDiagnostic = nil
@@ -2389,12 +2393,12 @@ final class AgentSession {
     /// `interruptible` is the same promise `Launch.interruptible` makes: only
     /// a CLI measured to take `control_request`/`interrupt` on its stdin
     /// stream should offer the button.
-    /// `cli` only names the binary in the watchdog's message, so a session
-    /// that does not know which CLI it is hosting still gets the backstop.
+    /// A session whose CLI is unknown still gets the startup backstop.
     func startRemote(interruptible: Bool = false,
                      cli: String? = nil,
                      sink: @escaping @Sendable (Data) async throws -> Void) {
         guard process == nil, remoteSink == nil else { return }
+        hostedCLI = cli
         streamDiagnostic = nil
         remoteSink = sink
         let named = cli.map { "`\($0)`" } ?? "the agent CLI"
@@ -2478,6 +2482,7 @@ final class AgentSession {
         guard let streams = remoteStreamsBox.current() else { return false }
         // Not `abandonCarriedCorrelation`: a window about to reopen must not
         // deliver a queued instruction into it.
+        parkedTask = nil
         let closedOpenWindow = endReplayWindow()
         if let displaced = uninstalledCarry {
             uninstalledCarry = nil
@@ -2814,9 +2819,10 @@ final class AgentSession {
             if !replayingHistory {
                 onTurnEnd?(stopped ? "the session was stopped before this turn finished"
                                    : "the agent exited before finishing this turn",
-                           end, answered?.taskId)
+                           end, answered == parkedTask ? nil : answered?.taskId)
             }
         }
+        parkedTask = nil
         // Nothing can reach this session's correlation any more — no stdin, no
         // stream — so waiting for a STATUS would only delay the leader.
         if let task = pendingTask {
@@ -2928,7 +2934,11 @@ final class AgentSession {
         receipt: (@MainActor (SendDisposition) -> Void)? = nil
     ) throws -> Int {
         guard isRunning else { throw SendError.notRunning }
-        let payload = try Self.encode(text: text)
+        let cwd = turnCwd(for: text, from: speaker)
+        let payload = try Self.encode(
+            text: text, cwd: cwd,
+            resetCwd: hostedCLI == "codex" && cwd == nil
+        )
         try writeToTransport(payload, receipt: receipt)
         // Shown from the receipt (`isReplay`) rather than from here, so what is
         // drawn is what the agent confirmed receiving — not what was hoped for.
@@ -2941,7 +2951,11 @@ final class AgentSession {
     /// TASK_ID moves the task correlation.
     private func beginWrittenTurn(from speaker: Speaker, taskId: String?) {
         noteTaskActivity()
-        if speaker == .leader, let taskId { correlate(taskId) }
+        if speaker == .leader, let taskId {
+            correlate(taskId)
+        } else {
+            parkedTask = nil
+        }
         // A person joining a turn the CLI started itself makes it theirs: the
         // result may now answer them, so it must not close the pending task.
         if turnInFlight, speaker == .person, turnOrigin == .selfStarted {
@@ -2979,6 +2993,7 @@ final class AgentSession {
                 // its correlation now, and a loss would block the task it renews.
             }
         }
+        parkedTask = nil
         taskCorrelationGeneration &+= 1
         pendingTask = PendingTask(taskId: taskId, generation: taskCorrelationGeneration)
         uncorrelatedStatusGeneration = nil
@@ -3062,6 +3077,14 @@ final class AgentSession {
     }
 
     @ObservationIgnored private var pendingTask: PendingTask?
+    /// A task the worker itself parked with an explicit BLOCKED or
+    /// NEEDS_REVIEW. It has no deadline, so nothing re-blocks it, and only a
+    /// turn the CLI starts on its own may continue it: the worker's own later
+    /// DONE closes it. Any input written to the session afterwards — a leader
+    /// or person turn without TASK_ID, a new TASK_ID dispatch — or a replay or
+    /// stop drops it, because a later selfStarted turn could be answering that
+    /// input instead of the parked task.
+    @ObservationIgnored private var parkedTask: PendingTask?
     @ObservationIgnored private var taskCorrelationGeneration: UInt64 = 0
     /// The pending correlation a turn not tied to it stated a STATUS during.
     /// That turn may be answering something else, so it cannot settle the
@@ -3094,7 +3117,8 @@ final class AgentSession {
 
     private var correlatedTask: PendingTask? {
         switch turnOrigin {
-        case .dispatch, .selfStarted: return pendingTask
+        case .dispatch: return pendingTask
+        case .selfStarted: return pendingTask ?? parkedTask
         case .leaderPlain, .person, nil: return nil
         }
     }
@@ -3144,13 +3168,30 @@ final class AgentSession {
     /// running, which is what makes interrupting useful.
     @ObservationIgnored private var queued: [(text: String, taskId: String?)] = []
 
-    static func encode(text: String) throws -> Data {
-        var data = try JSONSerialization.data(withJSONObject: [
+    static func encode(text: String, cwd: String? = nil, resetCwd: Bool = false) throws -> Data {
+        var frame: [String: Any] = [
             "type": "user",
             "message": ["role": "user", "content": text],
-        ])
+        ]
+        if let cwd {
+            frame["cwd"] = cwd
+        } else if resetCwd {
+            frame["cwd"] = NSNull()
+        }
+        var data = try JSONSerialization.data(withJSONObject: frame)
         data.append(0x0A)
         return data
+    }
+
+    nonisolated static let cwdEnvelopeCLIs: Set<String> = ["codex"]
+
+    @ObservationIgnored private var hostedCLI: String?
+    @ObservationIgnored var workingDirectoryForTask: ((String) -> String?)?
+
+    private func turnCwd(for text: String, from speaker: Speaker) -> String? {
+        guard let hostedCLI, Self.cwdEnvelopeCLIs.contains(hostedCLI),
+              speaker == .leader, let taskId = Self.taskId(in: text) else { return nil }
+        return workingDirectoryForTask?(taskId)
     }
 
     /// Appends a notice row the app produced itself — e.g. a slash command's
@@ -3642,11 +3683,20 @@ final class AgentSession {
         // stated rather than inferred from a screen going quiet.
         saidThisTurn.removeAll()
         noteTaskActivity()
-        let stated = AgentPipeCompletion.explicitStatus(in: final) != nil
+        let verdict = AgentPipeCompletion.explicitStatus(in: final)
+        let stated = verdict != nil
+        var reportedTaskId = answered?.taskId
         if replayingHistory {
             // A replayed result answered the retired pane, never this one.
         } else if let answered, pendingTask == answered, stated {
             pendingTask = nil
+            parkedTask = verdict == "DONE" ? nil : answered
+        } else if let answered, parkedTask == answered {
+            if verdict == "DONE" {
+                parkedTask = nil
+            } else if !stated {
+                reportedTaskId = nil
+            }
         } else if answered == nil, stated, let pendingTask {
             uncorrelatedStatusGeneration = pendingTask.generation
         } else if answered != nil {
@@ -3656,7 +3706,7 @@ final class AgentSession {
             taskStatusWaitStart = nil
         }
         if !replayingHistory {
-            onTurnEnd?(final, end, answered?.taskId)
+            onTurnEnd?(final, end, reportedTaskId)
         }
 
         // The next leader turn only now, so it gets a turn of its own. A
@@ -4101,6 +4151,8 @@ final class AgentSession {
     }
 
     var pendingTaskIdForTesting: String? { pendingTask?.taskId }
+
+    var parkedTaskIdForTesting: String? { parkedTask?.taskId }
 
     var isReplayingHistoryForTesting: Bool { replayingHistory }
 

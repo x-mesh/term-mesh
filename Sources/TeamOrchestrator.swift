@@ -7263,16 +7263,33 @@ final class TeamOrchestrator: ObservableObject {
         _ session: AgentSession,
         teamName: String,
         agentName: String,
-        agentInstanceId: String?
+        agentInstanceId: String?,
+        report: ((String?, String) -> Void)? = nil
     ) {
+        session.workingDirectoryForTask = { taskId in
+            nativeWorkerTask(
+                teamName: teamName, agentName: agentName,
+                agentInstanceId: agentInstanceId, taskId: taskId
+            )?.worktreePath
+        }
         session.onTurnEnd = { final, _, taskId in
-            fileReport(teamName: teamName, agentName: agentName,
-                       agentInstanceId: agentInstanceId,
-                       taskId: taskId, text: final)
+            let reportTaskId = taskId.flatMap {
+                nativeWorkerTask(
+                    teamName: teamName, agentName: agentName,
+                    agentInstanceId: agentInstanceId, taskId: $0
+                )?.id
+            }
+            if let report {
+                report(reportTaskId, final)
+            } else {
+                fileReport(teamName: teamName, agentName: agentName,
+                           agentInstanceId: agentInstanceId,
+                           taskId: reportTaskId, text: final)
+            }
             AutoReplyEmit.settleNativeTurn(
                 teamName: teamName, agentName: agentName,
                 agentInstanceId: agentInstanceId,
-                final: final, taskId: taskId
+                final: final, taskId: reportTaskId
             )
         }
         session.onTaskCorrelationLost = { taskId, loss in
@@ -7282,6 +7299,21 @@ final class TeamOrchestrator: ObservableObject {
                 taskId: taskId, reason: loss.reason
             )
         }
+    }
+
+    private static func nativeWorkerTask(
+        teamName: String, agentName: String, agentInstanceId: String?, taskId: String
+    ) -> TeamTask? {
+        let store = TeamDataStore.shared
+        guard let task = store.getTask(teamName: teamName, taskId: taskId),
+              task.assignee == agentName,
+              !AutoReplyEmit.terminalStatuses.contains(task.status),
+              store.agentIdentityMatches(
+                teamName: teamName, agentName: agentName,
+                expectedInstanceId: task.assigneeInstanceId,
+                reportedInstanceId: agentInstanceId
+              ) else { return nil }
+        return task
     }
 
     /// File a turn's full text where the leader looks for it.

@@ -127,7 +127,7 @@ for raw in sys.stdin:
         # than special-casing the first: an agent that never warms is reported
         # as timed out and `add` exits nonzero.
         print(json.dumps({"method": "item/completed", "params": {"item": {
-            "type": "agentMessage", "text": "pong"
+            "type": "agentMessage", "text": "STATUS: DONE\nFILES: none\nVERIFY: pong\nNEXT: none\nFULL_REPORT: n/a\npong"
         }}}), flush=True)
         print(json.dumps({"method": "turn/completed", "params": {
             "threadId": "qlat-thread", "turn": {"status": "completed"}

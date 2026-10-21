@@ -38,6 +38,30 @@ Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Lib
 
 Spike 상세: `docs/spike/agent-pipe-render.md`
 
+### 작업 재개와 후속 지시
+
+기존 작업을 이어서 지시할 때는 task ID를 명시한다.
+
+```bash
+tm-agent send executor '실패 원인을 확인했으니 다시 시도해 주세요.' --task <task-id>
+```
+
+`--task`는 기존 작업의 담당자와 인스턴스를 확인하고 같은 task ID로 후속
+지시를 보낸다. 작업에 worktree가 있으면 경로도 함께 전달한다. task ID 없는
+`send`는 독립적인 대화이므로 그 답변의 DONE이 기존 작업을 완료하지 않는다.
+인스턴스 소유권을 확인할 수 없는 headless 경로로는 작업 후속 지시를 전송하지 않는다.
+
+Native worker가 BLOCKED 또는 NEEDS_REVIEW를 보고한 뒤 같은 작업을 스스로
+재개하면 후속 DONE을 그 작업에 반영한다. 다른 task ID, 사람 입력, 독립적인
+leader 대화가 들어오거나 작업이 완료되면 이전 연결은 이어받지 않는다.
+BLOCKED 이후 leader가 원인을 알려 주고 재시도를 맡길 때는 `--task`를 쓴다.
+
+Native Codex의 Rust bridge는 task 보드에서 확인한 작업 worktree를 각 실행
+요청의 `cwd`로 전달한다. 지시문에 적힌 경로는 실행 경로의 근거로 쓰지 않는다.
+worktree 없는 새 작업과 독립적인 대화는 세션 시작 경로로 되돌린다. 진행 중인
+턴 뒤에 작업이 대기하더라도 각 작업의 경로는 해당 턴과 함께 전달된다.
+도구 호출이 별도로 지정한 `workdir`는 이 경로 전달로 덮어쓰지 않는다.
+
 ### Remote native agent environment
 
 GUI에서 만든 Project도 양쪽 앱이 live-presentation protocol을 지원하면 원격에서

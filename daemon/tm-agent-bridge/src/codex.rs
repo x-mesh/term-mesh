@@ -235,6 +235,7 @@ pub struct CodexBridge<T: Transport> {
     /// None means no effort override. Some(None) sends JSON null to Codex.
     pub effort: Option<Option<String>>,
     pub thread_id: Option<String>,
+    pub turn_cwd: Option<String>,
 }
 
 impl<T: Transport> CodexBridge<T> {
@@ -246,6 +247,7 @@ impl<T: Transport> CodexBridge<T> {
             model,
             effort: None,
             thread_id: None,
+            turn_cwd: None,
         }
     }
 
@@ -256,6 +258,10 @@ impl<T: Transport> CodexBridge<T> {
         if let Some(effort) = &control.effort {
             self.effort = Some(effort.clone());
         }
+    }
+
+    pub fn apply_turn_cwd(&mut self, cwd: Option<&str>) {
+        self.turn_cwd = Some(cwd.unwrap_or(&self.cwd).to_string());
     }
 
     pub fn start(&mut self) -> bool {
@@ -337,6 +343,7 @@ impl<T: Transport> CodexBridge<T> {
             model,
             effort,
             thread_id,
+            turn_cwd,
             ..
         } = self;
 
@@ -361,6 +368,9 @@ impl<T: Transport> CodexBridge<T> {
         });
         if let Some(model) = model.as_deref() {
             params["model"] = Value::String(model.to_string());
+        }
+        if let Some(cwd) = turn_cwd.as_deref() {
+            params["cwd"] = Value::String(cwd.to_string());
         }
         if let Some(effort) = effort {
             params["effort"] = effort
