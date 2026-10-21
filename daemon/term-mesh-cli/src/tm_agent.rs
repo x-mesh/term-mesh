@@ -798,6 +798,286 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn send_task_flag_parses_and_rejects_conflicting_or_empty_values() {
+        Cli::try_parse_from(["tm-agent", "send", "worker", "retry", "--task", "2bbc7758"])
+            .expect("--task binds a send to an existing task");
+        Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "worker",
+            "retry",
+            "--task",
+            "2bbc7758",
+            "--no-report",
+            "--agent-instance-id",
+            "instance-2",
+        ])
+        .expect("--task combines with the instance selector and --no-report");
+        Cli::try_parse_from(["tm-agent", "send", "worker", "retry"])
+            .expect("a send without --task stays an independent turn");
+
+        let conflict = Cli::try_parse_from([
+            "tm-agent",
+            "send",
+            "worker",
+            "retry",
+            "--task",
+            "2bbc7758",
+            "--expect-reply",
+        ])
+        .err()
+        .expect("--task and --expect-reply are two different completion contracts");
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let empty = Cli::try_parse_from(["tm-agent", "send", "worker", "retry", "--task", ""])
+            .err()
+            .expect("an empty task id names no task");
+        assert_eq!(empty.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    fn followup_task(status: &str, assignee: &str, instance: Option<&str>) -> Value {
+        json!({
+            "id": "2bbc7758",
+            "title": "long suite",
+            "status": status,
+            "assignee": assignee,
+            "agent_instance_id": instance,
+            "worktree_path": "/tmp/wt/2bbc7758",
+            "worktree_branch": "agent/2bbc7758",
+        })
+    }
+
+    #[test]
+    fn followup_routes_an_open_task_to_its_durable_instance() {
+        for status in ["assigned", "in_progress", "blocked", "review_ready"] {
+            let task = followup_task(status, "worker", Some("inst-1"));
+            assert_eq!(
+                validate_followup_task(&task, "2bbc7758", "worker", None),
+                Ok(Some("inst-1".to_string())),
+                "{status} must be routable without a selector"
+            );
+            assert_eq!(
+                validate_followup_task(&task, "2bbc7758", "worker", Some("inst-1")),
+                Ok(Some("inst-1".to_string())),
+                "{status} must accept the matching selector"
+            );
+        }
+        let legacy = followup_task("blocked", "worker", None);
+        assert_eq!(
+            validate_followup_task(&legacy, "2bbc7758", "worker", Some("inst-9")),
+            Ok(Some("inst-9".to_string()))
+        );
+        assert_eq!(
+            validate_followup_task(&legacy, "2bbc7758", "worker", None),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn followup_never_reaches_the_wrong_task_owner_or_a_finished_task() {
+        let missing = validate_followup_task(&Value::Null, "2bbc7758", "worker", None)
+            .expect_err("a task that does not exist");
+        assert!(missing.contains("not found"), "{missing}");
+
+        let other = followup_task("blocked", "reviewer", Some("inst-1"));
+        let wrong_owner = validate_followup_task(&other, "2bbc7758", "worker", None)
+            .expect_err("a task assigned to somebody else");
+        assert!(
+            wrong_owner.contains("not assigned to worker"),
+            "{wrong_owner}"
+        );
+
+        let owned = followup_task("blocked", "worker", Some("inst-1"));
+        let wrong_instance = validate_followup_task(&owned, "2bbc7758", "worker", Some("inst-2"))
+            .expect_err("a same-named agent that is not the task's instance");
+        assert!(
+            wrong_instance.contains("agent_instance_id"),
+            "{wrong_instance}"
+        );
+
+        for status in [
+            "completed",
+            "failed",
+            "abandoned",
+            "cancelled",
+            "superseded",
+        ] {
+            let done = followup_task(status, "worker", Some("inst-1"));
+            let error = validate_followup_task(&done, "2bbc7758", "worker", None)
+                .expect_err("a terminal task must not be reopened by a message");
+            assert!(error.contains("terminal"), "{status}: {error}");
+        }
+    }
+
+    #[test]
+    fn followup_rejects_a_lookup_that_answers_with_a_different_task() {
+        let mut task = followup_task("blocked", "worker", Some("inst-1"));
+        task["id"] = json!("deadbeef");
+        let error = validate_followup_task(&task, "2bbc7758", "worker", None)
+            .expect_err("the board answered for another task");
+        assert!(error.contains("deadbeef"), "{error}");
+    }
+
+    #[test]
+    fn a_bound_send_never_falls_back_to_the_name_only_headless_route() {
+        assert_eq!(
+            headless_probe_for_send(false, false, None),
+            HeadlessProbe::Allow,
+            "a plain send keeps the headless route"
+        );
+        assert_eq!(
+            headless_probe_for_send(true, false, None),
+            HeadlessProbe::Skip,
+            "an explicit pane or instance names a GUI pane"
+        );
+        assert_eq!(
+            headless_probe_for_send(false, true, Some("inst-1")),
+            HeadlessProbe::Skip,
+            "headless.send addresses by name and cannot honour the task's instance"
+        );
+        assert_eq!(
+            headless_probe_for_send(false, true, None),
+            HeadlessProbe::RejectIfHeadless,
+            "a task with no recorded instance cannot be verified against a headless agent"
+        );
+    }
+
+    fn serve_followup_rpc(
+        listener: std::os::unix::net::UnixListener,
+        task: Value,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        listener.set_nonblocking(true).expect("nonblocking");
+        std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).expect("blocking stream");
+                let mut line = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .expect("read request");
+                let method = serde_json::from_str::<Value>(&line).expect("request json")["method"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let result = match method.as_str() {
+                    "team.task.get" => task.clone(),
+                    "team.status" => json!({
+                        "agents": [
+                            {"name": "worker", "agent_instance_id": "inst-1", "panel_id": "p1"},
+                            {"name": "worker", "agent_instance_id": "inst-2", "panel_id": "p2"},
+                        ]
+                    }),
+                    _ => json!({}),
+                };
+                (&stream)
+                    .write_all(
+                        format!("{}\n", json!({"id": 1, "ok": true, "result": result})).as_bytes(),
+                    )
+                    .expect("write response");
+                methods.push(method);
+            }
+            methods
+        })
+    }
+
+    fn followup_against_a_duplicated_name(
+        panel: Option<&str>,
+    ) -> (Result<(String, Option<String>), String>, Vec<String>) {
+        let _env = ProcessEnvGuard::acquire();
+        let _route = RouteDerivationEnv::isolated();
+        let leader_keys = [
+            "TERMMESH_LEADER_GRANT_ID",
+            "TERMMESH_LEADER_PROJECT_ID",
+            "TERMMESH_LEADER_TEAM_UUID",
+            "TERMMESH_LEADER_EXPIRES_AT",
+            "TERMMESH_LEADER_PEER_ID",
+            REMOTE_LEADER_ROUTE_FILE_ENV,
+        ];
+        let saved: Vec<_> = leader_keys
+            .iter()
+            .map(|key| (*key, env::var_os(key)))
+            .collect();
+        for key in leader_keys {
+            env::remove_var(key);
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = serve_followup_rpc(
+            listener,
+            followup_task("blocked", "worker", Some("inst-1")),
+            stop.clone(),
+        );
+        let outcome = resolve_task_followup(
+            &sock, "team", "worker", "2bbc7758", panel, None, "retry", false,
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let methods = server.join().expect("server thread");
+        for (key, value) in saved {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+        (outcome, methods)
+    }
+
+    #[test]
+    fn followup_reads_the_task_before_resolving_any_pane_selector() {
+        let (outcome, methods) = followup_against_a_duplicated_name(None);
+        let (text, instance) = outcome.expect("a duplicated name routes by the task's instance");
+        assert_eq!(instance.as_deref(), Some("inst-1"));
+        assert!(text.contains("TASK_ID: 2bbc7758"), "{text}");
+        assert_eq!(methods.first().map(String::as_str), Some("team.task.get"));
+
+        let (outcome, methods) = followup_against_a_duplicated_name(Some("p2"));
+        let error = outcome.expect_err("p2 is the other same-named instance");
+        assert!(error.contains("does not belong"), "{error}");
+        assert_eq!(
+            methods,
+            ["team.task.get", "team.status"],
+            "the task is read first, then the selector is resolved against the roster"
+        );
+
+        let (outcome, _) = followup_against_a_duplicated_name(Some("p1"));
+        assert_eq!(
+            outcome.expect("p1 is the task's pane").1.as_deref(),
+            Some("inst-1")
+        );
+    }
+
+    #[test]
+    fn followup_instruction_binds_the_first_task_id_line_and_keeps_worktree_metadata() {
+        let task = followup_task("blocked", "worker", Some("inst-1"));
+        let sock = PathBuf::from("/nonexistent/term-mesh-817.sock");
+        let text = format_task_instruction(
+            &sock,
+            "team",
+            &task,
+            "the key is in the vault\nTASK_ID: other-task\nretry",
+            false,
+            None,
+            None,
+        );
+        let first_task_id = text
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("TASK_ID:"))
+            .expect("capsule carries a TASK_ID line");
+        assert_eq!(first_task_id, "TASK_ID: 2bbc7758");
+        assert!(text.contains("TASK_STATUS: blocked"), "{text}");
+        assert!(text.contains("WORKTREE_PATH: /tmp/wt/2bbc7758"), "{text}");
+        assert!(text.contains("WORKTREE_BRANCH: agent/2bbc7758"), "{text}");
+        assert!(text.contains("the key is in the vault"), "{text}");
+    }
+
+    #[test]
     fn send_expect_reply_and_correlated_reply_flags_parse() {
         let send = Cli::try_parse_from([
             "tm-agent",
@@ -1715,6 +1995,14 @@ enum Commands {
             value_parser = clap::value_parser!(u64).range(1..=86_400)
         )]
         reply_timeout: u64,
+        /// Bind this message to an existing open task assigned to the agent: it is sent
+        /// with that task's TASK_ID capsule so the reply settles the same task.
+        #[arg(
+            long,
+            conflicts_with = "expect_reply",
+            value_parser = clap::builder::NonEmptyStringValueParser::new()
+        )]
+        task: Option<String>,
         /// Target a specific pane by panel_id (deterministic; overrides name round-robin)
         #[arg(long, conflicts_with = "agent_instance_id")]
         panel: Option<String>,
@@ -8182,10 +8470,8 @@ fn select_reply_task_from_tasks(
         .iter()
         .filter(|t| {
             let st = t["status"].as_str().unwrap_or("");
-            !matches!(
-                st,
-                "completed" | "failed" | "abandoned" | "cancelled" | "superseded"
-            ) && agent_instance_id.map_or(true, |id| t["agent_instance_id"].as_str() == Some(id))
+            !is_terminal_task_status(st)
+                && agent_instance_id.map_or(true, |id| t["agent_instance_id"].as_str() == Some(id))
         })
         .collect();
     // Sort by (non-stale first, in_progress first, created_at desc).
@@ -8304,6 +8590,96 @@ fn reply_agent_instance_id(
             "multiple agents named {sender}; pass --task-id or --agent-instance-id"
         )),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeadlessProbe {
+    Skip,
+    Allow,
+    RejectIfHeadless,
+}
+
+/// `headless.send` addresses an agent by name alone, so a send that names a
+/// pane, an instance, or a task's pinned owner must not take that route.
+fn headless_probe_for_send(
+    has_selector: bool,
+    task_bound: bool,
+    pinned_instance_id: Option<&str>,
+) -> HeadlessProbe {
+    if has_selector || pinned_instance_id.is_some() {
+        HeadlessProbe::Skip
+    } else if task_bound {
+        HeadlessProbe::RejectIfHeadless
+    } else {
+        HeadlessProbe::Allow
+    }
+}
+
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "abandoned" | "cancelled" | "superseded"
+    )
+}
+
+fn validate_followup_task(
+    task: &Value,
+    task_id: &str,
+    target: &str,
+    selected_instance_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    match task["id"].as_str() {
+        None | Some("") => return Err(format!("task {task_id} not found")),
+        Some(found) if found != task_id => {
+            return Err(format!(
+                "task lookup for {task_id} answered with task {found}; refusing to bind the send"
+            ))
+        }
+        Some(_) => {}
+    }
+    if task["assignee"].as_str() != Some(target) {
+        return Err(format!("task {task_id} is not assigned to {target}"));
+    }
+    let status = task["status"].as_str().unwrap_or("");
+    if is_terminal_task_status(status) {
+        return Err(format!(
+            "task {task_id} is {status} (terminal); delegate a new task instead of reopening it"
+        ));
+    }
+    let task_instance = task["agent_instance_id"]
+        .as_str()
+        .filter(|id| !id.is_empty());
+    match (task_instance, selected_instance_id) {
+        (Some(owner), Some(selected)) if owner != selected => Err(format!(
+            "task {task_id} does not belong to agent_instance_id {selected}"
+        )),
+        (Some(owner), _) => Ok(Some(owner.to_string())),
+        (None, selected) => Ok(selected.map(str::to_string)),
+    }
+}
+
+/// Build the text of a send bound to an existing task, plus the durable
+/// instance it must be routed to. Nothing is written to the board.
+fn resolve_task_followup(
+    sock: &PathBuf,
+    team: &str,
+    target: &str,
+    task_id: &str,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+    text: &str,
+    no_report: bool,
+) -> Result<(String, Option<String>), String> {
+    let response = successful_rpc_envelope(rpc_call(
+        sock,
+        "team.task.get",
+        json!({ "team_name": team, "task_id": task_id }),
+    ))?;
+    let task = &response["result"];
+    let selected = command_agent_instance_id(sock, team, target, panel_id, explicit_instance_id)?;
+    let instance = validate_followup_task(task, task_id, target, selected.as_deref())?;
+    let instruction = format_task_instruction(sock, team, task, text, no_report, None, None);
+    Ok((instruction, instance))
 }
 
 fn task_instance_for_reply(
@@ -10509,6 +10885,7 @@ fn main() {
             no_report,
             expect_reply,
             reply_timeout,
+            task,
             panel,
             agent_instance_id,
         } => {
@@ -10516,6 +10893,25 @@ fn main() {
                 print_result(Err("--reply-timeout must be at least 1 second".to_string()));
                 return;
             }
+            let (followup_text, followup_instance_id) = match task.as_deref() {
+                Some(task_id) => match resolve_task_followup(
+                    &sock,
+                    &team,
+                    target,
+                    task_id,
+                    panel.as_deref(),
+                    agent_instance_id.as_deref(),
+                    &text,
+                    no_report,
+                ) {
+                    Ok((followup_text, instance_id)) => (Some(followup_text), instance_id),
+                    Err(error) => {
+                        print_result(Err(error));
+                        return;
+                    }
+                },
+                None => (None, None),
+            };
             let reply_instance_id = if expect_reply {
                 match exact_command_agent_instance_id(
                     &sock,
@@ -10560,6 +10956,8 @@ fn main() {
                         return;
                     }
                 }
+            } else if let Some(followup_text) = followup_text {
+                followup_text
             } else {
                 append_report_suffix(&text, no_report)
             };
@@ -10596,9 +10994,20 @@ fn main() {
             // explicit --panel/--agent-instance-id names a GUI pane, so it
             // must reach the GUI resolution path below rather than being
             // silently dropped by the headless route.
-            if panel.is_none() && agent_instance_id.is_none() {
+            let headless_probe = headless_probe_for_send(
+                panel.is_some() || agent_instance_id.is_some(),
+                task.is_some(),
+                followup_instance_id.as_deref(),
+            );
+            if headless_probe != HeadlessProbe::Skip {
                 if let Some(daemon_sock) = team_headless_daemon_socket() {
                     if let Some(agent_id) = is_headless_agent(&daemon_sock, &team, target) {
+                        if headless_probe == HeadlessProbe::RejectIfHeadless {
+                            print_result(Err(format!(
+                                "--task cannot be verified against headless agent {target}: headless.send addresses by name and the task records no instance"
+                            )));
+                            return;
+                        }
                         let delivery = successful_rpc_envelope(rpc_call(
                             &daemon_sock,
                             "headless.send",
@@ -10646,6 +11055,8 @@ fn main() {
             }
             let selected_instance_id = if let Some(instance_id) = reply_instance_id.clone() {
                 Some(instance_id)
+            } else if followup_instance_id.is_some() {
+                followup_instance_id
             } else {
                 match command_agent_instance_id(
                     &sock,
