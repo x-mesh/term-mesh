@@ -1366,13 +1366,15 @@ final class AgentSession {
     func visibleTranscriptText(lineLimit: Int? = nil) -> String {
         Self.visibleTranscriptText(
             rows: Self.displayRows(for: entries).rows,
-            lineLimit: lineLimit
+            lineLimit: lineLimit,
+            footer: toolFailureWarning
         )
     }
 
     static func visibleTranscriptText(
         rows: [Row],
-        lineLimit: Int? = nil
+        lineLimit: Int? = nil,
+        footer: String? = nil
     ) -> String {
         let text = rows.compactMap { row -> String? in
             switch row.entry {
@@ -1388,8 +1390,11 @@ final class AgentSession {
                 // projection, so omission is the conservative equivalent.
                 return nil
             case .tool(_, let call):
-                return "\(call.name) \(projectedToolHeadline(call.headline))"
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                var line = "\(projectedToolHeadline(call.name)) \(projectedToolHeadline(call.headline))"
+                if call.failed {
+                    line += " — failed: " + usefulErrorLine(in: call.result ?? "")
+                }
+                return line.trimmingCharacters(in: .whitespacesAndNewlines)
             case .turnEnded(_, let end):
                 var parts: [String] = []
                 if let status = end.verdict?.status, !status.isEmpty { parts.append(status) }
@@ -1398,9 +1403,9 @@ final class AgentSession {
             case .notice(_, let text):
                 return "! " + redactingCredentials(text)
             }
-        }.joined(separator: "\n")
+        } + (footer.map { [$0] } ?? [])
 
-        return tailBoundedTranscript(text, lineLimit: lineLimit)
+        return tailBoundedTranscript(text.joined(separator: "\n"), lineLimit: lineLimit)
     }
 
     /// 300 is the shipped bound. The override exists so the bound itself can be
@@ -2972,6 +2977,7 @@ final class AgentSession {
         if !turnInFlight {
             turnStartedAt = Date()
             turnOrigin = origin
+            toolFailures.beginTurn()
         }
         turnInFlight = true
         cancelTaskStatusDeadline()
@@ -3085,6 +3091,89 @@ final class AgentSession {
     /// stop drops it, because a later selfStarted turn could be answering that
     /// input instead of the parked task.
     @ObservationIgnored private var parkedTask: PendingTask?
+
+    struct ToolFailureHealth {
+        static let attentionThreshold = 3
+        private static let countedLimit = 1_024
+
+        private(set) var total = 0
+        private(set) var turnFailures = 0
+        private(set) var consecutive = 0
+        private(set) var lastError: String?
+        private(set) var lastTool: String?
+        private var turnSerial = 0
+        private var counted: Set<String> = []
+        private var countedOrder: [String] = []
+
+        var needsAttention: Bool { consecutive >= Self.attentionThreshold }
+
+        mutating func beginTurn() {
+            turnSerial += 1
+            turnFailures = 0
+            consecutive = 0
+        }
+
+        mutating func record(id: String, tool: String, failed: Bool, error: @autoclosure () -> String) {
+            let key = "\(turnSerial)/\(id)"
+            guard counted.insert(key).inserted else { return }
+            countedOrder.append(key)
+            if countedOrder.count > Self.countedLimit {
+                counted.remove(countedOrder.removeFirst())
+            }
+            guard failed else {
+                consecutive = 0
+                return
+            }
+            total += 1
+            turnFailures += 1
+            consecutive += 1
+            lastTool = tool
+            lastError = error()
+        }
+    }
+
+    @ObservationIgnored private var toolFailures = ToolFailureHealth()
+
+    var toolFailureSummary: [String: Any] {
+        var summary: [String: Any] = [
+            "total": toolFailures.total,
+            "turn_failures": toolFailures.turnFailures,
+            "consecutive": toolFailures.consecutive,
+            "needs_attention": toolFailures.needsAttention,
+        ]
+        if let lastError = toolFailures.lastError { summary["last_error"] = lastError }
+        if let lastTool = toolFailures.lastTool { summary["last_tool"] = lastTool }
+        return summary
+    }
+
+    private var toolFailureWarning: String? {
+        guard toolFailures.needsAttention else { return nil }
+        let last = [toolFailures.lastTool, toolFailures.lastError].compactMap { $0 }
+            .joined(separator: ": ")
+        return "! \(toolFailures.consecutive) consecutive tool failures this turn"
+            + (last.isEmpty ? "" : " (last \(last))")
+            + ". Interrupt it and re-send a simpler instruction, or restart the session if it keeps failing."
+    }
+
+    private func noteToolOutcome(id: String, call: ToolCall, isError: Bool) {
+        guard !replayingHistory else { return }
+        if isError, stopRequested { return }
+        toolFailures.record(
+            id: id, tool: Self.projectedToolHeadline(call.name), failed: isError,
+            error: Self.usefulErrorLine(in: call.result ?? ""))
+    }
+
+    static func usefulErrorLine(in body: String) -> String {
+        let noisePrefixes = ["script failed", "script error", "wall time", "exit code"]
+        let lines = body.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let line = lines.first { candidate in
+            let lowered = candidate.lowercased()
+            return lowered != "output:" && !noisePrefixes.contains { lowered.hasPrefix($0) }
+        } ?? lines.first ?? "no error output"
+        return projectedToolHeadline(line)
+    }
     @ObservationIgnored private var taskCorrelationGeneration: UInt64 = 0
     /// The pending correlation a turn not tied to it stated a STATUS during.
     /// That turn may be answering something else, so it cannot settle the
@@ -3579,6 +3668,7 @@ final class AgentSession {
               index < entries.count,
               case .tool(let entryId, var call) = entries[index]
         else { return }
+        defer { noteToolOutcome(id: id, call: call, isError: block["is_error"] as? Bool ?? false) }
         var body = block["content"]
         if let blocks = body as? [[String: Any]] {
             body = blocks.compactMap { $0["text"] as? String }.joined()
@@ -3599,6 +3689,7 @@ final class AgentSession {
             dlog("agent.turn.selfStarted event=result task=\(pendingTask?.taskId ?? "-")")
             #endif
             turnOrigin = .selfStarted
+            toolFailures.beginTurn()
         }
         let answered = correlatedTask
         let usage = o["usage"] as? [String: Any] ?? [:]

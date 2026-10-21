@@ -9280,6 +9280,9 @@ final class TeamOrchestrator: ObservableObject {
                     "workspace_id": agent.workspaceId.uuidString,
                 ]
                 info["completed_task_count"] = agent.completedTaskCount
+                for (key, value) in nativeAgentHealth(
+                    teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId
+                ) { info[key] = value }
                 if let pid = agent.panelId {
                     info["panel_id"] = pid.uuidString
                 }
@@ -10964,6 +10967,24 @@ final class TeamOrchestrator: ObservableObject {
             workspaceId: agent.workspaceId,
             panelId: panelId
         )?.session
+    }
+
+    func nativeAgentHealth(
+        teamName: String, agentName: String, agentInstanceId: String
+    ) -> [String: Any] {
+        guard let session = nativeAgentSession(
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+        ) else { return [:] }
+        let failures = session.toolFailureSummary
+        let needsAttention = failures["needs_attention"] as? Bool ?? false
+        var health: [String: Any] = [
+            "tool_failures": failures,
+            "health": needsAttention ? "degraded" : "ok",
+        ]
+        if needsAttention {
+            health["recovery_hint"] = "Inspect recent tool failures and checkpoint work before using tm-agent restart --hard."
+        }
+        return health
     }
 
     /// Get all agent panels for a team.

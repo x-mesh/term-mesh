@@ -62,6 +62,24 @@ worktree 없는 새 작업과 독립적인 대화는 세션 시작 경로로 되
 턴 뒤에 작업이 대기하더라도 각 작업의 경로는 해당 턴과 함께 전달된다.
 도구 호출이 별도로 지정한 `workdir`는 이 경로 전달로 덮어쓰지 않는다.
 
+### 도구 실패와 세션 건강 상태
+
+Native worker의 `tm-agent read`에는 실패한 도구의 짧은 오류 요약이 표시된다.
+요약은 길이를 제한하고 credential을 가린다. `tm-agent status`의 각 native
+worker에는 `tool_failures`가 있으며 세션 전체 `total`, 현재 또는 마지막 턴의
+`turn_failures`와 `consecutive`, `last_error`, `last_tool`, `needs_attention`을 담는다.
+같은 턴에서 도구가 3번 연속 실패하면 `health: degraded`와 복구 제안이 표시된다.
+성공한 도구 또는 새 턴은 연속 실패 수를 초기화한다.
+
+건강 신호는 작업의 STATUS와 별개다. `NEEDS_REVIEW`는 계속 `review_ready`로
+기록하며, 미커밋 변경만으로 실패를 판정하지 않는다. 자동으로 세션을 재시작하지
+않으므로 오류를 확인하고 변경을 보존한 뒤 필요하면 `tm-agent restart --hard`를
+사용한다. 기존 `recycle`은 활성 작업을 보호하며, `--auto-recycle N`은 completed
+작업 수를 기준으로 동작한다.
+
+Codex bridge는 app-server가 전달한 도구 결과를 보존한다. Codex upstream이
+이벤트로 노출하지 않은 오류는 이 신호만으로 관측할 수 없다.
+
 ### Remote native agent environment
 
 GUI에서 만든 Project도 양쪽 앱이 live-presentation protocol을 지원하면 원격에서

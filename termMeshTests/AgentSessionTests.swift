@@ -4384,6 +4384,307 @@ final class AgentSessionTests: XCTestCase {
         }
     }
 
+    // MARK: - #818 tool failure health
+
+    private let scriptFailure = "Script failed\nWall time 0.0 seconds\nScript error:\nSyntaxError: Invalid or unexpected token"
+
+    private func toolUse(_ id: String, name: String = "Bash") -> String {
+        event(["type": "assistant", "message": ["content": [
+            ["type": "tool_use", "id": id, "name": name, "input": ["command": "run \(id)"]]]]])
+    }
+
+    private func toolResult(_ id: String, _ content: String, failed: Bool) -> String {
+        event(["type": "user", "message": ["content": [
+            ["type": "tool_result", "tool_use_id": id, "content": content, "is_error": failed]]]])
+    }
+
+    private func failTool(_ s: AgentSession, _ id: String, name: String = "Bash", body: String? = nil) {
+        s.ingestForTesting(toolUse(id, name: name))
+        s.ingestForTesting(toolResult(id, body ?? scriptFailure, failed: true))
+    }
+
+    private func passTool(_ s: AgentSession, _ id: String) {
+        s.ingestForTesting(toolUse(id))
+        s.ingestForTesting(toolResult(id, "ok", failed: false))
+    }
+
+    private func health(_ s: AgentSession) -> [String: Any] { s.toolFailureSummary }
+
+    func testToolFailureSummaryCountsAConsecutiveStreakAndFlagsAttentionAtThree() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "f1")
+        failTool(s, "f2", name: "exec")
+        var summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 2)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 2)
+        XCTAssertEqual(summary["consecutive"] as? Int, 2)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+
+        failTool(s, "f3", name: "exec")
+        summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 3)
+        XCTAssertEqual(summary["consecutive"] as? Int, 3)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, true)
+        XCTAssertEqual(summary["last_tool"] as? String, "exec")
+        XCTAssertEqual(summary["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
+    }
+
+    func testASelfStartedTurnKeepsItsFailuresAfterCompletion() {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        failTool(s, "self1")
+        failTool(s, "self2")
+        failTool(s, "self3")
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 3)
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn", "is_error": false]))
+        XCTAssertEqual(health(s)["turn_failures"] as? Int, 3)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 3)
+        XCTAssertEqual(health(s)["needs_attention"] as? Bool, true)
+    }
+
+    func testASelfStartedTurnDoesNotInheritThePreviousStreak() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("first turn", from: .person)
+        failTool(s, "written1")
+        failTool(s, "written2")
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn", "is_error": false]))
+        failTool(s, "self1")
+        XCTAssertEqual(health(s)["total"] as? Int, 3)
+        XCTAssertEqual(health(s)["turn_failures"] as? Int, 1)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 1)
+        XCTAssertEqual(health(s)["needs_attention"] as? Bool, false)
+    }
+
+    func testASuccessResetsTheStreakButNotTheTurnOrSessionCounts() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "f1")
+        failTool(s, "f2")
+        passTool(s, "ok1")
+        failTool(s, "f3")
+
+        let summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 3)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 3)
+        XCTAssertEqual(summary["consecutive"] as? Int, 1)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+    }
+
+    func testANewTurnResetsTheTurnAndStreakCountsButKeepsTheSessionTotal() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("first", from: .person)
+        failTool(s, "f1")
+        failTool(s, "f2")
+        failTool(s, "f3")
+        s.ingestForTesting(resultSaying("giving up"))
+        XCTAssertEqual(health(s)["turn_failures"] as? Int, 3, "the latest turn stays visible after it ends")
+
+        try s.send("second", from: .person)
+
+        let summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 3)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 0)
+        XCTAssertEqual(summary["consecutive"] as? Int, 0)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+    }
+
+    func testARepeatedToolResultIsCountedOnce() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "dup")
+        s.ingestForTesting(toolResult("dup", scriptFailure, failed: true))
+        s.ingestForTesting(toolUse("dup"))
+        s.ingestForTesting(toolResult("dup", scriptFailure, failed: true))
+
+        XCTAssertEqual(health(s)["total"] as? Int, 1)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 1)
+    }
+
+    func testACancelledToolIsNotAFailure() throws {
+        let s = AgentSession()
+        s.startRemote(interruptible: true) { _ in }
+        try s.send("long job", from: .person)
+        s.ingestForTesting(toolUse("c1"))
+
+        s.interrupt()
+        s.ingestForTesting(toolResult("c1", "interrupted by user", failed: true))
+
+        XCTAssertEqual(health(s)["total"] as? Int, 0)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 0)
+        XCTAssertNil(health(s)["last_error"])
+        XCTAssertNil(health(s)["last_tool"])
+
+        s.ingestForTesting(resultSaying("stopped"))
+        try s.send("again", from: .person)
+        failTool(s, "real")
+        XCTAssertEqual(health(s)["total"] as? Int, 1, "a genuine failure after the stop still counts")
+    }
+
+    func testFailureCountsSurviveTranscriptPruning() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+        failTool(s, "f1")
+        failTool(s, "f2")
+
+        for index in 0..<2_100 { s.appendLocalNotice("filler \(index)") }
+
+        let summary = health(s)
+        XCTAssertEqual(summary["total"] as? Int, 2)
+        XCTAssertEqual(summary["consecutive"] as? Int, 2)
+        XCTAssertEqual(summary["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
+    }
+
+    func testReplayedFailuresAreNotCounted() async throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        let history = Data((toolUse("old") + "\n" + toolResult("old", scriptFailure, failed: true) + "\n"
+            + resultSaying("earlier turn") + "\n").utf8)
+
+        expectReplay(s, bytes: UInt64(history.count), .init(taskId: "c0c0c0c0", turnWasInFlight: false))
+        s.consume(history)
+        let replayed = await waitUntil { self.turnEndedCount(s) == 1 }
+
+        XCTAssertTrue(replayed)
+        XCTAssertEqual(health(s)["total"] as? Int, 0)
+
+        try s.send("live", from: .person)
+        failTool(s, "live1")
+        XCTAssertEqual(health(s)["total"] as? Int, 1, "a live failure after the replay window still counts")
+    }
+
+    func testTheRealCodexWrapperShapeSummarizesTheScriptErrorNotTheOutputLabel() throws {
+        let wrapper = "Script failed\nWall time 0.0 seconds\nOutput:\nScript error:\nSyntaxError: Invalid or unexpected token"
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "w1", name: "exec", body: wrapper)
+
+        XCTAssertEqual(health(s)["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
+        let row = try XCTUnwrap(s.visibleTranscriptText().components(separatedBy: "\n").first {
+            $0.hasPrefix("exec ")
+        })
+        XCTAssertTrue(row.hasSuffix("failed: SyntaxError: Invalid or unexpected token"), row)
+    }
+
+    func testAnOutputLineThatCarriesTextIsStillAUsefulErrorLine() {
+        XCTAssertEqual(
+            AgentSession.usefulErrorLine(in: "Output: permission denied\nexit 1"),
+            "Output: permission denied")
+        XCTAssertEqual(AgentSession.usefulErrorLine(in: "Output:\n\n"), "Output:")
+    }
+
+    func testTheLastToolNameIsBoundedAndRedactedButNormalNamesSurvive() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+
+        failTool(s, "n1", name: "exec")
+        XCTAssertEqual(health(s)["last_tool"] as? String, "exec")
+
+        failTool(s, "n2", name: "API_KEY=fixturesecret")
+        let redacted = try XCTUnwrap(health(s)["last_tool"] as? String)
+        XCTAssertFalse(redacted.contains("fixturesecret"), redacted)
+
+        failTool(s, "n3", name: "tool_" + String(repeating: "z", count: 10_500))
+        let bounded = try XCTUnwrap(health(s)["last_tool"] as? String)
+        XCTAssertLessThanOrEqual(bounded.utf8.count, 200, "\(bounded.utf8.count)")
+        XCTAssertTrue(bounded.hasPrefix("tool_"), bounded)
+
+        let transcript = s.visibleTranscriptText()
+        XCTAssertFalse(transcript.contains("fixturesecret"))
+        XCTAssertFalse(transcript.contains(String(repeating: "z", count: 1_000)))
+    }
+
+    func testNothingFailedMeansNoLastFields() {
+        let summary = AgentSession().toolFailureSummary
+        XCTAssertEqual(summary["total"] as? Int, 0)
+        XCTAssertEqual(summary["turn_failures"] as? Int, 0)
+        XCTAssertEqual(summary["consecutive"] as? Int, 0)
+        XCTAssertEqual(summary["needs_attention"] as? Bool, false)
+        XCTAssertNil(summary["last_error"])
+        XCTAssertNil(summary["last_tool"])
+    }
+
+    func testTheVisibleTranscriptShowsABoundedRedactedErrorOnAFailedToolRow() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        failTool(s, "f1", body: "Error: push rejected for \(token)\n" + String(repeating: "x", count: 5_000))
+
+        let text = s.visibleTranscriptText()
+        let row = try XCTUnwrap(text.components(separatedBy: "\n").first { $0.hasPrefix("Bash ") })
+
+        XCTAssertTrue(row.contains("Error: push rejected"), row)
+        XCTAssertFalse(row.contains(token), row)
+        XCTAssertLessThan(row.utf8.count, 400, row)
+    }
+
+    func testARepeatedFailureWarningAppearsOnlyAtTheThresholdAndSuggestsRecovery() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("fix it", from: .person)
+        failTool(s, "f1")
+        failTool(s, "f2")
+        XCTAssertFalse(s.visibleTranscriptText().contains("consecutive tool failures"))
+
+        failTool(s, "f3")
+        let text = s.visibleTranscriptText()
+        let warning = try XCTUnwrap(text.components(separatedBy: "\n").first {
+            $0.contains("consecutive tool failures")
+        })
+
+        XCTAssertTrue(warning.hasPrefix("! "), warning)
+        XCTAssertTrue(warning.contains("3"), warning)
+        XCTAssertTrue(warning.contains("SyntaxError: Invalid or unexpected token"), warning)
+        XCTAssertTrue(warning.lowercased().contains("interrupt") || warning.lowercased().contains("restart"), warning)
+        XCTAssertLessThan(warning.utf8.count, 600, warning)
+
+        passTool(s, "ok")
+        XCTAssertFalse(s.visibleTranscriptText().contains("consecutive tool failures"))
+    }
+
+    func testToolFailuresDoNotChangeATaskBoundTurnsStatedVerdict() throws {
+        let team = "health-verdict-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        var ends: [AgentSession.TurnEnd] = []
+        let s = AgentSession()
+        s.onTurnEnd = { final, end, taskId in
+            ends.append(end)
+            AutoReplyEmit.settleNativeTurn(
+                teamName: team, agentName: "executor", agentInstanceId: "inst-1",
+                final: final, taskId: taskId, store: .shared)
+        }
+        s.startRemote { _ in }
+
+        try s.send("TASK_ID: \(task.id)\nrun the suite", from: .leader)
+        failTool(s, "f1")
+        failTool(s, "f2")
+        failTool(s, "f3")
+        s.ingestForTesting(assistantSaid("All set.\n\nSTATUS: DONE\nFILES: none\nVERIFY: n/a\nNEXT: NONE\nFULL_REPORT: n/a"))
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn"]))
+
+        XCTAssertEqual(ends.count, 1)
+        XCTAssertEqual(ends.last?.verdict?.status, "DONE")
+        XCTAssertEqual(store.getTask(teamName: team, taskId: task.id)?.status, "completed")
+        XCTAssertEqual(health(s)["needs_attention"] as? Bool, true)
+        XCTAssertEqual(health(s)["consecutive"] as? Int, 3)
+        s.stop()
+    }
+
     func testTheStatusDeadlineNeverFiresWhileATurnIsRunning() async throws {
         var lost: [String] = []
         let s = AgentSession(pendingTaskStatusDeadline: 0.05)

@@ -4096,7 +4096,7 @@ class TerminalController {
         // and `checkout` falling back to a workspace UUID. Derived here, on the
         // actor that owns the member, so both status implementations answer
         // with the same value.
-        let teamInfo: (leaderSessionId: String, leaderEffort: String, workspaceId: String, workingDirectory: String, integrationTargetPath: String, worktreeMode: String, checkoutMode: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, effort: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, leaderEffort: String, workspaceId: String, workingDirectory: String, integrationTargetPath: String, worktreeMode: String, checkoutMode: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, effort: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?, toolHealth: [String: Any])], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -4115,6 +4115,9 @@ class TerminalController {
                         worktreePath: a.worktreePath,
                         originalAgentWorkDir: a.originalAgentWorkDir,
                         teamWorkingDirectory: team.workingDirectory
+                     ),
+                     toolHealth: TeamOrchestrator.shared.nativeAgentHealth(
+                        teamName: teamName, agentName: a.name, agentInstanceId: a.agentInstanceId
                      ))
                 },
                 createdAt: ISO8601DateFormatter().string(from: team.createdAt),
@@ -4148,6 +4151,7 @@ class TerminalController {
                 "workspace_id": agent.workspaceId,
                 "completed_task_count": agent.completedTaskCount,
             ]
+            for (key, value) in agent.toolHealth { info[key] = value }
             if let pid = agent.panelId {
                 info["panel_id"] = pid
             }
@@ -4341,14 +4345,17 @@ class TerminalController {
         guard let agentInstanceId = selection.instanceId else {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
         }
-        let agentInfo: (id: String, name: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, worktreeBranch: String?, worktreePath: String?)? = await MainActor.run {
+        let agentInfo: (id: String, name: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, worktreeBranch: String?, worktreePath: String?, toolHealth: [String: Any])? = await MainActor.run {
             guard let agent = TeamOrchestrator.shared.resolveAgentForRPC(
                 teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
             ).agent else { return nil }
             return (id: agent.id, name: agent.name, cli: agent.cli, model: agent.model,
                     agentType: agent.agentType, color: agent.color,
                     workspaceId: agent.workspaceId.uuidString, panelId: agent.panelId?.uuidString,
-                    worktreeBranch: agent.worktreeBranch, worktreePath: agent.worktreePath)
+                    worktreeBranch: agent.worktreeBranch, worktreePath: agent.worktreePath,
+                    toolHealth: TeamOrchestrator.shared.nativeAgentHealth(
+                        teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                    ))
         }
         guard let agentInfo else {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
@@ -4365,6 +4372,7 @@ class TerminalController {
             info["panel_id"] = pid
         }
         for (key, value) in enrichment { info[key] = value }
+        for (key, value) in agentInfo.toolHealth { info[key] = value }
         if let branch = agentInfo.worktreeBranch { info["worktree_branch"] = branch }
         if let path = agentInfo.worktreePath { info["worktree_path"] = path }
         return v2Ok(id: id, result: info)
