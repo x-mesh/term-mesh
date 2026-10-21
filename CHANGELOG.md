@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.276.4] - 2026-10-22
+
+### Fixed
+
+- A native worker that stops a task with BLOCKED or NEEDS_REVIEW and later resumes it on its own now closes that task when it reports DONE. Before, the DONE did not reach the task board and the task stayed open. Input from a person, a different task ID, or a replay of the session ends the link to the stopped task, so a later turn cannot close it by accident.
+- Native Codex agents now run each task in that task's worktree. Before, a Codex pane worked in the directory where its session started, and the task's path existed only as text in the prompt. A task without a worktree, and a plain conversation, go back to the session's start directory. A path written inside the prompt text is never followed.
+- A tool call that failed in a native Codex pane is now shown to the leader. Before, the results of function, dynamic, and MCP tool calls were dropped, so a script that failed to parse looked like a quiet turn.
+
+### Added
+
+- `tm-agent send <agent> <text> --task <task-id>` sends a follow-up for an existing open task. It checks that the task belongs to that agent and instance, and sends the follow-up with the same task ID, so the reply settles that task. Finished tasks and headless agents whose owner cannot be verified are refused.
+- `team status` and the agent status now report `tool_failures` and a `health` value for native agents. After three tool failures in a row in one turn, `health` becomes `degraded`, the status adds a recovery hint, and the pane transcript ends with a warning.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.276.3] - 2026-10-20
 
 ### Fixed
