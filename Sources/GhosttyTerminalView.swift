@@ -795,6 +795,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // as if it belonged to the child pane. Only the CLI running inside the
         // pane may add its session identity to tool subprocesses.
         env = Self.removingInheritedCLISessionIdentity(from: env)
+        if let marker = Self.remotePaneMarker(
+            peerHostConfigured: PeerHostCoordinator.autoStartSocketPath(
+                environment: ProcessInfo.processInfo.environment,
+                preferenceEnabled: PeerFederationSettings.autoStart,
+                preferencePath: ""
+            ) != nil,
+            inheritedValue: env["SSH_CONNECTION"]
+                ?? ProcessInfo.processInfo.environment["SSH_CONNECTION"]
+        ) {
+            env[marker.name] = marker.value
+        }
         // P15: expose THIS instance's term-meshd daemon socket so `tm-agent watch
         // on/off/status` (which target the daemon's `watch.*` RPC) reach this app's
         // own daemon — tagged/isolated builds included — without the user setting
@@ -1155,6 +1166,21 @@ final class TerminalSurface: Identifiable, ObservableObject {
             environment[key] = ""
         }
         return environment
+    }
+
+    /// A pane on a peer host can be shown on another machine, so a CLI must
+    /// copy through the terminal (OSC 52) to reach the viewer's clipboard.
+    /// Codex decides that from SSH_CONNECTION; without it, it writes this
+    /// Mac's clipboard and reports success while the viewer keeps its old
+    /// contents. Same marker as daemon panes in `peer/surface.rs`. The value
+    /// is fixed when the shell starts, so it keys on the hosting
+    /// configuration rather than on whether a viewer is attached right now.
+    nonisolated static func remotePaneMarker(
+        peerHostConfigured: Bool,
+        inheritedValue: String?
+    ) -> (name: String, value: String)? {
+        guard peerHostConfigured, (inheritedValue ?? "").isEmpty else { return nil }
+        return ("SSH_CONNECTION", "127.0.0.1 0 127.0.0.1 0")
     }
 
     func updateSize(
