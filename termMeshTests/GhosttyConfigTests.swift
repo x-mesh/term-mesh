@@ -1276,6 +1276,15 @@ final class GhosttyEnvironmentOrderingTests: XCTestCase {
         XCTAssertEqual(cleaned["PATH"], "/usr/bin")
     }
 
+    func testPeerHostPaneGetsRemoteMarkerOnlyWhenNoneIsInherited() {
+        let marker = TerminalSurface.remotePaneMarker(peerHostConfigured: true, inheritedValue: nil)
+        XCTAssertEqual(marker?.name, "SSH_CONNECTION")
+        XCTAssertEqual(marker?.value, "127.0.0.1 0 127.0.0.1 0")
+        XCTAssertNotNil(TerminalSurface.remotePaneMarker(peerHostConfigured: true, inheritedValue: ""))
+        XCTAssertNil(TerminalSurface.remotePaneMarker(peerHostConfigured: true, inheritedValue: "10.0.0.1 1 10.0.0.2 22"))
+        XCTAssertNil(TerminalSurface.remotePaneMarker(peerHostConfigured: false, inheritedValue: nil))
+    }
+
     /// The one combination that cost a release: adding a name after
     /// `ghostty_init` recorded the environment block. libc grows the array and
     /// moves it, and ghostty keeps reading the old address — which in 0.174.0
