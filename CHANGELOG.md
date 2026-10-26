@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.277.0] - 2026-10-26
+
+### Fixed
+
+- A Codex conversation in a host pane no longer disappears when a peer attaches with "Force TUI redraw on attach" turned on. Before, the host typed Ctrl-L into the pane on each attach. Codex then cleared its screen and drew only its banner and input box, and a program that does not redraw showed a stray `^L`. The host now sends a window-change signal to the foreground program instead. Programs that run inside ssh, mosh, or tmux are not redrawn by this signal, because the window size does not change.
+- The first screen that a peer sees on attach now keeps the colors of the host pane. Before, the attach snapshot carried only text, so the output of a program that does not redraw lost its colors.
+- Codex in a Mac host app pane now copies text to the viewer's clipboard when you view the pane over a relay. Before, an app pane had no `SSH_CONNECTION` marker, so Codex wrote only to the host's clipboard and still reported a successful copy. New panes in an app with peer hosting turned on now get the marker, so Codex copies through OSC 52. A value that the pane inherits is kept.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.276.4] - 2026-10-22
 
 ### Fixed
