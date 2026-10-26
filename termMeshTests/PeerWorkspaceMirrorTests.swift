@@ -2011,3 +2011,20 @@ final class PeerRelayReconnectBackoffTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.19)
     }
 }
+
+final class PeerAttachRedrawTests: XCTestCase {
+    func testForegroundGroupBecomesTheSignalTarget() {
+        XCTAssertEqual(PeerAttachRedraw.signalTarget(foregroundProcessGroup: 4242), 4242)
+    }
+
+    /// 0 means the PTY has no foreground group; 1 is init. A signal to either
+    /// would hit the wrong processes.
+    func testGroupsThatCouldAddressUnrelatedProcessesAreRejected() {
+        XCTAssertNil(PeerAttachRedraw.signalTarget(foregroundProcessGroup: 0))
+        XCTAssertNil(PeerAttachRedraw.signalTarget(foregroundProcessGroup: 1))
+    }
+
+    func testGroupBeyondPidRangeIsRejected() {
+        XCTAssertNil(PeerAttachRedraw.signalTarget(foregroundProcessGroup: UInt64(Int32.max) + 1))
+    }
+}
