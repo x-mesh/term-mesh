@@ -36,6 +36,18 @@ private func ptyTapCallbackWithRawOutputSequence(
     hub.enqueueRawOutput(data, length: Int(len), rawEnd: rawEnd)
 }
 
+enum PeerAttachRedraw {
+    /// `ghostty_surface_foreground_pid` reports 0 when the PTY has no
+    /// foreground group, and a group of 1 or less would address init or every
+    /// process of the caller. Neither may receive a signal.
+    static func signalTarget(foregroundProcessGroup: UInt64) -> pid_t? {
+        guard foregroundProcessGroup > 1, foregroundProcessGroup <= UInt64(Int32.max) else {
+            return nil
+        }
+        return pid_t(foregroundProcessGroup)
+    }
+}
+
 // MARK: - PtyTapHub
 
 /// Bounded recent-output history for attach-time ANSI-preserving replay
@@ -1573,9 +1585,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // reads Ghostty's live cell grid on MainActor and must never run
         // under the hub lock (contended by Ghostty's IO reader thread).
         // Cost is one grid read per attach — attaches are user-driven and
-        // rare. ANSI styling is lost on this path (text only); fullscreen
-        // TUIs (vim, less, htop) won't redraw without SIGWINCH and
-        // require manual refresh.
+        // rare. The read keeps cell styling (see `readPaneAttachSnapshot`),
+        // so output from programs that never repaint, such as a server
+        // printing logs, arrives in color instead of as bare text.
         // Replay mouse-mode state the viewer missed. Apps that enabled
         // mouse reporting before this attach (Claude Code, vim, htop)
         // sent their DECSET sequences long before the PTY tap existed,
@@ -1592,7 +1604,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // re-send must not overwrite an exact mode (e.g. ?1003h) with
         // this guess. Applies uniformly whether the initial bytes come
         // from the buffer replay or the plain-text fallback.
-        let fallback = hub.stableSnapshot(capture: { readPaneSnapshot(sfcPtr) })
+        let fallback = hub.stableSnapshot(capture: { readPaneAttachSnapshot(sfcPtr) })
         let fallbackSnapshotSeq = fallback.seq
         let fallbackSnapshot = fallback.bytes
         var initialPrefix = peerTerminalPalettePrefix(
@@ -1621,26 +1633,22 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // a single visible ring.
         let isFirstAttach = Self.incrementPeerAttach(for: ts)
 
-        // Phase E-6: optional Ctrl-L injection so TUIs repaint with
-        // full styling on attach. The plain-text snapshot path above
-        // restores content but loses ANSI; sending Ctrl-L makes vim /
-        // htop / less redraw correctly. Disabled by default because
-        // the redraw is visible to the host's local viewer too.
+        // Phase E-6: optional redraw request on attach. The snapshot above
+        // already carries cell styling; what it cannot carry is a TUI's own
+        // state (cursor, modes), which a repaint from vim / htop / less
+        // restores. Disabled by default because the redraw is visible to
+        // the host's local viewer too.
+        //
+        // The request is SIGWINCH, not Ctrl-L: Codex answers Ctrl-L by
+        // erasing its screen and redrawing only the banner and composer,
+        // and it runs on the alternate screen where no scrollback can bring
+        // the conversation back. SIGWINCH makes the same TUIs repaint
+        // without that side effect.
         //
         // Gate on the 0→1 transition: clients 2..N attaching to the
         // same surface get the redraw bytes via the existing PTY tap
-        // (broadcast from the first attach's redraw), so emitting
-        // Ctrl-L on every attach would just stack form-feeds and
-        // multiply the host's local flicker.
-        //
-        // Phase P4 note: this flag exists to compensate for the plain-text
-        // snapshot's lost styling. When `usedBufferReplay` was true above,
-        // `snapshot` already carries the surface's real ANSI bytes verbatim
-        // — the redraw this flag forces is largely redundant for that
-        // attach (though still harmless/off by default). Left as-is rather
-        // than conditioning on `usedBufferReplay`: this setting is a
-        // blanket host-visible-flicker tradeoff the user opts into, not a
-        // per-attach optimization worth the added branching here.
+        // (broadcast from the first attach's redraw), so signalling on
+        // every attach would only multiply the host's local flicker.
         if isFirstAttach && PeerFederationSettings.forceRedrawOnAttach {
             // Defer briefly so the snapshot lands first; the redraw
             // bytes that come back through the PTY tap will then
@@ -1648,7 +1656,11 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             Task { @MainActor [weak ts] in
                 try? await Task.sleep(nanoseconds: 100_000_000)
                 guard let ptr = ts?.surface else { return }
-                sendPeerInputBytes(ptr, bytes: Data([0x0c]))
+                if let group = PeerAttachRedraw.signalTarget(
+                    foregroundProcessGroup: ghostty_surface_foreground_pid(ptr)
+                ) {
+                    killpg(group, SIGWINCH)
+                }
             }
         }
 
@@ -3909,6 +3921,14 @@ private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
     snapshot.append(contentsOf: [0x1b, 0x5b, 0x48])       // ESC [ H   — cursor home
     snapshot.append(body)
     return snapshot
+}
+
+/// The attach-time screen: the same styled VT reconstruction the resync heal
+/// sends, so a viewer opening a pane sees its colors. The plain-text read is
+/// kept only for a surface whose VT read fails.
+@MainActor
+private func readPaneAttachSnapshot(_ surface: ghostty_surface_t) -> Data? {
+    readPaneSnapshotWithRawOutputSequence(surface)?.bytes ?? readPaneSnapshot(surface)
 }
 
 @MainActor

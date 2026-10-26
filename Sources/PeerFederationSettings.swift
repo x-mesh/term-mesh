@@ -157,10 +157,12 @@ enum PeerFederationSettings {
             .flatMap(PeerKeepAwakeMode.init(rawValue:)) ?? defaultKeepAwakeMode
     }
 
-    /// Phase E-6: when on, the host injects Ctrl-L into the PTY at
-    /// each peer attach so full-screen TUIs (vim, htop, less) repaint
-    /// with full styling. Off by default — flicker is visible to the
-    /// host's local viewer too.
+    /// Phase E-6: when on, the host signals SIGWINCH to the PTY's foreground
+    /// process group at each peer attach so full-screen TUIs (vim, htop,
+    /// less) repaint with full styling. Off by default — flicker is visible
+    /// to the host's local viewer too. The window size does not change, so
+    /// a relay client in the foreground (ssh, mosh, tmux) forwards nothing
+    /// and the program behind it is not redrawn.
     static var forceRedrawOnAttach: Bool {
         UserDefaults.standard.bool(forKey: forceRedrawKey)
     }
