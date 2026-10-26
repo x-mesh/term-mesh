@@ -2622,8 +2622,8 @@ struct SettingsView: View {
             SettingsCardRow(
                 "Force TUI redraw on attach",
                 subtitle: peerFederationForceRedraw
-                    ? "Sends Ctrl-L to the host PTY whenever a peer attaches so vim, htop, less repaint with full color. The redraw is also visible to the host's local viewer."
-                    : "Initial-attach snapshot is plain text; full-screen TUIs keep their text but lose styling until they redraw on their own."
+                    ? "Sends a window-change signal to the host PTY whenever a peer attaches so vim, htop, less repaint themselves. The redraw is also visible to the host's local viewer."
+                    : "The attach snapshot keeps text and colors; full-screen TUIs may show a stale cursor until they redraw on their own."
             ) {
                 Toggle("", isOn: $peerFederationForceRedraw)
                     .labelsHidden()
