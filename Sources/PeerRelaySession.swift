@@ -4531,8 +4531,43 @@ final class PeerRelaySession {
             return session !== failedSession
         }
         var didRefreshTransport = false
+        var tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
         while await ownedReconnectMayProceed(afterLosing: failedSession) {
             guard let next = reconnectCircuit.nextAttempt() else {
+                if Self.circuitOpenDisposition(
+                    tunnelState: ownedTunnel?.currentState, canPark: onOwnedTunnelGaveUp != nil
+                ) == .waitForTunnel, await waitForRestartingOwnedTunnel(failedSession) {
+                    // The tunnel this pane rides came back on its own; its
+                    // attempts so far were spent against a dead route.
+                    reconnectCircuit.recordRecovery()
+                    tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
+                    RemoteWorkLog.infoOffMain(
+                        "Peer reconnect re-armed host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) — the tunnel is back"
+                    )
+                    continue
+                }
+                // A tunnel that gave up means the host is unreachable, which
+                // is a host-level loss, not this pane's. Ending the pane here
+                // closed a Project's leader, dropped its agents and let an
+                // emptied workspace fill with a local shell; the restored
+                // panes then landed beside it. Park the pane the way a
+                // deliberate host disconnect does, so the replacement
+                // transport reattaches it where it is.
+                // Judged again: the wait above ends on the tunnel's verdict.
+                if Self.circuitOpenDisposition(
+                    tunnelState: ownedTunnel?.currentState, canPark: onOwnedTunnelGaveUp != nil
+                ) == .parkUntilHostAnswers, let gaveUp = onOwnedTunnelGaveUp {
+                    gaveUp()
+                    if awaitingTransportReplacement {
+                        RemoteWorkLog.infoOffMain(
+                            "Peer reconnect parked host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) — the tunnel gave up; waiting for the host to answer"
+                        )
+                        await parkUntilTransportReplaced()
+                        reconnectCircuit.recordRecovery()
+                        tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
+                        continue
+                    }
+                }
                 RemoteWorkLog.warningOffMain(
                     "Peer reconnect circuit open host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) attempts=\(reconnectCircuit.attempts)"
                 )
@@ -4544,10 +4579,14 @@ final class PeerRelaySession {
                 // The pump waits inside this call, so a heal that commits a
                 // replacement during the backoff would go unread until the
                 // delay ends; the host then drops the unread session and the
-                // next backoff is longer. Wake as soon as the session moves.
-                await sleepUnlessSessionReplaced(failedSession, seconds: delay)
+                // next backoff is longer. Wake as soon as the session moves,
+                // or as soon as the tunnel comes back.
+                await sleepUnlessSessionReplaced(
+                    failedSession, seconds: delay, tunnelUpsAtLastAttempt: tunnelUpsAtLastAttempt
+                )
             }
             guard await ownedReconnectMayProceed(afterLosing: failedSession) else { break }
+            tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
             RemoteWorkLog.infoOffMain(
                 "Peer reconnect attempt host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) delay=\(delay) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
             )
@@ -4594,9 +4633,73 @@ final class PeerRelaySession {
         return session !== failedSession
     }
 
-    private func sleepUnlessSessionReplaced(_ failedSession: PeerSession, seconds: TimeInterval) async {
+    private func sleepUnlessSessionReplaced(
+        _ failedSession: PeerSession,
+        seconds: TimeInterval,
+        tunnelUpsAtLastAttempt: Int
+    ) async {
         await Self.waitOutBackoff(seconds: seconds) {
             !isTorndown && session === failedSession && (ownedTransportMayReconnect?() ?? true)
+                && (ownedTunnel?.upTransitionCount ?? 0) == tunnelUpsAtLastAttempt
+        }
+    }
+
+    /// The tunnel currently pooled for this pane's host, which after a
+    /// replacement is no longer the one the pane first attached through.
+    private var ownedTunnel: PeerSSHTunnel? {
+        hostKey.flatMap { PeerPaneHostRegistry.shared.activeLease(forKey: $0)?.tunnel }
+    }
+
+    enum CircuitOpenDisposition: Equatable {
+        /// The tunnel is still restarting on its own; its verdict decides.
+        case waitForTunnel
+        /// The tunnel gave up: the host is gone, not this pane. Park it.
+        case parkUntilHostAnswers
+        /// The tunnel is up (the host refused this pane) or was stopped on
+        /// purpose, or no owner can preserve the pane: end it on its banner.
+        case end
+    }
+
+    /// What a pane does once its own reconnect attempts are spent.
+    nonisolated static func circuitOpenDisposition(
+        tunnelState: PeerSSHTunnelState?,
+        canPark: Bool
+    ) -> CircuitOpenDisposition {
+        guard let tunnelState else { return .end }
+        if isRestarting(tunnelState) { return .waitForTunnel }
+        if case .failed = tunnelState, canPark { return .parkUntilHostAnswers }
+        return .end
+    }
+
+    /// Lets the owning pane mark itself preserved-for-the-host before the
+    /// reconnect loop parks it. Relay-helper panes park; callback panes have
+    /// no helper to keep, end, and rebuild in place through the same mark.
+    var onOwnedTunnelGaveUp: (@MainActor () -> Void)?
+
+    /// The circuit budgets this pane's own attempts (about three and a half
+    /// minutes), but the tunnel's restart budget is longer (about seven).
+    /// Ending the pane while its tunnel is still restarting threw away a
+    /// relay the tunnel was about to carry again, leaving a Reconnect banner
+    /// for an outage that had already healed. Wait for the tunnel's verdict
+    /// instead: true when it came back. A tunnel that gives up ends the pane
+    /// as before, and the automatic Retry for the failed host takes over.
+    private func waitForRestartingOwnedTunnel(_ failedSession: PeerSession) async -> Bool {
+        guard let tunnel = ownedTunnel, Self.isRestarting(tunnel.currentState) else { return false }
+        await Self.waitOutBackoff(seconds: Self.tunnelVerdictWaitSeconds, pollSeconds: 0.5) {
+            !isTorndown && session === failedSession && (ownedTransportMayReconnect?() ?? true)
+                && Self.isRestarting(tunnel.currentState)
+        }
+        return !isTorndown && session === failedSession && tunnel.currentState == .up
+    }
+
+    /// Longer than the tunnel's whole restart budget, so the wait ends on the
+    /// tunnel's verdict rather than on this bound.
+    static let tunnelVerdictWaitSeconds: TimeInterval = 600
+
+    nonisolated static func isRestarting(_ state: PeerSSHTunnelState) -> Bool {
+        switch state {
+        case .starting, .down, .reconnecting: return true
+        case .up, .failed, .stopped: return false
         }
     }
 

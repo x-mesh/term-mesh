@@ -1186,6 +1186,11 @@ final class RemoteHostStore: ObservableObject {
     }
 
     private var observer: NSObjectProtocol?
+    private var tunnelStateObserver: NSObjectProtocol?
+    /// What a failed roster read cleared, kept so a reread over the same
+    /// tunnel can restore launchability instead of leaving the row connected
+    /// but unable to start a Project.
+    private var rosterLossProvenance: [String: (path: String, provenance: PeerHostEndpointProvenance)] = [:]
     private var fetchTasks: [String: Task<Void, Never>] = [:]
     /// A Mac GUI may answer before its sibling daemon has bound the advertised
     /// session-owner socket. Discover that route independently from the serving
@@ -1268,6 +1273,16 @@ final class RemoteHostStore: ObservableObject {
                 guard self?.profileRebuildSuppressionCount == 0 else { return }
                 DispatchQueue.main.async { self?.rebuild() }
             }
+        tunnelStateObserver = NotificationCenter.default.addObserver(
+            forName: PeerSSHTunnel.stateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let tunnel = note.object as? PeerSSHTunnel,
+                  note.userInfo?[PeerSSHTunnel.stateUserInfoKey] as? PeerSSHTunnelState == .up
+            else { return }
+            Task { @MainActor in self?.tunnelCameBack(tunnel) }
+        }
         // Catch connections that opened before the sidebar first rendered.
         rebuild()
     }
@@ -1276,6 +1291,42 @@ final class RemoteHostStore: ObservableObject {
         if let token = observer {
             NotificationCenter.default.removeObserver(token)
         }
+        if let token = tunnelStateObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+    }
+
+    /// A roster read that failed while the tunnel was down marked the row
+    /// unreachable, and nothing read it again: a tunnel that restarts on its
+    /// own keeps the same lease, so no replacement hook fires. Its coming
+    /// back is the cue. A failed read marks the row failed again, so this
+    /// never reports a host reachable on credit.
+    private func tunnelCameBack(_ tunnel: PeerSSHTunnel) {
+        for (key, lease) in sidebarLeases where lease.tunnel === tunnel {
+            guard case .failed = hosts[key]?.connectionState,
+                  hosts[key]?.activeSockPath == lease.hostSockPath
+            else { continue }
+            hosts[key]?.connectionState = .connected
+            rereadLostRoster(key: key, path: lease.hostSockPath)
+        }
+    }
+
+    private func rereadLostRoster(key: String, path: String) {
+        fetchWorkspaces(
+            for: path, key: key,
+            provenance: Self.rosterRecoveryProvenance(saved: rosterLossProvenance[key], path: path)
+        )
+    }
+
+    /// The endpoint a lost roster had been authenticated through, reused only
+    /// for the same tunnel socket. Launch metadata read over any other
+    /// connection must not inherit it.
+    nonisolated static func rosterRecoveryProvenance(
+        saved: (path: String, provenance: PeerHostEndpointProvenance)?,
+        path: String
+    ) -> PeerHostEndpointProvenance? {
+        guard let saved, saved.path == path else { return nil }
+        return saved.provenance
     }
 
     private func rebuild() {
@@ -1410,6 +1461,12 @@ final class RemoteHostStore: ObservableObject {
                    configuredRemoteSocket: host.configuredEndpoint?.remoteSocket,
                    incomingRemoteSocket: conn.remoteSockPath
                ) {
+                // Never revive a failed row this way: its serving tunnel is
+                // what failed. Calling it connected because a Project pane's
+                // session-owner tunnel came back hid that from the automatic
+                // Retry and left the roster empty, which kept the Project's
+                // agents from being reopened.
+                if case .failed = host.connectionState { continue }
                 hosts[key]?.connectionState = .connected
                 continue
             }
@@ -1431,6 +1488,8 @@ final class RemoteHostStore: ObservableObject {
                 // connection, but store results under the stable key.
                 fetchWorkspaces(for: conn.hostSockPath, key: key, provenance: nil)
             } else {
+                let rosterWasLost: Bool
+                if case .failed = hosts[key]?.connectionState { rosterWasLost = true } else { rosterWasLost = false }
                 hosts[key]?.connectionState = .connected
                 // A profile-named entry keeps its user-chosen name; ad-hoc
                 // entries keep tracking the connection's display string.
@@ -1472,6 +1531,11 @@ final class RemoteHostStore: ObservableObject {
                     hosts[key]?.activeSockPath = conn.hostSockPath
                     replaceWorkspaceRoster([], for: key)
                     fetchWorkspaces(for: conn.hostSockPath, key: key, provenance: nil)
+                } else if rosterWasLost {
+                    // Same tunnel, back after a roster read failed on it: the
+                    // promotion above would otherwise show a connected row
+                    // with no workspaces and no way to launch a Project.
+                    rereadLostRoster(key: key, path: conn.hostSockPath)
                 }
             }
         }
@@ -1764,14 +1828,20 @@ final class RemoteHostStore: ObservableObject {
     /// Retiring the transport is the point. Releasing only the sidebar's ref
     /// left a lease a pane still held in the pool, and the connect that
     /// followed reused it — so "Retry" on a dead tunnel reconnected nothing.
+    ///
+    /// `automatic` is the row pass pressing Retry on the user's behalf. It
+    /// keeps the mark that a failed tunnel parked a pane, so a replacement
+    /// that fails again does not end the pane the park is holding.
     @discardableResult
-    func reconnectHost(_ host: HostEntry) -> HostReconnectOutcome {
+    func reconnectHost(_ host: HostEntry, automatic: Bool = false) -> HostReconnectOutcome {
         let key = host.id
         let registry = PeerPaneHostRegistry.shared
         // Resolve the pooled key before `invalidateAutoDetectedSocket` below
         // clears `remoteSockPath` — it is part of the key.
         let hostKey = sidebarLeases[key]?.key ?? connectingLeaseKeys[key] ?? (hosts[key] ?? host).paneHostSpec.hostKey
-        let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
+        let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(
+            hostKey, keepingTunnelRecovery: automatic
+        )
         let retiredPath = registry.disconnectTransport(for: hostKey, replacementFollows: true)
         let replacementToken = registry.pendingReplacementToken(for: hostKey)
         if let lease = sidebarLeases.removeValue(forKey: key) {
@@ -1842,6 +1912,120 @@ final class RemoteHostStore: ObservableObject {
         )
         connectSavedHost(hosts[key] ?? host)
         return outcome(true)
+    }
+
+    struct AutomaticReconnect: Equatable {
+        var attempts = 0
+        var notBefore = Date.distantPast
+        var probeTarget: PeerHostProbeTarget?
+        var probeTargetResolved = false
+    }
+
+    enum AutomaticReconnectDisposition: Equatable {
+        case track, keep, drop
+    }
+
+    /// Which rows Retry is pressed for on the user's behalf.
+    ///
+    /// A row starts being tracked only when it failed while still holding the
+    /// sidebar lease it was connected on and that lease's tunnel is dead: the
+    /// host was connected this run, nobody chose to leave it, and nothing else
+    /// will bring it back. Disconnect, Stop Browsing, Cancel and Delete all
+    /// release the lease or move the row to `.saved`, and a tunnel that came
+    /// back on its own keeps its lease alive, so none of those is retried.
+    /// Once tracked, the row stays tracked through the `.connecting`/`.failed`
+    /// churn of the retries themselves (Retry gives up the old lease).
+    nonisolated static func automaticReconnectDisposition(
+        state: HostConnectionState,
+        holdsSidebarLease: Bool,
+        sidebarLeaseIsDead: Bool,
+        isTracked: Bool
+    ) -> AutomaticReconnectDisposition {
+        switch state {
+        case .failed:
+            if isTracked { return .keep }
+            return holdsSidebarLease && sidebarLeaseIsDead ? .track : .drop
+        case .connecting:
+            return isTracked ? .keep : .drop
+        case .saved, .connected:
+            return .drop
+        }
+    }
+
+    /// A host that answers on its ssh port but still fails to connect (sshd
+    /// starting, auth broken) is retried less and less often, so a reachable
+    /// but broken host does not get a new ssh every pass.
+    nonisolated static func automaticReconnectBackoffSeconds(afterAttempts attempts: Int) -> TimeInterval {
+        guard attempts > 0 else { return 0 }
+        return min(600, 30 * pow(2, Double(min(attempts - 1, 5))))
+    }
+
+    private var automaticReconnects: [String: AutomaticReconnect] = [:]
+    private var isRunningAutomaticReconnectPass = false
+
+    /// Press Retry for every tracked row whose host answers on its ssh port.
+    /// The probe is a TCP connect, so a host that stays away costs no ssh
+    /// process however long it is gone. Returns how many Retries started.
+    @discardableResult
+    func runAutomaticReconnectPass() async -> Int {
+        guard !isRunningAutomaticReconnectPass else { return 0 }
+        isRunningAutomaticReconnectPass = true
+        defer { isRunningAutomaticReconnectPass = false }
+
+        let registry = PeerPaneHostRegistry.shared
+        for (key, host) in hosts {
+            let lease = sidebarLeases[key]
+            switch Self.automaticReconnectDisposition(
+                state: host.connectionState,
+                holdsSidebarLease: lease != nil,
+                sidebarLeaseIsDead: lease.map { registry.liveness(of: $0) == .dead } ?? false,
+                isTracked: automaticReconnects[key] != nil
+            ) {
+            case .track: automaticReconnects[key] = AutomaticReconnect()
+            case .keep: break
+            case .drop: automaticReconnects[key] = nil
+            }
+        }
+        for key in automaticReconnects.keys where hosts[key] == nil {
+            automaticReconnects[key] = nil
+        }
+
+        var started = 0
+        for key in automaticReconnects.keys.sorted() {
+            guard var progress = automaticReconnects[key],
+                  let host = hosts[key], case .failed = host.connectionState,
+                  Date() >= progress.notBefore,
+                  let target = host.sshTarget, !target.isEmpty
+            else { continue }
+            if !progress.probeTargetResolved {
+                let resolution = await PeerHostReachabilityProbe.resolve(
+                    sshTarget: target, port: host.sshPort
+                )
+                progress.probeTarget = resolution.target
+                progress.probeTargetResolved = PeerClientCoordinator.remembersProbeResolution(resolution)
+                automaticReconnects[key] = progress
+            }
+            // ProxyCommand hosts have no hop to probe; wake and network-change
+            // recovery still cover them.
+            guard let probeTarget = progress.probeTarget,
+                  await PeerHostReachabilityProbe.isReachable(probeTarget)
+            else { continue }
+            // A wake or network change cancels the pass to run its own lease
+            // judgment; a Retry now would retire the lease it is replacing.
+            guard !Task.isCancelled else { return started }
+            // The probe awaited; the user may have acted on the row meanwhile.
+            guard automaticReconnects[key] != nil,
+                  let current = hosts[key], case .failed = current.connectionState
+            else { continue }
+            progress.attempts += 1
+            progress.notBefore = Date().addingTimeInterval(
+                Self.automaticReconnectBackoffSeconds(afterAttempts: progress.attempts)
+            )
+            automaticReconnects[key] = progress
+            RemoteWorkLog.info("\(current.displayName) answers again — reconnecting")
+            if reconnectHost(current, automatic: true).started { started += 1 }
+        }
+        return started
     }
 
     /// Shared recovery entry point for Edit Peer Host and New Project.
@@ -2017,6 +2201,9 @@ final class RemoteHostStore: ObservableObject {
     /// refs and stay connected as ad-hoc entries.
     func stopBrowsingSavedHost(_ host: HostEntry) {
         let key = host.id
+        // Stop Browsing leaves a failed row `.failed`; it must still end the
+        // automatic Retries the row was getting.
+        automaticReconnects[key] = nil
         guard let lease = sidebarLeases[key] else { return }
         sidebarLeases[key] = nil
         PeerPaneHostRegistry.shared.release(lease)
@@ -2282,6 +2469,9 @@ final class RemoteHostStore: ObservableObject {
                 if !Task.isCancelled,
                    self.hosts[key]?.activeSockPath == path,
                    self.hosts[key]?.isConnected == true {
+                    if let provenance = self.hosts[key]?.hostCLIBinDirsProvenance {
+                        self.rosterLossProvenance[key] = (path, provenance)
+                    }
                     self.hosts[key]?.connectionState = .failed(Self.unreachableReason)
                     self.replaceWorkspaceRoster([], for: key)
                     self.hosts[key]?.teams = []

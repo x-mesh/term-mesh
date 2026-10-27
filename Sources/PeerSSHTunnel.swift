@@ -231,6 +231,13 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// actor; observers can safely touch UI state directly.
     var onStateChange: (@MainActor (PeerSSHTunnelState) -> Void)?
 
+    /// Posted on the main actor after `onStateChange`, with the tunnel as
+    /// `object` and the new state under `stateUserInfoKey`. `onStateChange`
+    /// has one owner; a pooled tunnel is shared by panes, mirrors and the
+    /// sidebar, which each need to hear that it came back.
+    static let stateDidChangeNotification = Notification.Name("PeerSSHTunnelStateDidChange")
+    static let stateUserInfoKey = "state"
+
     init(
         sshTarget: String,
         remoteSockPath: String,
@@ -258,6 +265,16 @@ final class PeerSSHTunnel: @unchecked Sendable {
     var currentState: PeerSSHTunnelState {
         lock.lock(); defer { lock.unlock() }
         return state
+    }
+
+    private var upTransitions = 0
+
+    /// How many times this tunnel has come up. A reconnect loop compares it
+    /// before and after waiting, so a tunnel that came back mid-attempt or
+    /// mid-backoff ends the wait instead of being noticed up to 30s late.
+    var upTransitionCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return upTransitions
     }
 
     /// Local port serving the remote dashboard, or `nil` when the
@@ -887,12 +904,18 @@ final class PeerSSHTunnel: @unchecked Sendable {
     private func emit(_ newState: PeerSSHTunnelState) {
         lock.lock()
         state = newState
+        if newState == .up { upTransitions += 1 }
         let cb = onStateChange
         lock.unlock()
         report(newState)
-        guard let cb else { return }
-        Task { @MainActor in
-            cb(newState)
+        Task { @MainActor [weak self] in
+            cb?(newState)
+            guard let self else { return }
+            NotificationCenter.default.post(
+                name: Self.stateDidChangeNotification,
+                object: self,
+                userInfo: [Self.stateUserInfoKey: newState]
+            )
         }
     }
 

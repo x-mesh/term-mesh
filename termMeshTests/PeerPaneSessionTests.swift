@@ -5271,6 +5271,268 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: key))
     }
 
+    func test_networkPathRecovery_ignoresLaunchReportAndUnchangedPath() {
+        let wifi = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: ["192.168.0.1"])
+        XCTAssertFalse(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: nil, changedTo: wifi))
+        XCTAssertFalse(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: wifi))
+        let offline = PeerNetworkPathSnapshot(isSatisfied: false, interfaces: [], gateways: [])
+        XCTAssertFalse(
+            PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: offline),
+            "nothing can be replaced while there is no route"
+        )
+    }
+
+    func test_networkPathRecovery_firesWhenPathReturnsOrRouteChanges() {
+        let offline = PeerNetworkPathSnapshot(isSatisfied: false, interfaces: [], gateways: [])
+        let wifi = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: ["192.168.0.1"])
+        let wifiWithVPN = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0", "utun4"], gateways: ["192.168.0.1"])
+        let otherWifi = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: ["10.0.0.1"])
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: offline, changedTo: wifi))
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: wifiWithVPN))
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifiWithVPN, changedTo: wifi))
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: otherWifi))
+    }
+
+    func test_automaticReconnectPass_pausesWhileAsleepOrOffline() {
+        let online = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: [])
+        let offline = PeerNetworkPathSnapshot(isSatisfied: false, interfaces: [], gateways: [])
+        XCTAssertTrue(PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: false, networkPath: online))
+        XCTAssertTrue(
+            PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: false, networkPath: nil),
+            "before the first path report the network is assumed present"
+        )
+        XCTAssertFalse(PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: false, networkPath: offline))
+        XCTAssertFalse(PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: true, networkPath: online))
+    }
+
+    /// Retry is pressed only for a host that was connected and lost, never
+    /// for one the user left or one whose tunnel came back by itself.
+    func test_automaticReconnect_tracksOnlyAFailedRowOnADeadSidebarLease() {
+        func disposition(
+            _ state: HostConnectionState, lease: Bool, dead: Bool, tracked: Bool
+        ) -> RemoteHostStore.AutomaticReconnectDisposition {
+            RemoteHostStore.automaticReconnectDisposition(
+                state: state, holdsSidebarLease: lease, sidebarLeaseIsDead: dead, isTracked: tracked
+            )
+        }
+        let failed = HostConnectionState.failed("unreachable")
+        XCTAssertEqual(disposition(failed, lease: true, dead: true, tracked: false), .track)
+        XCTAssertEqual(disposition(failed, lease: true, dead: false, tracked: false), .drop,
+                       "a tunnel still restarting, or back on its own, needs no Retry")
+        XCTAssertEqual(disposition(failed, lease: false, dead: false, tracked: false), .drop,
+                       "never connected this run, or the user let go of it")
+        XCTAssertEqual(disposition(failed, lease: false, dead: false, tracked: true), .keep,
+                       "a failed Retry gave the old lease up and must not end tracking")
+        XCTAssertEqual(disposition(.connecting, lease: false, dead: false, tracked: true), .keep)
+        XCTAssertEqual(disposition(.connecting, lease: false, dead: false, tracked: false), .drop)
+        XCTAssertEqual(disposition(.connected, lease: true, dead: false, tracked: true), .drop)
+        XCTAssertEqual(disposition(.saved, lease: false, dead: false, tracked: true), .drop,
+                       "Disconnect while failed ends the automatic retries")
+    }
+
+    func test_automaticReconnect_backsOffAReachableHostThatStillFails() {
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 0), 0)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 1), 30)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 2), 60)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 5), 480)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 6), 600)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 40), 600)
+    }
+
+    /// A wake, a network change or the session-owner probe can retire the
+    /// dead tunnel a pane parked on. Only a user's disconnect may take the
+    /// pane's claim to the automatic reattach away.
+    func test_tunnelRecoveryMark_survivesRegistryRetireButNotUserDisconnect() {
+        XCTAssertTrue(PeerClientCoordinator.keepsTunnelRecoveryMark(
+            awaitsTunnelRecovery: true, preparationIsAutomatic: true
+        ))
+        XCTAssertFalse(
+            PeerClientCoordinator.keepsTunnelRecoveryMark(
+                awaitsTunnelRecovery: true, preparationIsAutomatic: false
+            ),
+            "Disconnect Host ends the automatic reattach"
+        )
+        XCTAssertFalse(
+            PeerClientCoordinator.keepsTunnelRecoveryMark(
+                awaitsTunnelRecovery: false, preparationIsAutomatic: true
+            ),
+            "a retire never grants the mark to a pane that did not park on a failed tunnel"
+        )
+    }
+
+    /// Once a pane's own attempts are spent: wait for a restarting tunnel,
+    /// park on one that gave up, and end only on a tunnel that is up (the
+    /// host refused the pane) or stopped on purpose.
+    func test_circuitOpen_waitsParksOrEndsByTunnelState() {
+        func disposition(_ state: PeerSSHTunnelState?, canPark: Bool = true) -> PeerRelaySession.CircuitOpenDisposition {
+            PeerRelaySession.circuitOpenDisposition(tunnelState: state, canPark: canPark)
+        }
+        XCTAssertEqual(disposition(.reconnecting(attempt: 9)), .waitForTunnel)
+        XCTAssertEqual(disposition(.down(reason: "ssh exited")), .waitForTunnel)
+        XCTAssertEqual(disposition(.starting), .waitForTunnel)
+        XCTAssertEqual(disposition(.failed(reason: "gave up after 12 attempts")), .parkUntilHostAnswers)
+        XCTAssertEqual(
+            disposition(.failed(reason: "gave up after 12 attempts"), canPark: false), .end,
+            "a pane with no owner to preserve it ends as before"
+        )
+        XCTAssertEqual(disposition(.up), .end, "an up tunnel means the host refused this pane")
+        XCTAssertEqual(disposition(.stopped), .end, "a stopped tunnel was ended on purpose")
+        XCTAssertEqual(disposition(nil), .end, "a direct host has no tunnel to wait for")
+    }
+
+    /// The wiring, not just the predicates: a pane parked because its tunnel
+    /// gave up survives a failed replacement and an automatic retire through
+    /// the coordinator's own registry hooks, and only a user disconnect takes
+    /// its claim to the automatic reattach away.
+    @MainActor
+    func test_tunnelRecoveryPark_survivesAutomaticRetireAndFailedReplacement() async throws {
+        let socketPath = "/tmp/peer-park-wiring-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+        let registry = PeerPaneHostRegistry.shared
+        let coordinator = PeerClientCoordinator.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let key = spec.hostKey
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        let savedAbandon = registry.hostTransportReplacementAbandoned
+        defer {
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+            registry.hostTransportReplacementAbandoned = savedAbandon
+        }
+        coordinator.installHostTransportReplacementHooks()
+
+        let lease = try await registry.acquire(spec)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        surface.surfaceType = SessionHostPanes.agentSurfaceType
+        let pane = try await PeerPaneSession.attach(lease: lease, surface: surface, title: "park", spec: spec)
+        registry.release(lease)
+        coordinator.registerPaneSession(pane)
+        defer {
+            coordinator.deregisterPaneSession(pane)
+            pane.teardown()
+        }
+
+        pane.prepareForHostTransportDisconnect(stopRelay: false, tunnelGaveUp: true)
+        pane.relaySession.awaitTransportReplacementForTesting()
+        XCTAssertTrue(pane.awaitsTunnelRecovery)
+
+        registry.hostTransportReplacementAbandoned?(key)
+        XCTAssertTrue(
+            pane.relaySession.isAwaitingTransportReplacement,
+            "a replacement that failed while the host was away must not end the park"
+        )
+
+        registry.hostTransportWillRetire?(key)
+        XCTAssertTrue(pane.awaitsTunnelRecovery, "an automatic retire keeps the claim to the reattach")
+
+        _ = coordinator.preparePanesForHostDisconnect(key)
+        XCTAssertFalse(pane.awaitsTunnelRecovery, "Disconnect Host ends the automatic reattach")
+        _ = hostTask
+    }
+
+    func test_parkedReattach_backsOffAReachableHostAndForgetsIdleOnes() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        XCTAssertTrue(PeerClientCoordinator.mayAttemptParkedReattach(nil, at: start))
+        let first = PeerClientCoordinator.parkedReattachBackoff(afterFailureFollowing: nil, at: start)
+        XCTAssertEqual(first.attempts, 1)
+        XCTAssertEqual(first.notBefore, start.addingTimeInterval(30))
+        XCTAssertFalse(PeerClientCoordinator.mayAttemptParkedReattach(first, at: start.addingTimeInterval(29)))
+        XCTAssertTrue(PeerClientCoordinator.mayAttemptParkedReattach(first, at: start.addingTimeInterval(30)))
+        let second = PeerClientCoordinator.parkedReattachBackoff(
+            afterFailureFollowing: first, at: start.addingTimeInterval(30)
+        )
+        XCTAssertEqual(second.attempts, 2)
+        XCTAssertEqual(second.notBefore, start.addingTimeInterval(90))
+
+        let parked = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-parked.sock").hostKey
+        let idle = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-idle.sock").hostKey
+        XCTAssertEqual(
+            PeerClientCoordinator.hostKeysToForget(remembered: [parked, idle], waiting: [parked]),
+            [idle]
+        )
+    }
+
+    /// A ProxyCommand host stays unprobeable for the whole incident; asking
+    /// `ssh -G` again every pass spawned a process for nothing. Only a failed
+    /// lookup is asked again.
+    func test_probeResolution_remembersUnprobeableButNotAFailedLookup() {
+        let target = PeerHostProbeTarget(host: "100.64.60.4", port: 22)
+        XCTAssertTrue(PeerClientCoordinator.remembersProbeResolution(.target(target)))
+        XCTAssertTrue(PeerClientCoordinator.remembersProbeResolution(.unprobeable))
+        XCTAssertFalse(PeerClientCoordinator.remembersProbeResolution(.unresolved))
+        XCTAssertEqual(PeerHostReachabilityProbe.Resolution.target(target).target, target)
+        XCTAssertNil(PeerHostReachabilityProbe.Resolution.unprobeable.target)
+    }
+
+    /// A replacement that fails while the host is still away must not end a
+    /// pane parked on its failed tunnel; that was the Project leader the
+    /// park exists to keep.
+    func test_failedReplacement_keepsTunnelRecoveryParks() {
+        XCTAssertFalse(PeerClientCoordinator.abandonsParkOnFailedReplacement(awaitsTunnelRecovery: true))
+        XCTAssertTrue(PeerClientCoordinator.abandonsParkOnFailedReplacement(awaitsTunnelRecovery: false))
+    }
+
+    /// A pane whose own attempts ran out keeps waiting only while its tunnel
+    /// is still trying; a tunnel that is up or has given up decides at once.
+    func test_reconnectCircuit_waitsOnlyForARestartingTunnel() {
+        XCTAssertTrue(PeerRelaySession.isRestarting(.starting))
+        XCTAssertTrue(PeerRelaySession.isRestarting(.down(reason: "ssh exited")))
+        XCTAssertTrue(PeerRelaySession.isRestarting(.reconnecting(attempt: 4)))
+        XCTAssertFalse(PeerRelaySession.isRestarting(.up))
+        XCTAssertFalse(PeerRelaySession.isRestarting(.failed(reason: "gave up after 12 attempts")))
+        XCTAssertFalse(PeerRelaySession.isRestarting(.stopped))
+        XCTAssertGreaterThan(
+            PeerRelaySession.tunnelVerdictWaitSeconds, 420,
+            "the wait must outlast the tunnel's own restart budget (about seven minutes)"
+        )
+    }
+
+    func test_rosterRecovery_reusesProvenanceOnlyForTheSameTunnel() {
+        let endpoint = PeerHostEndpointProvenance(
+            sshTarget: "jinwoo@100.64.60.4", port: nil, identityFile: nil, remoteSocket: ""
+        )
+        let saved = (path: "/tmp/tm-peer-ssh-1-a.sock", provenance: endpoint)
+        XCTAssertEqual(
+            RemoteHostStore.rosterRecoveryProvenance(saved: saved, path: "/tmp/tm-peer-ssh-1-a.sock"),
+            endpoint
+        )
+        XCTAssertNil(
+            RemoteHostStore.rosterRecoveryProvenance(saved: saved, path: "/tmp/tm-peer-ssh-1-b.sock"),
+            "launch metadata read over another tunnel must not inherit the lost one's endpoint"
+        )
+        XCTAssertNil(RemoteHostStore.rosterRecoveryProvenance(saved: nil, path: "/tmp/tm-peer-ssh-1-a.sock"))
+    }
+
+    func test_reachabilityProbe_readsTheHopSSHWouldDial() {
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "user jinwoo\nhostname 100.64.60.4\nport 22\n"),
+            .direct(PeerHostProbeTarget(host: "100.64.60.4", port: 22))
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "hostname box.example\nport 2222\nproxycommand none\n"),
+            .direct(PeerHostProbeTarget(host: "box.example", port: 2222))
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "hostname inner\nport 22\nproxyjump ops@bastion:2200,mid\n"),
+            .jump("ops@bastion:2200")
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "hostname inner\nport 22\nproxycommand nc -X 5 -x p:1080 %h %p\n"),
+            .unprobeable
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.jumpDestination("ops@bastion:2200").destination, "ops@bastion"
+        )
+        XCTAssertEqual(PeerHostReachabilityProbe.jumpDestination("ops@bastion:2200").port, 2200)
+        XCTAssertNil(PeerHostReachabilityProbe.jumpDestination("bastion").port)
+    }
+
     @MainActor
     func test_transportRecovery_coalescesStaleGenerationAndAllowsNextIncident() async {
         let recovery = PeerPaneTransportRecovery()
