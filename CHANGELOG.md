@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.278.0] - 2026-10-27
+
+### Fixed
+
+- A peer host that comes back after a long network outage now reconnects without a manual Retry. Before, an ssh tunnel that failed 12 reconnect attempts stopped for good, so the sidebar, mirrored workspaces, and panes stayed down until you pressed Retry. term-mesh now checks the host's ssh port with a plain TCP connect every 15 seconds and reconnects when the host answers. It starts no ssh process while the host stays away, and it stops the check while this Mac sleeps or has no network. A change in this Mac's network path now runs the same tunnel check as a wake. In an 8-minute outage, the sidebar, mirrors, and panes came back 10.8 seconds after the network returned.
+- The sidebar now reads the host's workspace and Project lists again when a tunnel comes back on its own. Before, the lists stayed empty after the tunnel recovered, which blocked Project member restore and new Projects.
+- Panes and mirrors now reattach as soon as their tunnel is up again, instead of waiting out a retry delay of up to 30 seconds. A pane no longer ends while its tunnel is still reconnecting, so a mirror does not replace it with a new pane that lost its scrollback. In a 60-second outage, a pane came back 0.7 seconds after the tunnel, down from 15.9 seconds.
+- A remote Project keeps its layout when its tunnel fails. Before, the leader pane closed, the executor left, a local shell filled the empty workspace, and the restored panes landed beside it. Panes now wait in place and reattach to the same position when the host answers. A wake or network change while the host is still away no longer ends the waiting panes. Panes that you disconnect yourself are not reattached automatically.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.277.0] - 2026-10-26
 
 ### Fixed
