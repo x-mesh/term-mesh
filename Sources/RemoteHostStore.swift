@@ -1186,6 +1186,11 @@ final class RemoteHostStore: ObservableObject {
     }
 
     private var observer: NSObjectProtocol?
+    private var tunnelStateObserver: NSObjectProtocol?
+    /// What a failed roster read cleared, kept so a reread over the same
+    /// tunnel can restore launchability instead of leaving the row connected
+    /// but unable to start a Project.
+    private var rosterLossProvenance: [String: (path: String, provenance: PeerHostEndpointProvenance)] = [:]
     private var fetchTasks: [String: Task<Void, Never>] = [:]
     /// A Mac GUI may answer before its sibling daemon has bound the advertised
     /// session-owner socket. Discover that route independently from the serving
@@ -1268,6 +1273,16 @@ final class RemoteHostStore: ObservableObject {
                 guard self?.profileRebuildSuppressionCount == 0 else { return }
                 DispatchQueue.main.async { self?.rebuild() }
             }
+        tunnelStateObserver = NotificationCenter.default.addObserver(
+            forName: PeerSSHTunnel.stateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let tunnel = note.object as? PeerSSHTunnel,
+                  note.userInfo?[PeerSSHTunnel.stateUserInfoKey] as? PeerSSHTunnelState == .up
+            else { return }
+            Task { @MainActor in self?.tunnelCameBack(tunnel) }
+        }
         // Catch connections that opened before the sidebar first rendered.
         rebuild()
     }
@@ -1276,6 +1291,42 @@ final class RemoteHostStore: ObservableObject {
         if let token = observer {
             NotificationCenter.default.removeObserver(token)
         }
+        if let token = tunnelStateObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+    }
+
+    /// A roster read that failed while the tunnel was down marked the row
+    /// unreachable, and nothing read it again: a tunnel that restarts on its
+    /// own keeps the same lease, so no replacement hook fires. Its coming
+    /// back is the cue. A failed read marks the row failed again, so this
+    /// never reports a host reachable on credit.
+    private func tunnelCameBack(_ tunnel: PeerSSHTunnel) {
+        for (key, lease) in sidebarLeases where lease.tunnel === tunnel {
+            guard case .failed = hosts[key]?.connectionState,
+                  hosts[key]?.activeSockPath == lease.hostSockPath
+            else { continue }
+            hosts[key]?.connectionState = .connected
+            rereadLostRoster(key: key, path: lease.hostSockPath)
+        }
+    }
+
+    private func rereadLostRoster(key: String, path: String) {
+        fetchWorkspaces(
+            for: path, key: key,
+            provenance: Self.rosterRecoveryProvenance(saved: rosterLossProvenance[key], path: path)
+        )
+    }
+
+    /// The endpoint a lost roster had been authenticated through, reused only
+    /// for the same tunnel socket. Launch metadata read over any other
+    /// connection must not inherit it.
+    nonisolated static func rosterRecoveryProvenance(
+        saved: (path: String, provenance: PeerHostEndpointProvenance)?,
+        path: String
+    ) -> PeerHostEndpointProvenance? {
+        guard let saved, saved.path == path else { return nil }
+        return saved.provenance
     }
 
     private func rebuild() {
@@ -1431,6 +1482,8 @@ final class RemoteHostStore: ObservableObject {
                 // connection, but store results under the stable key.
                 fetchWorkspaces(for: conn.hostSockPath, key: key, provenance: nil)
             } else {
+                let rosterWasLost: Bool
+                if case .failed = hosts[key]?.connectionState { rosterWasLost = true } else { rosterWasLost = false }
                 hosts[key]?.connectionState = .connected
                 // A profile-named entry keeps its user-chosen name; ad-hoc
                 // entries keep tracking the connection's display string.
@@ -1472,6 +1525,11 @@ final class RemoteHostStore: ObservableObject {
                     hosts[key]?.activeSockPath = conn.hostSockPath
                     replaceWorkspaceRoster([], for: key)
                     fetchWorkspaces(for: conn.hostSockPath, key: key, provenance: nil)
+                } else if rosterWasLost {
+                    // Same tunnel, back after a roster read failed on it: the
+                    // promotion above would otherwise show a connected row
+                    // with no workspaces and no way to launch a Project.
+                    rereadLostRoster(key: key, path: conn.hostSockPath)
                 }
             }
         }
@@ -2395,6 +2453,9 @@ final class RemoteHostStore: ObservableObject {
                 if !Task.isCancelled,
                    self.hosts[key]?.activeSockPath == path,
                    self.hosts[key]?.isConnected == true {
+                    if let provenance = self.hosts[key]?.hostCLIBinDirsProvenance {
+                        self.rosterLossProvenance[key] = (path, provenance)
+                    }
                     self.hosts[key]?.connectionState = .failed(Self.unreachableReason)
                     self.replaceWorkspaceRoster([], for: key)
                     self.hosts[key]?.teams = []

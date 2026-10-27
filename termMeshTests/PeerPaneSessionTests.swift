@@ -5339,6 +5339,22 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 40), 600)
     }
 
+    func test_rosterRecovery_reusesProvenanceOnlyForTheSameTunnel() {
+        let endpoint = PeerHostEndpointProvenance(
+            sshTarget: "jinwoo@100.64.60.4", port: nil, identityFile: nil, remoteSocket: ""
+        )
+        let saved = (path: "/tmp/tm-peer-ssh-1-a.sock", provenance: endpoint)
+        XCTAssertEqual(
+            RemoteHostStore.rosterRecoveryProvenance(saved: saved, path: "/tmp/tm-peer-ssh-1-a.sock"),
+            endpoint
+        )
+        XCTAssertNil(
+            RemoteHostStore.rosterRecoveryProvenance(saved: saved, path: "/tmp/tm-peer-ssh-1-b.sock"),
+            "launch metadata read over another tunnel must not inherit the lost one's endpoint"
+        )
+        XCTAssertNil(RemoteHostStore.rosterRecoveryProvenance(saved: nil, path: "/tmp/tm-peer-ssh-1-a.sock"))
+    }
+
     func test_reachabilityProbe_readsTheHopSSHWouldDial() {
         XCTAssertEqual(
             PeerHostReachabilityProbe.hop(fromSSHConfig: "user jinwoo\nhostname 100.64.60.4\nport 22\n"),
