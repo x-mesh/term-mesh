@@ -2003,6 +2003,9 @@ final class RemoteHostStore: ObservableObject {
             guard let probeTarget = progress.probeTarget,
                   await PeerHostReachabilityProbe.isReachable(probeTarget)
             else { continue }
+            // A wake or network change cancels the pass to run its own lease
+            // judgment; a Retry now would retire the lease it is replacing.
+            guard !Task.isCancelled else { return started }
             // The probe awaited; the user may have acted on the row meanwhile.
             guard automaticReconnects[key] != nil,
                   let current = hosts[key], case .failed = current.connectionState

@@ -5339,6 +5339,55 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 40), 600)
     }
 
+    /// A wake, a network change or the session-owner probe can retire the
+    /// dead tunnel a pane parked on. Only a user's disconnect may take the
+    /// pane's claim to the automatic reattach away.
+    func test_tunnelRecoveryMark_survivesRegistryRetireButNotUserDisconnect() {
+        XCTAssertTrue(PeerClientCoordinator.keepsTunnelRecoveryMark(
+            awaitsTunnelRecovery: true, retireIsRegistryInitiated: true
+        ))
+        XCTAssertFalse(
+            PeerClientCoordinator.keepsTunnelRecoveryMark(
+                awaitsTunnelRecovery: true, retireIsRegistryInitiated: false
+            ),
+            "Disconnect Host ends the automatic reattach"
+        )
+        XCTAssertFalse(
+            PeerClientCoordinator.keepsTunnelRecoveryMark(
+                awaitsTunnelRecovery: false, retireIsRegistryInitiated: true
+            ),
+            "a retire never grants the mark to a pane that did not park on a failed tunnel"
+        )
+    }
+
+    /// Once a pane's own attempts are spent: wait for a restarting tunnel,
+    /// park on one that gave up, and end only on a tunnel that is up (the
+    /// host refused the pane) or stopped on purpose.
+    func test_circuitOpen_waitsParksOrEndsByTunnelState() {
+        func disposition(_ state: PeerSSHTunnelState?, canPark: Bool = true) -> PeerRelaySession.CircuitOpenDisposition {
+            PeerRelaySession.circuitOpenDisposition(tunnelState: state, canPark: canPark)
+        }
+        XCTAssertEqual(disposition(.reconnecting(attempt: 9)), .waitForTunnel)
+        XCTAssertEqual(disposition(.down(reason: "ssh exited")), .waitForTunnel)
+        XCTAssertEqual(disposition(.starting), .waitForTunnel)
+        XCTAssertEqual(disposition(.failed(reason: "gave up after 12 attempts")), .parkUntilHostAnswers)
+        XCTAssertEqual(
+            disposition(.failed(reason: "gave up after 12 attempts"), canPark: false), .end,
+            "a pane with no owner to preserve it ends as before"
+        )
+        XCTAssertEqual(disposition(.up), .end, "an up tunnel means the host refused this pane")
+        XCTAssertEqual(disposition(.stopped), .end, "a stopped tunnel was ended on purpose")
+        XCTAssertEqual(disposition(nil), .end, "a direct host has no tunnel to wait for")
+    }
+
+    /// A replacement that fails while the host is still away must not end a
+    /// pane parked on its failed tunnel; that was the Project leader the
+    /// park exists to keep.
+    func test_failedReplacement_keepsTunnelRecoveryParks() {
+        XCTAssertFalse(PeerClientCoordinator.abandonsParkOnFailedReplacement(awaitsTunnelRecovery: true))
+        XCTAssertTrue(PeerClientCoordinator.abandonsParkOnFailedReplacement(awaitsTunnelRecovery: false))
+    }
+
     /// A pane whose own attempts ran out keeps waiting only while its tunnel
     /// is still trying; a tunnel that is up or has given up decides at once.
     func test_reconnectCircuit_waitsOnlyForARestartingTunnel() {
