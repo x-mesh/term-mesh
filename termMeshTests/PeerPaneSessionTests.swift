@@ -5344,17 +5344,17 @@ final class PeerPaneSessionTests: XCTestCase {
     /// pane's claim to the automatic reattach away.
     func test_tunnelRecoveryMark_survivesRegistryRetireButNotUserDisconnect() {
         XCTAssertTrue(PeerClientCoordinator.keepsTunnelRecoveryMark(
-            awaitsTunnelRecovery: true, retireIsRegistryInitiated: true
+            awaitsTunnelRecovery: true, preparationIsAutomatic: true
         ))
         XCTAssertFalse(
             PeerClientCoordinator.keepsTunnelRecoveryMark(
-                awaitsTunnelRecovery: true, retireIsRegistryInitiated: false
+                awaitsTunnelRecovery: true, preparationIsAutomatic: false
             ),
             "Disconnect Host ends the automatic reattach"
         )
         XCTAssertFalse(
             PeerClientCoordinator.keepsTunnelRecoveryMark(
-                awaitsTunnelRecovery: false, retireIsRegistryInitiated: true
+                awaitsTunnelRecovery: false, preparationIsAutomatic: true
             ),
             "a retire never grants the mark to a pane that did not park on a failed tunnel"
         )
@@ -5378,6 +5378,96 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(disposition(.up), .end, "an up tunnel means the host refused this pane")
         XCTAssertEqual(disposition(.stopped), .end, "a stopped tunnel was ended on purpose")
         XCTAssertEqual(disposition(nil), .end, "a direct host has no tunnel to wait for")
+    }
+
+    /// The wiring, not just the predicates: a pane parked because its tunnel
+    /// gave up survives a failed replacement and an automatic retire through
+    /// the coordinator's own registry hooks, and only a user disconnect takes
+    /// its claim to the automatic reattach away.
+    @MainActor
+    func test_tunnelRecoveryPark_survivesAutomaticRetireAndFailedReplacement() async throws {
+        let socketPath = "/tmp/peer-park-wiring-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+        let registry = PeerPaneHostRegistry.shared
+        let coordinator = PeerClientCoordinator.shared
+        let spec = PeerPaneHostSpec.direct(sockPath: socketPath)
+        let key = spec.hostKey
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        let savedAbandon = registry.hostTransportReplacementAbandoned
+        defer {
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+            registry.hostTransportReplacementAbandoned = savedAbandon
+        }
+        coordinator.installHostTransportReplacementHooks()
+
+        let lease = try await registry.acquire(spec)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        surface.surfaceType = SessionHostPanes.agentSurfaceType
+        let pane = try await PeerPaneSession.attach(lease: lease, surface: surface, title: "park", spec: spec)
+        registry.release(lease)
+        coordinator.registerPaneSession(pane)
+        defer {
+            coordinator.deregisterPaneSession(pane)
+            pane.teardown()
+        }
+
+        pane.prepareForHostTransportDisconnect(stopRelay: false, tunnelGaveUp: true)
+        pane.relaySession.awaitTransportReplacementForTesting()
+        XCTAssertTrue(pane.awaitsTunnelRecovery)
+
+        registry.hostTransportReplacementAbandoned?(key)
+        XCTAssertTrue(
+            pane.relaySession.isAwaitingTransportReplacement,
+            "a replacement that failed while the host was away must not end the park"
+        )
+
+        registry.hostTransportWillRetire?(key)
+        XCTAssertTrue(pane.awaitsTunnelRecovery, "an automatic retire keeps the claim to the reattach")
+
+        _ = coordinator.preparePanesForHostDisconnect(key)
+        XCTAssertFalse(pane.awaitsTunnelRecovery, "Disconnect Host ends the automatic reattach")
+        _ = hostTask
+    }
+
+    func test_parkedReattach_backsOffAReachableHostAndForgetsIdleOnes() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        XCTAssertTrue(PeerClientCoordinator.mayAttemptParkedReattach(nil, at: start))
+        let first = PeerClientCoordinator.parkedReattachBackoff(afterFailureFollowing: nil, at: start)
+        XCTAssertEqual(first.attempts, 1)
+        XCTAssertEqual(first.notBefore, start.addingTimeInterval(30))
+        XCTAssertFalse(PeerClientCoordinator.mayAttemptParkedReattach(first, at: start.addingTimeInterval(29)))
+        XCTAssertTrue(PeerClientCoordinator.mayAttemptParkedReattach(first, at: start.addingTimeInterval(30)))
+        let second = PeerClientCoordinator.parkedReattachBackoff(
+            afterFailureFollowing: first, at: start.addingTimeInterval(30)
+        )
+        XCTAssertEqual(second.attempts, 2)
+        XCTAssertEqual(second.notBefore, start.addingTimeInterval(90))
+
+        let parked = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-parked.sock").hostKey
+        let idle = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-idle.sock").hostKey
+        XCTAssertEqual(
+            PeerClientCoordinator.hostKeysToForget(remembered: [parked, idle], waiting: [parked]),
+            [idle]
+        )
+    }
+
+    /// A ProxyCommand host stays unprobeable for the whole incident; asking
+    /// `ssh -G` again every pass spawned a process for nothing. Only a failed
+    /// lookup is asked again.
+    func test_probeResolution_remembersUnprobeableButNotAFailedLookup() {
+        let target = PeerHostProbeTarget(host: "100.64.60.4", port: 22)
+        XCTAssertTrue(PeerClientCoordinator.remembersProbeResolution(.target(target)))
+        XCTAssertTrue(PeerClientCoordinator.remembersProbeResolution(.unprobeable))
+        XCTAssertFalse(PeerClientCoordinator.remembersProbeResolution(.unresolved))
+        XCTAssertEqual(PeerHostReachabilityProbe.Resolution.target(target).target, target)
+        XCTAssertNil(PeerHostReachabilityProbe.Resolution.unprobeable.target)
     }
 
     /// A replacement that fails while the host is still away must not end a

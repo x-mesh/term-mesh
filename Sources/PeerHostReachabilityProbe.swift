@@ -50,21 +50,42 @@ enum PeerHostReachabilityProbe {
         return (String(hop[..<colon]), port)
     }
 
-    /// One level of `ProxyJump` is followed; a jump host that itself jumps
-    /// or uses `ProxyCommand` is left to the event triggers.
-    static func resolveTarget(sshTarget: String, port: Int?) async -> PeerHostProbeTarget? {
-        switch await sshConfigHop(destination: sshTarget, port: port) {
-        case let .direct(target):
-            return target
-        case let .jump(hop):
-            let jump = jumpDestination(hop)
-            if case let .direct(target) = await sshConfigHop(destination: jump.destination, port: jump.port) {
-                return target
-            }
-            return nil
-        case .unprobeable, nil:
+    enum Resolution: Equatable, Sendable {
+        case target(PeerHostProbeTarget)
+        /// `ssh -G` answered, and the hop cannot be probed (`ProxyCommand`, or
+        /// a jump host that jumps again). Stable until the ssh config changes.
+        case unprobeable
+        /// `ssh -G` itself failed; worth asking again.
+        case unresolved
+
+        var target: PeerHostProbeTarget? {
+            if case let .target(target) = self { return target }
             return nil
         }
+    }
+
+    /// One level of `ProxyJump` is followed; a jump host that itself jumps
+    /// or uses `ProxyCommand` is left to the event triggers.
+    static func resolve(sshTarget: String, port: Int?) async -> Resolution {
+        switch await sshConfigHop(destination: sshTarget, port: port) {
+        case let .direct(target):
+            return .target(target)
+        case let .jump(hop):
+            let jump = jumpDestination(hop)
+            switch await sshConfigHop(destination: jump.destination, port: jump.port) {
+            case let .direct(target): return .target(target)
+            case .jump, .unprobeable: return .unprobeable
+            case nil: return .unresolved
+            }
+        case .unprobeable:
+            return .unprobeable
+        case nil:
+            return .unresolved
+        }
+    }
+
+    static func resolveTarget(sshTarget: String, port: Int?) async -> PeerHostProbeTarget? {
+        await resolve(sshTarget: sshTarget, port: port).target
     }
 
     private static func sshConfigHop(destination: String, port: Int?) async -> ConfigHop? {

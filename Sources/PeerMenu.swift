@@ -145,11 +145,16 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     private var isSystemAsleep = false
     /// `ssh -G` resolved once per host: it is a local process, but the parked
     /// pass runs every 15s for as long as a host stays away.
-    private var parkedHostProbeTargets: [PeerPaneHostKey: PeerHostProbeTarget] = [:]
+    private var parkedHostProbeTargets: [PeerPaneHostKey: PeerHostReachabilityProbe.Resolution] = [:]
     /// A host that answers on its ssh port but still fails to rebuild (auth
     /// broken, daemon socket gone) is retried less and less often, as the
     /// sidebar's Retry is, instead of getting a new ssh every pass.
-    private var parkedReattachBackoff: [PeerPaneHostKey: (attempts: Int, notBefore: Date)] = [:]
+    private var parkedReattachBackoff: [PeerPaneHostKey: ParkedReattachBackoff] = [:]
+
+    struct ParkedReattachBackoff: Equatable {
+        var attempts: Int
+        var notBefore: Date
+    }
 
     static let savedRunnerStatusDidChangeNotification =
         Notification.Name("PeerSavedRunnerStatusDidChange")
@@ -321,15 +326,16 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     }
 
     /// Any acquire can retire a dead tunnel — a wake, a network change, the
-    /// session-owner probe — and the retire runs the same preparation a user
-    /// disconnect does. Only the user's disconnect may clear the mark that a
-    /// failed tunnel parked the pane; a registry retire must keep it, or the
-    /// pane loses its claim to the automatic reattach.
+    /// session-owner probe — and so can the automatic Retry for a failed row;
+    /// each runs the same preparation a user disconnect does. Only the user
+    /// (Disconnect Host, or pressing Retry) may clear the mark that a failed
+    /// tunnel parked the pane; anything automatic must keep it, or the pane
+    /// loses its claim to the automatic reattach.
     nonisolated static func keepsTunnelRecoveryMark(
         awaitsTunnelRecovery: Bool,
-        retireIsRegistryInitiated: Bool
+        preparationIsAutomatic: Bool
     ) -> Bool {
-        awaitsTunnelRecovery && retireIsRegistryInitiated
+        awaitsTunnelRecovery && preparationIsAutomatic
     }
 
     /// A replacement that fails while the host is still unreachable says
@@ -480,10 +486,11 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
         // A host nothing waits on any more starts the next incident fresh:
         // its ssh config may have changed in between.
-        for key in parkedHostProbeTargets.keys where specs[key] == nil {
+        let waiting = Set(specs.keys)
+        for key in Self.hostKeysToForget(remembered: parkedHostProbeTargets.keys, waiting: waiting) {
             parkedHostProbeTargets[key] = nil
         }
-        for key in parkedReattachBackoff.keys where specs[key] == nil {
+        for key in Self.hostKeysToForget(remembered: parkedReattachBackoff.keys, waiting: waiting) {
             parkedReattachBackoff[key] = nil
         }
         var reattached = 0
@@ -493,7 +500,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 reattached += resumePanesAfterHostReconnect(key)
                 continue
             }
-            if let backoff = parkedReattachBackoff[key], Date() < backoff.notBefore { continue }
+            guard Self.mayAttemptParkedReattach(parkedReattachBackoff[key], at: Date()) else { continue }
             guard let probe = await probeTarget(for: key, spec: spec),
                   await PeerHostReachabilityProbe.isReachable(probe)
             else { continue }
@@ -507,12 +514,8 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 parkedReattachBackoff[key] = nil
                 parkedHostProbeTargets[key] = nil
             } catch {
-                let attempts = (parkedReattachBackoff[key]?.attempts ?? 0) + 1
-                parkedReattachBackoff[key] = (
-                    attempts,
-                    Date().addingTimeInterval(
-                        RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: attempts)
-                    )
+                parkedReattachBackoff[key] = Self.parkedReattachBackoff(
+                    afterFailureFollowing: parkedReattachBackoff[key], at: Date()
                 )
                 RemoteWorkLog.info(
                     "Could not rebuild the SSH tunnel to \(key.shortLabel) for paused panes: \(error)"
@@ -526,11 +529,44 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// A failed `ssh -G` is not remembered, so the next pass asks again.
     private func probeTarget(for key: PeerPaneHostKey, spec: PeerPaneHostSpec) async -> PeerHostProbeTarget? {
         guard case let .ssh(target, _, port, _) = spec else { return nil }
-        if let cached = parkedHostProbeTargets[key] { return cached }
-        guard let resolved = await PeerHostReachabilityProbe.resolveTarget(sshTarget: target, port: port)
-        else { return nil }
-        parkedHostProbeTargets[key] = resolved
-        return resolved
+        if let cached = parkedHostProbeTargets[key] { return cached.target }
+        let resolution = await PeerHostReachabilityProbe.resolve(sshTarget: target, port: port)
+        if Self.remembersProbeResolution(resolution) {
+            parkedHostProbeTargets[key] = resolution
+        }
+        return resolution.target
+    }
+
+    /// A ProxyCommand host stays unprobeable for the whole incident, so that
+    /// verdict is kept like a target is; only a failed `ssh -G` is asked again.
+    nonisolated static func remembersProbeResolution(_ resolution: PeerHostReachabilityProbe.Resolution) -> Bool {
+        resolution != .unresolved
+    }
+
+    nonisolated static func mayAttemptParkedReattach(_ backoff: ParkedReattachBackoff?, at now: Date) -> Bool {
+        guard let backoff else { return true }
+        return now >= backoff.notBefore
+    }
+
+    nonisolated static func parkedReattachBackoff(
+        afterFailureFollowing previous: ParkedReattachBackoff?,
+        at now: Date
+    ) -> ParkedReattachBackoff {
+        let attempts = (previous?.attempts ?? 0) + 1
+        return ParkedReattachBackoff(
+            attempts: attempts,
+            notBefore: now.addingTimeInterval(
+                RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: attempts)
+            )
+        )
+    }
+
+    /// Hosts whose remembered probe or backoff no pane waits on any more.
+    nonisolated static func hostKeysToForget<Keys: Sequence>(
+        remembered: Keys,
+        waiting: Set<PeerPaneHostKey>
+    ) -> [PeerPaneHostKey] where Keys.Element == PeerPaneHostKey {
+        remembered.filter { !waiting.contains($0) }
     }
 
     private func networkPathDidUpdate(_ snapshot: PeerNetworkPathSnapshot) {
@@ -581,7 +617,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 stopRelay: stopRelay,
                 tunnelGaveUp: Self.keepsTunnelRecoveryMark(
                     awaitsTunnelRecovery: session.awaitsTunnelRecovery,
-                    retireIsRegistryInitiated: keepingTunnelRecovery
+                    preparationIsAutomatic: keepingTunnelRecovery
                 )
             )
         }

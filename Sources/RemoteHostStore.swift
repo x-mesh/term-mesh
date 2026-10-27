@@ -1829,13 +1829,18 @@ final class RemoteHostStore: ObservableObject {
     /// left a lease a pane still held in the pool, and the connect that
     /// followed reused it — so "Retry" on a dead tunnel reconnected nothing.
     @discardableResult
-    func reconnectHost(_ host: HostEntry) -> HostReconnectOutcome {
+    /// `automatic` is the row pass pressing Retry on the user's behalf. It
+    /// keeps the mark that a failed tunnel parked a pane, so a replacement
+    /// that fails again does not end the pane the park is holding.
+    func reconnectHost(_ host: HostEntry, automatic: Bool = false) -> HostReconnectOutcome {
         let key = host.id
         let registry = PeerPaneHostRegistry.shared
         // Resolve the pooled key before `invalidateAutoDetectedSocket` below
         // clears `remoteSockPath` — it is part of the key.
         let hostKey = sidebarLeases[key]?.key ?? connectingLeaseKeys[key] ?? (hosts[key] ?? host).paneHostSpec.hostKey
-        let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
+        let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(
+            hostKey, keepingTunnelRecovery: automatic
+        )
         let retiredPath = registry.disconnectTransport(for: hostKey, replacementFollows: true)
         let replacementToken = registry.pendingReplacementToken(for: hostKey)
         if let lease = sidebarLeases.removeValue(forKey: key) {
@@ -2016,7 +2021,7 @@ final class RemoteHostStore: ObservableObject {
             )
             automaticReconnects[key] = progress
             RemoteWorkLog.info("\(current.displayName) answers again — reconnecting")
-            if reconnectHost(current).started { started += 1 }
+            if reconnectHost(current, automatic: true).started { started += 1 }
         }
         return started
     }
