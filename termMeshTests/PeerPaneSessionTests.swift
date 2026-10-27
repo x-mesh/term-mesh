@@ -5339,6 +5339,21 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 40), 600)
     }
 
+    /// A pane whose own attempts ran out keeps waiting only while its tunnel
+    /// is still trying; a tunnel that is up or has given up decides at once.
+    func test_reconnectCircuit_waitsOnlyForARestartingTunnel() {
+        XCTAssertTrue(PeerRelaySession.isRestarting(.starting))
+        XCTAssertTrue(PeerRelaySession.isRestarting(.down(reason: "ssh exited")))
+        XCTAssertTrue(PeerRelaySession.isRestarting(.reconnecting(attempt: 4)))
+        XCTAssertFalse(PeerRelaySession.isRestarting(.up))
+        XCTAssertFalse(PeerRelaySession.isRestarting(.failed(reason: "gave up after 12 attempts")))
+        XCTAssertFalse(PeerRelaySession.isRestarting(.stopped))
+        XCTAssertGreaterThan(
+            PeerRelaySession.tunnelVerdictWaitSeconds, 420,
+            "the wait must outlast the tunnel's own restart budget (about seven minutes)"
+        )
+    }
+
     func test_rosterRecovery_reusesProvenanceOnlyForTheSameTunnel() {
         let endpoint = PeerHostEndpointProvenance(
             sshTarget: "jinwoo@100.64.60.4", port: nil, identityFile: nil, remoteSocket: ""

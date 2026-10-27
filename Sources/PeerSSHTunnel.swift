@@ -267,6 +267,16 @@ final class PeerSSHTunnel: @unchecked Sendable {
         return state
     }
 
+    private var upTransitions = 0
+
+    /// How many times this tunnel has come up. A reconnect loop compares it
+    /// before and after waiting, so a tunnel that came back mid-attempt or
+    /// mid-backoff ends the wait instead of being noticed up to 30s late.
+    var upTransitionCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return upTransitions
+    }
+
     /// Local port serving the remote dashboard, or `nil` when the
     /// forward is off or could not be established.
     var dashboardLocalPort: Int? {
@@ -894,6 +904,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
     private func emit(_ newState: PeerSSHTunnelState) {
         lock.lock()
         state = newState
+        if newState == .up { upTransitions += 1 }
         let cb = onStateChange
         lock.unlock()
         report(newState)

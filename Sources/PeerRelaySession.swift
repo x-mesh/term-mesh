@@ -4531,8 +4531,19 @@ final class PeerRelaySession {
             return session !== failedSession
         }
         var didRefreshTransport = false
+        var tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
         while await ownedReconnectMayProceed(afterLosing: failedSession) {
             guard let next = reconnectCircuit.nextAttempt() else {
+                if await waitForRestartingOwnedTunnel(failedSession) {
+                    // The tunnel this pane rides came back on its own; its
+                    // attempts so far were spent against a dead route.
+                    reconnectCircuit.recordRecovery()
+                    tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
+                    RemoteWorkLog.infoOffMain(
+                        "Peer reconnect re-armed host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) — the tunnel is back"
+                    )
+                    continue
+                }
                 RemoteWorkLog.warningOffMain(
                     "Peer reconnect circuit open host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) attempts=\(reconnectCircuit.attempts)"
                 )
@@ -4544,10 +4555,14 @@ final class PeerRelaySession {
                 // The pump waits inside this call, so a heal that commits a
                 // replacement during the backoff would go unread until the
                 // delay ends; the host then drops the unread session and the
-                // next backoff is longer. Wake as soon as the session moves.
-                await sleepUnlessSessionReplaced(failedSession, seconds: delay)
+                // next backoff is longer. Wake as soon as the session moves,
+                // or as soon as the tunnel comes back.
+                await sleepUnlessSessionReplaced(
+                    failedSession, seconds: delay, tunnelUpsAtLastAttempt: tunnelUpsAtLastAttempt
+                )
             }
             guard await ownedReconnectMayProceed(afterLosing: failedSession) else { break }
+            tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
             RemoteWorkLog.infoOffMain(
                 "Peer reconnect attempt host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) delay=\(delay) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
             )
@@ -4594,9 +4609,47 @@ final class PeerRelaySession {
         return session !== failedSession
     }
 
-    private func sleepUnlessSessionReplaced(_ failedSession: PeerSession, seconds: TimeInterval) async {
+    private func sleepUnlessSessionReplaced(
+        _ failedSession: PeerSession,
+        seconds: TimeInterval,
+        tunnelUpsAtLastAttempt: Int
+    ) async {
         await Self.waitOutBackoff(seconds: seconds) {
             !isTorndown && session === failedSession && (ownedTransportMayReconnect?() ?? true)
+                && (ownedTunnel?.upTransitionCount ?? 0) == tunnelUpsAtLastAttempt
+        }
+    }
+
+    /// The tunnel currently pooled for this pane's host, which after a
+    /// replacement is no longer the one the pane first attached through.
+    private var ownedTunnel: PeerSSHTunnel? {
+        hostKey.flatMap { PeerPaneHostRegistry.shared.activeLease(forKey: $0)?.tunnel }
+    }
+
+    /// The circuit budgets this pane's own attempts (about three and a half
+    /// minutes), but the tunnel's restart budget is longer (about seven).
+    /// Ending the pane while its tunnel is still restarting threw away a
+    /// relay the tunnel was about to carry again, leaving a Reconnect banner
+    /// for an outage that had already healed. Wait for the tunnel's verdict
+    /// instead: true when it came back. A tunnel that gives up ends the pane
+    /// as before, and the automatic Retry for the failed host takes over.
+    private func waitForRestartingOwnedTunnel(_ failedSession: PeerSession) async -> Bool {
+        guard let tunnel = ownedTunnel, Self.isRestarting(tunnel.currentState) else { return false }
+        await Self.waitOutBackoff(seconds: Self.tunnelVerdictWaitSeconds, pollSeconds: 0.5) {
+            !isTorndown && session === failedSession && (ownedTransportMayReconnect?() ?? true)
+                && Self.isRestarting(tunnel.currentState)
+        }
+        return !isTorndown && session === failedSession && tunnel.currentState == .up
+    }
+
+    /// Longer than the tunnel's whole restart budget, so the wait ends on the
+    /// tunnel's verdict rather than on this bound.
+    static let tunnelVerdictWaitSeconds: TimeInterval = 600
+
+    nonisolated static func isRestarting(_ state: PeerSSHTunnelState) -> Bool {
+        switch state {
+        case .starting, .down, .reconnecting: return true
+        case .up, .failed, .stopped: return false
         }
     }
 

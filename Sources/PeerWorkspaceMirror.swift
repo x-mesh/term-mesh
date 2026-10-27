@@ -1147,18 +1147,21 @@ final class PeerWorkspaceMirrorController {
             isTornDown: isTornDown, hasWorkspace: workspace != nil,
             isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
         ) == .proceed else { return }
+        var tunnelUpsAtLastAttempt = lease.tunnel?.upTransitionCount ?? 0
         while Self.reconnectStep(
             isTornDown: isTornDown, hasWorkspace: workspace != nil,
             isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
         ) == .proceed {
             attempt += 1
             let delaySeconds = min(30.0, pow(2.0, Double(min(attempt, 5))))
-            do {
-                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
-            } catch {
-                return
+            // A tunnel that comes back mid-backoff ends the wait; sleeping out
+            // the rest left the layout blank for up to 30s after the route
+            // had already returned.
+            await PeerRelaySession.waitOutBackoff(seconds: delaySeconds) {
+                !isTornDown && (lease.tunnel?.upTransitionCount ?? 0) == tunnelUpsAtLastAttempt
             }
             if isTornDown || Task.isCancelled { return }
+            tunnelUpsAtLastAttempt = lease.tunnel?.upTransitionCount ?? 0
             do {
                 let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
                 // A host that is frozen rather than gone — asleep, behind a
