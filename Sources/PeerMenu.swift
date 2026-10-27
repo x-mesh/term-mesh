@@ -143,6 +143,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     private var automaticReconnectTask: Task<Void, Never>?
     private var sleepObservers: [NSObjectProtocol] = []
     private var isSystemAsleep = false
+    /// `ssh -G` resolved once per host: it is a local process, but the parked
+    /// pass runs every 15s for as long as a host stays away.
+    private var parkedHostProbeTargets: [PeerPaneHostKey: PeerHostProbeTarget?] = [:]
 
     static let savedRunnerStatusDidChangeNotification =
         Notification.Name("PeerSavedRunnerStatusDidChange")
@@ -416,9 +419,53 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 guard Self.shouldRunAutomaticReconnectPass(
                     isSystemAsleep: self.isSystemAsleep, networkPath: self.lastNetworkPath
                 ) else { continue }
+                // Parked panes first: rebuilding the row's own tunnel here
+                // reaches the sidebar through the replacement hook, which
+                // leaves the row pass nothing to Retry.
+                await self.reattachPanesParkedOnFailedTunnels()
                 await RemoteHostStore.shared.runAutomaticReconnectPass()
             }
         }
+    }
+
+    /// Panes parked because their tunnel gave up, including those no sidebar
+    /// row retries for: a Project's leader and agents ride the host's
+    /// session-owner daemon, a different tunnel from the row's. Rebuild that
+    /// tunnel only once its host answers, so an unreachable host costs no
+    /// ssh, then move the parked panes onto it where they stand.
+    @discardableResult
+    func reattachPanesParkedOnFailedTunnels() async -> Int {
+        let registry = PeerPaneHostRegistry.shared
+        var specs: [PeerPaneHostKey: PeerPaneHostSpec] = [:]
+        for session in openPaneSessions where session.awaitsTunnelRecovery && !session.isTorndown {
+            specs[session.lease.key] = session.originSpec
+        }
+        var reattached = 0
+        for (key, spec) in specs {
+            guard case let .ssh(target, _, port, _) = spec else { continue }
+            if let lease = registry.activeLease(forKey: key), registry.liveness(of: lease) == .usable {
+                reattached += resumePanesAfterHostReconnect(key)
+                continue
+            }
+            if parkedHostProbeTargets[key] == nil {
+                parkedHostProbeTargets[key] = .some(
+                    await PeerHostReachabilityProbe.resolveTarget(sshTarget: target, port: port)
+                )
+            }
+            guard let probe = parkedHostProbeTargets[key] ?? nil,
+                  await PeerHostReachabilityProbe.isReachable(probe)
+            else { continue }
+            do {
+                let lease = try await registry.acquire(spec, waiter: UUID(), background: true)
+                reattached += resumePanesAfterHostReconnect(key)
+                registry.release(lease)
+            } catch {
+                RemoteWorkLog.info(
+                    "Could not rebuild the SSH tunnel to \(key.shortLabel) for paused panes: \(error)"
+                )
+            }
+        }
+        return reattached
     }
 
     private func networkPathDidUpdate(_ snapshot: PeerNetworkPathSnapshot) {

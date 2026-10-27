@@ -764,6 +764,10 @@ final class PeerPaneSession {
     /// relay failure. Agent panes normally recreate themselves on failure;
     /// an intentional disconnect must keep the visible pane in place instead.
     private(set) var hostTransportWasDisconnected = false
+    /// The pane is preserved because its tunnel gave up, not because someone
+    /// disconnected the host. Only these are reattached automatically once
+    /// the host answers again; a deliberate disconnect stays disconnected.
+    private(set) var awaitsTunnelRecovery = false
     private(set) var relayStartupState: RelayStartupState = .pending
     var relayStartupFailure: (@MainActor (Error) -> Void)?
     var relayStartupSucceeded: (@MainActor () -> Void)?
@@ -927,6 +931,9 @@ final class PeerPaneSession {
         self.surfaceTitle = surfaceTitle
         self.originSpec = originSpec
         self.originSurface = originSurface
+        relaySession.onOwnedTunnelGaveUp = { [weak self] in
+            self?.prepareForHostTransportDisconnect(stopRelay: false, tunnelGaveUp: true)
+        }
     }
 
     // ── Discovery ────────────────────────────────────────────────────
@@ -1307,6 +1314,7 @@ final class PeerPaneSession {
         lease = replacement
         PeerPaneHostRegistry.shared.release(previous)
         hostTransportWasDisconnected = false
+        awaitsTunnelRecovery = false
         return true
     }
 
@@ -1375,8 +1383,9 @@ final class PeerPaneSession {
     /// Preserve this pane while its host transport is intentionally ended.
     /// SSH panes will receive EOF when the pooled tunnel stops. Direct-socket
     /// panes have no tunnel to stop, so their owned relay is stopped here.
-    func prepareForHostTransportDisconnect(stopRelay: Bool) {
+    func prepareForHostTransportDisconnect(stopRelay: Bool, tunnelGaveUp: Bool = false) {
         hostTransportWasDisconnected = true
+        awaitsTunnelRecovery = tunnelGaveUp
         guard stopRelay else {
             // The tunnel's EOF is about to reach this relay. Parking it keeps
             // the helper (the pane's shell) alive for `retarget(to:)`.
