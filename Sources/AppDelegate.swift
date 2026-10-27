@@ -759,6 +759,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Before any host can be acquired: a lease the registry replaces on
         // its own must reach the panes and the sidebar that held the old one.
         PeerClientCoordinator.shared.installHostTransportReplacementHooks()
+        // Unit tests pin hosts failed and leases dead on purpose; a background
+        // Retry would race them.
+        if !AppLaunchEnvironment.isRunningUnderXCTest(ProcessInfo.processInfo.environment) {
+            PeerClientCoordinator.shared.startPeerTransportRecoveryTriggers()
+        }
 
 #if DEBUG
         writeUITestDiagnosticsIfNeeded(stage: "didFinishLaunching")

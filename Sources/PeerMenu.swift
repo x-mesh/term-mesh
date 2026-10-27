@@ -18,6 +18,7 @@
 import AppKit
 import Bonsplit
 import Darwin
+import Network
 import PeerProto
 
 /// Resources a Force Disconnect asked to close. Pane sessions, live mirrors,
@@ -44,6 +45,27 @@ struct PeerForceDisconnectCounts: Equatable, Sendable {
             total: targetIDs.count, panes: panes, mirrors: mirrors,
             relayWindows: relayWindows,
             other: targetIDs.subtracting(classified).count
+        )
+    }
+}
+
+/// The parts of an `NWPath` whose change strands an established ssh tunnel.
+struct PeerNetworkPathSnapshot: Equatable, Sendable {
+    let isSatisfied: Bool
+    let interfaces: [String]
+    let gateways: [String]
+
+    init(isSatisfied: Bool, interfaces: [String], gateways: [String]) {
+        self.isSatisfied = isSatisfied
+        self.interfaces = interfaces
+        self.gateways = gateways
+    }
+
+    init(_ path: NWPath) {
+        self.init(
+            isSatisfied: path.status == .satisfied,
+            interfaces: path.availableInterfaces.map(\.name).sorted(),
+            gateways: path.gateways.map { "\($0)" }.sorted()
         )
     }
 }
@@ -115,6 +137,12 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     private var activeConnectionFlows: Set<ConnectionFlow> = []
     private var savedRunnerStatuses: [UUID: PeerSavedRunnerStatus] = [:]
     private var savedRunnerProfilesInFlight: Set<UUID> = []
+    private var networkPathMonitor: NWPathMonitor?
+    private var lastNetworkPath: PeerNetworkPathSnapshot?
+    private var networkPathRecoveryTask: Task<Void, Never>?
+    private var automaticReconnectTask: Task<Void, Never>?
+    private var sleepObservers: [NSObjectProtocol] = []
+    private var isSystemAsleep = false
 
     static let savedRunnerStatusDidChangeNotification =
         Notification.Name("PeerSavedRunnerStatusDidChange")
@@ -295,7 +323,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// own keepalive settles a half-dead one within 45s of waking, and an
     /// end-to-end probe here would read a cold post-wake network as death.
     @discardableResult
-    func recoverPeerTransportsAfterWake() async -> Int {
+    func recoverPeerTransportsAfterWake(reason: String = "wake") async -> Int {
         let registry = PeerPaneHostRegistry.shared
         var replaced = 0
         for (key, lease) in registry.pooledLeases() {
@@ -308,14 +336,121 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 if current !== lease { replaced += 1 }
             } catch {
                 RemoteWorkLog.info(
-                    "Could not replace the SSH tunnel to \(key.shortLabel) after wake: \(error)"
+                    "Could not replace the SSH tunnel to \(key.shortLabel) after \(reason): \(error)"
                 )
             }
         }
         #if DEBUG
-        dlog("wakeRecovery.peer replaced=\(replaced)")
+        dlog("wakeRecovery.peer reason=\(reason) replaced=\(replaced)")
         #endif
         return replaced
+    }
+
+    /// Wake is not the only moment a tunnel dies with nothing left to
+    /// replace it. A network that drops or changes while the Mac stays
+    /// awake leaves the tunnel's own retry budget to run out (12 attempts,
+    /// about seven minutes), after which it sits in `.failed` and every
+    /// pane, mirror and sidebar row on it waits for a Retry nobody presses.
+    /// Run the wake judgment when the local network changes, and press Retry
+    /// for a failed host once it answers again.
+    func startPeerTransportRecoveryTriggers() {
+        guard networkPathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let snapshot = PeerNetworkPathSnapshot(path)
+            Task { @MainActor in self?.networkPathDidUpdate(snapshot) }
+        }
+        monitor.start(queue: DispatchQueue(label: "term-mesh.peer.network-path", qos: .utility))
+        networkPathMonitor = monitor
+
+        // Timers already stop while the Mac sleeps; this also covers the
+        // dark wakes in between, when no host is worth probing.
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        sleepObservers = [
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.isSystemAsleep = true }
+            },
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.isSystemAsleep = false
+                    self?.scheduleAutomaticReconnectPass(after: Self.afterWakePassDelayNanoseconds)
+                }
+            },
+        ]
+        scheduleAutomaticReconnectPass(after: Self.automaticReconnectIntervalNanoseconds)
+    }
+
+    /// The probe is a TCP connect with no process behind it, so a short fixed
+    /// interval costs little and bounds the recovery delay once a host is back.
+    private static let automaticReconnectIntervalNanoseconds: UInt64 = 15_000_000_000
+
+    /// Same grace the wake path gives the network before ssh meets it.
+    private static let networkSettleNanoseconds: UInt64 = 3_000_000_000
+
+    /// AppDelegate's wake recovery acquires first: its 3s grace plus a tunnel
+    /// start of up to 15s. Pressing Retry inside that window would retire the
+    /// lease that acquire is replacing.
+    private static let afterWakePassDelayNanoseconds: UInt64 = 20_000_000_000
+
+    nonisolated static func shouldRunAutomaticReconnectPass(
+        isSystemAsleep: Bool,
+        networkPath: PeerNetworkPathSnapshot?
+    ) -> Bool {
+        !isSystemAsleep && networkPath?.isSatisfied != false
+    }
+
+    /// One loop, restarted rather than duplicated: a network change or wake
+    /// moves the next pass forward instead of adding a second loop.
+    private func scheduleAutomaticReconnectPass(after delay: UInt64) {
+        automaticReconnectTask?.cancel()
+        automaticReconnectTask = Task { @MainActor [weak self] in
+            var wait = delay
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: wait)
+                guard let self, !Task.isCancelled else { return }
+                wait = Self.automaticReconnectIntervalNanoseconds
+                guard Self.shouldRunAutomaticReconnectPass(
+                    isSystemAsleep: self.isSystemAsleep, networkPath: self.lastNetworkPath
+                ) else { continue }
+                await RemoteHostStore.shared.runAutomaticReconnectPass()
+            }
+        }
+    }
+
+    private func networkPathDidUpdate(_ snapshot: PeerNetworkPathSnapshot) {
+        let previous = lastNetworkPath
+        lastNetworkPath = snapshot
+        guard Self.shouldRecoverTransports(afterNetworkPath: previous, changedTo: snapshot) else { return }
+        #if DEBUG
+        dlog("peer.networkPath.changed interfaces=\(snapshot.interfaces) gateways=\(snapshot.gateways.count)")
+        #endif
+        networkPathRecoveryTask?.cancel()
+        // Same reason as after wake: no Retry while this acquire is in flight.
+        automaticReconnectTask?.cancel()
+        networkPathRecoveryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.networkSettleNanoseconds)
+            guard let self, !Task.isCancelled else { return }
+            await self.recoverPeerTransportsAfterWake(reason: "network change")
+            self.scheduleAutomaticReconnectPass(after: 0)
+        }
+    }
+
+    /// The first report is the network the app launched on, not a change.
+    /// After that, a path that becomes usable again or moves to different
+    /// interfaces or gateways (Wi-Fi to Ethernet, a VPN coming up) has
+    /// invalidated whatever route the existing tunnels were using.
+    nonisolated static func shouldRecoverTransports(
+        afterNetworkPath previous: PeerNetworkPathSnapshot?,
+        changedTo current: PeerNetworkPathSnapshot
+    ) -> Bool {
+        guard current.isSatisfied, let previous else { return false }
+        return !previous.isSatisfied
+            || previous.interfaces != current.interfaces
+            || previous.gateways != current.gateways
     }
 
     /// Mark every pane on this host as intentionally disconnected before the

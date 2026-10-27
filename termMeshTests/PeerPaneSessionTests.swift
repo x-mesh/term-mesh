@@ -5271,6 +5271,98 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: key))
     }
 
+    func test_networkPathRecovery_ignoresLaunchReportAndUnchangedPath() {
+        let wifi = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: ["192.168.0.1"])
+        XCTAssertFalse(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: nil, changedTo: wifi))
+        XCTAssertFalse(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: wifi))
+        let offline = PeerNetworkPathSnapshot(isSatisfied: false, interfaces: [], gateways: [])
+        XCTAssertFalse(
+            PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: offline),
+            "nothing can be replaced while there is no route"
+        )
+    }
+
+    func test_networkPathRecovery_firesWhenPathReturnsOrRouteChanges() {
+        let offline = PeerNetworkPathSnapshot(isSatisfied: false, interfaces: [], gateways: [])
+        let wifi = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: ["192.168.0.1"])
+        let wifiWithVPN = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0", "utun4"], gateways: ["192.168.0.1"])
+        let otherWifi = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: ["10.0.0.1"])
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: offline, changedTo: wifi))
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: wifiWithVPN))
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifiWithVPN, changedTo: wifi))
+        XCTAssertTrue(PeerClientCoordinator.shouldRecoverTransports(afterNetworkPath: wifi, changedTo: otherWifi))
+    }
+
+    func test_automaticReconnectPass_pausesWhileAsleepOrOffline() {
+        let online = PeerNetworkPathSnapshot(isSatisfied: true, interfaces: ["en0"], gateways: [])
+        let offline = PeerNetworkPathSnapshot(isSatisfied: false, interfaces: [], gateways: [])
+        XCTAssertTrue(PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: false, networkPath: online))
+        XCTAssertTrue(
+            PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: false, networkPath: nil),
+            "before the first path report the network is assumed present"
+        )
+        XCTAssertFalse(PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: false, networkPath: offline))
+        XCTAssertFalse(PeerClientCoordinator.shouldRunAutomaticReconnectPass(isSystemAsleep: true, networkPath: online))
+    }
+
+    /// Retry is pressed only for a host that was connected and lost, never
+    /// for one the user left or one whose tunnel came back by itself.
+    func test_automaticReconnect_tracksOnlyAFailedRowOnADeadSidebarLease() {
+        func disposition(
+            _ state: HostConnectionState, lease: Bool, dead: Bool, tracked: Bool
+        ) -> RemoteHostStore.AutomaticReconnectDisposition {
+            RemoteHostStore.automaticReconnectDisposition(
+                state: state, holdsSidebarLease: lease, sidebarLeaseIsDead: dead, isTracked: tracked
+            )
+        }
+        let failed = HostConnectionState.failed("unreachable")
+        XCTAssertEqual(disposition(failed, lease: true, dead: true, tracked: false), .track)
+        XCTAssertEqual(disposition(failed, lease: true, dead: false, tracked: false), .drop,
+                       "a tunnel still restarting, or back on its own, needs no Retry")
+        XCTAssertEqual(disposition(failed, lease: false, dead: false, tracked: false), .drop,
+                       "never connected this run, or the user let go of it")
+        XCTAssertEqual(disposition(failed, lease: false, dead: false, tracked: true), .keep,
+                       "a failed Retry gave the old lease up and must not end tracking")
+        XCTAssertEqual(disposition(.connecting, lease: false, dead: false, tracked: true), .keep)
+        XCTAssertEqual(disposition(.connecting, lease: false, dead: false, tracked: false), .drop)
+        XCTAssertEqual(disposition(.connected, lease: true, dead: false, tracked: true), .drop)
+        XCTAssertEqual(disposition(.saved, lease: false, dead: false, tracked: true), .drop,
+                       "Disconnect while failed ends the automatic retries")
+    }
+
+    func test_automaticReconnect_backsOffAReachableHostThatStillFails() {
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 0), 0)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 1), 30)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 2), 60)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 5), 480)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 6), 600)
+        XCTAssertEqual(RemoteHostStore.automaticReconnectBackoffSeconds(afterAttempts: 40), 600)
+    }
+
+    func test_reachabilityProbe_readsTheHopSSHWouldDial() {
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "user jinwoo\nhostname 100.64.60.4\nport 22\n"),
+            .direct(PeerHostProbeTarget(host: "100.64.60.4", port: 22))
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "hostname box.example\nport 2222\nproxycommand none\n"),
+            .direct(PeerHostProbeTarget(host: "box.example", port: 2222))
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "hostname inner\nport 22\nproxyjump ops@bastion:2200,mid\n"),
+            .jump("ops@bastion:2200")
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.hop(fromSSHConfig: "hostname inner\nport 22\nproxycommand nc -X 5 -x p:1080 %h %p\n"),
+            .unprobeable
+        )
+        XCTAssertEqual(
+            PeerHostReachabilityProbe.jumpDestination("ops@bastion:2200").destination, "ops@bastion"
+        )
+        XCTAssertEqual(PeerHostReachabilityProbe.jumpDestination("ops@bastion:2200").port, 2200)
+        XCTAssertNil(PeerHostReachabilityProbe.jumpDestination("bastion").port)
+    }
+
     @MainActor
     func test_transportRecovery_coalescesStaleGenerationAndAllowsNextIncident() async {
         let recovery = PeerPaneTransportRecovery()
