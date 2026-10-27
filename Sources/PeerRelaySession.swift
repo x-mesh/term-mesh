@@ -4534,7 +4534,9 @@ final class PeerRelaySession {
         var tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
         while await ownedReconnectMayProceed(afterLosing: failedSession) {
             guard let next = reconnectCircuit.nextAttempt() else {
-                if await waitForRestartingOwnedTunnel(failedSession) {
+                if Self.circuitOpenDisposition(
+                    tunnelState: ownedTunnel?.currentState, canPark: onOwnedTunnelGaveUp != nil
+                ) == .waitForTunnel, await waitForRestartingOwnedTunnel(failedSession) {
                     // The tunnel this pane rides came back on its own; its
                     // attempts so far were spent against a dead route.
                     reconnectCircuit.recordRecovery()
@@ -4551,7 +4553,10 @@ final class PeerRelaySession {
                 // panes then landed beside it. Park the pane the way a
                 // deliberate host disconnect does, so the replacement
                 // transport reattaches it where it is.
-                if ownedTunnelGaveUp, let gaveUp = onOwnedTunnelGaveUp {
+                // Judged again: the wait above ends on the tunnel's verdict.
+                if Self.circuitOpenDisposition(
+                    tunnelState: ownedTunnel?.currentState, canPark: onOwnedTunnelGaveUp != nil
+                ) == .parkUntilHostAnswers, let gaveUp = onOwnedTunnelGaveUp {
                     gaveUp()
                     if awaitingTransportReplacement {
                         RemoteWorkLog.infoOffMain(
@@ -4645,9 +4650,25 @@ final class PeerRelaySession {
         hostKey.flatMap { PeerPaneHostRegistry.shared.activeLease(forKey: $0)?.tunnel }
     }
 
-    private var ownedTunnelGaveUp: Bool {
-        if case .failed = ownedTunnel?.currentState { return true }
-        return false
+    enum CircuitOpenDisposition: Equatable {
+        /// The tunnel is still restarting on its own; its verdict decides.
+        case waitForTunnel
+        /// The tunnel gave up: the host is gone, not this pane. Park it.
+        case parkUntilHostAnswers
+        /// The tunnel is up (the host refused this pane) or was stopped on
+        /// purpose, or no owner can preserve the pane: end it on its banner.
+        case end
+    }
+
+    /// What a pane does once its own reconnect attempts are spent.
+    nonisolated static func circuitOpenDisposition(
+        tunnelState: PeerSSHTunnelState?,
+        canPark: Bool
+    ) -> CircuitOpenDisposition {
+        guard let tunnelState else { return .end }
+        if isRestarting(tunnelState) { return .waitForTunnel }
+        if case .failed = tunnelState, canPark { return .parkUntilHostAnswers }
+        return .end
     }
 
     /// Lets the owning pane mark itself preserved-for-the-host before the

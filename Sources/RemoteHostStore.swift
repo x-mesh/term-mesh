@@ -1828,14 +1828,20 @@ final class RemoteHostStore: ObservableObject {
     /// Retiring the transport is the point. Releasing only the sidebar's ref
     /// left a lease a pane still held in the pool, and the connect that
     /// followed reused it — so "Retry" on a dead tunnel reconnected nothing.
+    ///
+    /// `automatic` is the row pass pressing Retry on the user's behalf. It
+    /// keeps the mark that a failed tunnel parked a pane, so a replacement
+    /// that fails again does not end the pane the park is holding.
     @discardableResult
-    func reconnectHost(_ host: HostEntry) -> HostReconnectOutcome {
+    func reconnectHost(_ host: HostEntry, automatic: Bool = false) -> HostReconnectOutcome {
         let key = host.id
         let registry = PeerPaneHostRegistry.shared
         // Resolve the pooled key before `invalidateAutoDetectedSocket` below
         // clears `remoteSockPath` — it is part of the key.
         let hostKey = sidebarLeases[key]?.key ?? connectingLeaseKeys[key] ?? (hosts[key] ?? host).paneHostSpec.hostKey
-        let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
+        let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(
+            hostKey, keepingTunnelRecovery: automatic
+        )
         let retiredPath = registry.disconnectTransport(for: hostKey, replacementFollows: true)
         let replacementToken = registry.pendingReplacementToken(for: hostKey)
         if let lease = sidebarLeases.removeValue(forKey: key) {
@@ -1992,10 +1998,11 @@ final class RemoteHostStore: ObservableObject {
                   let target = host.sshTarget, !target.isEmpty
             else { continue }
             if !progress.probeTargetResolved {
-                progress.probeTarget = await PeerHostReachabilityProbe.resolveTarget(
+                let resolution = await PeerHostReachabilityProbe.resolve(
                     sshTarget: target, port: host.sshPort
                 )
-                progress.probeTargetResolved = true
+                progress.probeTarget = resolution.target
+                progress.probeTargetResolved = PeerClientCoordinator.remembersProbeResolution(resolution)
                 automaticReconnects[key] = progress
             }
             // ProxyCommand hosts have no hop to probe; wake and network-change
@@ -2003,6 +2010,9 @@ final class RemoteHostStore: ObservableObject {
             guard let probeTarget = progress.probeTarget,
                   await PeerHostReachabilityProbe.isReachable(probeTarget)
             else { continue }
+            // A wake or network change cancels the pass to run its own lease
+            // judgment; a Retry now would retire the lease it is replacing.
+            guard !Task.isCancelled else { return started }
             // The probe awaited; the user may have acted on the row meanwhile.
             guard automaticReconnects[key] != nil,
                   let current = hosts[key], case .failed = current.connectionState
@@ -2013,7 +2023,7 @@ final class RemoteHostStore: ObservableObject {
             )
             automaticReconnects[key] = progress
             RemoteWorkLog.info("\(current.displayName) answers again — reconnecting")
-            if reconnectHost(current).started { started += 1 }
+            if reconnectHost(current, automatic: true).started { started += 1 }
         }
         return started
     }
