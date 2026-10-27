@@ -513,6 +513,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 registry.release(lease)
                 parkedReattachBackoff[key] = nil
                 parkedHostProbeTargets[key] = nil
+            } catch is CancellationError {
+                // A wake or network change took over; the host did not fail.
+                return reattached
             } catch {
                 parkedReattachBackoff[key] = Self.parkedReattachBackoff(
                     afterFailureFollowing: parkedReattachBackoff[key], at: Date()

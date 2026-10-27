@@ -84,10 +84,6 @@ enum PeerHostReachabilityProbe {
         }
     }
 
-    static func resolveTarget(sshTarget: String, port: Int?) async -> PeerHostProbeTarget? {
-        await resolve(sshTarget: sshTarget, port: port).target
-    }
-
     private static func sshConfigHop(destination: String, port: Int?) async -> ConfigHop? {
         var arguments = ["-G"]
         if let port { arguments += ["-p", String(port)] }

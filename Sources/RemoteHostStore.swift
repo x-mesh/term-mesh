@@ -1828,10 +1828,11 @@ final class RemoteHostStore: ObservableObject {
     /// Retiring the transport is the point. Releasing only the sidebar's ref
     /// left a lease a pane still held in the pool, and the connect that
     /// followed reused it — so "Retry" on a dead tunnel reconnected nothing.
-    @discardableResult
+    ///
     /// `automatic` is the row pass pressing Retry on the user's behalf. It
     /// keeps the mark that a failed tunnel parked a pane, so a replacement
     /// that fails again does not end the pane the park is holding.
+    @discardableResult
     func reconnectHost(_ host: HostEntry, automatic: Bool = false) -> HostReconnectOutcome {
         let key = host.id
         let registry = PeerPaneHostRegistry.shared
@@ -1997,10 +1998,11 @@ final class RemoteHostStore: ObservableObject {
                   let target = host.sshTarget, !target.isEmpty
             else { continue }
             if !progress.probeTargetResolved {
-                progress.probeTarget = await PeerHostReachabilityProbe.resolveTarget(
+                let resolution = await PeerHostReachabilityProbe.resolve(
                     sshTarget: target, port: host.sshPort
                 )
-                progress.probeTargetResolved = true
+                progress.probeTarget = resolution.target
+                progress.probeTargetResolved = PeerClientCoordinator.remembersProbeResolution(resolution)
                 automaticReconnects[key] = progress
             }
             // ProxyCommand hosts have no hop to probe; wake and network-change
