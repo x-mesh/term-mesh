@@ -1844,6 +1844,116 @@ final class RemoteHostStore: ObservableObject {
         return outcome(true)
     }
 
+    struct AutomaticReconnect: Equatable {
+        var attempts = 0
+        var notBefore = Date.distantPast
+        var probeTarget: PeerHostProbeTarget?
+        var probeTargetResolved = false
+    }
+
+    enum AutomaticReconnectDisposition: Equatable {
+        case track, keep, drop
+    }
+
+    /// Which rows Retry is pressed for on the user's behalf.
+    ///
+    /// A row starts being tracked only when it failed while still holding the
+    /// sidebar lease it was connected on and that lease's tunnel is dead: the
+    /// host was connected this run, nobody chose to leave it, and nothing else
+    /// will bring it back. Disconnect, Stop Browsing, Cancel and Delete all
+    /// release the lease or move the row to `.saved`, and a tunnel that came
+    /// back on its own keeps its lease alive, so none of those is retried.
+    /// Once tracked, the row stays tracked through the `.connecting`/`.failed`
+    /// churn of the retries themselves (Retry gives up the old lease).
+    nonisolated static func automaticReconnectDisposition(
+        state: HostConnectionState,
+        holdsSidebarLease: Bool,
+        sidebarLeaseIsDead: Bool,
+        isTracked: Bool
+    ) -> AutomaticReconnectDisposition {
+        switch state {
+        case .failed:
+            if isTracked { return .keep }
+            return holdsSidebarLease && sidebarLeaseIsDead ? .track : .drop
+        case .connecting:
+            return isTracked ? .keep : .drop
+        case .saved, .connected:
+            return .drop
+        }
+    }
+
+    /// A host that answers on its ssh port but still fails to connect (sshd
+    /// starting, auth broken) is retried less and less often, so a reachable
+    /// but broken host does not get a new ssh every pass.
+    nonisolated static func automaticReconnectBackoffSeconds(afterAttempts attempts: Int) -> TimeInterval {
+        guard attempts > 0 else { return 0 }
+        return min(600, 30 * pow(2, Double(min(attempts - 1, 5))))
+    }
+
+    private var automaticReconnects: [String: AutomaticReconnect] = [:]
+    private var isRunningAutomaticReconnectPass = false
+
+    /// Press Retry for every tracked row whose host answers on its ssh port.
+    /// The probe is a TCP connect, so a host that stays away costs no ssh
+    /// process however long it is gone. Returns how many Retries started.
+    @discardableResult
+    func runAutomaticReconnectPass() async -> Int {
+        guard !isRunningAutomaticReconnectPass else { return 0 }
+        isRunningAutomaticReconnectPass = true
+        defer { isRunningAutomaticReconnectPass = false }
+
+        let registry = PeerPaneHostRegistry.shared
+        for (key, host) in hosts {
+            let lease = sidebarLeases[key]
+            switch Self.automaticReconnectDisposition(
+                state: host.connectionState,
+                holdsSidebarLease: lease != nil,
+                sidebarLeaseIsDead: lease.map { registry.liveness(of: $0) == .dead } ?? false,
+                isTracked: automaticReconnects[key] != nil
+            ) {
+            case .track: automaticReconnects[key] = AutomaticReconnect()
+            case .keep: break
+            case .drop: automaticReconnects[key] = nil
+            }
+        }
+        for key in automaticReconnects.keys where hosts[key] == nil {
+            automaticReconnects[key] = nil
+        }
+
+        var started = 0
+        for key in automaticReconnects.keys.sorted() {
+            guard var progress = automaticReconnects[key],
+                  let host = hosts[key], case .failed = host.connectionState,
+                  Date() >= progress.notBefore,
+                  let target = host.sshTarget, !target.isEmpty
+            else { continue }
+            if !progress.probeTargetResolved {
+                progress.probeTarget = await PeerHostReachabilityProbe.resolveTarget(
+                    sshTarget: target, port: host.sshPort
+                )
+                progress.probeTargetResolved = true
+                automaticReconnects[key] = progress
+            }
+            // ProxyCommand hosts have no hop to probe; wake and network-change
+            // recovery still cover them.
+            guard let probeTarget = progress.probeTarget,
+                  await PeerHostReachabilityProbe.isReachable(probeTarget)
+            else { continue }
+            // The probe awaited; the user may have acted on the row meanwhile.
+            guard automaticReconnects[key] != nil,
+                  let current = hosts[key], case .failed = current.connectionState
+            else { continue }
+            progress.attempts += 1
+            progress.notBefore = Date().addingTimeInterval(
+                Self.automaticReconnectBackoffSeconds(afterAttempts: progress.attempts)
+            )
+            automaticReconnects[key] = progress
+            RemoteWorkLog.info("\(current.displayName) answers again — reconnecting")
+            if reconnectHost(current).started { started += 1 }
+        }
+        return started
+    }
+
     /// Shared recovery entry point for Edit Peer Host and New Project.
     /// Saving and reconnecting must be one action: saving a corrected profile
     /// while leaving the failed HostEntry alive made both screens look fixed
@@ -2017,6 +2127,9 @@ final class RemoteHostStore: ObservableObject {
     /// refs and stay connected as ad-hoc entries.
     func stopBrowsingSavedHost(_ host: HostEntry) {
         let key = host.id
+        // Stop Browsing leaves a failed row `.failed`; it must still end the
+        // automatic Retries the row was getting.
+        automaticReconnects[key] = nil
         guard let lease = sidebarLeases[key] else { return }
         sidebarLeases[key] = nil
         PeerPaneHostRegistry.shared.release(lease)
