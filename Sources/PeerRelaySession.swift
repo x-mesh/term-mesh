@@ -4544,6 +4544,25 @@ final class PeerRelaySession {
                     )
                     continue
                 }
+                // A tunnel that gave up means the host is unreachable, which
+                // is a host-level loss, not this pane's. Ending the pane here
+                // closed a Project's leader, dropped its agents and let an
+                // emptied workspace fill with a local shell; the restored
+                // panes then landed beside it. Park the pane the way a
+                // deliberate host disconnect does, so the replacement
+                // transport reattaches it where it is.
+                if ownedTunnelGaveUp, let gaveUp = onOwnedTunnelGaveUp {
+                    gaveUp()
+                    if awaitingTransportReplacement {
+                        RemoteWorkLog.infoOffMain(
+                            "Peer reconnect parked host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) — the tunnel gave up; waiting for the host to answer"
+                        )
+                        await parkUntilTransportReplaced()
+                        reconnectCircuit.recordRecovery()
+                        tunnelUpsAtLastAttempt = ownedTunnel?.upTransitionCount ?? 0
+                        continue
+                    }
+                }
                 RemoteWorkLog.warningOffMain(
                     "Peer reconnect circuit open host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) attempts=\(reconnectCircuit.attempts)"
                 )
@@ -4625,6 +4644,16 @@ final class PeerRelaySession {
     private var ownedTunnel: PeerSSHTunnel? {
         hostKey.flatMap { PeerPaneHostRegistry.shared.activeLease(forKey: $0)?.tunnel }
     }
+
+    private var ownedTunnelGaveUp: Bool {
+        if case .failed = ownedTunnel?.currentState { return true }
+        return false
+    }
+
+    /// Lets the owning pane mark itself preserved-for-the-host before the
+    /// reconnect loop parks it. Relay-helper panes park; callback panes have
+    /// no helper to keep, end, and rebuild in place through the same mark.
+    var onOwnedTunnelGaveUp: (@MainActor () -> Void)?
 
     /// The circuit budgets this pane's own attempts (about three and a half
     /// minutes), but the tunnel's restart budget is longer (about seven).

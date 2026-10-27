@@ -1461,6 +1461,12 @@ final class RemoteHostStore: ObservableObject {
                    configuredRemoteSocket: host.configuredEndpoint?.remoteSocket,
                    incomingRemoteSocket: conn.remoteSockPath
                ) {
+                // Never revive a failed row this way: its serving tunnel is
+                // what failed. Calling it connected because a Project pane's
+                // session-owner tunnel came back hid that from the automatic
+                // Retry and left the roster empty, which kept the Project's
+                // agents from being reopened.
+                if case .failed = host.connectionState { continue }
                 hosts[key]?.connectionState = .connected
                 continue
             }
