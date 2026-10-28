@@ -73,6 +73,7 @@ Do not retry or poll. Do not change team membership.
 ## Failure modes
 
 - `no surface id`: not inside a term-mesh pane. Pass `--surface <TERMMESH_SURFACE_ID>`.
+- `this is a Claude background session`: a `/bg` session has no pane, and its `TERMMESH_SURFACE_ID` belongs to the pane that launched the claude daemon. Do not pass that value to `--surface`; exposing it routes the phone's input to another session. Open the session in a term-mesh pane and run `/rc on` there.
 - `no app socket for this surface`: `TERMMESH_SOCKET_PATH` is missing (shell started outside term-mesh). Pass `--app-socket /tmp/term-mesh.sock` (the app's control socket).
 - `no term-meshd socket found`: the daemon is not running for this app instance. Check `tm-agent doctor`.
 - `remote.on: ...` from the daemon: the daemon predates this feature; update term-mesh.

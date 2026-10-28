@@ -5465,6 +5465,16 @@ fn claude_config_dir() -> Option<PathBuf> {
     }
 }
 
+/// A Claude background session (`/bg`) runs in the claude daemon's own pty,
+/// not in a pane, and inherits the `TERMMESH_SURFACE_ID` of the pane that
+/// started the daemon. `CLAUDE_CODE_SESSION_KIND=bg` is set on the session
+/// process but not passed to its Bash children, so `CLAUDE_JOB_DIR`, which
+/// only background sessions give their tools, is what a tool sees.
+fn is_claude_background_session(env_var: &dyn Fn(&str) -> Option<String>) -> bool {
+    env_var("CLAUDE_CODE_SESSION_KIND").is_some_and(|kind| kind.trim() == "bg")
+        || env_var("CLAUDE_JOB_DIR").is_some_and(|dir| !dir.trim().is_empty())
+}
+
 /// What `claude.inbox.register` needs, from the environment Claude Code gives
 /// its Bash children. `None` outside an interactive Claude session in a
 /// term-mesh pane. The transcript and pid are looked up by session id: the
@@ -5473,6 +5483,11 @@ fn claude_inbox_params(
     env_var: &dyn Fn(&str) -> Option<String>,
     config_dir: &Path,
 ) -> Option<Value> {
+    // The inherited surface is another session's pane; registering there
+    // would take that pane's leader inbox.
+    if is_claude_background_session(env_var) {
+        return None;
+    }
     let get = |name: &str| env_var(name).filter(|value| !value.is_empty());
     let surface = get("TERMMESH_SURFACE_ID")?;
     let socket = get("CLAUDE_CODE_MESSAGING_SOCKET")?;
@@ -5620,6 +5635,17 @@ mod claude_inbox_report_tests {
             env.remove(missing);
             assert!(params(&env, dir.path()).is_none(), "{missing} unset");
         }
+    }
+
+    #[test]
+    fn a_background_session_does_not_take_the_launching_panes_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = claude_env();
+        env.insert(
+            "CLAUDE_JOB_DIR",
+            "/Users/me/.claude/jobs/99e1e8fa".to_string(),
+        );
+        assert!(params(&env, dir.path()).is_none());
     }
 
     #[test]
@@ -16098,26 +16124,27 @@ fn resolve_remote_surface(explicit: Option<&str>) -> Result<String, String> {
     remote_surface_from(
         explicit,
         env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
-        env::var("CLAUDE_CODE_SESSION_KIND").ok().as_deref(),
+        is_claude_background_session(&|name| env::var(name).ok()),
     )
 }
 
-/// A Claude background session (`/bg`) runs in the claude daemon's own pty,
-/// not in a pane, and only inherits the launching pane's
-/// `TERMMESH_SURFACE_ID`. Using it would expose that other pane's session.
+/// In a Claude background session the inherited surface is another session's
+/// pane ([`is_claude_background_session`]); exposing it would route mobile
+/// input to that session.
 fn remote_surface_from(
     explicit: Option<&str>,
     env_value: Option<&str>,
-    session_kind: Option<&str>,
+    background: bool,
 ) -> Result<String, String> {
     if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(s.to_string());
     }
-    if session_kind.map(str::trim) == Some("bg") {
+    if background {
         return Err(
             "this is a Claude background session: it has no term-mesh pane, and \
-             $TERMMESH_SURFACE_ID belongs to the pane that launched it. Run /rc in a pane \
-             that hosts the session, or pass --surface <id>"
+             $TERMMESH_SURFACE_ID belongs to another session's pane. Run /rc in the pane \
+             that shows this session; pass --surface only with that pane's id, never \
+             $TERMMESH_SURFACE_ID"
                 .to_string(),
         );
     }
@@ -16438,32 +16465,54 @@ mod remote_command_tests {
     #[test]
     fn surface_flag_wins_over_env_and_missing_is_an_error() {
         assert_eq!(
-            remote_surface_from(Some(" abc "), Some("env"), None).unwrap(),
+            remote_surface_from(Some(" abc "), Some("env"), false).unwrap(),
             "abc"
         );
         assert_eq!(
-            remote_surface_from(Some("  "), Some("env"), None).unwrap(),
+            remote_surface_from(Some("  "), Some("env"), false).unwrap(),
             "env"
         );
-        assert_eq!(remote_surface_from(None, Some("env"), None).unwrap(), "env");
-        assert!(remote_surface_from(None, None, None)
+        assert_eq!(
+            remote_surface_from(None, Some("env"), false).unwrap(),
+            "env"
+        );
+        assert!(remote_surface_from(None, None, false)
             .unwrap_err()
             .contains("--surface"));
-        assert!(remote_surface_from(None, Some(" "), None).is_err());
+        assert!(remote_surface_from(None, Some(" "), false).is_err());
     }
 
     #[test]
     fn background_session_refuses_the_inherited_surface() {
-        let err = remote_surface_from(None, Some("env"), Some("bg")).unwrap_err();
+        let err = remote_surface_from(None, Some("env"), true).unwrap_err();
         assert!(err.contains("background session"));
         assert_eq!(
-            remote_surface_from(Some("abc"), Some("env"), Some("bg")).unwrap(),
+            remote_surface_from(Some("abc"), Some("env"), true).unwrap(),
             "abc"
         );
-        assert_eq!(
-            remote_surface_from(None, Some("env"), Some("interactive")).unwrap(),
-            "env"
-        );
+    }
+
+    /// The Bash tool of a background session has `CLAUDE_JOB_DIR` but not
+    /// `CLAUDE_CODE_SESSION_KIND`; a pane session has neither.
+    #[test]
+    fn a_background_session_is_recognized_from_what_its_tools_see() {
+        let detect = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            is_claude_background_session(&|name| {
+                vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+            })
+        };
+        assert!(detect(&[(
+            "CLAUDE_JOB_DIR",
+            "/Users/me/.claude/jobs/99e1e8fa"
+        )]));
+        assert!(detect(&[("CLAUDE_CODE_SESSION_KIND", "bg")]));
+        assert!(!detect(&[("CLAUDE_CODE_SESSION_KIND", "interactive")]));
+        assert!(!detect(&[("CLAUDE_JOB_DIR", " ")]));
+        assert!(!detect(&[]));
     }
 
     #[test]
