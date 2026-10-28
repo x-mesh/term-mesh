@@ -259,6 +259,9 @@ These files change frequently upstream; be careful when rebasing the fork:
     `kitty_replay_tracking` checks in `surfaceMessageWriter` and
     `messageWriter`. They are separate conditions.
   - Use the upstream `discardSurfaceMessage`. It also frees `program_status`.
+  - For a dropped termio message, call `termio.mailbox.discard` in both
+    branches. Upstream `discardTermioMessage` frees only `write_alloc` and
+    leaks `change_config`, so the fork removes it.
 
 - `src/Surface.zig`
   - In `deinit`, set `tearing_down` and call `wakeWaiters` before the upstream
