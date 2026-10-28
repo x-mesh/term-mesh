@@ -69,6 +69,9 @@ typedef enum {
   GHOSTTY_PLATFORM_OPENGL = 3,
   GHOSTTY_PLATFORM_METAL_EXTERNAL = 4,
   GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED = 5,
+  // cmux fork: requires a libghostty built with -Dembedded-offscreen and the
+  // OpenGL renderer. Otherwise ghostty_surface_new returns NULL.
+  GHOSTTY_PLATFORM_OFFSCREEN = 6,
 } ghostty_platform_e;
 
 typedef enum {
@@ -146,6 +149,8 @@ typedef enum {
   GHOSTTY_BINDING_FLAGS_ALL = 1 << 1,
   GHOSTTY_BINDING_FLAGS_GLOBAL = 1 << 2,
   GHOSTTY_BINDING_FLAGS_PERFORMABLE = 1 << 3,
+  // The binding is consumed locally and emits no PTY bytes or grid changes.
+  GHOSTTY_BINDING_FLAGS_PREDICTION_LOCAL_ONLY = 1 << 4,
 } ghostty_binding_flags_e;
 
 typedef enum {
@@ -534,12 +539,41 @@ typedef struct {
   ghostty_opengl_swap_buffers_cb swap_buffers;
 } ghostty_platform_opengl_s;
 
+// cmux fork: offscreen rendering with no native window, view, or
+// embedder-owned GL context. Ghostty owns a surfaceless EGL context (one per
+// drawing thread, shared by its offscreen surfaces), renders into its own
+// framebuffer, and delivers each frame through
+// ghostty_surface_set_frame_callback or ghostty_surface_set_dmabuf_callback.
+//
+// Offscreen surfaces draw on the app thread: when a frame is due, Ghostty
+// emits GHOSTTY_ACTION_RENDER and the embedder calls ghostty_surface_draw,
+// which delivers the frame before it returns. Create, draw, and free
+// offscreen surfaces on that one thread. Terminal IO is independent: combine
+// it with GHOSTTY_SURFACE_IO_MANUAL_MIRROR to render an embedder-owned PTY.
+//
+// The EGL context is created on first use and is never destroyed; it lives
+// until the drawing thread or the process exits. On Linux, link the final
+// executable with -lEGL (libghostty references the egl* symbols but does not
+// load libEGL itself). On Windows, Mesa's libEGL.dll is loaded at runtime from
+// cmux_mesa\ next to the executable, then from the default search path.
+//
+// width/height are the initial size in pixels (0 keeps the default) and
+// scale the initial content scale (<= 0 keeps scale_factor). Use
+// ghostty_surface_set_size and ghostty_surface_set_content_scale to change
+// them later.
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+  double scale;
+} ghostty_platform_offscreen_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
   ghostty_platform_opengl_s opengl;
   ghostty_platform_metal_external_s metal_external;
   ghostty_platform_metal_external_leased_s metal_external_leased;
+  ghostty_platform_offscreen_s offscreen;
 } ghostty_platform_u;
 
 typedef enum {
@@ -568,6 +602,19 @@ typedef void (*ghostty_pty_tee_cb)(void* userdata,
 // bookkeeping completes. Metal delivers after assigning its IOSurface on the
 // main thread. Synchronous backends deliver on the rendering caller's thread.
 typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
+
+// cmux fork: terminal outcome for an explicitly tokened render that did not
+// reach the host layer. The callback is paired with
+// ghostty_render_presented_cb and receives the same render token.
+typedef enum {
+  GHOSTTY_RENDER_PRESENTATION_PRESENTED = 0,
+  GHOSTTY_RENDER_PRESENTATION_DISCARDED = 1,
+  GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED = 2,
+} ghostty_render_presentation_status_e;
+typedef void (*ghostty_render_failed_cb)(
+    void*,
+    uint64_t,
+    ghostty_render_presentation_status_e);
 
 // cmux fork: semantic font binding actions emitted after the native mutation
 // succeeds. The callback runs synchronously on the surface's GUI thread.
@@ -710,6 +757,12 @@ typedef struct {
   uint8_t g;
   uint8_t b;
 } ghostty_config_color_s;
+
+// config.WindowPadding.C (window-padding-x, window-padding-y), in points
+typedef struct {
+  uint32_t top_left;
+  uint32_t bottom_right;
+} ghostty_config_window_padding_s;
 
 // config.ColorList
 typedef struct {
@@ -1070,6 +1123,41 @@ typedef struct {
   int8_t progress;
 } ghostty_action_progress_report_s;
 
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_EVENT_REPORT,
+  GHOSTTY_PROGRAM_STATUS_EVENT_PROMPT_START,
+} ghostty_program_status_event_e;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_IDLE,
+  GHOSTTY_PROGRAM_STATUS_WORKING,
+  GHOSTTY_PROGRAM_STATUS_DONE,
+  GHOSTTY_PROGRAM_STATUS_BLOCKED,
+  GHOSTTY_PROGRAM_STATUS_ERROR,
+  GHOSTTY_PROGRAM_STATUS_CLEAR,
+} ghostty_program_status_state_e;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_KIND_NONE,
+  GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION,
+  GHOSTTY_PROGRAM_STATUS_KIND_QUESTION,
+  GHOSTTY_PROGRAM_STATUS_KIND_AUTH,
+} ghostty_program_status_kind_e;
+
+// apprt.Action.ProgramStatus.C
+// String pointers are borrowed and valid only for the duration of the action
+// callback. They are NUL-terminated when non-NULL.
+typedef struct {
+  ghostty_program_status_event_e event;
+  ghostty_program_status_state_e state;
+  ghostty_program_status_kind_e kind;
+  int8_t progress;
+  const char* id;
+  const char* app;
+  const char* title;
+  const char* msg;
+} ghostty_action_program_status_s;
+
 // apprt.action.CommandFinished.C
 typedef struct {
   // -1 if no exit code was reported, otherwise 0-255
@@ -1169,6 +1257,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_PROGRAM_STATUS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1210,6 +1299,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_program_status_s program_status;
 } ghostty_action_u;
 
 typedef struct {
@@ -1217,6 +1307,16 @@ typedef struct {
   ghostty_action_u action;
 } ghostty_action_s;
 
+// Whether `len` bytes of `text` (not NUL-terminated), a regex link under the
+// pointer, are a link. False: no hover underline, no pointer change, no
+// mouse-over-link and no open. OSC 8 links and always-highlighted links are
+// not asked. Called on the renderer thread and on the app thread, sometimes
+// with the terminal lock held, so it answers from what it already knows and
+// never calls into Ghostty; to change an answer, the embedder sends the
+// pointer position again (ghostty_surface_mouse_pos) or refreshes.
+typedef bool (*ghostty_surface_link_filter_cb)(void* userdata,
+                                               const char* text,
+                                               uintptr_t len);
 typedef void (*ghostty_runtime_wakeup_cb)(void*);
 typedef bool (*ghostty_runtime_read_clipboard_cb)(void*,
                                                   ghostty_clipboard_e,
@@ -1332,6 +1432,11 @@ GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
 GHOSTTY_API void ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
+// Updates app-scoped configuration without synchronously propagating it to
+// surfaces. The embedder must update every live surface separately.
+GHOSTTY_API void ghostty_app_update_config_without_surface_propagation(
+    ghostty_app_t,
+    ghostty_config_t);
 GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
@@ -1347,6 +1452,36 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     ghostty_app_t,
     const ghostty_surface_config_s*,
     size_t scrollback_limit_bytes);
+// cmux fork: create a surface whose command is a directly executed argv,
+// without changing ghostty_surface_config_s's public ABI. argv[0] is the
+// program (PATH is searched); no shell parsing or expansion is performed. On
+// POSIX the argv is exec'd without /bin/sh (macOS still uses login(1) like
+// Ghostty's `direct:` command config). On Windows it is serialized with
+// CreateProcessW quoting rules; argv[0] must not contain a double quote.
+// Exception: on macOS, bash and nu shell integration (when enabled) still
+// rewrites the argv into a /bin/sh command string, as upstream does for
+// `direct:` commands; set shell-integration = none to avoid it.
+// The strings are copied and only need to remain valid for the duration of
+// the call.
+//
+// When argv_len > 0, config->command and the `initial-command` config are
+// ignored, and wait-after-command is not forced: the surface closes when the
+// process exits, like the default shell. As for any shell, an exit within
+// abnormal-command-exit-runtime (nonzero status, or any status on macOS)
+// keeps the surface open with an error message. config->wait_after_command
+// still applies. argv_len == 0 behaves like ghostty_surface_new. Returns
+// NULL if argv or any element is NULL, argv[0] is empty, or (Windows)
+// argv[0] contains a double quote.
+GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_argv(
+    ghostty_app_t,
+    const ghostty_surface_config_s*,
+    const char* const* argv,
+    size_t argv_len);
+// cmux fork: retire the surface from Ghostty app routing and begin bounded
+// child-process termination without joining or freeing native surface state.
+// After this call, the embedder must make no other surface API calls and must
+// eventually call ghostty_surface_free. Safe to call repeatedly before free.
+GHOSTTY_API void ghostty_surface_request_process_termination(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
@@ -1371,6 +1506,55 @@ GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+
+// cmux fork: offscreen platform frame delivery. `frame` is borrowed and valid
+// only during the call. Callbacks run on the thread that draws the surface
+// (inside ghostty_surface_draw). Other platforms ignore these registrations.
+// Call the setters on that same thread. A callback must not call
+// ghostty_surface_draw, ghostty_surface_free, or either setter for the surface
+// that is being drawn: the draw holds renderer locks and still uses the
+// surface after the callback returns.
+typedef void (*ghostty_frame_callback_cb)(void* userdata, const void* frame);
+
+// One CPU-readback frame: RGBA8, rows bottom-up (OpenGL order), `stride`
+// bytes per row. Passed as the `frame` argument of the frame callback.
+// `data` is reused for the next frame: copy it before the callback returns.
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+  uint32_t stride;
+  const uint8_t* data;
+} ghostty_offscreen_frame_s;
+
+// Delivers each frame as a ghostty_offscreen_frame_s*. NULL stops delivery.
+GHOSTTY_API void ghostty_surface_set_frame_callback(ghostty_surface_t,
+                                                    ghostty_frame_callback_cb,
+                                                    void* userdata);
+
+// One dmabuf-exported frame (Linux): a single RGBA plane. The callback owns
+// `fd` and must close it. The DRM format modifier is split into hi/lo halves.
+// Every frame of a surface exports the same GPU buffer (a new fd each time),
+// and the next ghostty_surface_draw of that surface overwrites it. The
+// rendering is complete (glFinish) before the callback runs.
+typedef struct {
+  int32_t fd;
+  uint32_t fourcc;
+  uint32_t num_planes;
+  uint32_t stride;
+  uint32_t offset;
+  uint32_t modifier_hi;
+  uint32_t modifier_lo;
+  uint32_t width;
+  uint32_t height;
+} ghostty_dmabuf_frame_s;
+
+// Linux only: when set, each frame is exported as a dmabuf and delivered as a
+// ghostty_dmabuf_frame_s* instead of a CPU readback. Needs a driver with
+// EGL_MESA_image_dma_buf_export; when export fails the frame goes to the
+// frame callback instead. NULL goes back to CPU readback.
+GHOSTTY_API void ghostty_surface_set_dmabuf_callback(ghostty_surface_t,
+                                                     ghostty_frame_callback_cb,
+                                                     void* userdata);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
@@ -1384,6 +1568,14 @@ GHOSTTY_API bool ghostty_surface_set_render_presented_callback(
     ghostty_surface_t,
     ghostty_render_presented_cb,
     void* userdata);
+// cmux fork: install the per-surface callback for explicitly tokened renders
+// that were discarded by the host layer or failed in the renderer. Call once
+// directly after construction. The callback userdata remains valid until
+// ghostty_surface_free returns.
+GHOSTTY_API bool ghostty_surface_set_render_failed_callback(
+    ghostty_surface_t,
+    ghostty_render_failed_cb,
+    void* userdata);
 // cmux fork: install a per-surface callback for successfully performed font
 // binding actions. Call once after construction. The callback is synchronous
 // on the GUI thread, must not destroy or otherwise reenter the surface, is not
@@ -1395,14 +1587,47 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     void* userdata);
 // cmux fork: submit a forced render associated with `token`. When successful,
 // the installed callback fires after the backend presents the exact rendered
-// frame. On Metal this follows main-thread IOSurface assignment. A failed or
-// size-discarded render has no callback.
+// frame. On Metal this follows main-thread IOSurface assignment. Failed or
+// discarded renders invoke the optional render-failed callback instead.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
+// cmux fork: queue a tokened forced render executed on the renderer thread.
+// Thread-safe while the renderer OS thread owns rendering, unlike
+// ghostty_surface_render_now_with_token which renders on the calling thread
+// and requires embedder-owned renderer state. Returns false on iOS and after
+// another platform activates external-drain rendering; those embedders must
+// submit through their external render driver instead. Deliberately ignores the
+// occlusion visibility gate so an occluded window still renders a fresh frame
+// (ground-truth capture). The installed render-presented callback fires only
+// after the exact frame is presented to the platform layer (Metal: after the
+// main-thread IOSurface assignment). Returns false when no render-presented
+// callback is installed or another tokened draw is still pending; a
+// successfully queued render whose draw is skipped (renderer unrealized or
+// zero-sized surface) invokes the optional render-failed callback.
+GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
+                                                           uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Installs the link filter for this surface; a NULL callback removes it.
+// userdata must stay valid until the filter is removed or
+// ghostty_surface_free returns.
+GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
+                                                 ghostty_surface_link_filter_cb,
+                                                 void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+// cmux fork: reserve extra drawable pixels above and below the padded grid
+// for render-only scrollback overscan (the iOS scroll-edge-effect bands
+// under the navigation bar and the bottom chrome). The app-facing size
+// round-trip (ghostty_surface_set_size/ghostty_surface_size) and the mouse
+// coordinate space are unchanged; the drawable grows by the insets and the
+// renderer fills the bands with the rows directly above and below the
+// viewport, translated in the same critical section as the pixel scroll
+// offset. The terminal grid and PTY size never change from this call.
+// Arguments: top inset px, bottom inset px.
+GHOSTTY_API void ghostty_surface_set_render_insets(ghostty_surface_t,
+                                                   uint32_t,
+                                                   uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_grid_metrics(
     ghostty_surface_t,
@@ -1430,6 +1655,22 @@ GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
 GHOSTTY_API bool ghostty_surface_scroll_to_row_if_revision(
     ghostty_surface_t,
     uint64_t,
+    uint64_t,
+    ghostty_surface_scrollbar_s*);
+// cmux fork: pixel-precise variant of scroll_to_row_if_revision. Atomically
+// scrolls the viewport to the absolute row AND applies a fractional vertical
+// pixel offset in the same critical section; the renderer snapshots the pair
+// under one lock so every presented frame is composed from one consistent
+// scroll position. Positive offsets shift rendered content up, revealing the
+// top sliver of the next row (the renderer overscans one row). The offset is
+// a render-space translation only: terminal state and the PTY-visible grid
+// are unaffected, it is forced to zero on the alternate screen, and any other
+// viewport move resets it to zero. Arguments: row, pixel offset, expected
+// row-space revision, out scrollbar snapshot.
+GHOSTTY_API bool ghostty_surface_scroll_to_row_pixel_if_revision(
+    ghostty_surface_t,
+    uint64_t,
+    float,
     uint64_t,
     ghostty_surface_scrollbar_s*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
@@ -1464,6 +1705,40 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_v2(
     uintptr_t,
     bool,
     bool);
+// cmux fork: resolve a UTF-8 grapheme cluster (ptr, len) with style
+// (bold, italic) and a constraint width (1 or 2) through this surface's
+// LIVE font pipeline: the shared grid's CodepointResolver/Collection
+// (including fallback faces added by dynamic CoreText discovery this
+// session) and a private CoreText shaper with the surface's font
+// features. Returns a JSON document (format "cmux.font-query.v1") with
+// one entry per shaper run: PostScript name, family, source
+// ("primary" | "embedded" | "discovered" | "asset" | "sprite" |
+// "codepoint-map", the last when a config font-codepoint-map entry
+// decided the face), color flag, and per-cell glyph indices/offsets.
+// Free the result with ghostty_string_free; empty string (ptr == NULL)
+// on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_resolve_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
+// cmux fork: like ghostty_surface_font_resolve_json, but additionally
+// rasterizes every resolved glyph through the app's own render path
+// (CoreText Face.renderGlyph or the sprite face) into a private atlas.
+// Each glyph object gains width/height/glyph_offset_x/glyph_offset_y,
+// pixel_format ("coverage16-le" for monochrome — the pipeline's 8-bit
+// coverage widened losslessly, v16 = v8 * 257 — or "bgra8-premul-p3"
+// for color glyphs, premultiplied Display P3 BGRA verbatim), and
+// data_b64. Free with ghostty_string_free; empty string on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_rasterize_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
@@ -1488,6 +1763,45 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 
+typedef struct {
+  uint32_t primary;
+  uint32_t alternate;
+} ghostty_surface_kitty_image_id_cursors;
+
+typedef struct {
+  ghostty_surface_kitty_image_id_cursors replay;
+  ghostty_surface_kitty_image_id_cursors next;
+} ghostty_surface_kitty_image_id_cursor_state;
+
+typedef struct {
+  uint64_t image_bytes;
+  // Producer-side limit for retained encoded replay bytes. The restore input
+  // is already bounded; this is not a decoded-image storage limit.
+  uint64_t inflight_bytes;
+  uint64_t images;
+  uint64_t placements;
+} ghostty_surface_kitty_graphics_limits;
+
+typedef struct {
+  uint32_t image_id;
+  uint32_t image_number;
+} ghostty_surface_kitty_image_alias;
+
+// Restore non-VT Kitty state around a replay on a new surface before it has
+// received other output. The surface applies limits, replay cursors, the replay
+// prefix/suffix, aliases on the active screen, and final cursors under one
+// terminal lock. alias_count must not exceed 65,536. On false, discard the
+// surface; restore state can be partial.
+GHOSTTY_API bool ghostty_surface_restore_kitty_replay(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    uint32_t,
+    ghostty_surface_kitty_graphics_limits,
+    ghostty_surface_kitty_image_id_cursor_state,
+    const ghostty_surface_kitty_image_alias*,
+    uintptr_t);
+
 // cmux fork: PTY tee callback. Fires for every byte slice the read thread
 // produces before the VT parser sees it. Used by the Mac sync server to
 // broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback
@@ -1498,6 +1812,9 @@ GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 void* userdata);
 
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
+// cmux fork: true when the terminal's active screen is the alternate screen.
+// Takes the renderer state mutex, same as ghostty_surface_mouse_captured.
+GHOSTTY_API bool ghostty_surface_is_alternate_screen(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
                                                  ghostty_input_mouse_button_e,
@@ -1521,6 +1838,9 @@ GHOSTTY_API void ghostty_surface_split_resize(ghostty_surface_t,
                                                  uint16_t);
 GHOSTTY_API void ghostty_surface_split_equalize(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_binding_action(ghostty_surface_t, const char*, uintptr_t);
+// cmux fork: non-blocking prompt reveal for display-driven embedded clients.
+// A false result means the terminal-state mutex was busy; retry later.
+GHOSTTY_API bool ghostty_surface_try_scroll_to_bottom(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
                                                                const char*,
                                                                void*,
@@ -1529,6 +1849,30 @@ GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// cmux fork: the shell input (OSC 133 B region) the cursor is editing.
+// Offsets count caret stops: input cells holding text, wide-character spacers
+// skipped, over the cursor's soft-wrapped line only (a hard newline in a
+// multi-line buffer ends the region). Each stop is one Left/Right arrow step
+// for zle/readline. ghostty_surface_prompt_input returns false, leaving the
+// struct untouched, unless the terminal is at a prompt on the primary screen
+// and the cursor's line shows a prompt before its input; a line holding a
+// multi-codepoint grapheme is also refused. Text a line editor draws after the
+// buffer in input mode (zsh-autosuggestions) counts as input. The selection
+// fields are set only when the active selection lies wholly within the input.
+// ghostty_surface_select_prompt_input selects stops [start, end) without
+// writing a clipboard.
+typedef struct {
+  uint32_t length;
+  uint32_t caret;
+  bool has_selection;
+  uint32_t selection_start;
+  uint32_t selection_end;
+} ghostty_surface_prompt_input_s;
+GHOSTTY_API bool ghostty_surface_prompt_input(ghostty_surface_t,
+                                              ghostty_surface_prompt_input_s*);
+GHOSTTY_API bool ghostty_surface_select_prompt_input(ghostty_surface_t,
+                                                     uint32_t,
+                                                     uint32_t);
 // cmux fork: tracked keyboard-selection operations in viewport coordinates.
 // These avoid synthesizing mouse gestures and keep terminal row identity,
 // selection motion, rendering, and clipboard formatting inside Ghostty.

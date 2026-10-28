@@ -89,59 +89,52 @@ over this summary.
     concurrency control, so only the embedder knows when its writes are done.
   - Caller contract: after `ghostty_init`, from the thread that made the change,
     with no other ghostty call in flight.
+- Since the 2026-10-28 upstream sync, `global.syncEnviron()` returns
+  `error.OutOfMemory`. The export keeps its `void` signature, logs the error,
+  and keeps the previous environment snapshot.
 - Upstreamable: yes, in principle — it adds an export and changes no behavior
   for anyone who does not call it.
 
-### 4) Bound POSIX fork/exec subprocess teardown
+### 4) Shorter subprocess teardown deadlines on top of upstream
 
-- Commits:
-  - `c495aadb2` (fix(termio): bound subprocess teardown)
-  - `3f755ee80` (fix(termio): harden bounded subprocess teardown)
-  - `e3854c249` (fix(termio): shorten embedded teardown deadlines)
-  - `54d11c14c` (fix(termio): keep process-group discovery long, shutdown short)
+- History: commits `c495aadb2`, `3f755ee80`, `e3854c249` and `54d11c14c` held
+  a fork-only bounded teardown. In the 2026-10-28 upstream sync, upstream
+  `manaflow-ai` had its own bounded teardown (`KillTimeouts`, `SIGHUP` to
+  `SIGTERM` to `SIGKILL`). The sync took the upstream implementation whole and
+  dropped the fork version.
 - Files:
   - `src/termio/Exec.zig`
-- Summary:
-  - Gives the child process group a bounded `SIGHUP` grace period, then sends
-    `SIGKILL` once and observes it for a separately bounded force period.
-    Graceful shutdown and forced-shutdown observation use 20 ten-millisecond
-    attempts each (about 200 ms per phase); group discovery keeps 100 (about
-    one second). The asymmetry is deliberate: the first two run on every close
-    and the embedder waits on them, while discovery only sleeps in the rare
-    window before the child calls `setsid`, and giving up on it early forces
-    the direct-child fallback that lets same-group descendants survive.
-  - This shortens, and does not remove, the teardown stall. It reduced the
-    deterministic `SIGHUP`-resistant probe from about 2.9 seconds to about
-    0.65 seconds. The worst case is longer than one phase: a late `setsid`
-    followed by `child_moved` at the end of the force phase can chain
-    discovery, both group phases, and both direct-fallback phases, so polling
-    alone can approach 1.8 seconds, and the renderer and read-thread joins are
-    added on top. Those joins are still synchronous and are not made bounded
-    by this change, so pane close remains a main-thread block — a shorter one.
-    Describe it that way to users rather than as a fixed freeze.
-  - Never sends a group signal to the embedding app's own process group. If
-    child pre-exec setup fails it exits immediately; if group discovery still
-    does not produce the expected `pgid == pid`, cleanup uses a bounded direct
-    child fallback.
-  - Continues checking same-group descendants after the direct child is
-    signaled, while preserving the direct child's wait status through the grace
-    period so its PID cannot be reused as an unrelated process-group ID before
-    `SIGKILL`. If the force deadline expires, cleanup logs the residual process
-    group and returns instead of keeping synchronous surface teardown blocked.
-    Descendants that move into another process group remain out of scope.
-  - A `SIGHUP` cleanup handler that exceeds the grace period may be interrupted
-    by `SIGKILL`; this is the intentional tradeoff for a bounded UI teardown.
-    Shortening the grace period from one second to about 200 ms raises how
-    often that interruption happens, so shell exit work that is slower than
-    that — history writes, `zshexit`-style hooks, an editor flushing state —
-    can be cut short when its pane is closed. Suspect this first if a user
-    reports losing shell history on close.
-  - Regression tests observe real `SIGHUP` delivery before escalation, cover a
-    same-group descendant outliving its parent, verify bounded own-PGID
-    discovery/direct fallback, confirm direct-child reaping, and pin the
-    deadline asymmetry so a later edit cannot unify the three periods.
-- Upstreamable: yes, subject to agreement on the grace/force deadlines and the
-  intentional residual-process tradeoff.
+- What the fork keeps:
+  - Shorter `KillTimeouts` defaults: `sighup_grace` 200 ms and `sigkill_grace`
+    200 ms. Upstream uses 12 s and 3 s. `sigterm_grace` (250 ms) and
+    `poll_interval` (10 ms) match upstream.
+  - A failed `childPreExec` exits the child with status 1. Upstream logs the
+    error and continues to exec.
+- Why the defaults are shorter:
+  - `stop()` runs in `Exec.threadExit` on the IO thread. `Surface.deinit`
+    joins that thread, and term-mesh calls `ghostty_surface_free` on the main
+    actor. Each grace period therefore blocks the UI.
+  - Upstream sizes `sighup_grace` for the 10 s Claude `SessionEnd` hook. That
+    size assumes that the embedder calls
+    `ghostty_surface_request_process_termination` before it frees the surface.
+    term-mesh does not call it yet.
+  - With 200 ms, a `SIGHUP` handler that is slower than that can be cut short.
+    Shell history writes, `zshexit` hooks and a Claude `SessionEnd` hook are in
+    that group. If a user reports lost shell history on close, check this first.
+- The fork version signaled only the group of the direct child (`login`). A
+  term-mesh pane runs `login`, then `zsh` in its own group, then the
+  foreground job in a third group. After a close, `zsh` and the foreground job
+  survived. Upstream also signals the terminal foreground group, and
+  `tests_v2/test_surface_teardown_latency.py` now fails if the child survives.
+- The same test guards the shorter defaults. Its `slow_hup` workload handles
+  `SIGHUP` for 5 s, so the free waits out `sighup_grace`. If the sync step for
+  item 4 is missed, that free takes about 12 s and the test fails.
+- Upstream covers the earlier fork invariants with its own tests: the
+  embedder's own process group never gets a signal, the direct child gets
+  `SIGKILL` when `setsid` did not happen yet, same-group descendants are
+  reaped, and a reaped child's cached process group is not signaled.
+- Upstreamable: no. The defaults are specific to an embedder that frees on
+  the UI thread.
 
 ### 5) Surface teardown must not wait on the consumers it stops
 
@@ -218,6 +211,9 @@ over this summary.
 - A program that both drives a prompt marker and wants the mouse would lose
   tracking at its prompt. Shell integration is what emits these markers, so
   that combination is not expected.
+- Upstream handles the same two markers for OSC 7501 program status
+  (`programStatusPromptStart`). Zig rejects a duplicate switch value, so both
+  actions are in one switch arm. Keep them together.
 
 ### 7) Detach the macOS layer display callback before the renderer is freed
 
@@ -236,6 +232,11 @@ over this summary.
   owns the layer.
 - term-mesh calls `ghostty_surface_free` on the main actor, so the detach runs
   inline and does not wait on the main queue.
+- Upstream `e2a26bc94` fixes the same crash in a different location: it clears
+  the same ivars when `invalidateSurfaceUpdates` runs on main. After the
+  2026-10-28 sync both clears are present. Clearing twice is harmless. Both
+  paths run inline on the main thread and use `dispatch_sync` only from other
+  threads.
 - Upstreamable: yes, if upstream also lets the host view outlive the renderer.
 
 ## Merge conflict notes
@@ -250,8 +251,20 @@ These files change frequently upstream; be careful when rebasing the fork:
   - OSC dispatch logic moves often. Re-check the integration points for the OSC 99 parser.
 
 - `src/termio/Exec.zig`
-  - Preserve bounded group discovery, `SIGHUP` grace, one-shot `SIGKILL`
-    escalation, force-period observation, and the own-PGID safety fallback
-    when upstream changes subprocess/process-group cleanup.
+  - Take the upstream teardown implementation. Then apply the shorter
+    `KillTimeouts` defaults from item 4 again.
+
+- `src/termio/stream_handler.zig`
+  - Keep the fork `tearing_down` checks next to the upstream
+    `kitty_replay_tracking` checks in `surfaceMessageWriter` and
+    `messageWriter`. They are separate conditions.
+  - Use the upstream `discardSurfaceMessage`. It also frees `program_status`.
+  - For a dropped termio message, call `termio.mailbox.discard` in both
+    branches. Upstream `discardTermioMessage` frees only `write_alloc` and
+    leaks `change_config`, so the fork removes it.
+
+- `src/Surface.zig`
+  - In `deinit`, set `tearing_down` and call `wakeWaiters` before the upstream
+    renderer stop and `requestProcessTermination` calls.
 
 If you resolve a conflict, update this doc with what changed.

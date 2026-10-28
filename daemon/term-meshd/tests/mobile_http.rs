@@ -2175,6 +2175,21 @@ fn claude_local_commands_become_notices_instead_of_turns() {
 }
 
 #[test]
+fn claude_injected_meta_rows_are_not_shown_as_the_persons_turns() {
+    let rows = vec![
+        json!({ "type": "user", "uuid": "u1", "message": { "content": "PR 올려줘" } }),
+        json!({ "type": "user", "uuid": "u2", "isMeta": true, "message": { "content": [
+            { "type": "text", "text": "Base directory for this skill: /x/skills/write" }
+        ] } }),
+        json!({ "type": "user", "uuid": "u3", "isMeta": true, "message": { "content":
+            "(Re-invocation of /xm:write)" } }),
+    ];
+    let entries = http_mobile::claude_entries(&rows);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["text"], "PR 올려줘");
+}
+
+#[test]
 fn only_a_terminal_catalog_offers_the_model_picker() {
     let temp = tempfile::tempdir().unwrap();
     for (native, action) in [(false, Some("pick_model")), (true, None)] {
