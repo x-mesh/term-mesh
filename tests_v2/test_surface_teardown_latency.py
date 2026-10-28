@@ -3,11 +3,16 @@
 while it runs.
 
 Closing a pane calls `ghostty_surface_free` on the main actor, and that call
-blocks until Ghostty joins the surface's renderer and IO threads. When the pane's
-child ignores SIGHUP and SIGTERM the join waits out the bounded kill deadlines,
-so this is the workload that turns a close into a visible UI freeze. Ignoring
-SIGHUP alone is not enough: Ghostty sees that the group leader ignores it and
-moves straight to SIGTERM, which ends such a child in a few milliseconds.
+blocks until Ghostty joins the surface's renderer and IO threads. Two children
+make the join wait out a kill deadline, and each workload pins one of them:
+
+  * `ignore` ignores SIGHUP and SIGTERM. Ghostty sees that the group leader
+    ignores SIGHUP and moves straight to SIGTERM, so this waits out
+    `sigterm_grace` before SIGKILL. Ignoring SIGHUP alone is not enough: SIGTERM
+    then ends the child in a few milliseconds.
+  * `slow_hup` handles SIGHUP but takes seconds to finish, like a Claude
+    `SessionEnd` hook. Ghostty waits out `sighup_grace` before SIGKILL, so this
+    is the only workload that fails if that grace returns to upstream's 12 s.
 
 Two properties matter and this test asserts both:
 
@@ -42,13 +47,26 @@ READY_TIMEOUT_SECONDS = 8.0
 FREE_COUNT_QUIET_SECONDS = 1.0
 CHILD_EXIT_SECONDS = 2.0
 
-# The floor proves the resistant path actually ran. A child that ignores SIGHUP
-# and SIGTERM waits out the 250 ms SIGTERM grace before SIGKILL, and a free that
-# skipped that path returns in about 30 ms. 150 ms sits well clear of both.
-# Revisit this number if the `KillTimeouts` defaults change; see
-# docs/ghostty-fork.md.
+# The floor proves the resistant path actually ran. The workloads wait out the
+# 250 ms SIGTERM grace or the 200 ms SIGHUP grace before SIGKILL, and a free
+# that skipped them returns in about 30 ms. 150 ms sits well clear of both.
+# The ceiling is what keeps the fork's shorter `KillTimeouts` defaults: upstream's
+# 12 s `sighup_grace` puts `slow_hup` far above it. Revisit both numbers if the
+# defaults change; see docs/ghostty-fork.md.
 MIN_FREE_MS = 150.0
 MAX_FREE_MS = 1_500.0
+
+# Python runs the handler between bytecodes, so it interrupts the long sleep
+# and holds the process past any grace below a few seconds.
+WORKLOADS = {
+    "ignore": (
+        "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    ),
+    "slow_hup": (
+        "signal.signal(signal.SIGHUP, lambda *_: (time.sleep(5), sys.exit(0))); "
+    ),
+}
 
 # What a user waits for: another command must answer while the free blocks main.
 # Held under the app's own 2 s main-thread command budget with margin.
@@ -119,9 +137,10 @@ def process_alive(pid: str) -> bool:
     return subprocess.run(["ps", "-p", pid], capture_output=True).returncode == 0
 
 
-def start_resistant_pane() -> tuple[str, str]:
-    """Open a split whose child ignores SIGHUP and SIGTERM, so its free must
-    wait out the grace deadlines and end in SIGKILL. Returns (surface, pid)."""
+def start_resistant_pane(workload: str) -> tuple[str, str]:
+    """Open a split whose child resists teardown as `WORKLOADS[workload]`
+    describes, so its free must wait out a grace deadline and end in SIGKILL.
+    Returns (surface, pid)."""
     # The shell echoes the typed command, so the marker is assembled at run
     # time; a marker that appears verbatim in the command line is matched
     # before the child has installed its handlers.
@@ -133,8 +152,7 @@ def start_resistant_pane() -> tuple[str, str]:
             victim,
             "/usr/bin/python3 -c '"
             "import signal,sys,time; "
-            "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"{WORKLOADS[workload]}"
             'print("TM_TEARDOWN_READY_" + sys.argv[1], flush=True); '
             f"time.sleep(60)' {token}\n",
         )
@@ -142,9 +160,9 @@ def start_resistant_pane() -> tuple[str, str]:
     return victim, child_pid(token)
 
 
-def measure_iteration() -> tuple[float, float]:
+def measure_iteration(workload: str) -> tuple[float, float]:
     """Return (free duration ms, probe latency seconds)."""
-    victim, pid = start_resistant_pane()
+    victim, pid = start_resistant_pane(workload)
 
     with termmesh() as observer:
         baseline = observer.surface_free_status(victim)
@@ -205,11 +223,11 @@ def measure_iteration() -> tuple[float, float]:
     return float(duration_ms), probe_seconds
 
 
-def main() -> int:
+def check_workload(workload: str) -> str:
     frees: list[float] = []
     probes: list[float] = []
     for _ in range(ITERATIONS):
-        free_ms, probe_seconds = measure_iteration()
+        free_ms, probe_seconds = measure_iteration(workload)
         frees.append(free_ms)
         probes.append(probe_seconds)
 
@@ -218,24 +236,27 @@ def main() -> int:
 
     if min(frees) < MIN_FREE_MS:
         raise termmeshError(
-            f"a free returned faster than {MIN_FREE_MS:.0f} ms, so the "
-            f"HUP-resistant path did not run and this test proved nothing: "
+            f"{workload}: a free returned faster than {MIN_FREE_MS:.0f} ms, so "
+            f"the resistant path did not run and this test proved nothing: "
             f"{free_report} ms"
         )
     if max(frees) >= MAX_FREE_MS:
         raise termmeshError(
-            f"surface free exceeded {MAX_FREE_MS:.0f} ms: {free_report} ms"
+            f"{workload}: surface free exceeded {MAX_FREE_MS:.0f} ms: "
+            f"{free_report} ms"
         )
     if max(probes) >= PROBE_BUDGET_SECONDS:
         raise termmeshError(
-            f"main-thread command exceeded {PROBE_BUDGET_SECONDS:.1f}s during "
-            f"teardown: {probe_report} ms (frees {free_report} ms)"
+            f"{workload}: main-thread command exceeded "
+            f"{PROBE_BUDGET_SECONDS:.1f}s during teardown: {probe_report} ms "
+            f"(frees {free_report} ms)"
         )
+    return f"{workload} frees {free_report} ms, probes {probe_report} ms"
 
-    print(
-        "PASS: resistant surface free stayed bounded "
-        f"({free_report} ms) and commands kept answering ({probe_report} ms)"
-    )
+
+def main() -> int:
+    reports = [check_workload(workload) for workload in WORKLOADS]
+    print("PASS: resistant surface frees stayed bounded; " + "; ".join(reports))
     return 0
 
 

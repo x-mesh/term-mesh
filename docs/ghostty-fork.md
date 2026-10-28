@@ -126,6 +126,9 @@ over this summary.
   foreground job in a third group. After a close, `zsh` and the foreground job
   survived. Upstream also signals the terminal foreground group, and
   `tests_v2/test_surface_teardown_latency.py` now fails if the child survives.
+- The same test guards the shorter defaults. Its `slow_hup` workload handles
+  `SIGHUP` for 5 s, so the free waits out `sighup_grace`. If the sync step for
+  item 4 is missed, that free takes about 12 s and the test fails.
 - Upstream covers the earlier fork invariants with its own tests: the
   embedder's own process group never gets a signal, the direct child gets
   `SIGKILL` when `setsid` did not happen yet, same-group descendants are
