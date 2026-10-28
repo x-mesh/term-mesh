@@ -3015,7 +3015,10 @@ pub(crate) fn claude_entries(lines: &[Value]) -> Vec<Value> {
                 }
                 continue;
             }
-            if let Some(text) = user_visible_text(text) {
+            // `isMeta` rows are text the CLI injects for the model (skill
+            // bodies, reminders), not something the person typed.
+            let injected = row.get("isMeta").and_then(Value::as_bool) == Some(true);
+            if let Some(text) = user_visible_text(text).filter(|_| !injected) {
                 entries
                     .push(json!({ "id": id, "kind": "said", "speaker": "person", "text": text }));
             }
