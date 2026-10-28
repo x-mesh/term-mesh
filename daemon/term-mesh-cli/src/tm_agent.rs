@@ -16095,12 +16095,31 @@ fn remote_rpc(sock: &PathBuf, method: &str, params: Value) -> Value {
 
 /// `--surface` wins; otherwise the pane's own `TERMMESH_SURFACE_ID`.
 fn resolve_remote_surface(explicit: Option<&str>) -> Result<String, String> {
-    remote_surface_from(explicit, env::var("TERMMESH_SURFACE_ID").ok().as_deref())
+    remote_surface_from(
+        explicit,
+        env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
+        env::var("CLAUDE_CODE_SESSION_KIND").ok().as_deref(),
+    )
 }
 
-fn remote_surface_from(explicit: Option<&str>, env_value: Option<&str>) -> Result<String, String> {
+/// A Claude background session (`/bg`) runs in the claude daemon's own pty,
+/// not in a pane, and only inherits the launching pane's
+/// `TERMMESH_SURFACE_ID`. Using it would expose that other pane's session.
+fn remote_surface_from(
+    explicit: Option<&str>,
+    env_value: Option<&str>,
+    session_kind: Option<&str>,
+) -> Result<String, String> {
     if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(s.to_string());
+    }
+    if session_kind.map(str::trim) == Some("bg") {
+        return Err(
+            "this is a Claude background session: it has no term-mesh pane, and \
+             $TERMMESH_SURFACE_ID belongs to the pane that launched it. Run /rc in a pane \
+             that hosts the session, or pass --surface <id>"
+                .to_string(),
+        );
     }
     env_value
         .map(str::trim)
@@ -16419,15 +16438,32 @@ mod remote_command_tests {
     #[test]
     fn surface_flag_wins_over_env_and_missing_is_an_error() {
         assert_eq!(
-            remote_surface_from(Some(" abc "), Some("env")).unwrap(),
+            remote_surface_from(Some(" abc "), Some("env"), None).unwrap(),
             "abc"
         );
-        assert_eq!(remote_surface_from(Some("  "), Some("env")).unwrap(), "env");
-        assert_eq!(remote_surface_from(None, Some("env")).unwrap(), "env");
-        assert!(remote_surface_from(None, None)
+        assert_eq!(
+            remote_surface_from(Some("  "), Some("env"), None).unwrap(),
+            "env"
+        );
+        assert_eq!(remote_surface_from(None, Some("env"), None).unwrap(), "env");
+        assert!(remote_surface_from(None, None, None)
             .unwrap_err()
             .contains("--surface"));
-        assert!(remote_surface_from(None, Some(" ")).is_err());
+        assert!(remote_surface_from(None, Some(" "), None).is_err());
+    }
+
+    #[test]
+    fn background_session_refuses_the_inherited_surface() {
+        let err = remote_surface_from(None, Some("env"), Some("bg")).unwrap_err();
+        assert!(err.contains("background session"));
+        assert_eq!(
+            remote_surface_from(Some("abc"), Some("env"), Some("bg")).unwrap(),
+            "abc"
+        );
+        assert_eq!(
+            remote_surface_from(None, Some("env"), Some("interactive")).unwrap(),
+            "env"
+        );
     }
 
     #[test]
