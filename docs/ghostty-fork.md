@@ -121,6 +121,11 @@ over this summary.
   - With 200 ms, a `SIGHUP` handler that is slower than that can be cut short.
     Shell history writes, `zshexit` hooks and a Claude `SessionEnd` hook are in
     that group. If a user reports lost shell history on close, check this first.
+- The fork version signaled only the group of the direct child (`login`). A
+  term-mesh pane runs `login`, then `zsh` in its own group, then the
+  foreground job in a third group. After a close, `zsh` and the foreground job
+  survived. Upstream also signals the terminal foreground group, and
+  `tests_v2/test_surface_teardown_latency.py` now fails if the child survives.
 - Upstream covers the earlier fork invariants with its own tests: the
   embedder's own process group never gets a signal, the direct child gets
   `SIGKILL` when `setsid` did not happen yet, same-group descendants are

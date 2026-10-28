@@ -4,8 +4,10 @@ while it runs.
 
 Closing a pane calls `ghostty_surface_free` on the main actor, and that call
 blocks until Ghostty joins the surface's renderer and IO threads. When the pane's
-child ignores SIGHUP the join waits out the fork's bounded kill deadlines, so this
-is the workload that turns a close into a visible UI freeze.
+child ignores SIGHUP and SIGTERM the join waits out the bounded kill deadlines,
+so this is the workload that turns a close into a visible UI freeze. Ignoring
+SIGHUP alone is not enough: Ghostty sees that the group leader ignores it and
+moves straight to SIGTERM, which ends such a child in a few milliseconds.
 
 Two properties matter and this test asserts both:
 
@@ -22,8 +24,12 @@ starts, and that query is answered off-main so it works while the main thread is
 blocked.
 """
 
+import os
+import signal
+import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 import sys
 
@@ -34,12 +40,13 @@ from termmesh import termmesh, termmeshError
 ITERATIONS = 5
 READY_TIMEOUT_SECONDS = 8.0
 FREE_COUNT_QUIET_SECONDS = 1.0
+CHILD_EXIT_SECONDS = 2.0
 
-# The floor proves the resistant path actually ran. With the fork's current
-# deadlines a HUP-ignoring child costs one grace period plus one force period
-# (20 attempts x 10 ms each, so about 400 ms), and a free that skipped that path
-# returns in single-digit milliseconds. 150 ms sits well clear of both. Revisit
-# this number if those deadlines change; see docs/ghostty-fork.md.
+# The floor proves the resistant path actually ran. A child that ignores SIGHUP
+# and SIGTERM waits out the 250 ms SIGTERM grace before SIGKILL, and a free that
+# skipped that path returns in about 30 ms. 150 ms sits well clear of both.
+# Revisit this number if the `KillTimeouts` defaults change; see
+# docs/ghostty-fork.md.
 MIN_FREE_MS = 150.0
 MAX_FREE_MS = 1_500.0
 
@@ -92,28 +99,52 @@ def assert_free_count_stays_exactly_one(
     return latest
 
 
-def start_resistant_pane(index: int) -> str:
-    """Open a split whose child ignores SIGHUP, so its free must wait out the
-    fork's grace and force deadlines rather than exiting on the first signal."""
-    marker = f"TM_TEARDOWN_READY_{index}"
+def child_pid(token: str) -> str:
+    """The token is only in the child's argv. `/usr/bin/python3` is a shim
+    that briefly shares that argv while it starts the real interpreter, so
+    wait until one process remains."""
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    pids: list[str] = []
+    while time.monotonic() < deadline:
+        pids = subprocess.run(
+            ["pgrep", "-f", token], capture_output=True, text=True
+        ).stdout.split()
+        if len(pids) == 1:
+            return pids[0]
+        time.sleep(0.05)
+    raise termmeshError(f"expected one child for {token}, found {pids}")
+
+
+def process_alive(pid: str) -> bool:
+    return subprocess.run(["ps", "-p", pid], capture_output=True).returncode == 0
+
+
+def start_resistant_pane() -> tuple[str, str]:
+    """Open a split whose child ignores SIGHUP and SIGTERM, so its free must
+    wait out the grace deadlines and end in SIGKILL. Returns (surface, pid)."""
+    # The shell echoes the typed command, so the marker is assembled at run
+    # time; a marker that appears verbatim in the command line is matched
+    # before the child has installed its handlers.
+    token = uuid.uuid4().hex
     with termmesh() as setup:
         victim = setup.new_split("right")
         setup.focus_surface(victim)
         setup.send_surface(
             victim,
             "/usr/bin/python3 -c '"
-            "import signal,time; "
+            "import signal,sys,time; "
             "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
-            f'print("{marker}", flush=True); '
-            "time.sleep(60)'\n",
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            'print("TM_TEARDOWN_READY_" + sys.argv[1], flush=True); '
+            f"time.sleep(60)' {token}\n",
         )
-        wait_for_marker(setup, victim, marker)
-    return victim
+        wait_for_marker(setup, victim, f"TM_TEARDOWN_READY_{token}")
+    return victim, child_pid(token)
 
 
-def measure_iteration(index: int) -> tuple[float, float]:
+def measure_iteration() -> tuple[float, float]:
     """Return (free duration ms, probe latency seconds)."""
-    victim = start_resistant_pane(index)
+    victim, pid = start_resistant_pane()
 
     with termmesh() as observer:
         baseline = observer.surface_free_status(victim)
@@ -155,6 +186,16 @@ def measure_iteration(index: int) -> tuple[float, float]:
     if close_error:
         raise termmeshError(f"surface.close failed: {close_error[0]!r}")
 
+    # A free that returns while the child lives has bounded nothing. The child
+    # sits in the terminal's foreground group, which differs from the group of
+    # the direct child (`login`) once the shell uses job control.
+    deadline = time.monotonic() + CHILD_EXIT_SECONDS
+    while process_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if process_alive(pid):
+        os.kill(int(pid), signal.SIGKILL)
+        raise termmeshError(f"child {pid} survived the surface free: {victim}")
+
     # The close path is terminal, so this id must not realize another surface
     # before deinit. max_duration_ms remains the stable duration field exposed
     # by the shared DEBUG telemetry.
@@ -167,8 +208,8 @@ def measure_iteration(index: int) -> tuple[float, float]:
 def main() -> int:
     frees: list[float] = []
     probes: list[float] = []
-    for index in range(ITERATIONS):
-        free_ms, probe_seconds = measure_iteration(index)
+    for _ in range(ITERATIONS):
+        free_ms, probe_seconds = measure_iteration()
         frees.append(free_ms)
         probes.append(probe_seconds)
 
