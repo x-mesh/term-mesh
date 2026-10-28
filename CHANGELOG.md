@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.279.0] - 2026-10-29
+
+### Fixed
+
+- Closing a pane now ends the shell and the foreground job that run in it. Before, term-mesh stopped only the login process group, so the shell and its foreground job kept running as orphan processes after the pane closed. A program that ignores the hang-up and terminate signals is stopped about 0.3 seconds after you close its pane.
+- `/rc on` in a Claude background session (`/bg`) no longer exposes a different pane to the mobile app. A background session has no pane of its own and inherited the surface of the pane that started the Claude daemon, so mobile input went to that pane. `tm-agent remote on/off/status` now refuses to run in a background session unless you give `--surface <id>`. A background session also no longer registers the leader inbox of that pane.
+- Mobile Chat no longer shows skill bodies and system notices from Claude as messages that you typed.
+
+### Changed
+
+- The bundled Ghostty terminal engine now includes 265 upstream commits.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.278.0] - 2026-10-27
 
 ### Fixed
