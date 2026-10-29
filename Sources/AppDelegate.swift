@@ -676,6 +676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // accept() silently fail and locks both the control socket and
         // peer.sock into "connect OK / recv timeout" until restart.
         Self.raiseFileDescriptorLimit()
+        MachineNameCache.warmUp()
 
         let env = ProcessInfo.processInfo.environment
         let isRunningUnderXCTest = isRunningUnderXCTest(env)

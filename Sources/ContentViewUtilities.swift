@@ -343,7 +343,7 @@ final class DraggableFolderNSView: NSView, NSDraggingSource {
         }
 
         // Add computer name at the bottom (like native proxy icon)
-        let computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        let computerName = MachineNameCache.computerName
         let computerIcon = NSImage(named: NSImage.computerName) ?? NSImage()
         computerIcon.size = NSSize(width: 16, height: 16)
 
