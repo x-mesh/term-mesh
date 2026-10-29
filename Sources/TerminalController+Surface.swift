@@ -1114,17 +1114,31 @@ extension TerminalController {
         return result
     }
 
+    /// Ghostty answers an empty string for a cluster outside 1...128 bytes
+    /// (`ghostty/src/apprt/embedded.zig`), which would surface as `internal_error`
+    /// after a main-queue hop; reject it here instead.
+    nonisolated static let fontResolveMaxTextBytes = 128
+
+    nonisolated static func fontResolveInputError(byteCount: Int, width: Int) -> String? {
+        guard (1...fontResolveMaxTextBytes).contains(byteCount) else {
+            return "text must be 1...\(fontResolveMaxTextBytes) UTF-8 bytes"
+        }
+        guard (1...2).contains(width) else { return "width must be 1 or 2" }
+        return nil
+    }
+
     /// `surface.font_resolve`: which face Ghostty picks for `text` on this
     /// surface (`ghostty_surface_font_resolve_json`): PostScript name, family and
     /// source (`primary`, `discovered`, `codepoint-map`, ...). Read-only; it
     /// never changes focus.
     func v2SurfaceFontResolve(params: [String: Any]) -> V2CallResult {
-        guard let text = params["text"] as? String, !text.isEmpty else {
+        guard let text = params["text"] as? String else {
             return .err(code: "invalid_params", message: "text is required", data: nil)
         }
         let width = v2Int(params, "width") ?? 2
-        guard (1...2).contains(width) else {
-            return .err(code: "invalid_params", message: "width must be 1 or 2", data: nil)
+        let textByteCount = text.utf8.count
+        if let message = Self.fontResolveInputError(byteCount: textByteCount, width: width) {
+            return .err(code: "invalid_params", message: message, data: nil)
         }
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
@@ -1151,10 +1165,9 @@ extension TerminalController {
                 result = self.v2TerminalSurfaceUnavailable(terminalPanel: terminalPanel, surfaceId: surfaceId)
                 return
             }
-            let bytes = Array(text.utf8)
             let exported: ghostty_string_s = text.withCString { cstr in
                 ghostty_surface_font_resolve_json(
-                    surface, cstr, UInt(bytes.count), bold, italic, UInt8(width)
+                    surface, cstr, UInt(textByteCount), bold, italic, UInt8(width)
                 )
             }
             defer { ghostty_string_free(exported) }

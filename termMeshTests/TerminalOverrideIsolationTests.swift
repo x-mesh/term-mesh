@@ -270,4 +270,25 @@ final class TerminalOverrideIsolationTests: XCTestCase {
     private func fontFamilyLines(_ lines: [String]) -> [String] {
         lines.filter { $0.hasPrefix("font-family =") }
     }
+
+    // MARK: - surface.font_resolve input validation
+
+    func test_fontResolveInputError_textByteBounds() {
+        let check = { (text: String) in
+            TerminalController.fontResolveInputError(byteCount: text.utf8.count, width: 2)
+        }
+        XCTAssertNotNil(check(""))
+        XCTAssertNil(check("한"))
+        let atLimit = String(repeating: "한", count: 42) + "ab"
+        XCTAssertEqual(atLimit.utf8.count, 128)
+        XCTAssertNil(check(atLimit))
+        XCTAssertEqual(check(atLimit + "c"), "text must be 1...128 UTF-8 bytes")
+    }
+
+    func test_fontResolveInputError_widthBounds() {
+        XCTAssertNotNil(TerminalController.fontResolveInputError(byteCount: 3, width: 0))
+        XCTAssertNil(TerminalController.fontResolveInputError(byteCount: 3, width: 1))
+        XCTAssertNil(TerminalController.fontResolveInputError(byteCount: 3, width: 2))
+        XCTAssertNotNil(TerminalController.fontResolveInputError(byteCount: 3, width: 3))
+    }
 }
