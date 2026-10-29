@@ -410,7 +410,9 @@ struct AgentPanelView: View {
                             )
                     }
                     if session.rows.isEmpty { emptyState }
-                    ForEach(AgentSession.transcriptItems(for: session.rows)) { item in
+                    let items = AgentSession.transcriptItems(for: session.rows)
+                    let selectableIDs = TranscriptSelection.selectableItemIDs(items.map(\.id))
+                    ForEach(items) { item in
                         switch item {
                         case .row(let row):
                             TranscriptRow(
@@ -418,6 +420,7 @@ struct AgentPanelView: View {
                                 streaming: session.streamingIds.contains(row.id),
                                 open: openTools.contains(row.id),
                                 root: panel.workingDirectory,
+                                selectable: selectableIDs.contains(row.id),
                                 setOpen: { setToolOpen(row.id, $0) }
                             )
                             .equatable()
@@ -431,6 +434,7 @@ struct AgentPanelView: View {
                                 setOpen: { setToolGroupOpen(group, $0) },
                                 setToolOpen: setToolOpen
                             )
+                            .environment(\.transcriptRowSelectable, selectableIDs.contains(group.id))
                             .id(group.id)
                         }
                     }
@@ -1126,6 +1130,9 @@ private struct TranscriptRow: View, Equatable {
     let streaming: Bool
     let open: Bool
     let root: String
+    /// Whether this row is among the most recent ones that get a selection
+    /// source; see `TranscriptSelection.maxSelectableItems`.
+    let selectable: Bool
     let setOpen: (Bool) -> Void
 
     /// `setOpen` is deliberately not compared: the parent rebuilds that closure
@@ -1140,10 +1147,13 @@ private struct TranscriptRow: View, Equatable {
             && lhs.streaming == rhs.streaming
             && lhs.open == rhs.open
             && lhs.root == rhs.root
+            && lhs.selectable == rhs.selectable
     }
 
     var body: some View {
-        content.padding(.top, item.topGap)
+        content
+            .padding(.top, item.topGap)
+            .environment(\.transcriptRowSelectable, selectable)
     }
 
     @ViewBuilder
@@ -2362,8 +2372,20 @@ enum TranscriptSelection {
     /// because up to `AgentSession.maxRenderedEntries` rows can be mounted at once.
     static let maxSelectableBytes = 4 * 1024
 
-    static func isSelectable(_ text: String) -> Bool {
-        text.utf8.count <= maxSelectableBytes
+    /// Only the newest transcript items get a selection source at all. Each source
+    /// is a TextKit object with its own layout, so 300 of them are the same cost
+    /// the container-wide scope had, paid per row. Older rows copy through their
+    /// context menu or "Copy Transcript". 20 is a guess that covers what is on
+    /// screen while following the bottom; it has not been measured.
+    static let maxSelectableItems = 20
+
+    /// The ids, out of `ids` in display order, that may be selected.
+    static func selectableItemIDs(_ ids: [UUID], limit: Int = maxSelectableItems) -> Set<UUID> {
+        Set(ids.suffix(limit))
+    }
+
+    static func isSelectable(_ text: String, recentRow: Bool = true) -> Bool {
+        recentRow && text.utf8.count <= maxSelectableBytes
     }
 
     /// The whole transcript as plain text, for the one copy that spans rows.
@@ -2377,9 +2399,14 @@ enum TranscriptSelection {
             case .thought(_, let body):
                 return body.flatMap { $0.isEmpty ? nil : "thinking: \($0)" }
             case .tool(_, let call):
-                let head = "\(call.name) \(call.headline)"
-                guard let result = call.result, !result.isEmpty else { return head }
-                return "\(head)\n\(result)"
+                // Same order the row draws: headline, the diff, then a result —
+                // which `ChangeRow` shows only when the edit failed.
+                var parts = ["\(call.name) \(call.headline)"]
+                if let change = call.change { parts.append(AgentDiff.text(change)) }
+                if let result = call.result, !result.isEmpty, call.change == nil || call.failed {
+                    parts.append(result)
+                }
+                return parts.joined(separator: "\n")
             case .turnEnded:
                 return nil
             case .notice(_, let text):
@@ -2431,11 +2458,23 @@ enum TranscriptSelection {
     }
 }
 
+private struct TranscriptRowSelectableKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    fileprivate var transcriptRowSelectable: Bool {
+        get { self[TranscriptRowSelectableKey.self] }
+        set { self[TranscriptRowSelectableKey.self] = newValue }
+    }
+}
+
 private struct TranscriptSelectable: ViewModifier {
     let text: String
+    @Environment(\.transcriptRowSelectable) private var recentRow
 
     func body(content: Content) -> some View {
-        if TranscriptSelection.isSelectable(text) {
+        if TranscriptSelection.isSelectable(text, recentRow: recentRow) {
             content.textSelection(.enabled)
         } else {
             content

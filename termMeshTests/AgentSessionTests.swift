@@ -6798,6 +6798,49 @@ final class TranscriptSelectionTests: XCTestCase {
         )
     }
 
+    func testPlainTextIncludesTheDiffOfAnEditInDisplayOrder() {
+        let change = AgentDiff.Change(
+            path: "Sources/Foo.swift", kind: .edit, added: 1, removed: 1,
+            lines: [.removed(old: 1, text: "let a = 1"), .added(new: 1, text: "let a = 2")],
+            elided: 0, everywhere: false
+        )
+        var edit = AgentSession.ToolCall(name: "Edit", headline: "Sources/Foo.swift", result: "Applied")
+        edit.change = change
+        var failed = AgentSession.ToolCall(name: "Edit", headline: "Sources/Bar.swift", result: "no match")
+        failed.change = change
+        failed.failed = true
+        let diff = AgentDiff.text(change)
+        XCTAssertFalse(diff.isEmpty)
+        XCTAssertEqual(
+            TranscriptSelection.plainText(of: [.tool(id: UUID(), edit)]),
+            "Edit Sources/Foo.swift\n\(diff)",
+            "a successful edit's result is one sentence the diff already says"
+        )
+        XCTAssertEqual(
+            TranscriptSelection.plainText(of: [.tool(id: UUID(), failed)]),
+            "Edit Sources/Bar.swift\n\(diff)\nno match",
+            "a failed edit keeps its error after the diff, as ChangeRow draws it"
+        )
+    }
+
+    func testOnlyTheNewestItemsAreSelectable() {
+        let ids = (0..<30).map { _ in UUID() }
+        let selectable = TranscriptSelection.selectableItemIDs(ids, limit: 20)
+        XCTAssertEqual(selectable.count, 20)
+        XCTAssertTrue(selectable.contains(ids[29]))
+        XCTAssertTrue(selectable.contains(ids[10]))
+        XCTAssertFalse(selectable.contains(ids[9]))
+        XCTAssertEqual(TranscriptSelection.selectableItemIDs(Array(ids.prefix(3))).count, 3)
+        XCTAssertTrue(TranscriptSelection.selectableItemIDs([]).isEmpty)
+    }
+
+    func testSelectionNeedsBothARecentRowAndASmallText() {
+        XCTAssertTrue(TranscriptSelection.isSelectable("short", recentRow: true))
+        XCTAssertFalse(TranscriptSelection.isSelectable("short", recentRow: false))
+        let big = String(repeating: "a", count: TranscriptSelection.maxSelectableBytes + 1)
+        XCTAssertFalse(TranscriptSelection.isSelectable(big, recentRow: true))
+    }
+
     func testPlainTextSkipsEmptyThoughtsAndKeepsRunningTools() {
         let running = AgentSession.ToolCall(name: "Read", headline: "f.swift")
         let entries: [AgentSession.Entry] = [

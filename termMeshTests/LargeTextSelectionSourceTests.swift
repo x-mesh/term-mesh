@@ -99,21 +99,45 @@ final class LargeTextSelectionSourceTests: XCTestCase {
 
     /// The transcript's selection scope used to be one `.textSelection(.enabled)` a
     /// dozen lines below the container's frame, beyond what the window above sees.
-    /// Count the real call sites instead: the size-capped modifier and the short
-    /// verdict fields in the turn footer are the only ones allowed.
-    func testAgentTranscriptHasNoUncappedSelectionScope() throws {
+    /// Allowed call sites are named by where they live, not counted: inside
+    /// `TranscriptSelectable`, the one modifier that applies the byte cap and the
+    /// recent-row limit, and inside `TurnFooter`, whose verdict fields are a few
+    /// words. A direct call anywhere else bypasses both caps.
+    func testAgentTranscriptSelectionOnlyGoesThroughTheCappedModifier() throws {
         let source = try String(
             contentsOf: findProjectRoot().appendingPathComponent("Sources/Panels/AgentPanelView.swift"),
             encoding: .utf8
         )
-        let callSites = source.components(separatedBy: "\n").filter {
-            let line = $0.trimmingCharacters(in: .whitespaces)
-            return !line.hasPrefix("//") && line.contains(".textSelection(.enabled)")
+        let lines = source.components(separatedBy: "\n")
+
+        /// Line range of a top-level type: its declaration to the next line that is just `}`.
+        func range(ofType declaration: String) throws -> ClosedRange<Int> {
+            let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix(declaration) }, "\(declaration) is gone")
+            let end = try XCTUnwrap(lines[start...].firstIndex { $0 == "}" })
+            return start...end
+        }
+        let allowed = [
+            try range(ofType: "private struct TranscriptSelectable"),
+            try range(ofType: "private struct TurnFooter"),
+        ]
+
+        var offenders: [String] = []
+        for (index, raw) in lines.enumerated() {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.hasPrefix("//"), line.contains(".textSelection(.enabled)") else { continue }
+            if !allowed.contains(where: { $0.contains(index) }) {
+                offenders.append("AgentPanelView.swift:\(index + 1): \(line)")
+            }
         }
         XCTAssertEqual(
-            callSites.count, 2,
-            "AgentPanelView may enable selection only in TranscriptSelectable (size-capped) "
-                + "and the turn footer's verdict fields; got \(callSites)"
+            offenders, [],
+            "selection must go through transcriptSelectable (byte cap and recent-row limit)"
+        )
+
+        let guarded = lines[try range(ofType: "private struct TranscriptSelectable")]
+        XCTAssertTrue(
+            guarded.contains { $0.contains("TranscriptSelection.isSelectable(text, recentRow: recentRow)") },
+            "TranscriptSelectable must apply both the byte cap and the recent-row limit"
         )
     }
 
