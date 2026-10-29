@@ -6412,6 +6412,56 @@ final class WindowDragHandleHitTests: XCTestCase {
     }
 }
 
+final class TitlebarDoubleClickActionTests: XCTestCase {
+    func testResolvesSystemDoubleClickSetting() {
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: nil, miniaturizeOnDoubleClick: false), .zoom)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: nil, miniaturizeOnDoubleClick: true), .minimize)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "Maximize", miniaturizeOnDoubleClick: true), .zoom)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "Fill", miniaturizeOnDoubleClick: false), .zoom)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "Minimize", miniaturizeOnDoubleClick: false), .minimize)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "None", miniaturizeOnDoubleClick: true), .none)
+    }
+
+    private func mouseUp(clickCount: Int) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .leftMouseUp, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 0, clickCount: clickCount, pressure: 0
+        )!
+    }
+
+    func testSkipsActionWhenAppKitAlreadyChangedTheWindow() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: true
+        )
+        let snapshot = TitlebarDoubleClickSnapshot(window: window)
+        XCTAssertFalse(snapshot.appKitActed(on: window))
+
+        window.setFrame(NSRect(x: 0, y: 0, width: 800, height: 600), display: false)
+        XCTAssertTrue(snapshot.appKitActed(on: window))
+
+        var pending: TitlebarDoubleClickSnapshot? = snapshot
+        let frameBefore = window.frame
+        XCTAssertTrue(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 2), pending: &pending, window: window))
+        XCTAssertNil(pending)
+        XCTAssertEqual(window.frame, frameBefore, "AppKit already acted, so the window must not change again")
+    }
+
+    func testIgnoresMouseUpsThatAreNotTheSecondClickOfOwnDoubleClick() {
+        var pending: TitlebarDoubleClickSnapshot?
+        XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 2), pending: &pending, window: nil))
+
+        let snapshot = TitlebarDoubleClickSnapshot(frame: .zero, isMiniaturized: false)
+        pending = snapshot
+        XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 1), pending: &pending, window: nil))
+        XCTAssertNil(pending)
+
+        pending = snapshot
+        XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 3), pending: &pending, window: nil))
+        XCTAssertNil(pending)
+    }
+}
+
 @MainActor
 final class DraggableFolderHitTests: XCTestCase {
     func testFolderHitTestReturnsContainerWhenInsideBounds() {

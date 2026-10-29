@@ -3,8 +3,7 @@ import Bonsplit
 import SwiftUI
 
 /// Claims the sidebar title-bar area so the SwiftUI ScrollView underneath does not
-/// swallow its clicks. AppKit then zooms on a double-click there by itself; calling
-/// zoom(nil) as well ran a second zoom that undid the first.
+/// swallow its clicks. See `handleTitlebarDoubleClickMouseUp` for the double-click.
 struct DoubleClickZoomView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         DoubleClickZoomNSView()
@@ -13,8 +12,22 @@ struct DoubleClickZoomView: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     private final class DoubleClickZoomNSView: NSView {
+        private var pendingDoubleClick: TitlebarDoubleClickSnapshot?
+
         override var mouseDownCanMoveWindow: Bool { true }
         override func hitTest(_ point: NSPoint) -> NSView? { self }
+
+        override func mouseDown(with event: NSEvent) {
+            pendingDoubleClick = event.clickCount == 2 ? window.map(TitlebarDoubleClickSnapshot.init) : nil
+            super.mouseDown(with: event)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            if handleTitlebarDoubleClickMouseUp(event, pending: &pendingDoubleClick, window: window) {
+                return
+            }
+            super.mouseUp(with: event)
+        }
     }
 }
 
