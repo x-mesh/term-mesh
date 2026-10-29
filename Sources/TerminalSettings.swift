@@ -97,6 +97,7 @@ enum TerminalSettingsOverride {
     static let fileName = "terminal-settings.config"
 
     static let fontFamilyKey = "terminalFontFamily"
+    static let fallbackFontFamilyKey = "terminalFallbackFontFamily"
     static let fontSizeKey = "terminalFontSize"
     static let themeLightKey = "terminalThemeLight"
     static let themeDarkKey = "terminalThemeDark"
@@ -128,6 +129,7 @@ enum TerminalSettingsOverride {
     /// not produce a line" rule is directly testable.
     static func configLines(defaults: UserDefaults, mode: AppearanceMode) -> [String]? {
         let fontFamily = defaults.string(forKey: fontFamilyKey) ?? ""
+        let fallbackFontFamily = defaults.string(forKey: fallbackFontFamilyKey) ?? ""
         let fontSize = defaults.double(forKey: fontSizeKey)
         let themeLight = defaults.string(forKey: themeLightKey) ?? ""
         let themeDark = defaults.string(forKey: themeDarkKey) ?? ""
@@ -143,6 +145,11 @@ enum TerminalSettingsOverride {
             // font-family is a RepeatableString in ghostty — must clear first, then set
             lines.append("font-family = ")
             lines.append("font-family = \(fontFamily)")
+        }
+        if !fallbackFontFamily.isEmpty {
+            // Without a primary font there is nothing to clear: this line must append to the
+            // ghostty config's list rather than replace it.
+            lines.append("font-family = \(fallbackFontFamily)")
         }
         if fontSize > 0 {
             lines.append("font-size = \(Int(fontSize))")

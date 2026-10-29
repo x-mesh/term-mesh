@@ -205,4 +205,34 @@ final class TerminalOverrideIsolationTests: XCTestCase {
         XCTAssertTrue(lines.contains("font-size = 16"), "got \(lines)")
         XCTAssertTrue(lines.contains("scrollback-limit = 50000"), "got \(lines)")
     }
+
+    // MARK: - Fallback font ordering
+
+    func test_configLines_primaryFontOnlyClearsThenSets() throws {
+        defaults.set("Hack Nerd Font Mono", forKey: TerminalSettingsOverride.fontFamilyKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertEqual(fontFamilyLines(lines), ["font-family = ", "font-family = Hack Nerd Font Mono"])
+    }
+
+    func test_configLines_primaryThenFallbackAfterClear() throws {
+        defaults.set("Hack Nerd Font Mono", forKey: TerminalSettingsOverride.fontFamilyKey)
+        defaults.set("Apple SD Gothic Neo", forKey: TerminalSettingsOverride.fallbackFontFamilyKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertEqual(fontFamilyLines(lines), [
+            "font-family = ",
+            "font-family = Hack Nerd Font Mono",
+            "font-family = Apple SD Gothic Neo",
+        ])
+    }
+
+    /// No clear line: the fallback must append to the ghostty config's own primary font.
+    func test_configLines_fallbackOnlyDoesNotClear() throws {
+        defaults.set("Apple SD Gothic Neo", forKey: TerminalSettingsOverride.fallbackFontFamilyKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertEqual(fontFamilyLines(lines), ["font-family = Apple SD Gothic Neo"])
+    }
+
+    private func fontFamilyLines(_ lines: [String]) -> [String] {
+        lines.filter { $0.hasPrefix("font-family =") }
+    }
 }

@@ -330,6 +330,7 @@ enum TermMeshUserDefaultsObserver {
     static let appearanceModeKey = AppearanceSettings.appearanceModeKey
     static let terminalKeys = [
         TerminalSettingsOverride.fontFamilyKey,
+        TerminalSettingsOverride.fallbackFontFamilyKey,
         TerminalSettingsOverride.fontSizeKey,
         TerminalSettingsOverride.themeLightKey,
         TerminalSettingsOverride.themeDarkKey,

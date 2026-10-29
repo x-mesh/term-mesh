@@ -2151,6 +2151,26 @@
         }
       }
     },
+    "None": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "없음"
+          }
+        }
+      }
+    },
+    "Fallback Font (Korean)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "보조 글꼴(한글)"
+          }
+        }
+      }
+    },
     "Font Size": {
       "localizations": {
         "ko": {

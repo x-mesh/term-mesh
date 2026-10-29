@@ -196,6 +196,7 @@ struct SettingsView: View {
     @AppStorage(TermMeshDaemon.mobileAllowedLoginsKey) private var mobileAllowedLogins = ""
     @AppStorage(TermMeshDaemon.mobilePortKey) private var mobilePort = TermMeshDaemon.defaultMobilePort
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
+    @AppStorage(TerminalSettingsOverride.fallbackFontFamilyKey) private var terminalFallbackFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
     @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
@@ -973,6 +974,32 @@ struct SettingsView: View {
                 ) {
                     Picker("", selection: $terminalFontFamily) {
                         Text("Default (from config)").tag("")
+                        let fonts = MonospaceFontList.list()
+                        let monoCount = MonospaceFontList.monospaceFontCount
+                        if monoCount > 0 {
+                            Divider()
+                            ForEach(fonts.prefix(monoCount), id: \.self) { font in
+                                Text(font).tag(font)
+                            }
+                        }
+                        if fonts.count > monoCount {
+                            Divider()
+                            ForEach(fonts.suffix(from: monoCount), id: \.self) { font in
+                                Text(font).tag(font)
+                            }
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+            }
+
+            if settingsMatch("font", "fallback", "korean", "hangul", "terminal") {
+                SettingsCardDivider()
+
+                SettingsCardRow("Fallback Font (Korean)", controlWidth: pickerColumnWidth) {
+                    Picker("", selection: $terminalFallbackFontFamily) {
+                        Text("None").tag("")
                         let fonts = MonospaceFontList.list()
                         let monoCount = MonospaceFontList.monospaceFontCount
                         if monoCount > 0 {
@@ -3126,6 +3153,7 @@ struct SettingsView: View {
         languageMode = LanguageSettings.defaultMode.rawValue
         appearanceMode = AppearanceSettings.defaultMode.rawValue
         terminalFontFamily = ""
+        terminalFallbackFontFamily = ""
         terminalFontSize = 0
         terminalThemeLight = ""
         terminalThemeDark = ""
