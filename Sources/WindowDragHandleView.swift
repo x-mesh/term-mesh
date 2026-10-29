@@ -6,6 +6,86 @@ private func windowDragHandleFormatPoint(_ point: NSPoint) -> String {
     String(format: "(%.1f,%.1f)", point.x, point.y)
 }
 
+/// What a title-bar double-click does, as chosen in System Settings > Desktop & Dock.
+enum TitlebarDoubleClickAction: Equatable {
+    case zoom
+    case minimize
+    case none
+
+    static func resolve(actionOnDoubleClick: String?, miniaturizeOnDoubleClick: Bool) -> Self {
+        switch actionOnDoubleClick {
+        case "Minimize": return .minimize
+        case "None": return .none
+        // "Fill" has no public API; zoom is the closest window-sized action.
+        case .some: return .zoom
+        case nil: return miniaturizeOnDoubleClick ? .minimize : .zoom
+        }
+    }
+
+    static var current: Self {
+        let defaults = UserDefaults.standard
+        return resolve(
+            actionOnDoubleClick: defaults.string(forKey: "AppleActionOnDoubleClick"),
+            miniaturizeOnDoubleClick: defaults.bool(forKey: "AppleMiniaturizeOnDoubleClick")
+        )
+    }
+
+    func perform(on window: NSWindow) {
+        switch self {
+        case .zoom: window.zoom(nil)
+        case .minimize: window.miniaturize(nil)
+        case .none: break
+        }
+    }
+}
+
+/// The window state at the second click's mouse-down, to tell whether AppKit acted.
+struct TitlebarDoubleClickSnapshot: Equatable {
+    let frame: NSRect
+    let isMiniaturized: Bool
+
+    init(window: NSWindow) {
+        frame = window.frame
+        isMiniaturized = window.isMiniaturized
+    }
+
+    init(frame: NSRect, isMiniaturized: Bool) {
+        self.frame = frame
+        self.isMiniaturized = isMiniaturized
+    }
+
+    /// macOS 27.0 runs the title-bar double-click action from a title-frame gesture
+    /// recognizer inside `sendEvent`, before the second mouse-up reaches our view,
+    /// and the zoom has finished by then. macOS 27.2 does nothing and still delivers
+    /// that mouse-up. Both deliver it, so only a window change since the mouse-down
+    /// shows that AppKit already acted; acting again zoomed the window back.
+    func appKitActed(on window: NSWindow) -> Bool {
+        window.frame != frame || window.isMiniaturized != isMiniaturized
+    }
+}
+
+func handleTitlebarDoubleClickMouseUp(
+    _ event: NSEvent,
+    pending: inout TitlebarDoubleClickSnapshot?,
+    window: NSWindow?
+) -> Bool {
+    let snapshot = pending
+    pending = nil
+    guard let snapshot, event.clickCount == 2, let window else { return false }
+    if snapshot.appKitActed(on: window) {
+        #if DEBUG
+        dlog("titlebar.doubleClick action=appKit")
+        #endif
+        return true
+    }
+    let action = TitlebarDoubleClickAction.current
+    #if DEBUG
+    dlog("titlebar.doubleClick action=\(action)")
+    #endif
+    action.perform(on: window)
+    return true
+}
+
 private var windowDragSuppressionDepthKey: UInt8 = 0
 
 func beginWindowDragSuppression(window: NSWindow?) -> Int? {
@@ -216,9 +296,7 @@ struct WindowDragHandleView: NSViewRepresentable {
             )
             #endif
 
-            // AppKit zooms the window on a title-bar double-click by itself, even
-            // though this view takes the mouse-down. A zoom(nil) here ran a second
-            // zoom that undid the first, so the window grew and shrank back.
+            pendingDoubleClick = event.clickCount == 2 ? window.map(TitlebarDoubleClickSnapshot.init) : nil
             if event.clickCount >= 2 {
                 pendingDragEvent = nil
                 return
@@ -255,9 +333,13 @@ struct WindowDragHandleView: NSViewRepresentable {
 
         override func mouseUp(with event: NSEvent) {
             pendingDragEvent = nil
+            if handleTitlebarDoubleClickMouseUp(event, pending: &pendingDoubleClick, window: window) {
+                return
+            }
             super.mouseUp(with: event)
         }
 
         private var pendingDragEvent: NSEvent?
+        private var pendingDoubleClick: TitlebarDoubleClickSnapshot?
     }
 }
