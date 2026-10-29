@@ -21,6 +21,10 @@ final class RenderTokenProbeTests: XCTestCase {
                 .rawValue,
             "backend_failed"
         )
+        XCTAssertEqual(
+            RenderTokenProbeOutcome.from(failureStatusRawValue: 99).rawValue,
+            "unknown"
+        )
     }
 
     func testRejectProducesRejectedOutcome() {
@@ -41,6 +45,25 @@ final class RenderTokenProbeTests: XCTestCase {
 
         XCTAssertNil(probe.begin())
         probe.reject(token: token)
+    }
+
+    func testLateCallbackDoesNotCompleteNextToken() {
+        let probe = RenderTokenProbe()
+        let firstToken = try! XCTUnwrap(probe.begin())
+
+        XCTAssertEqual(probe.wait(token: firstToken, timeout: 0).outcome, .timeout)
+        let secondToken = try! XCTUnwrap(probe.begin())
+
+        DispatchQueue.global().async {
+            probe.present(token: firstToken)
+            probe.present(token: secondToken)
+        }
+
+        let result = probe.wait(token: secondToken, timeout: 1)
+        XCTAssertEqual(result.token, secondToken)
+        XCTAssertEqual(result.outcome, .presented)
+        XCTAssertFalse(result.callbackOnMain ?? true)
+        XCTAssertEqual(result.callbackStatus, 0)
     }
 }
 #endif

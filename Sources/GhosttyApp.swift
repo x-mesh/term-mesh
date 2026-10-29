@@ -179,6 +179,7 @@ enum RenderTokenProbeOutcome: String {
     case presented
     case discarded
     case backendFailed = "backend_failed"
+    case unknown
     case rejected
     case timeout
 
@@ -189,7 +190,7 @@ enum RenderTokenProbeOutcome: String {
         case Int(GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED.rawValue):
             return .backendFailed
         default:
-            return .backendFailed
+            return .unknown
         }
     }
 }
