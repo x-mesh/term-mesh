@@ -154,6 +154,9 @@ final class GhosttySurfaceCallbackContext {
     weak var terminalSurface: TerminalSurface?
     let surfaceId: UUID
     let cachedTabId: UUID?
+    #if DEBUG
+    let renderTokenProbe = RenderTokenProbe()
+    #endif
 
     init(surfaceView: GhosttyNSView, terminalSurface: TerminalSurface) {
         self.surfaceView = surfaceView
@@ -170,6 +173,131 @@ final class GhosttySurfaceCallbackContext {
         terminalSurface?.surface ?? surfaceView?.terminalSurface?.surface
     }
 }
+
+#if DEBUG
+enum RenderTokenProbeOutcome: String {
+    case presented
+    case discarded
+    case backendFailed = "backend_failed"
+    case rejected
+    case timeout
+}
+
+struct RenderTokenProbeResult {
+    let token: UInt64
+    let outcome: RenderTokenProbeOutcome
+    let latencyMilliseconds: Double
+    let callbackOnMain: Bool?
+    let callbackStatus: Int?
+}
+
+final class RenderTokenProbe {
+    private struct Pending {
+        let token: UInt64
+        let startedAt: UInt64
+    }
+
+    private let condition = NSCondition()
+    private var nextToken: UInt64 = 0
+    private var pending: Pending?
+    private var completed: RenderTokenProbeResult?
+
+    func begin() -> UInt64? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard pending == nil else { return nil }
+
+        nextToken &+= 1
+        if nextToken == 0 { nextToken = 1 }
+        pending = Pending(token: nextToken, startedAt: DispatchTime.now().uptimeNanoseconds)
+        completed = nil
+        return nextToken
+    }
+
+    func reject(token: UInt64) {
+        complete(
+            token: token,
+            outcome: .rejected,
+            callbackOnMain: nil,
+            callbackStatus: nil
+        )
+    }
+
+    func present(token: UInt64) {
+        complete(
+            token: token,
+            outcome: .presented,
+            callbackOnMain: Thread.isMainThread,
+            callbackStatus: 0
+        )
+    }
+
+    func fail(token: UInt64, status: ghostty_render_presentation_status_e) {
+        let outcome: RenderTokenProbeOutcome
+        switch status {
+        case GHOSTTY_RENDER_PRESENTATION_DISCARDED:
+            outcome = .discarded
+        case GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED:
+            outcome = .backendFailed
+        default:
+            outcome = .backendFailed
+        }
+        complete(
+            token: token,
+            outcome: outcome,
+            callbackOnMain: Thread.isMainThread,
+            callbackStatus: Int(status.rawValue)
+        )
+    }
+
+    func wait(token: UInt64, timeout: TimeInterval) -> RenderTokenProbeResult {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while completed?.token != token && pending?.token == token {
+            if !condition.wait(until: deadline) { break }
+        }
+        if let completed, completed.token == token { return completed }
+
+        let startedAt = pending?.token == token ? pending?.startedAt : nil
+        if pending?.token == token { pending = nil }
+        let now = DispatchTime.now().uptimeNanoseconds
+        return RenderTokenProbeResult(
+            token: token,
+            outcome: .timeout,
+            latencyMilliseconds: Self.milliseconds(from: startedAt, to: now),
+            callbackOnMain: nil,
+            callbackStatus: nil
+        )
+    }
+
+    private func complete(
+        token: UInt64,
+        outcome: RenderTokenProbeOutcome,
+        callbackOnMain: Bool?,
+        callbackStatus: Int?
+    ) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard let pending, pending.token == token else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        self.pending = nil
+        completed = RenderTokenProbeResult(
+            token: token,
+            outcome: outcome,
+            latencyMilliseconds: Self.milliseconds(from: pending.startedAt, to: now),
+            callbackOnMain: callbackOnMain,
+            callbackStatus: callbackStatus
+        )
+        condition.broadcast()
+    }
+
+    private static func milliseconds(from startedAt: UInt64?, to now: UInt64) -> Double {
+        guard let startedAt else { return 0 }
+        return Double(now &- startedAt) / 1_000_000
+    }
+}
+#endif
 
 // Minimal Ghostty wrapper for terminal rendering
 // This uses libghostty (GhosttyKit.xcframework) for actual terminal emulation

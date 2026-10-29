@@ -10,6 +10,33 @@ import Bonsplit
 import IOSurface
 import os
 
+#if DEBUG
+private func ghosttyRenderTokenPresented(
+    _ userdata: UnsafeMutableRawPointer?,
+    _ token: UInt64
+) {
+    guard let userdata else { return }
+    Unmanaged<GhosttySurfaceCallbackContext>
+        .fromOpaque(userdata)
+        .takeUnretainedValue()
+        .renderTokenProbe
+        .present(token: token)
+}
+
+private func ghosttyRenderTokenFailed(
+    _ userdata: UnsafeMutableRawPointer?,
+    _ token: UInt64,
+    _ status: ghostty_render_presentation_status_e
+) {
+    guard let userdata else { return }
+    Unmanaged<GhosttySurfaceCallbackContext>
+        .fromOpaque(userdata)
+        .takeUnretainedValue()
+        .renderTokenProbe
+        .fail(token: token, status: status)
+}
+#endif
+
 enum TerminalAutoBlankRecoveryDecision: Equatable {
     case healthy
     case confirm
@@ -1060,6 +1087,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return
         }
         guard let createdSurface = surface else { return }
+        #if DEBUG
+        let callbackUserdata = callbackContext.toOpaque()
+        if !ghostty_surface_set_render_presented_callback(
+            createdSurface,
+            ghosttyRenderTokenPresented,
+            callbackUserdata
+        ) || !ghostty_surface_set_render_failed_callback(
+            createdSurface,
+            ghosttyRenderTokenFailed,
+            callbackUserdata
+        ) {
+            Logger.ui.error("Failed to install render-token callbacks")
+        }
+        #endif
         // A newly-created Ghostty surface always starts with a realized renderer. If the
         // owning workspace was hidden while creation/retry completed, apply that state now;
         // the visibility setter will arrange the delayed GPU release without extending it
@@ -1676,6 +1717,22 @@ final class TerminalSurface: Identifiable, ObservableObject {
         backgroundSurfaceStartQueued = false
         releaseGhosttySurfaceAsync(reason: "panelClose")
     }
+
+    #if DEBUG
+    @MainActor
+    func requestRenderTokenProbe() -> (probe: RenderTokenProbe, token: UInt64, accepted: Bool)? {
+        guard let surface,
+              let callbackContext = surfaceCallbackContext?.takeUnretainedValue(),
+              let token = callbackContext.renderTokenProbe.begin() else {
+            return nil
+        }
+        let accepted = ghostty_surface_request_render_with_token(surface, token)
+        if !accepted {
+            callbackContext.renderTokenProbe.reject(token: token)
+        }
+        return (callbackContext.renderTokenProbe, token, accepted)
+    }
+    #endif
 
     // MARK: - Surface read lease API (Phase 1 infrastructure)
 
