@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import Foundation
 
 // MARK: - Override File Location
@@ -146,9 +147,9 @@ enum TerminalSettingsOverride {
             lines.append("font-family = ")
             lines.append("font-family = \(fontFamily)")
         }
-        if !fallbackFontFamily.isEmpty {
-            // Without a primary font there is nothing to clear: this line must append to the
-            // ghostty config's list rather than replace it.
+        // Without a primary font the first font-family entry would become ghostty's primary, so a
+        // lone fallback (e.g. a Hangul font) would draw Latin text too. The saved value is kept.
+        if !fontFamily.isEmpty, !fallbackFontFamily.isEmpty {
             lines.append("font-family = \(fallbackFontFamily)")
         }
         if fontSize > 0 {
@@ -443,5 +444,81 @@ enum MonospaceFontList {
             }
         }
         return false
+    }
+}
+
+// MARK: - Fallback Font Language Sections
+
+/// Groups fonts for the fallback-font picker by the user's preferred languages.
+/// Support is decided by probing real glyphs: `CTFontCopySupportedLanguages` reports
+/// declared languages and is unreliable for CJK faces, while a sample-character
+/// glyph lookup answers "can this font draw it" directly.
+enum FallbackFontLanguages {
+    /// Representative characters per language; a font supports a language only if it has all of them.
+    static let sampleText: [String: String] = [
+        "ko": "한글",
+        "ja": "あア",
+        "zh-Hans": "简体",
+        "zh-Hant": "繁體",
+    ]
+
+    /// Filled once per launch by the settings view; main thread only.
+    @MainActor static var cachedSupport: [String: Set<String>]?
+
+    /// Ordered, de-duplicated language ids for `Locale.preferredLanguages`. English and
+    /// languages without a sample are dropped; Chinese maps to its script.
+    static func languageIDs(preferredLanguages: [String]) -> [String] {
+        var ids: [String] = []
+        for tag in preferredLanguages {
+            let parts = tag.split(separator: "-").map(String.init)
+            guard let base = parts.first?.lowercased() else { continue }
+            var id = base
+            if base == "zh" {
+                let hant = parts.contains("Hant") || parts.contains(where: { ["TW", "HK", "MO"].contains($0) })
+                id = hant ? "zh-Hant" : "zh-Hans"
+            }
+            if sampleText[id] != nil, !ids.contains(id) { ids.append(id) }
+        }
+        return ids
+    }
+
+    /// Splits `fonts` into those supporting any of `languages` and the rest; both keep input order.
+    static func partition(
+        fonts: [String], supportedLanguages: [String: Set<String>], languages: [String]
+    ) -> (preferred: [String], rest: [String]) {
+        guard !languages.isEmpty else { return ([], fonts) }
+        let wanted = Set(languages)
+        var preferred: [String] = []
+        var rest: [String] = []
+        for font in fonts {
+            if let supported = supportedLanguages[font], !supported.isDisjoint(with: wanted) {
+                preferred.append(font)
+            } else {
+                rest.append(font)
+            }
+        }
+        return (preferred, rest)
+    }
+
+    /// Which of `languages` each family can draw. CoreText only, so it is safe off the main thread.
+    static func supportedLanguages(families: [String], languages: [String]) -> [String: Set<String>] {
+        var result: [String: Set<String>] = [:]
+        for family in families {
+            let descriptor = CTFontDescriptorCreateWithAttributes(
+                [kCTFontFamilyNameAttribute: family] as CFDictionary
+            )
+            let font = CTFontCreateWithFontDescriptor(descriptor, 12, nil)
+            var supported: Set<String> = []
+            for language in languages {
+                guard let sample = sampleText[language] else { continue }
+                let units = Array(sample.utf16)
+                var glyphs = [CGGlyph](repeating: 0, count: units.count)
+                if CTFontGetGlyphsForCharacters(font, units, &glyphs, units.count) {
+                    supported.insert(language)
+                }
+            }
+            if !supported.isEmpty { result[family] = supported }
+        }
+        return result
     }
 }

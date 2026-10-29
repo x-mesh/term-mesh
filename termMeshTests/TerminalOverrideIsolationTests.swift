@@ -225,11 +225,46 @@ final class TerminalOverrideIsolationTests: XCTestCase {
         ])
     }
 
-    /// No clear line: the fallback must append to the ghostty config's own primary font.
-    func test_configLines_fallbackOnlyDoesNotClear() throws {
+    /// A lone fallback would become ghostty's primary font and draw Latin text; the saved value stays in defaults.
+    func test_configLines_fallbackWithoutPrimaryWritesNoFontLine() throws {
         defaults.set("Apple SD Gothic Neo", forKey: TerminalSettingsOverride.fallbackFontFamilyKey)
+        defaults.set(16.0, forKey: TerminalSettingsOverride.fontSizeKey)
         let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
-        XCTAssertEqual(fontFamilyLines(lines), ["font-family = Apple SD Gothic Neo"])
+        XCTAssertEqual(fontFamilyLines(lines), [])
+        XCTAssertEqual(defaults.string(forKey: TerminalSettingsOverride.fallbackFontFamilyKey), "Apple SD Gothic Neo")
+    }
+
+    // MARK: - Fallback font language sections
+
+    func test_languageIDs_dropsEnglishAndMapsChinese() {
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["en-US", "ko-KR", "ja-JP"]), ["ko", "ja"])
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["zh-Hans-CN", "zh-TW", "zh-HK"]), ["zh-Hans", "zh-Hant"])
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["en-US", "en-GB"]), [])
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["ko-KR", "ko"]), ["ko"])
+    }
+
+    func test_partition_movesSupportingFontsFirstKeepingOrder() {
+        let support: [String: Set<String>] = [
+            "Apple SD Gothic Neo": ["ko"], "Hiragino Sans": ["ja"], "Noto Sans CJK": ["ko", "ja"],
+        ]
+        let fonts = ["Arial", "Apple SD Gothic Neo", "Hiragino Sans", "Noto Sans CJK"]
+        let split = FallbackFontLanguages.partition(fonts: fonts, supportedLanguages: support, languages: ["ko"])
+        XCTAssertEqual(split.preferred, ["Apple SD Gothic Neo", "Noto Sans CJK"])
+        XCTAssertEqual(split.rest, ["Arial", "Hiragino Sans"])
+    }
+
+    func test_partition_noLanguagesLeavesEverythingInRest() {
+        let split = FallbackFontLanguages.partition(fonts: ["A", "B"], supportedLanguages: ["A": ["ko"]], languages: [])
+        XCTAssertEqual(split.preferred, [])
+        XCTAssertEqual(split.rest, ["A", "B"])
+    }
+
+    func test_supportedLanguages_probesRealGlyphs() {
+        let support = FallbackFontLanguages.supportedLanguages(
+            families: ["Apple SD Gothic Neo", "Menlo"], languages: ["ko"]
+        )
+        XCTAssertEqual(support["Apple SD Gothic Neo"], ["ko"])
+        XCTAssertNil(support["Menlo"])
     }
 
     private func fontFamilyLines(_ lines: [String]) -> [String] {

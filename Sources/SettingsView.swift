@@ -197,6 +197,7 @@ struct SettingsView: View {
     @AppStorage(TermMeshDaemon.mobilePortKey) private var mobilePort = TermMeshDaemon.defaultMobilePort
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fallbackFontFamilyKey) private var terminalFallbackFontFamily = ""
+    @State private var fallbackFontSupport: [String: Set<String>]?
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
     @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
@@ -994,29 +995,50 @@ struct SettingsView: View {
                 }
             }
 
-            if settingsMatch("font", "fallback", "korean", "hangul", "terminal") {
+            if settingsMatch("font", "fallback", "korean", "japanese", "chinese", "cjk", "hangul", "terminal") {
                 SettingsCardDivider()
 
-                SettingsCardRow("Fallback Font (Korean)", controlWidth: pickerColumnWidth) {
+                SettingsCardRow(
+                    "Fallback Font",
+                    subtitle: terminalFontFamily.isEmpty
+                        ? "Select a primary font first"
+                        : "Draws characters the primary font lacks (Korean, Japanese, Chinese, etc.)",
+                    controlWidth: pickerColumnWidth
+                ) {
                     Picker("", selection: $terminalFallbackFontFamily) {
                         Text("None").tag("")
                         let fonts = MonospaceFontList.list()
                         let monoCount = MonospaceFontList.monospaceFontCount
-                        if monoCount > 0 {
+                        let sections = fallbackFontSections(
+                            mono: Array(fonts.prefix(monoCount)),
+                            other: Array(fonts.suffix(from: monoCount))
+                        )
+                        if !terminalFallbackFontFamily.isEmpty, !fonts.contains(terminalFallbackFontFamily) {
+                            Text(terminalFallbackFontFamily).tag(terminalFallbackFontFamily)
+                        }
+                        if !sections.preferred.isEmpty {
                             Divider()
-                            ForEach(fonts.prefix(monoCount), id: \.self) { font in
+                            ForEach(sections.preferred, id: \.self) { font in
                                 Text(font).tag(font)
                             }
                         }
-                        if fonts.count > monoCount {
+                        if !sections.mono.isEmpty {
                             Divider()
-                            ForEach(fonts.suffix(from: monoCount), id: \.self) { font in
+                            ForEach(sections.mono, id: \.self) { font in
+                                Text(font).tag(font)
+                            }
+                        }
+                        if !sections.other.isEmpty {
+                            Divider()
+                            ForEach(sections.other, id: \.self) { font in
                                 Text(font).tag(font)
                             }
                         }
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
+                    .disabled(terminalFontFamily.isEmpty)
+                    .task { await loadFallbackFontSupport() }
                 }
             }
 
@@ -3147,6 +3169,33 @@ struct SettingsView: View {
         let text = DiagnosticsReport.build(daemonStatus: daemonStatusInfo)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// Fonts supporting the user's non-English languages go first. Support is probed once off
+    /// the main thread; until it lands the picker shows the plain mono/other sections.
+    private func fallbackFontSections(
+        mono: [String], other: [String]
+    ) -> (preferred: [String], mono: [String], other: [String]) {
+        let languages = FallbackFontLanguages.languageIDs(preferredLanguages: Locale.preferredLanguages)
+        guard let support = fallbackFontSupport, !languages.isEmpty else { return ([], mono, other) }
+        let monoSplit = FallbackFontLanguages.partition(fonts: mono, supportedLanguages: support, languages: languages)
+        let otherSplit = FallbackFontLanguages.partition(fonts: other, supportedLanguages: support, languages: languages)
+        return (monoSplit.preferred + otherSplit.preferred, monoSplit.rest, otherSplit.rest)
+    }
+
+    private func loadFallbackFontSupport() async {
+        if let cached = FallbackFontLanguages.cachedSupport {
+            fallbackFontSupport = cached
+            return
+        }
+        let languages = FallbackFontLanguages.languageIDs(preferredLanguages: Locale.preferredLanguages)
+        guard !languages.isEmpty else { return }
+        let families = MonospaceFontList.list()
+        let support = await Task.detached(priority: .userInitiated) {
+            FallbackFontLanguages.supportedLanguages(families: families, languages: languages)
+        }.value
+        FallbackFontLanguages.cachedSupport = support
+        fallbackFontSupport = support
     }
 
     private func resetAllSettings() {
