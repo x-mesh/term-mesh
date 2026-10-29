@@ -205,4 +205,90 @@ final class TerminalOverrideIsolationTests: XCTestCase {
         XCTAssertTrue(lines.contains("font-size = 16"), "got \(lines)")
         XCTAssertTrue(lines.contains("scrollback-limit = 50000"), "got \(lines)")
     }
+
+    // MARK: - Fallback font ordering
+
+    func test_configLines_primaryFontOnlyClearsThenSets() throws {
+        defaults.set("Hack Nerd Font Mono", forKey: TerminalSettingsOverride.fontFamilyKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertEqual(fontFamilyLines(lines), ["font-family = ", "font-family = Hack Nerd Font Mono"])
+    }
+
+    func test_configLines_primaryThenFallbackAfterClear() throws {
+        defaults.set("Hack Nerd Font Mono", forKey: TerminalSettingsOverride.fontFamilyKey)
+        defaults.set("Apple SD Gothic Neo", forKey: TerminalSettingsOverride.fallbackFontFamilyKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertEqual(fontFamilyLines(lines), [
+            "font-family = ",
+            "font-family = Hack Nerd Font Mono",
+            "font-family = Apple SD Gothic Neo",
+        ])
+    }
+
+    /// A lone fallback would become ghostty's primary font and draw Latin text; the saved value stays in defaults.
+    func test_configLines_fallbackWithoutPrimaryWritesNoFontLine() throws {
+        defaults.set("Apple SD Gothic Neo", forKey: TerminalSettingsOverride.fallbackFontFamilyKey)
+        defaults.set(16.0, forKey: TerminalSettingsOverride.fontSizeKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertEqual(fontFamilyLines(lines), [])
+        XCTAssertEqual(defaults.string(forKey: TerminalSettingsOverride.fallbackFontFamilyKey), "Apple SD Gothic Neo")
+    }
+
+    // MARK: - Fallback font language sections
+
+    func test_languageIDs_dropsEnglishAndMapsChinese() {
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["en-US", "ko-KR", "ja-JP"]), ["ko", "ja"])
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["zh-Hans-CN", "zh-TW", "zh-HK"]), ["zh-Hans", "zh-Hant"])
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["en-US", "en-GB"]), [])
+        XCTAssertEqual(FallbackFontLanguages.languageIDs(preferredLanguages: ["ko-KR", "ko"]), ["ko"])
+    }
+
+    func test_partition_movesSupportingFontsFirstKeepingOrder() {
+        let support: [String: Set<String>] = [
+            "Apple SD Gothic Neo": ["ko"], "Hiragino Sans": ["ja"], "Noto Sans CJK": ["ko", "ja"],
+        ]
+        let fonts = ["Arial", "Apple SD Gothic Neo", "Hiragino Sans", "Noto Sans CJK"]
+        let split = FallbackFontLanguages.partition(fonts: fonts, supportedLanguages: support, languages: ["ko"])
+        XCTAssertEqual(split.preferred, ["Apple SD Gothic Neo", "Noto Sans CJK"])
+        XCTAssertEqual(split.rest, ["Arial", "Hiragino Sans"])
+    }
+
+    func test_partition_noLanguagesLeavesEverythingInRest() {
+        let split = FallbackFontLanguages.partition(fonts: ["A", "B"], supportedLanguages: ["A": ["ko"]], languages: [])
+        XCTAssertEqual(split.preferred, [])
+        XCTAssertEqual(split.rest, ["A", "B"])
+    }
+
+    func test_supportedLanguages_probesRealGlyphs() {
+        let support = FallbackFontLanguages.supportedLanguages(
+            families: ["Apple SD Gothic Neo", "Menlo"], languages: ["ko"]
+        )
+        XCTAssertEqual(support["Apple SD Gothic Neo"], ["ko"])
+        XCTAssertNil(support["Menlo"])
+    }
+
+    private func fontFamilyLines(_ lines: [String]) -> [String] {
+        lines.filter { $0.hasPrefix("font-family =") }
+    }
+
+    // MARK: - surface.font_resolve input validation
+
+    func test_fontResolveInputError_textByteBounds() {
+        let check = { (text: String) in
+            TerminalController.fontResolveInputError(byteCount: text.utf8.count, width: 2)
+        }
+        XCTAssertNotNil(check(""))
+        XCTAssertNil(check("한"))
+        let atLimit = String(repeating: "한", count: 42) + "ab"
+        XCTAssertEqual(atLimit.utf8.count, 128)
+        XCTAssertNil(check(atLimit))
+        XCTAssertEqual(check(atLimit + "c"), "text must be 1...128 UTF-8 bytes")
+    }
+
+    func test_fontResolveInputError_widthBounds() {
+        XCTAssertNotNil(TerminalController.fontResolveInputError(byteCount: 3, width: 0))
+        XCTAssertNil(TerminalController.fontResolveInputError(byteCount: 3, width: 1))
+        XCTAssertNil(TerminalController.fontResolveInputError(byteCount: 3, width: 2))
+        XCTAssertNotNil(TerminalController.fontResolveInputError(byteCount: 3, width: 3))
+    }
 }

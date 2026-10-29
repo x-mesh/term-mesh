@@ -1114,6 +1114,85 @@ extension TerminalController {
         return result
     }
 
+    /// Ghostty answers an empty string for a cluster outside 1...128 bytes
+    /// (`ghostty/src/apprt/embedded.zig`), which would surface as `internal_error`
+    /// after a main-queue hop; reject it here instead.
+    nonisolated static let fontResolveMaxTextBytes = 128
+
+    nonisolated static func fontResolveInputError(byteCount: Int, width: Int) -> String? {
+        guard (1...fontResolveMaxTextBytes).contains(byteCount) else {
+            return "text must be 1...\(fontResolveMaxTextBytes) UTF-8 bytes"
+        }
+        guard (1...2).contains(width) else { return "width must be 1 or 2" }
+        return nil
+    }
+
+    /// `surface.font_resolve`: which face Ghostty picks for `text` on this
+    /// surface (`ghostty_surface_font_resolve_json`): PostScript name, family and
+    /// source (`primary`, `discovered`, `codepoint-map`, ...). Read-only; it
+    /// never changes focus.
+    func v2SurfaceFontResolve(params: [String: Any]) -> V2CallResult {
+        guard let text = params["text"] as? String else {
+            return .err(code: "invalid_params", message: "text is required", data: nil)
+        }
+        let width = v2Int(params, "width") ?? 2
+        let textByteCount = text.utf8.count
+        if let message = Self.fontResolveInputError(byteCount: textByteCount, width: width) {
+            return .err(code: "invalid_params", message: message, data: nil)
+        }
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        let bold = v2Bool(params, "bold") ?? false
+        let italic = v2Bool(params, "italic") ?? false
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to resolve font", data: nil)
+        // Main: the ghostty_surface_t is only guaranteed alive while the panel is, and panels are owned by the main actor.
+        let completed = v2MainExec {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            guard let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId else {
+                result = .err(code: "not_found", message: "No focused surface", data: nil)
+                return
+            }
+            guard let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "invalid_params", message: "Surface is not a terminal", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+            guard let surface = terminalPanel.surface.surface else {
+                result = self.v2TerminalSurfaceUnavailable(terminalPanel: terminalPanel, surfaceId: surfaceId)
+                return
+            }
+            let exported: ghostty_string_s = text.withCString { cstr in
+                ghostty_surface_font_resolve_json(
+                    surface, cstr, UInt(textByteCount), bold, italic, UInt8(width)
+                )
+            }
+            defer { ghostty_string_free(exported) }
+            guard let ptr = exported.ptr, exported.len > 0 else {
+                result = .err(code: "internal_error", message: "Font resolve returned nothing", data: nil)
+                return
+            }
+            let raw = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
+            let data = Data(buffer: UnsafeBufferPointer(start: raw, count: Int(exported.len)))
+            guard let resolved = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                result = .err(code: "internal_error", message: "Font resolve is not a JSON object", data: nil)
+                return
+            }
+            result = .ok([
+                "resolved": resolved,
+                "surface_id": surfaceId.uuidString,
+                "workspace_id": ws.id.uuidString
+            ])
+        }
+        if !completed {
+            return .err(code: "timeout", message: "Main thread busy (IME or modal UI active)", data: nil)
+        }
+        return result
+    }
+
     /// Nil here is a normal lifecycle state: SwiftUI may have created a panel
     /// model before Ghostty mounts it, and a remote pane may still be waiting
     /// for its relay helper. Callers can retry; reporting `internal_error` made
