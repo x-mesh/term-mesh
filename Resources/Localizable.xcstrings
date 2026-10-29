@@ -271,6 +271,16 @@
         }
       }
     },
+    "Agent error": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "에이전트 오류"
+          }
+        }
+      }
+    },
     "Agent Models": {
       "localizations": {
         "ko": {
@@ -1281,6 +1291,16 @@
         }
       }
     },
+    "Idle": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대기 중"
+          }
+        }
+      }
+    },
     "Leader Overlap is turned off": {
       "localizations": {
         "ko": {
@@ -2267,6 +2287,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "원격 세션이 연결돼 있어도 이 Mac은 평소대로 잠들며, 잠들 때마다 연결이 끊깁니다."
+          }
+        }
+      }
+    },
+    "Waiting for an answer": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "답변 대기"
+          }
+        }
+      }
+    },
+    "Waiting for input": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "입력 대기"
+          }
+        }
+      }
+    },
+    "Waiting for permission": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "권한 승인 대기"
+          }
+        }
+      }
+    },
+    "Waiting for sign-in": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "로그인 대기"
           }
         }
       }
@@ -5362,6 +5422,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "워크트리를 만들 폴더"
+          }
+        }
+      }
+    },
+    "Working": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업 중"
           }
         }
       }
