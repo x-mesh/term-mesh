@@ -13,6 +13,19 @@ enum ReviewBoardSettings {
         isEnabled()
     }
 
+    /// Until the user opens it, the board stays out of the way.
+    static let defaultClosed = true
+
+    /// The last open/closed choice, so a window starts the way the user left it.
+    static func isClosed(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: isClosedKey) != nil else { return defaultClosed }
+        return defaults.bool(forKey: isClosedKey)
+    }
+
+    static func setClosed(_ closed: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(closed, forKey: isClosedKey)
+    }
+
     static func isVisible(enabled: Bool, isClosed: Bool) -> Bool {
         enabled && !isClosed
     }

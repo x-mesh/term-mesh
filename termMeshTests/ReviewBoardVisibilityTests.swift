@@ -40,6 +40,34 @@ final class ReviewBoardVisibilityTests: XCTestCase {
         XCTAssertTrue(ReviewBoardSettings.isVisible, "closing must not be a one-way door")
     }
 
+    private func isolatedDefaults() -> UserDefaults {
+        let suite = "term-mesh.tests.reviewboard.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return defaults
+    }
+
+    func testBoardStartsClosedUntilTheUserOpensIt() {
+        XCTAssertTrue(ReviewBoardSettings.defaultClosed)
+        XCTAssertTrue(ReviewBoardSettings.isClosed(defaults: isolatedDefaults()))
+    }
+
+    func testTheLastOpenOrClosedChoiceIsRestored() {
+        let defaults = isolatedDefaults()
+
+        ReviewBoardSettings.setClosed(false, defaults: defaults)
+        XCTAssertFalse(ReviewBoardSettings.isClosed(defaults: defaults), "an explicit open survives a relaunch")
+
+        ReviewBoardSettings.setClosed(true, defaults: defaults)
+        XCTAssertTrue(ReviewBoardSettings.isClosed(defaults: defaults))
+    }
+
+    func testRestoringTheClosedChoiceLeavesTheFeatureGateAlone() {
+        let defaults = isolatedDefaults()
+        ReviewBoardSettings.setClosed(true, defaults: defaults)
+        XCTAssertTrue(ReviewBoardSettings.isEnabled(defaults: defaults), "reviewBoard.enabled keeps its meaning")
+    }
+
     func testToggleAlternates() {
         ReviewBoardSettings.setVisible(false)
         ReviewBoardSettings.toggleVisible()
