@@ -827,6 +827,16 @@ extension TerminalController {
         ])
     }
 
+    /// Off-main: returns the census the 2 s sampler last stored, so it also answers
+    /// while the main thread is stuck in the layout pass the census describes.
+    func v2DebugLayoutCensus() -> V2CallResult {
+        let census = LayoutHangDiagnostics.latestCensusSnapshot()
+        guard !census.isEmpty else {
+            return .err(code: "unavailable", message: "No census sampled yet", data: nil)
+        }
+        return .ok(["census": census])
+    }
+
     func v2DebugLayout() -> V2CallResult {
         let resp = layoutDebug()
         guard resp.hasPrefix("OK ") else {
