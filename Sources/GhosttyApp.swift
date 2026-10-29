@@ -181,6 +181,17 @@ enum RenderTokenProbeOutcome: String {
     case backendFailed = "backend_failed"
     case rejected
     case timeout
+
+    static func from(failureStatusRawValue status: Int) -> RenderTokenProbeOutcome {
+        switch status {
+        case Int(GHOSTTY_RENDER_PRESENTATION_DISCARDED.rawValue):
+            return .discarded
+        case Int(GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED.rawValue):
+            return .backendFailed
+        default:
+            return .backendFailed
+        }
+    }
 }
 
 struct RenderTokenProbeResult {
@@ -233,18 +244,9 @@ final class RenderTokenProbe {
     }
 
     func fail(token: UInt64, status: ghostty_render_presentation_status_e) {
-        let outcome: RenderTokenProbeOutcome
-        switch status {
-        case GHOSTTY_RENDER_PRESENTATION_DISCARDED:
-            outcome = .discarded
-        case GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED:
-            outcome = .backendFailed
-        default:
-            outcome = .backendFailed
-        }
         complete(
             token: token,
-            outcome: outcome,
+            outcome: .from(failureStatusRawValue: Int(status.rawValue)),
             callbackOnMain: Thread.isMainThread,
             callbackStatus: Int(status.rawValue)
         )
