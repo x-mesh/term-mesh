@@ -1267,6 +1267,9 @@ class GhosttyApp {
             if action.tag == GHOSTTY_ACTION_DESKTOP_NOTIFICATION {
                 dlog("notify.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
             }
+            if action.tag == GHOSTTY_ACTION_PROGRAM_STATUS {
+                dlog("program_status.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
+            }
             #endif
             return false
         }
@@ -1485,6 +1488,51 @@ class GhosttyApp {
                     subtitle: "",
                     body: body
                 )
+            }
+            return true
+        case GHOSTTY_ACTION_PROGRAM_STATUS:
+            // The strings are borrowed for this callback only; only `app` is
+            // copied. `msg` and `title` carry command text and are not kept.
+            let status = action.action.program_status
+            let event: ProgramStatusReducer.Event =
+                status.event == GHOSTTY_PROGRAM_STATUS_EVENT_PROMPT_START ? .promptStart : .report
+            let rawState: ProgramStatusReducer.RawState
+            switch status.state {
+            case GHOSTTY_PROGRAM_STATUS_WORKING: rawState = .working
+            case GHOSTTY_PROGRAM_STATUS_DONE: rawState = .done
+            case GHOSTTY_PROGRAM_STATUS_BLOCKED: rawState = .blocked
+            case GHOSTTY_PROGRAM_STATUS_ERROR: rawState = .error
+            case GHOSTTY_PROGRAM_STATUS_CLEAR: rawState = .clear
+            default: rawState = .idle
+            }
+            let kind: ProgramStatusKind?
+            switch status.kind {
+            case GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION: kind = .permission
+            case GHOSTTY_PROGRAM_STATUS_KIND_QUESTION: kind = .question
+            case GHOSTTY_PROGRAM_STATUS_KIND_AUTH: kind = .auth
+            default: kind = nil
+            }
+            guard let report = ProgramStatusReducer.report(
+                event: event,
+                state: rawState,
+                kind: kind,
+                app: status.app.map { String(cString: $0) }
+            ) else { return true }
+            #if DEBUG
+            dlog("program_status.action report=\(report) tab=\((callbackTabId ?? surfaceView.tabId)?.uuidString.prefix(8) ?? "<nil>") surface=\((callbackSurfaceId ?? surfaceView.terminalSurface?.id)?.uuidString.prefix(8) ?? "<nil>")")
+            #endif
+            guard let tabId = callbackTabId ?? surfaceView.tabId,
+                  let surfaceId = callbackSurfaceId ?? surfaceView.terminalSurface?.id else { return true }
+            DispatchQueue.main.async {
+                guard let app = AppDelegate.shared,
+                      let manager = app.tabManagerFor(tabId: tabId) ?? app.tabManager,
+                      let workspace = manager.tabs.first(where: { $0.id == tabId }) else {
+                    #if DEBUG
+                    dlog("program_status.dropped no workspace tab=\(tabId.uuidString.prefix(8))")
+                    #endif
+                    return
+                }
+                workspace.applyProgramStatus(report, panelId: surfaceId)
             }
             return true
         case GHOSTTY_ACTION_COLOR_CHANGE:
