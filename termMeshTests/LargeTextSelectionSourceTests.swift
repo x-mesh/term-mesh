@@ -97,44 +97,40 @@ final class LargeTextSelectionSourceTests: XCTestCase {
         )
     }
 
-    /// The transcript's selection scope used to be one `.textSelection(.enabled)` a
-    /// dozen lines below the container's frame, beyond what the window above sees.
-    /// Allowed call sites are named by where they live, not counted: inside
-    /// `TranscriptSelectable`, the one modifier that applies the byte cap and the
-    /// recent-row limit, and inside `TurnFooter`, whose verdict fields are a few
-    /// words. A direct call anywhere else bypasses both caps.
-    func testAgentTranscriptSelectionOnlyGoesThroughTheCappedModifier() throws {
+    /// Selection in the agent transcript has one door: `TranscriptSelectable`, which
+    /// applies the 20-leaf budget and the byte cap. A direct `.textSelection(.enabled)`
+    /// anywhere else in the file makes a source outside both limits — a transcript
+    /// footer did exactly that — so the call is allowed only inside that type.
+    func testAgentTranscriptSelectionIsOnlyEnabledInsideTranscriptSelectable() throws {
         let source = try String(
             contentsOf: findProjectRoot().appendingPathComponent("Sources/Panels/AgentPanelView.swift"),
             encoding: .utf8
         )
         let lines = source.components(separatedBy: "\n")
 
-        /// Line range of a top-level type: its declaration to the next line that is just `}`.
-        func range(ofType declaration: String) throws -> ClosedRange<Int> {
-            let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix(declaration) }, "\(declaration) is gone")
-            let end = try XCTUnwrap(lines[start...].firstIndex { $0 == "}" })
-            return start...end
-        }
-        let allowed = [
-            try range(ofType: "private struct TranscriptSelectable"),
-            try range(ofType: "private struct TurnFooter"),
-        ]
+        let start = try XCTUnwrap(
+            lines.firstIndex { $0.hasPrefix("private struct TranscriptSelectable") },
+            "TranscriptSelectable is gone — update this test to name what replaced it"
+        )
+        let end = try XCTUnwrap(lines[start...].firstIndex { $0 == "}" })
+        let allowed = start...end
 
         var offenders: [String] = []
+        var insideAllowed = 0
         for (index, raw) in lines.enumerated() {
             let line = raw.trimmingCharacters(in: .whitespaces)
             guard !line.hasPrefix("//"), line.contains(".textSelection(.enabled)") else { continue }
-            if !allowed.contains(where: { $0.contains(index) }) {
+            if allowed.contains(index) { insideAllowed += 1 } else {
                 offenders.append("AgentPanelView.swift:\(index + 1): \(line)")
             }
         }
         XCTAssertEqual(
             offenders, [],
-            "selection must go through transcriptSelectable (byte cap and recent-row limit)"
+            "enable selection only through transcriptSelectable (20-leaf budget, 4KB cap)"
         )
+        XCTAssertEqual(insideAllowed, 1, "TranscriptSelectable must be the one place that enables it")
 
-        let guarded = lines[try range(ofType: "private struct TranscriptSelectable")]
+        let guarded = lines[allowed]
         XCTAssertTrue(
             guarded.contains { $0.contains("TranscriptSelection.isSelectable(text, recentRow: recentRow)") },
             "TranscriptSelectable must apply both the byte cap and the recent-row limit"

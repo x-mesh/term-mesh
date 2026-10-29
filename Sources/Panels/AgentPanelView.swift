@@ -1346,12 +1346,18 @@ private struct TurnFooter: View {
                                 .font(.system(size: 9, weight: .semibold).monospaced())
                                 .foregroundStyle(.tertiary)
                                 .frame(width: 76, alignment: .leading)
+                            // Not selectable: a selection source outside
+                            // `TranscriptSelectable` would sit beyond its recent-row
+                            // budget. The Copy below takes the whole block instead.
                             Text(value)
                                 .font(.system(size: 10).monospaced())
-                                .textSelection(.enabled)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                    Button("Copy") { TranscriptSelection.copy(TranscriptSelection.detailsText(v.details)) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tint)
                 }
                 .padding(.leading, 2)
             }
@@ -2407,6 +2413,11 @@ enum TranscriptSelection {
             }
         }
         return selectableItemIDs(leaves, limit: limit)
+    }
+
+    /// A footer's detail fields as the plain text its Copy puts on the pasteboard.
+    static func detailsText(_ details: [(String, String)]) -> String {
+        details.map { "\($0.0): \($0.1)" }.joined(separator: "\n")
     }
 
     static func isSelectable(_ text: String, recentRow: Bool = true) -> Bool {

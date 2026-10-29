@@ -6851,6 +6851,43 @@ final class TranscriptSelectionTests: XCTestCase {
         XCTAssertEqual(collapsed, [items.last!.id], "a collapsed group mounts no rows and takes no share")
     }
 
+    @MainActor
+    func testAMixedTranscriptNeverHasMoreThanTheBudgetOfSelectableLeaves() {
+        let end = AgentSession.TurnEnd(stop: "end_turn", failed: false, cost: nil, duration: nil,
+                                       tokensIn: nil, tokensOut: nil)
+        var entries: [AgentSession.Entry] = []
+        for turn in 0..<12 {
+            entries.append(.said(id: UUID(), .person, "ask \(turn)"))
+            entries.append(.thought(id: UUID(), "thinking \(turn)"))
+            for call in 0..<4 {
+                entries.append(.tool(id: UUID(), AgentSession.ToolCall(
+                    name: "Bash", headline: "c\(turn)-\(call)", result: "ok")))
+            }
+            entries.append(.answered(id: UUID(), "answer \(turn)"))
+            entries.append(.turnEnded(id: UUID(), end))
+        }
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+        let leafCount = items.reduce(0) { total, item in
+            if case .toolGroup(let group) = item { return total + group.rows.count }
+            return total + 1
+        }
+        XCTAssertGreaterThan(leafCount, 3 * TranscriptSelection.maxSelectableItems)
+
+        for open in [true, false] {
+            let selectable = TranscriptSelection.selectableLeafIDs(items, groupIsOpen: { _ in open })
+            XCTAssertLessThanOrEqual(selectable.count, TranscriptSelection.maxSelectableItems)
+            XCTAssertFalse(selectable.isEmpty)
+        }
+    }
+
+    func testFooterDetailsCopyAsOneBlock() {
+        XCTAssertEqual(
+            TranscriptSelection.detailsText([("FILES", "a.swift b.swift"), ("NEXT", "merge")]),
+            "FILES: a.swift b.swift\nNEXT: merge"
+        )
+        XCTAssertEqual(TranscriptSelection.detailsText([]), "")
+    }
+
     func testExcerptKeepsGraphemeClustersWhole() {
         let clusters = ["e\u{301}", "👩‍👩‍👧‍👦", "🇰🇷", "한"]
         for cluster in clusters {
