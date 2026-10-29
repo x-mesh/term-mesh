@@ -235,7 +235,7 @@ struct ContentView: View {
     @State private var sidebarWidth: CGFloat = SidebarLayoutSettings.loadWidth() ?? 200
     @State private var reviewBoardWidth: CGFloat = ReviewBoardSettings.loadWidth()
     @State private var reviewBoardDragPreviousTranslation: CGFloat?
-    @State private var isReviewBoardClosed = false
+    @State private var isReviewBoardClosed = ReviewBoardSettings.isClosed()
     @State private var lastClampedWidth: CGFloat = 0
     @State private var hoveredResizerHandles: Set<SidebarResizerHandle> = []
     @State private var isResizerDragging = false
@@ -2124,6 +2124,11 @@ struct ContentView: View {
         // little and cannot deadlock itself.
         view = AnyView(view.onReceive(RemoteHostStore.shared.objectWillChange) { _ in
             peerStoreRevision &+= 1
+        })
+
+        // Per-window state stays per-window; the last change is what the next launch restores.
+        view = AnyView(view.onChange(of: isReviewBoardClosed) { _, closed in
+            ReviewBoardSettings.setClosed(closed)
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .reviewBoardTaskSelected)) { notification in
