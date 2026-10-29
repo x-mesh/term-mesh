@@ -43,12 +43,13 @@ final class LargeTextSelectionSourceTests: XCTestCase {
         (
             "Panels/AgentPanelView.swift",
             "Text(result)",
-            "a tool result of any length; transcriptSelectable caps it and offers Copy"
+            "a tool result of any length; displayExcerpt caps what is laid out and "
+                + "transcriptSelectable caps selection"
         ),
         (
             "Panels/AgentPanelView.swift",
-            "Text(code).font",
-            "a code block, which inherits the cap from MarkdownText"
+            "Text(shown).font",
+            "a code block, which inherits the selection cap from MarkdownText and is truncated by `shown`"
         ),
         (
             "Panels/AgentPanelView.swift",

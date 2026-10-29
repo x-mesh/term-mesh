@@ -6807,4 +6807,28 @@ final class TranscriptSelectionTests: XCTestCase {
         ]
         XCTAssertEqual(TranscriptSelection.plainText(of: entries), "Read f.swift")
     }
+
+    func testExcerptLeavesTextWithinTheLimitAlone() {
+        let text = String(repeating: "a", count: 100)
+        XCTAssertEqual(TranscriptSelection.displayExcerpt(text, limit: 100), text)
+        XCTAssertFalse(TranscriptSelection.isTruncated(text, limit: 100))
+    }
+
+    func testExcerptKeepsBothEndsAndStaysUnderTheLimit() {
+        let text = "HEAD" + String(repeating: "x", count: 10_000) + "TAIL"
+        let shown = TranscriptSelection.displayExcerpt(text, limit: 1_000)
+        XCTAssertTrue(TranscriptSelection.isTruncated(text, limit: 1_000))
+        XCTAssertTrue(shown.hasPrefix("HEAD"))
+        XCTAssertTrue(shown.hasSuffix("TAIL"))
+        XCTAssertTrue(shown.contains("KB not shown"))
+        XCTAssertLessThan(shown.utf8.count, 1_200, "limit plus the marker, not the whole text")
+    }
+
+    func testExcerptNeverSplitsAMultiByteCharacter() {
+        let text = String(repeating: "한", count: 2_000) + "🙂" + String(repeating: "글", count: 2_000)
+        let shown = TranscriptSelection.displayExcerpt(text, limit: 1_001)
+        XCTAssertFalse(shown.unicodeScalars.contains("\u{FFFD}"))
+        XCTAssertTrue(shown.hasPrefix("한"))
+        XCTAssertTrue(shown.hasSuffix("글"))
+    }
 }

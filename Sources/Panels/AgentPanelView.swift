@@ -1658,6 +1658,20 @@ private struct PreparedCodeBlock: View {
     let language: String?
     let code: AttributedString
 
+    /// Characters, not bytes: an `AttributedString` is cut by character offset.
+    /// The byte limit divided by 4 (worst case UTF-8 width) keeps it under the cap.
+    private var shown: AttributedString {
+        let limit = TranscriptSelection.maxDisplayedBytes / 4
+        guard code.characters.count > limit else { return code }
+        let half = limit / 2
+        let headEnd = code.index(code.startIndex, offsetByCharacters: half)
+        let tailStart = code.index(code.endIndex, offsetByCharacters: -half)
+        var cut = AttributedString(code[code.startIndex..<headEnd])
+        cut.append(AttributedString("\n… \(code.characters.count - 2 * half) characters not shown, right-click to copy …\n"))
+        cut.append(AttributedString(code[tailStart..<code.endIndex]))
+        return cut
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let language, !language.isEmpty {
@@ -1667,8 +1681,11 @@ private struct PreparedCodeBlock: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 // Selection comes from `MarkdownText`; an `.enabled` here would
                 // override its size cap for this block.
-                Text(code).font(.system(size: 11, design: .monospaced))
+                Text(shown).font(.system(size: 11, design: .monospaced))
                     .padding(.horizontal, 8).padding(.vertical, 6)
+            }
+            .contextMenu {
+                Button("Copy") { TranscriptSelection.copy(String(code.characters)) }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2029,13 +2046,19 @@ private struct ToolRow: View {
                 // Folded by default. A tool result can be thousands of lines,
                 // and in a terminal all of them are in the way of the answer.
                 ScrollView(.horizontal) {
-                    Text(result)
+                    Text(TranscriptSelection.displayExcerpt(result))
                         .font(.system(size: 10).monospaced())
                         .transcriptSelectable(result)
                 }
                 .frame(maxHeight: 200)
                 .padding(6)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 4))
+                if TranscriptSelection.isTruncated(result) {
+                    Button("copy full result") { TranscriptSelection.copy(result) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tint)
+                }
             }
         }
     }
@@ -2363,6 +2386,42 @@ enum TranscriptSelection {
                 return "! \(text)"
             }
         }.joined(separator: "\n\n")
+    }
+
+    /// How much of one block (a tool result, a code block) is laid out. A single
+    /// 200 KB line with no newline makes TextKit insert one run at a time into a
+    /// growing vector, which is quadratic; the 8V hang stack was inside that.
+    static let maxDisplayedBytes = 32 * 1024
+
+    /// `text` itself when it fits, else its first and last half-limit of bytes
+    /// around a marker saying how much was left out. Cut on scalar boundaries.
+    static func displayExcerpt(_ text: String, limit: Int = maxDisplayedBytes) -> String {
+        guard text.utf8.count > limit else { return text }
+        let half = limit / 2
+        var head = String.UnicodeScalarView()
+        var headBytes = 0
+        for scalar in text.unicodeScalars {
+            let width = String(scalar).utf8.count
+            if headBytes + width > half { break }
+            head.append(scalar)
+            headBytes += width
+        }
+        var tail: [Unicode.Scalar] = []
+        var tailBytes = 0
+        for scalar in text.unicodeScalars.reversed() {
+            let width = String(scalar).utf8.count
+            if tailBytes + width > half { break }
+            tail.append(scalar)
+            tailBytes += width
+        }
+        var tailText = String.UnicodeScalarView()
+        tailText.append(contentsOf: tail.reversed())
+        let omitted = text.utf8.count - headBytes - tailBytes
+        return String(head) + "\n… \(omitted / 1024) KB not shown, use copy for the full text …\n" + String(tailText)
+    }
+
+    static func isTruncated(_ text: String, limit: Int = maxDisplayedBytes) -> Bool {
+        text.utf8.count > limit
     }
 
     static func copy(_ text: String) {
