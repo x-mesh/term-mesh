@@ -119,16 +119,91 @@ final class GhosttyDefaultBackgroundNotificationDispatcher {
     }
 }
 
-func resolveTerminalOpenURLTarget(_ rawValue: String) -> TerminalOpenURLTarget? {
+/// What a terminal link needs to be read as a path: the pane's directory as the
+/// shell last reported it (nil when unknown) and how to ask whether a path exists.
+struct TerminalRelativePathContext {
+    let workingDirectory: String?
+    let fileExists: (String) -> Bool
+
+    static func live(workingDirectory: String?) -> TerminalRelativePathContext {
+        TerminalRelativePathContext(
+            workingDirectory: workingDirectory,
+            fileExists: { FileManager.default.fileExists(atPath: $0) }
+        )
+    }
+}
+
+/// Drops the position a compiler or test runner appends to a path: a pytest
+/// `::node` and a trailing `:line[:col]`, plus the colon that ends a diagnostic.
+func strippingTerminalPathSuffix(_ value: String) -> String {
+    var path = value
+    if let node = path.range(of: "::") {
+        path = String(path[..<node.lowerBound])
+    }
+    while path.hasSuffix(":") { path.removeLast() }
+    for _ in 0..<2 {
+        guard let colon = path.lastIndex(of: ":") else { break }
+        let tail = path[path.index(after: colon)...]
+        guard !tail.isEmpty, tail.allSatisfy(\.isASCII), tail.allSatisfy(\.isNumber) else { break }
+        path = String(path[..<colon])
+    }
+    return path
+}
+
+private func terminalLinkLooksLikeRelativePath(_ value: String) -> Bool {
+    value.hasPrefix("./") || value.hasPrefix("../") || value.hasPrefix("~/") || value.contains("/")
+}
+
+/// True when the scheme-less text reads as a web address once the browser
+/// resolver has turned it into a URL: `localhost`, an IPv4 or IPv6 literal, or
+/// a dotted name whose last label is letters (an IDN label counts in its
+/// `xn--` form). The host comes from the normalized URL, so case, a trailing
+/// dot, and userinfo do not change the answer.
+func terminalLinkStartsWithWebHost(_ value: String) -> Bool {
+    guard let url = resolveBrowserNavigableURL(value),
+          let host = BrowserInsecureHTTPSettings.normalizeHost(url.host ?? "") else { return false }
+    if host == "localhost" || host.contains(":") { return true }
+    let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+    if labels.count == 4,
+       labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isASCII) && $0.allSatisfy(\.isNumber) && Int($0).map { $0 <= 255 } == true }) {
+        return true
+    }
+    guard labels.count >= 2, labels.allSatisfy({ !$0.isEmpty }), let last = labels.last else { return false }
+    return last.hasPrefix("xn--") || (last.count >= 2 && last.allSatisfy { $0.isASCII && $0.isLetter })
+}
+
+/// True for the text the resolver answers with a file-existence check.
+func terminalLinkNeedsFileCheck(_ rawValue: String) -> Bool {
+    let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, !NSString(string: trimmed).isAbsolutePath else { return false }
+    if let scheme = URL(string: trimmed)?.scheme, !scheme.isEmpty { return false }
+    return terminalLinkLooksLikeRelativePath(trimmed)
+}
+
+/// `relativePaths` turns on reading scheme-less paths as files. With it nil a
+/// scheme-less value is treated as a web address, the behaviour relay panes keep.
+func resolveTerminalOpenURLTarget(
+    _ rawValue: String,
+    relativePaths: TerminalRelativePathContext? = nil
+) -> TerminalOpenURLTarget? {
     let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
 
     if NSString(string: trimmed).isAbsolutePath {
-        return .external(URL(fileURLWithPath: trimmed))
+        guard relativePaths != nil else {
+            return .external(URL(fileURLWithPath: trimmed))
+        }
+        let path = strippingTerminalPathSuffix(trimmed)
+        guard !path.isEmpty else { return nil }
+        return .external(URL(fileURLWithPath: path))
     }
 
     if let parsed = URL(string: trimmed),
        let scheme = parsed.scheme?.lowercased() {
+        if scheme == "file", !parsed.path.hasPrefix("/") {
+            // `file:23` from a diagnostic is a line number, not a location.
+            return nil
+        }
         if scheme == "http" || scheme == "https" {
             guard BrowserInsecureHTTPSettings.normalizeHost(parsed.host ?? "") != nil else {
                 return .external(parsed)
@@ -136,6 +211,24 @@ func resolveTerminalOpenURLTarget(_ rawValue: String) -> TerminalOpenURLTarget? 
             return .embeddedBrowser(parsed)
         }
         return .external(parsed)
+    }
+
+    if let relativePaths, terminalLinkLooksLikeRelativePath(trimmed) {
+        let path = strippingTerminalPathSuffix(trimmed)
+        guard !path.isEmpty else { return nil }
+        var resolved: String?
+        if path.hasPrefix("~/") {
+            resolved = NSString(string: path).expandingTildeInPath
+        } else if let directory = relativePaths.workingDirectory, !directory.isEmpty {
+            resolved = URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: directory, isDirectory: true))
+                .standardizedFileURL.path
+        }
+        if let resolved, relativePaths.fileExists(resolved) {
+            return .external(URL(fileURLWithPath: resolved))
+        }
+        // A file that is not there opens nothing, unless the text starts with
+        // a web host: `example.com/docs` has no file behind it and is a page.
+        guard terminalLinkStartsWithWebHost(trimmed) else { return nil }
     }
 
     if let webURL = resolveBrowserNavigableURL(trimmed) {
@@ -154,6 +247,9 @@ final class GhosttySurfaceCallbackContext {
     weak var terminalSurface: TerminalSurface?
     let surfaceId: UUID
     let cachedTabId: UUID?
+    #if DEBUG
+    let renderTokenProbe = RenderTokenProbe()
+    #endif
 
     init(surfaceView: GhosttyNSView, terminalSurface: TerminalSurface) {
         self.surfaceView = surfaceView
@@ -170,6 +266,134 @@ final class GhosttySurfaceCallbackContext {
         terminalSurface?.surface ?? surfaceView?.terminalSurface?.surface
     }
 }
+
+#if DEBUG
+enum RenderTokenProbeOutcome: String {
+    case presented
+    case discarded
+    case backendFailed = "backend_failed"
+    case unknown
+    case rejected
+    case timeout
+
+    static func from(failureStatusRawValue status: Int) -> RenderTokenProbeOutcome {
+        switch status {
+        case Int(GHOSTTY_RENDER_PRESENTATION_DISCARDED.rawValue):
+            return .discarded
+        case Int(GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED.rawValue):
+            return .backendFailed
+        default:
+            return .unknown
+        }
+    }
+}
+
+struct RenderTokenProbeResult {
+    let token: UInt64
+    let outcome: RenderTokenProbeOutcome
+    let latencyMilliseconds: Double
+    let callbackOnMain: Bool?
+    let callbackStatus: Int?
+}
+
+final class RenderTokenProbe {
+    private struct Pending {
+        let token: UInt64
+        let startedAt: UInt64
+    }
+
+    private let condition = NSCondition()
+    private var nextToken: UInt64 = 0
+    private var pending: Pending?
+    private var completed: RenderTokenProbeResult?
+
+    func begin() -> UInt64? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard pending == nil else { return nil }
+
+        nextToken &+= 1
+        if nextToken == 0 { nextToken = 1 }
+        pending = Pending(token: nextToken, startedAt: DispatchTime.now().uptimeNanoseconds)
+        completed = nil
+        return nextToken
+    }
+
+    func reject(token: UInt64) {
+        complete(
+            token: token,
+            outcome: .rejected,
+            callbackOnMain: nil,
+            callbackStatus: nil
+        )
+    }
+
+    func present(token: UInt64) {
+        complete(
+            token: token,
+            outcome: .presented,
+            callbackOnMain: Thread.isMainThread,
+            callbackStatus: 0
+        )
+    }
+
+    func fail(token: UInt64, status: ghostty_render_presentation_status_e) {
+        complete(
+            token: token,
+            outcome: .from(failureStatusRawValue: Int(status.rawValue)),
+            callbackOnMain: Thread.isMainThread,
+            callbackStatus: Int(status.rawValue)
+        )
+    }
+
+    func wait(token: UInt64, timeout: TimeInterval) -> RenderTokenProbeResult {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while completed?.token != token && pending?.token == token {
+            if !condition.wait(until: deadline) { break }
+        }
+        if let completed, completed.token == token { return completed }
+
+        let startedAt = pending?.token == token ? pending?.startedAt : nil
+        if pending?.token == token { pending = nil }
+        let now = DispatchTime.now().uptimeNanoseconds
+        return RenderTokenProbeResult(
+            token: token,
+            outcome: .timeout,
+            latencyMilliseconds: Self.milliseconds(from: startedAt, to: now),
+            callbackOnMain: nil,
+            callbackStatus: nil
+        )
+    }
+
+    private func complete(
+        token: UInt64,
+        outcome: RenderTokenProbeOutcome,
+        callbackOnMain: Bool?,
+        callbackStatus: Int?
+    ) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard let pending, pending.token == token else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        self.pending = nil
+        completed = RenderTokenProbeResult(
+            token: token,
+            outcome: outcome,
+            latencyMilliseconds: Self.milliseconds(from: pending.startedAt, to: now),
+            callbackOnMain: callbackOnMain,
+            callbackStatus: callbackStatus
+        )
+        condition.broadcast()
+    }
+
+    private static func milliseconds(from startedAt: UInt64?, to now: UInt64) -> Double {
+        guard let startedAt else { return 0 }
+        return Double(now &- startedAt) / 1_000_000
+    }
+}
+#endif
 
 // Minimal Ghostty wrapper for terminal rendering
 // This uses libghostty (GhosttyKit.xcframework) for actual terminal emulation
@@ -1267,6 +1491,9 @@ class GhosttyApp {
             if action.tag == GHOSTTY_ACTION_DESKTOP_NOTIFICATION {
                 dlog("notify.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
             }
+            if action.tag == GHOSTTY_ACTION_PROGRAM_STATUS {
+                dlog("program_status.dropped no surfaceView (tab=\(callbackTabId?.uuidString.prefix(8) ?? "<nil>") surface=\(callbackSurfaceId?.uuidString.prefix(8) ?? "<nil>"))")
+            }
             #endif
             return false
         }
@@ -1437,6 +1664,7 @@ class GhosttyApp {
             #if DEBUG
             dlog("pwd.action pwd=\(pwd) tabId=\(surfaceView.tabId?.uuidString.prefix(8) ?? "<nil>") surfaceId=\(surfaceView.terminalSurface?.id.uuidString.prefix(8) ?? "<nil>")")
             #endif
+            surfaceView.recordReportedWorkingDirectory(pwd)
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id else { return true }
             DispatchQueue.main.async {
@@ -1485,6 +1713,51 @@ class GhosttyApp {
                     subtitle: "",
                     body: body
                 )
+            }
+            return true
+        case GHOSTTY_ACTION_PROGRAM_STATUS:
+            // The strings are borrowed for this callback only; only `app` is
+            // copied. `msg` and `title` carry command text and are not kept.
+            let status = action.action.program_status
+            let event: ProgramStatusReducer.Event =
+                status.event == GHOSTTY_PROGRAM_STATUS_EVENT_PROMPT_START ? .promptStart : .report
+            let rawState: ProgramStatusReducer.RawState
+            switch status.state {
+            case GHOSTTY_PROGRAM_STATUS_WORKING: rawState = .working
+            case GHOSTTY_PROGRAM_STATUS_DONE: rawState = .done
+            case GHOSTTY_PROGRAM_STATUS_BLOCKED: rawState = .blocked
+            case GHOSTTY_PROGRAM_STATUS_ERROR: rawState = .error
+            case GHOSTTY_PROGRAM_STATUS_CLEAR: rawState = .clear
+            default: rawState = .idle
+            }
+            let kind: ProgramStatusKind?
+            switch status.kind {
+            case GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION: kind = .permission
+            case GHOSTTY_PROGRAM_STATUS_KIND_QUESTION: kind = .question
+            case GHOSTTY_PROGRAM_STATUS_KIND_AUTH: kind = .auth
+            default: kind = nil
+            }
+            guard let report = ProgramStatusReducer.report(
+                event: event,
+                state: rawState,
+                kind: kind,
+                app: status.app.map { String(cString: $0) }
+            ) else { return true }
+            #if DEBUG
+            dlog("program_status.action report=\(report) tab=\((callbackTabId ?? surfaceView.tabId)?.uuidString.prefix(8) ?? "<nil>") surface=\((callbackSurfaceId ?? surfaceView.terminalSurface?.id)?.uuidString.prefix(8) ?? "<nil>")")
+            #endif
+            guard let tabId = callbackTabId ?? surfaceView.tabId,
+                  let surfaceId = callbackSurfaceId ?? surfaceView.terminalSurface?.id else { return true }
+            DispatchQueue.main.async {
+                guard let app = AppDelegate.shared,
+                      let manager = app.tabManagerFor(tabId: tabId) ?? app.tabManager,
+                      let workspace = manager.tabs.first(where: { $0.id == tabId }) else {
+                    #if DEBUG
+                    dlog("program_status.dropped no workspace tab=\(tabId.uuidString.prefix(8))")
+                    #endif
+                    return
+                }
+                workspace.applyProgramStatus(report, panelId: surfaceId)
             }
             return true
         case GHOSTTY_ACTION_COLOR_CHANGE:
@@ -1544,75 +1817,109 @@ class GhosttyApp {
             let openUrl = action.action.open_url
             // ghostty_action_open_url_s is pointer + length, not a C string.
             // Copy it while the synchronous Ghostty callback still owns the bytes.
-            guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len),
-                  let resolvedTarget = resolveTerminalOpenURLTarget(urlString) else {
+            guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len) else {
                 return false
             }
             let context: TerminalOpenURLContext = surfaceView.window is PeerRelayWorkspaceWindow
                 ? .peerRelay
                 : .standard
-            let target = routeTerminalOpenURLTarget(resolvedTarget, context: context)
-
-            // A relay surface has no local workspace in which to create an
-            // embedded browser. Return handled before leaving this callback so
-            // Ghostty does not run its fallback opener while holding the
-            // renderer mutex; the actual OS open happens asynchronously.
-            if context == .peerRelay {
-                let urlToOpen = target.url
-                #if DEBUG
-                dlog("relay.link.open external scheme=\(urlToOpen.scheme ?? "unknown")")
-                #endif
-                DispatchQueue.main.async {
-                    _ = NSWorkspace.shared.open(urlToOpen)
-                }
-                return true
-            }
-            if !BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser() {
-                let urlToOpen = target.url
-                DispatchQueue.main.async { _ = NSWorkspace.shared.open(urlToOpen) }
-                return true
-            }
-            switch target {
-            case let .external(url):
-                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
-                return true
-            case let .embeddedBrowser(url):
-                guard let host = BrowserInsecureHTTPSettings.normalizeHost(url.host ?? "") else {
-                    DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
-                    return true
-                }
-
-                // If a host whitelist is configured and this host isn't in it, open externally.
-                if !BrowserLinkOpenSettings.hostMatchesWhitelist(host) {
-                    DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
-                    return true
-                }
-                guard let tabId = surfaceView.tabId,
-                      let surfaceId = surfaceView.terminalSurface?.id else { return false }
-                // Ghostty runs this callback while holding the clicked surface's
-                // renderer mutex. Opening the browser moves focus off that surface,
-                // and ghostty_surface_set_focus takes the same mutex, so it must run
-                // after the callback returns or the main thread deadlocks.
-                DispatchQueue.main.async {
-                    let opened: Bool = {
-                        guard let app = AppDelegate.shared,
-                              let tabManager = app.tabManagerFor(tabId: tabId) ?? app.tabManager,
-                              let workspace = tabManager.tabs.first(where: { $0.id == tabId }) else {
-                            return false
-                        }
-                        if let targetPane = workspace.preferredBrowserTargetPane(fromPanelId: surfaceId) {
-                            return workspace.newBrowserSurface(inPane: targetPane, url: url, focus: true) != nil
-                        }
-                        return workspace.newBrowserSplit(from: surfaceId, orientation: .horizontal, url: url) != nil
-                    }()
-                    if !opened {
-                        _ = NSWorkspace.shared.open(url)
+            // Relay panes keep the old reading; their directory is not on this machine.
+            let relativePaths: TerminalRelativePathContext? = context == .peerRelay
+                ? nil
+                : .live(workingDirectory: surfaceView.reportedWorkingDirectory())
+            // The existence check can stall on a slow mount, and this callback
+            // holds the renderer lock, so a path candidate is settled off it.
+            if let relativePaths, terminalLinkNeedsFileCheck(urlString) {
+                let tabId = surfaceView.tabId
+                let surfaceId = surfaceView.terminalSurface?.id
+                Self.terminalLinkResolutionQueue.async {
+                    guard let resolved = resolveTerminalOpenURLTarget(urlString, relativePaths: relativePaths) else { return }
+                    DispatchQueue.main.async {
+                        _ = Self.openTerminalLink(resolved, context: context, tabId: tabId, surfaceId: surfaceId)
                     }
                 }
                 return true
             }
+            guard let resolvedTarget = resolveTerminalOpenURLTarget(urlString, relativePaths: relativePaths) else {
+                // Handled with nothing to open. Returning false would let Ghostty
+                // run its own opener on the raw text, which is the wrong target.
+                return true
+            }
+            return Self.openTerminalLink(resolvedTarget, context: context, tabId: surfaceView.tabId, surfaceId: surfaceView.terminalSurface?.id)
         default:
             return false
+        }
+    }
+
+    private static let terminalLinkResolutionQueue = DispatchQueue(
+        label: "term-mesh.terminal-link-resolution",
+        qos: .userInitiated
+    )
+
+    private static func openTerminalLink(
+        _ resolvedTarget: TerminalOpenURLTarget,
+        context: TerminalOpenURLContext,
+        tabId: UUID?,
+        surfaceId: UUID?
+    ) -> Bool {
+        let target = routeTerminalOpenURLTarget(resolvedTarget, context: context)
+
+        // A relay surface has no local workspace in which to create an
+        // embedded browser. Return handled before leaving this callback so
+        // Ghostty does not run its fallback opener while holding the
+        // renderer mutex; the actual OS open happens asynchronously.
+        if context == .peerRelay {
+            let urlToOpen = target.url
+            #if DEBUG
+            dlog("relay.link.open external scheme=\(urlToOpen.scheme ?? "unknown")")
+            #endif
+            DispatchQueue.main.async {
+                _ = NSWorkspace.shared.open(urlToOpen)
+            }
+            return true
+        }
+        if !BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser() {
+            let urlToOpen = target.url
+            DispatchQueue.main.async { _ = NSWorkspace.shared.open(urlToOpen) }
+            return true
+        }
+        switch target {
+        case let .external(url):
+            DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+            return true
+        case let .embeddedBrowser(url):
+            guard let host = BrowserInsecureHTTPSettings.normalizeHost(url.host ?? "") else {
+                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+                return true
+            }
+
+            // If a host whitelist is configured and this host isn't in it, open externally.
+            if !BrowserLinkOpenSettings.hostMatchesWhitelist(host) {
+                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+                return true
+            }
+            guard let tabId, let surfaceId else { return false }
+            // Ghostty runs this callback while holding the clicked surface's
+            // renderer mutex. Opening the browser moves focus off that surface,
+            // and ghostty_surface_set_focus takes the same mutex, so it must run
+            // after the callback returns or the main thread deadlocks.
+            DispatchQueue.main.async {
+                let opened: Bool = {
+                    guard let app = AppDelegate.shared,
+                          let tabManager = app.tabManagerFor(tabId: tabId) ?? app.tabManager,
+                          let workspace = tabManager.tabs.first(where: { $0.id == tabId }) else {
+                        return false
+                    }
+                    if let targetPane = workspace.preferredBrowserTargetPane(fromPanelId: surfaceId) {
+                        return workspace.newBrowserSurface(inPane: targetPane, url: url, focus: true) != nil
+                    }
+                    return workspace.newBrowserSplit(from: surfaceId, orientation: .horizontal, url: url) != nil
+                }()
+                if !opened {
+                    _ = NSWorkspace.shared.open(url)
+                }
+            }
+            return true
         }
     }
 

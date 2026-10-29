@@ -764,6 +764,51 @@ extension TerminalController {
         return .ok(["stats": obj])
     }
 
+    func v2DebugRenderToken(params: [String: Any]) -> V2CallResult {
+        guard !Thread.isMainThread else {
+            return .err(code: "unavailable", message: "Render-token probe requires a socket worker", data: nil)
+        }
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+
+        var request: (probe: RenderTokenProbe, token: UInt64, accepted: Bool)?
+        var error: V2CallResult?
+        let completed = v2MainExec(timeout: 2) {
+            guard let workspace = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                error = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? workspace.focusedPanelId
+            guard let surfaceId, let panel = workspace.terminalPanel(for: surfaceId) else {
+                error = .err(code: "not_found", message: "No terminal surface", data: nil)
+                return
+            }
+            guard let started = panel.surface.requestRenderTokenProbe() else {
+                error = .err(code: "busy", message: "Render token already pending or surface unavailable", data: nil)
+                return
+            }
+            request = started
+        }
+        guard completed else {
+            return .err(code: "timeout", message: "Main thread busy", data: nil)
+        }
+        if let error { return error }
+        guard let request else {
+            return .err(code: "internal_error", message: "Render-token request did not start", data: nil)
+        }
+
+        let result = request.probe.wait(token: request.token, timeout: 1)
+        return .ok([
+            "token": result.token,
+            "accepted": request.accepted,
+            "outcome": result.outcome.rawValue,
+            "latency_ms": result.latencyMilliseconds,
+            "callback_on_main": v2OrNull(result.callbackOnMain.map { $0 as Any }),
+            "callback_status": v2OrNull(result.callbackStatus.map { $0 as Any }),
+        ])
+    }
+
     /// Deliberately off-main: this is the one query that must answer while the
     /// main thread is blocked inside `ghostty_surface_free`. Wrapping it in
     /// `v2MainExec` would make it time out for precisely as long as the window
@@ -780,6 +825,16 @@ extension TerminalController {
             "last_duration_ms": v2OrNull(snapshot.lastDurationMs),
             "max_duration_ms": v2OrNull(snapshot.maxDurationMs),
         ])
+    }
+
+    /// Off-main: returns the census the 2 s sampler last stored, so it also answers
+    /// while the main thread is stuck in the layout pass the census describes.
+    func v2DebugLayoutCensus() -> V2CallResult {
+        let census = LayoutHangDiagnostics.latestCensusSnapshot()
+        guard !census.isEmpty else {
+            return .err(code: "unavailable", message: "No census sampled yet", data: nil)
+        }
+        return .ok(["census": census])
     }
 
     func v2DebugLayout() -> V2CallResult {

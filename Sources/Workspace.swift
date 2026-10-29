@@ -225,6 +225,9 @@ final class Workspace: Identifiable {
     nonisolated static let manualUnreadFocusGraceInterval: TimeInterval = 0.2
     nonisolated static let manualUnreadClearDelayAfterFocusFlash: TimeInterval = 0.2
     var statusEntries: [String: SidebarStatusEntry] = [:]
+    /// OSC 7501 reports keyed by panel. Kept apart from `statusEntries`, which
+    /// the Claude hooks own per workspace, so neither source overwrites the other.
+    var panelProgramStatuses: [UUID: SurfaceProgramStatus] = [:]
     var logEntries: [SidebarLogEntry] = []
     var progress: SidebarProgressState?
     var gitBranch: SidebarGitBranchState? {
@@ -1176,6 +1179,20 @@ final class Workspace: Identifiable {
             shellIntegrationHealth[panelId] = ShellIntegrationHealth(createdAt: Date())
         }
         shellIntegrationHealth[panelId]?.record(signal)
+    }
+
+    func applyProgramStatus(_ report: ProgramStatusReport, panelId: UUID) {
+        guard panels[panelId] != nil,
+              let next = ProgramStatusReducer.applying(
+                report,
+                surfaceId: panelId,
+                to: panelProgramStatuses
+              ) else { return }
+        panelProgramStatuses = next
+    }
+
+    var dominantProgramStatus: SurfaceProgramStatus? {
+        ProgramStatusReducer.dominant(panelProgramStatuses, liveSurfaceIds: Set(panels.keys))
     }
 
     func clearPanelGitBranch(panelId: UUID) {

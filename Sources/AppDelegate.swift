@@ -330,6 +330,7 @@ enum TermMeshUserDefaultsObserver {
     static let appearanceModeKey = AppearanceSettings.appearanceModeKey
     static let terminalKeys = [
         TerminalSettingsOverride.fontFamilyKey,
+        TerminalSettingsOverride.fallbackFontFamilyKey,
         TerminalSettingsOverride.fontSizeKey,
         TerminalSettingsOverride.themeLightKey,
         TerminalSettingsOverride.themeDarkKey,
@@ -675,6 +676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // accept() silently fail and locks both the control socket and
         // peer.sock into "connect OK / recv timeout" until restart.
         Self.raiseFileDescriptorLimit()
+        MachineNameCache.warmUp()
 
         let env = ProcessInfo.processInfo.environment
         let isRunningUnderXCTest = isRunningUnderXCTest(env)
@@ -705,6 +707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                         "turn log quarantine moved \(moved, privacy: .public) line(s)"
                     )
                 }
+                LeaderTurnLog.warmPolicyIndex()
             }
         }
 

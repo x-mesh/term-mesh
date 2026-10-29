@@ -477,6 +477,14 @@ struct TabItemView: View, Equatable {
                     .multilineTextAlignment(.leading)
             }
 
+            if sidebarShowStatusPills, let programStatus = tab.dominantProgramStatus {
+                SidebarProgramStatusBadge(
+                    status: programStatus,
+                    isActive: usesInvertedActiveForeground
+                )
+                .transition(.opacity)
+            }
+
             if sidebarShowStatusPills, !tab.statusEntries.isEmpty {
                 SidebarStatusPillsRow(
                     entries: tab.statusEntries.values.sorted(by: { (lhs, rhs) in
@@ -1986,6 +1994,76 @@ private struct ExpandedAgentRow: View {
         if elapsed < 3600 { return "\(Int(elapsed / 60))m" }
         if elapsed < 86400 { return "\(Int(elapsed / 3600))h" }
         return "\(Int(elapsed / 86400))d"
+    }
+}
+
+/// The most urgent OSC 7501 state among the workspace's panes. Shows state and
+/// kind only; the agent's `msg` can hold a command line and is never displayed.
+struct SidebarProgramStatusBadge: View {
+    let status: SurfaceProgramStatus
+    let isActive: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: iconName)
+                .font(.system(size: 9, weight: .semibold))
+            label
+                .font(.system(size: 10, weight: status.state == .blocked ? .semibold : .regular))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundColor(color)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var label: Text {
+        switch status.state {
+        case .blocked:
+            switch status.kind {
+            case .permission: return Text("Waiting for permission")
+            case .question: return Text("Waiting for an answer")
+            case .auth: return Text("Waiting for sign-in")
+            case nil: return Text("Waiting for input")
+            }
+        case .error: return Text("Agent error")
+        case .working: return Text("Working")
+        case .done: return Text("Done")
+        case .idle: return Text("Idle")
+        }
+    }
+
+    private var iconName: String {
+        switch status.state {
+        case .blocked:
+            switch status.kind {
+            case .permission: return "hand.raised.fill"
+            case .question: return "questionmark.circle.fill"
+            case .auth: return "key.fill"
+            case nil: return "exclamationmark.circle.fill"
+            }
+        case .error: return "xmark.circle.fill"
+        case .working: return "arrowtriangle.right.fill"
+        case .done: return "checkmark.circle.fill"
+        case .idle: return "circle"
+        }
+    }
+
+    private var color: Color {
+        if isActive {
+            switch status.state {
+            case .blocked, .error: return .white
+            case .working, .done: return .white.opacity(0.8)
+            case .idle: return .white.opacity(0.5)
+            }
+        }
+        switch status.state {
+        case .blocked: return .orange
+        case .error: return .red
+        case .working: return .blue
+        case .done: return .green
+        case .idle: return .secondary
+        }
     }
 }
 

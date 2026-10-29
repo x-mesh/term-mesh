@@ -43,7 +43,7 @@ final class DiagnosticsRedactor {
     init(
         homeDirectory: String = NSHomeDirectory(),
         userName: String = NSUserName(),
-        localHostName: String = ProcessInfo.processInfo.hostName,
+        localHostName: String = MachineNameCache.hostName,
         seedHosts: [String] = []
     ) {
         self.homeDirectory = homeDirectory

@@ -971,6 +971,107 @@ final class LeaderTurnLogTests: XCTestCase {
         try FileManager.default.removeItem(at: log)
         XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 0)
     }
+    private func routeLine(_ id: String, team: String = "alpha", suggested: String = "parallel") -> String {
+        #"{"event":"turn_route","turn_id":"\#(id)","ts":"2026-08-24T00:00:00Z","team":"\#(team)","actual_route":"direct","suggested_route":"\#(suggested)","policy_mode":"shadow","policy_applied":false,"cohort":"shadow"}"#
+    }
+
+    private func preparedLog(_ lines: [String]) throws -> URL {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data((lines.map { $0 + "\n" }.joined()).utf8).write(to: log)
+        return log
+    }
+
+    private func appendRaw(_ text: String, to log: URL) throws {
+        let handle = try FileHandle(forWritingTo: log)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(text.utf8))
+    }
+
+    func testPolicyReportDecodesOnlyAppendedLines() throws {
+        let log = try preparedLog([routeLine("a"), routeLine("b")])
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 2)
+        XCTAssertEqual(LeaderTurnLog.policyIndexDecodedLineCount(for: log), 2)
+
+        try appendRaw(routeLine("c") + "\n", to: log)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 3)
+        XCTAssertEqual(LeaderTurnLog.policyIndexDecodedLineCount(for: log), 3)
+    }
+
+    func testPolicyReportMatchesAFullDecodeOfTheSameLog() throws {
+        let log = try preparedLog([
+            routeLine("a"), routeLine("b", team: "beta"),
+            #"{"event":"turn_start","turn_id":"s","ts":"2026-08-24T00:00:00Z","team":"alpha","surface_id":"x"}"#,
+            "not json",
+        ])
+        LeaderTurnLog.appendTaskDispatch(
+            team: "alpha", requestID: "r", taskID: "t1", worker: "w",
+            workerInstanceID: "i", route: "parallel", waveID: "wave", delivery: "created", to: log
+        )
+        let incremental = LeaderTurnLog.policyReport(from: log)
+        try appendRaw(routeLine("c") + "\n", to: log)
+        let afterAppend = LeaderTurnLog.policyReport(from: log)
+
+        let copy = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: copy.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(at: log, to: copy)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: copy), afterAppend)
+        XCTAssertEqual(incremental.suggestedTurns, 2)
+        XCTAssertEqual(afterAppend.suggestedTurns, 3)
+        XCTAssertEqual(afterAppend.unlinkedDelegatedTasks, 1)
+    }
+
+    func testPolicyReportWaitsForTheNewlineOfAPartialLastLine() throws {
+        let log = try preparedLog([routeLine("a")])
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 1)
+
+        let next = routeLine("b")
+        let split = next.index(next.startIndex, offsetBy: 40)
+        try appendRaw(String(next[..<split]), to: log)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 1)
+        XCTAssertEqual(LeaderTurnLog.policyIndexDecodedLineCount(for: log), 1)
+
+        try appendRaw(String(next[split...]) + "\n", to: log)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 2)
+    }
+
+    func testPolicyReportStartsOverWhenTheLogIsTruncated() throws {
+        let log = try preparedLog([routeLine("a"), routeLine("b"), routeLine("c")])
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 3)
+
+        try Data((routeLine("z") + "\n").utf8).write(to: log)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 1)
+    }
+
+    func testPolicyReportStartsOverWhenTheLogIsReplacedByALongerFile() throws {
+        let log = try preparedLog([routeLine("a"), routeLine("b")])
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).cohortCounts["shadow"], 2)
+
+        let replacement = log.deletingLastPathComponent().appendingPathComponent("turns.new")
+        let lines = (0..<5).map { routeLine("n\($0)", team: "beta", suggested: "direct") }
+        try Data((lines.map { $0 + "\n" }.joined()).utf8).write(to: replacement)
+        _ = try FileManager.default.replaceItemAt(log, withItemAt: replacement)
+
+        let report = LeaderTurnLog.policyReport(from: log)
+        XCTAssertEqual(report.suggestedTurns, 5)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log, team: "alpha").suggestedTurns, 0)
+    }
+
+    func testPolicyReportStartsOverWhenTheLogIsRewrittenInPlaceToALongerFile() throws {
+        let log = try preparedLog([routeLine("a", team: "alpha")])
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log, team: "alpha").suggestedTurns, 1)
+
+        let lines = (0..<4).map { routeLine("m\($0)", team: "beta") }
+        try Data((lines.map { $0 + "\n" }.joined()).utf8).write(to: log)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log, team: "alpha").suggestedTurns, 0)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log, team: "beta").suggestedTurns, 4)
+    }
+
     func testPolicyReportSeparatesCohortsAppliedAndSuggestedDeviation() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(

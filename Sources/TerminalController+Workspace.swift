@@ -232,6 +232,19 @@ extension TerminalController {
             }
             result["status_count"] = ws.statusEntries.count
             result["log_count"] = ws.logEntries.count
+            if let dominant = ws.dominantProgramStatus {
+                result["program_status"] = Self.v2ProgramStatusPayload(dominant)
+            } else {
+                result["program_status"] = NSNull()
+            }
+            result["program_statuses"] = ws.panelProgramStatuses
+                .sorted { $0.key.uuidString < $1.key.uuidString }
+                .map { surfaceId, status -> [String: Any] in
+                    var entry = Self.v2ProgramStatusPayload(status)
+                    entry["surface_id"] = surfaceId.uuidString
+                    entry["surface_ref"] = v2Ref(kind: .surface, uuid: surfaceId)
+                    return entry
+                }
             payload = result
         }
 
@@ -239,6 +252,14 @@ extension TerminalController {
             return .err(code: "not_found", message: "Workspace not found", data: nil)
         }
         return .ok(payload)
+    }
+
+    private static func v2ProgramStatusPayload(_ status: SurfaceProgramStatus) -> [String: Any] {
+        [
+            "state": status.state.wireName,
+            "kind": status.kind.map { $0.wireName as Any } ?? NSNull(),
+            "app": status.app.map { $0 as Any } ?? NSNull(),
+        ]
     }
 
     private func v2SidebarGitBranch(in directory: String) -> (branch: String, isDirty: Bool)? {

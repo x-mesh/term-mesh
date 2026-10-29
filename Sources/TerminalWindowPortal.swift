@@ -1768,6 +1768,12 @@ final class WindowTerminalPortal: NSObject {
         installedReferenceView = nil
     }
 
+    /// For the hang census. `hostView` is installed beside the window's content view,
+    /// not inside it, so a walk of `contentView` never reaches the terminals. Hidden
+    /// hosted views stay attached here and are still laid out with the window.
+    var censusRootView: NSView? { hostView.superview == nil ? nil : hostView }
+    var censusEntryCount: Int { entriesByHostedId.count }
+
 #if DEBUG
     func debugEntryCount() -> Int {
         entriesByHostedId.count
@@ -1947,6 +1953,14 @@ enum TerminalWindowPortalRegistry {
     static func terminalViewAtWindowPoint(_ windowPoint: NSPoint, in window: NSWindow) -> GhosttyNSView? {
         let portal = portal(for: window)
         return portal.terminalViewAtWindowPoint(windowPoint)
+    }
+
+    static func censusRoots() -> (entries: Int, roots: [NSView]) {
+        let portals = Array(portalsByWindowId.values)
+        return (
+            portals.reduce(0) { $0 + $1.censusEntryCount },
+            portals.compactMap(\.censusRootView)
+        )
     }
 
 #if DEBUG

@@ -6769,3 +6769,180 @@ extension AgentSessionTests {
         XCTAssertEqual(AgentSlashProfileField.effort.controlFrameKey, "effort")
     }
 }
+
+
+/// Transcript selection is size-capped (Sentry TERM-MESH-3N); what is over the
+/// cap has to be copyable some other way.
+final class TranscriptSelectionTests: XCTestCase {
+    func testSelectabilityFollowsTheUTF8ByteCap() {
+        let cap = TranscriptSelection.maxSelectableBytes
+        XCTAssertTrue(TranscriptSelection.isSelectable(""))
+        XCTAssertTrue(TranscriptSelection.isSelectable(String(repeating: "a", count: cap)))
+        XCTAssertFalse(TranscriptSelection.isSelectable(String(repeating: "a", count: cap + 1)))
+        // 3 bytes per Hangul syllable: character count alone would let this through.
+        XCTAssertFalse(TranscriptSelection.isSelectable(String(repeating: "한", count: cap / 3 + 1)))
+    }
+
+    func testPlainTextCoversEveryRowKindInOrder() {
+        let call = AgentSession.ToolCall(name: "Bash", headline: "ls", result: "a\nb")
+        let entries: [AgentSession.Entry] = [
+            .said(id: UUID(), .person, "hi"),
+            .thought(id: UUID(), "hmm"),
+            .tool(id: UUID(), call),
+            .answered(id: UUID(), "done"),
+            .notice(id: UUID(), "careful"),
+        ]
+        XCTAssertEqual(
+            TranscriptSelection.plainText(of: entries),
+            "you: hi\n\nthinking: hmm\n\nBash ls\na\nb\n\ndone\n\n! careful"
+        )
+    }
+
+    func testPlainTextIncludesTheDiffOfAnEditInDisplayOrder() {
+        let change = AgentDiff.Change(
+            path: "Sources/Foo.swift", kind: .edit, added: 1, removed: 1,
+            lines: [.removed(old: 1, text: "let a = 1"), .added(new: 1, text: "let a = 2")],
+            elided: 0, everywhere: false
+        )
+        var edit = AgentSession.ToolCall(name: "Edit", headline: "Sources/Foo.swift", result: "Applied")
+        edit.change = change
+        var failed = AgentSession.ToolCall(name: "Edit", headline: "Sources/Bar.swift", result: "no match")
+        failed.change = change
+        failed.failed = true
+        let diff = AgentDiff.text(change)
+        XCTAssertFalse(diff.isEmpty)
+        XCTAssertEqual(
+            TranscriptSelection.plainText(of: [.tool(id: UUID(), edit)]),
+            "Edit Sources/Foo.swift\n\(diff)",
+            "a successful edit's result is one sentence the diff already says"
+        )
+        XCTAssertEqual(
+            TranscriptSelection.plainText(of: [.tool(id: UUID(), failed)]),
+            "Edit Sources/Bar.swift\n\(diff)\nno match",
+            "a failed edit keeps its error after the diff, as ChangeRow draws it"
+        )
+    }
+
+    func testOnlyTheNewestItemsAreSelectable() {
+        let ids = (0..<30).map { _ in UUID() }
+        let selectable = TranscriptSelection.selectableItemIDs(ids, limit: 20)
+        XCTAssertEqual(selectable.count, 20)
+        XCTAssertTrue(selectable.contains(ids[29]))
+        XCTAssertTrue(selectable.contains(ids[10]))
+        XCTAssertFalse(selectable.contains(ids[9]))
+        XCTAssertEqual(TranscriptSelection.selectableItemIDs(Array(ids.prefix(3))).count, 3)
+        XCTAssertTrue(TranscriptSelection.selectableItemIDs([]).isEmpty)
+    }
+
+    @MainActor
+    func testALongToolGroupDoesNotMultiplySelectionSources() {
+        let entries: [AgentSession.Entry] = (0..<25).map { i in
+            .tool(id: UUID(), AgentSession.ToolCall(name: "Bash", headline: "cmd \(i)", result: "ok"))
+        } + [.answered(id: UUID(), "done")]
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+        guard case .toolGroup(let group) = items.first else { return XCTFail("tools should fold into one group") }
+        XCTAssertEqual(group.rows.count, 25)
+
+        let open = TranscriptSelection.selectableLeafIDs(items, groupIsOpen: { _ in true })
+        XCTAssertEqual(open.count, TranscriptSelection.maxSelectableItems, "a group is 25 rows, not 1")
+        XCTAssertTrue(open.contains(items.last!.id), "the newest row keeps its share")
+
+        let collapsed = TranscriptSelection.selectableLeafIDs(items, groupIsOpen: { _ in false })
+        XCTAssertEqual(collapsed, [items.last!.id], "a collapsed group mounts no rows and takes no share")
+    }
+
+    @MainActor
+    func testAMixedTranscriptNeverHasMoreThanTheBudgetOfSelectableLeaves() {
+        let end = AgentSession.TurnEnd(stop: "end_turn", failed: false, cost: nil, duration: nil,
+                                       tokensIn: nil, tokensOut: nil)
+        var entries: [AgentSession.Entry] = []
+        for turn in 0..<12 {
+            entries.append(.said(id: UUID(), .person, "ask \(turn)"))
+            entries.append(.thought(id: UUID(), "thinking \(turn)"))
+            for call in 0..<4 {
+                entries.append(.tool(id: UUID(), AgentSession.ToolCall(
+                    name: "Bash", headline: "c\(turn)-\(call)", result: "ok")))
+            }
+            entries.append(.answered(id: UUID(), "answer \(turn)"))
+            entries.append(.turnEnded(id: UUID(), end))
+        }
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+        let leafCount = items.reduce(0) { total, item in
+            if case .toolGroup(let group) = item { return total + group.rows.count }
+            return total + 1
+        }
+        XCTAssertGreaterThan(leafCount, 3 * TranscriptSelection.maxSelectableItems)
+
+        for open in [true, false] {
+            let selectable = TranscriptSelection.selectableLeafIDs(items, groupIsOpen: { _ in open })
+            XCTAssertLessThanOrEqual(selectable.count, TranscriptSelection.maxSelectableItems)
+            XCTAssertFalse(selectable.isEmpty)
+        }
+    }
+
+    func testFooterDetailsCopyAsOneBlock() {
+        XCTAssertEqual(
+            TranscriptSelection.detailsText([("FILES", "a.swift b.swift"), ("NEXT", "merge")]),
+            "FILES: a.swift b.swift\nNEXT: merge"
+        )
+        XCTAssertEqual(TranscriptSelection.detailsText([]), "")
+    }
+
+    func testExcerptKeepsGraphemeClustersWhole() {
+        let clusters = ["e\u{301}", "👩‍👩‍👧‍👦", "🇰🇷", "한"]
+        for cluster in clusters {
+            for pad in 0..<12 {
+                let text = String(repeating: "a", count: pad) + String(repeating: cluster, count: 40)
+                    + String(repeating: "b", count: pad)
+                let shown = TranscriptSelection.displayExcerpt(text, limit: 64)
+                let head = shown.components(separatedBy: "\n… ").first ?? ""
+                let tail = shown.components(separatedBy: " …\n").last ?? ""
+                XCTAssertTrue(text.hasPrefix(head), "head split a cluster: \(cluster) pad \(pad)")
+                XCTAssertTrue(text.hasSuffix(tail), "tail split a cluster: \(cluster) pad \(pad)")
+                XCTAssertFalse(head.isEmpty)
+                XCTAssertFalse(tail.isEmpty)
+            }
+        }
+    }
+
+    func testSelectionNeedsBothARecentRowAndASmallText() {
+        XCTAssertTrue(TranscriptSelection.isSelectable("short", recentRow: true))
+        XCTAssertFalse(TranscriptSelection.isSelectable("short", recentRow: false))
+        let big = String(repeating: "a", count: TranscriptSelection.maxSelectableBytes + 1)
+        XCTAssertFalse(TranscriptSelection.isSelectable(big, recentRow: true))
+    }
+
+    func testPlainTextSkipsEmptyThoughtsAndKeepsRunningTools() {
+        let running = AgentSession.ToolCall(name: "Read", headline: "f.swift")
+        let entries: [AgentSession.Entry] = [
+            .thought(id: UUID(), nil),
+            .thought(id: UUID(), ""),
+            .tool(id: UUID(), running),
+        ]
+        XCTAssertEqual(TranscriptSelection.plainText(of: entries), "Read f.swift")
+    }
+
+    func testExcerptLeavesTextWithinTheLimitAlone() {
+        let text = String(repeating: "a", count: 100)
+        XCTAssertEqual(TranscriptSelection.displayExcerpt(text, limit: 100), text)
+        XCTAssertFalse(TranscriptSelection.isTruncated(text, limit: 100))
+    }
+
+    func testExcerptKeepsBothEndsAndStaysUnderTheLimit() {
+        let text = "HEAD" + String(repeating: "x", count: 10_000) + "TAIL"
+        let shown = TranscriptSelection.displayExcerpt(text, limit: 1_000)
+        XCTAssertTrue(TranscriptSelection.isTruncated(text, limit: 1_000))
+        XCTAssertTrue(shown.hasPrefix("HEAD"))
+        XCTAssertTrue(shown.hasSuffix("TAIL"))
+        XCTAssertTrue(shown.contains("KB not shown"))
+        XCTAssertLessThan(shown.utf8.count, 1_200, "limit plus the marker, not the whole text")
+    }
+
+    func testExcerptNeverSplitsAMultiByteCharacter() {
+        let text = String(repeating: "한", count: 2_000) + "🙂" + String(repeating: "글", count: 2_000)
+        let shown = TranscriptSelection.displayExcerpt(text, limit: 1_001)
+        XCTAssertFalse(shown.unicodeScalars.contains("\u{FFFD}"))
+        XCTAssertTrue(shown.hasPrefix("한"))
+        XCTAssertTrue(shown.hasSuffix("글"))
+    }
+}

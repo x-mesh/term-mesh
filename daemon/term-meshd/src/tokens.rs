@@ -182,8 +182,8 @@ impl UsageTracker {
         let claude_dir = self.state.lock().unwrap().claude_projects_dir.clone();
 
         // Primary: FSEvents-triggered scan via notify crate.
-        // Watches ~/.claude/projects/ recursively; fires scan_all() immediately
-        // on any *.jsonl create/modify event. Fallback poll (every 30s) catches
+        // Watches ~/.claude/projects/ recursively; reads only the *.jsonl files
+        // named by a create/modify event, so a write does not walk every project. Fallback poll (every 30s) catches
         // edge cases where the OS coalesces events under heavy write load.
         if claude_dir.exists() {
             let tracker_fsevent = self.clone();
@@ -214,16 +214,25 @@ impl UsageTracker {
                 }
                 tracing::info!("sidebar.token.watch.start path={}", watch_dir.display());
                 for event in rx {
-                    let is_jsonl_change =
-                        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
-                            && event
-                                .paths
-                                .iter()
-                                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"));
-                    if is_jsonl_change {
-                        if let Err(e) = tracker_fsevent.scan_all() {
-                            tracing::debug!("sidebar.token.parse.skip reason=scan_error: {e}");
-                        }
+                    if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                        continue;
+                    }
+                    let changed: Vec<PathBuf> = event
+                        .paths
+                        .iter()
+                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+                        .cloned()
+                        .collect();
+                    if changed.is_empty() {
+                        continue;
+                    }
+                    // A path outside the watched directory (FSEvents reports
+                    // resolved symlinks) would be tracked under a second key
+                    // and counted twice, so only such events take the full scan.
+                    if changed.iter().all(|p| p.starts_with(&watch_dir)) {
+                        tracker_fsevent.scan_changed(&changed);
+                    } else if let Err(e) = tracker_fsevent.scan_all() {
+                        tracing::debug!("sidebar.token.parse.skip reason=scan_error: {e}");
                     }
                 }
             });
@@ -303,6 +312,17 @@ impl UsageTracker {
             }
         }
         Ok(())
+    }
+
+    /// Reads the new bytes of the files an event named. Unlike `scan_all` it
+    /// does not walk the projects tree or prune deleted sessions; the fallback
+    /// poll still does both.
+    fn scan_changed(&self, paths: &[PathBuf]) {
+        for path in paths {
+            if let Err(e) = self.scan_file(path) {
+                tracing::debug!("Error scanning {}: {e}", path.display());
+            }
+        }
     }
 
     fn scan_jsonl_files_in(&self, dir: &Path) -> anyhow::Result<()> {
@@ -1805,5 +1825,72 @@ mod tests {
             iso8601_to_unix("2026-10-04T11:45:23Z")
         );
         assert_eq!(ctime_utc_to_unix("Sun Oct 4 11:45 2026"), None);
+    }
+
+    fn tracker_over(dir: &Path) -> UsageTracker {
+        let mut state = make_state();
+        state.claude_projects_dir = dir.to_path_buf();
+        UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    fn assistant_json(session_id: &str, input: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"{session_id}","cwd":"/p","timestamp":"2026-05-13T01:18:43.744Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":{input},"output_tokens":1}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn scan_changed_reads_only_the_named_file_and_only_new_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        let named = project.join("named.jsonl");
+        let other = project.join("other.jsonl");
+        std::fs::write(&named, format!("{}\n", assistant_json("named", 10))).unwrap();
+        std::fs::write(&other, format!("{}\n", assistant_json("other", 99))).unwrap();
+
+        let tracker = tracker_over(temp.path());
+        tracker.scan_changed(std::slice::from_ref(&named));
+        let snapshot = tracker.snapshot();
+        assert_eq!(
+            snapshot.sessions.len(),
+            1,
+            "the unnamed file must stay unread"
+        );
+        assert_eq!(snapshot.total_input_tokens, 10);
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&named)
+            .unwrap();
+        writeln!(file, "{}", assistant_json("named", 5)).unwrap();
+        tracker.scan_changed(std::slice::from_ref(&named));
+        tracker.scan_changed(std::slice::from_ref(&named));
+        assert_eq!(tracker.snapshot().total_input_tokens, 15);
+    }
+
+    #[test]
+    fn scan_changed_and_scan_all_do_not_double_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        let file = project.join("s.jsonl");
+        std::fs::write(&file, format!("{}\n", assistant_json("s", 7))).unwrap();
+
+        let tracker = tracker_over(temp.path());
+        tracker.scan_changed(std::slice::from_ref(&file));
+        tracker.scan_all().unwrap();
+        assert_eq!(tracker.snapshot().total_input_tokens, 7);
+    }
+
+    #[test]
+    fn scan_changed_ignores_a_missing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let tracker = tracker_over(temp.path());
+        tracker.scan_changed(&[temp.path().join("gone.jsonl")]);
+        assert!(tracker.snapshot().sessions.is_empty());
     }
 }

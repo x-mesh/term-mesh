@@ -271,6 +271,16 @@
         }
       }
     },
+    "Agent error": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "에이전트 오류"
+          }
+        }
+      }
+    },
     "Agent Models": {
       "localizations": {
         "ko": {
@@ -1126,6 +1136,16 @@
         }
       }
     },
+    "Copy Transcript": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대화 내용 복사"
+          }
+        }
+      }
+    },
     "Copy Update Logs": {
       "localizations": {
         "ko": {
@@ -1277,6 +1297,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "워커가 실행되는 동안 리더가 참여하는 방식입니다. 사용 안 함을 고르면 리더 동시 진행과 리더 턴의 위임 안내가 함께 멈춥니다. 동시 진행에는 작업 분배가 \"위임 우선\"이어야 하며, 이 설정이 작업 분배를 바꾸지는 않습니다."
+          }
+        }
+      }
+    },
+    "Idle": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대기 중"
           }
         }
       }
@@ -2151,6 +2181,46 @@
         }
       }
     },
+    "None": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "없음"
+          }
+        }
+      }
+    },
+    "Fallback Font": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "보조 글꼴"
+          }
+        }
+      }
+    },
+    "Select a primary font first": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "주 글꼴을 먼저 선택하세요"
+          }
+        }
+      }
+    },
+    "Draws characters the primary font lacks (Korean, Japanese, Chinese, etc.)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "주 글꼴에 없는 글자(한글·일본어·중국어 등)를 그릴 글꼴"
+          }
+        }
+      }
+    },
     "Font Size": {
       "localizations": {
         "ko": {
@@ -2227,6 +2297,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "원격 세션이 연결돼 있어도 이 Mac은 평소대로 잠들며, 잠들 때마다 연결이 끊깁니다."
+          }
+        }
+      }
+    },
+    "Waiting for an answer": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "답변 대기"
+          }
+        }
+      }
+    },
+    "Waiting for input": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "입력 대기"
+          }
+        }
+      }
+    },
+    "Waiting for permission": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "권한 승인 대기"
+          }
+        }
+      }
+    },
+    "Waiting for sign-in": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "로그인 대기"
           }
         }
       }
@@ -5322,6 +5432,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "워크트리를 만들 폴더"
+          }
+        }
+      }
+    },
+    "Working": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업 중"
           }
         }
       }

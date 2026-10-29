@@ -1355,6 +1355,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceReadText(params: params))
         case "surface.read_screen_grid":
             return v2Result(id: id, self.v2SurfaceReadScreenGrid(params: params))
+        case "surface.font_resolve":
+            return v2Result(id: id, self.v2SurfaceFontResolve(params: params))
 
         // Peer-federation saved hosts. Not DEBUG-gated: unlike the
         // `debug.peer.*` family below (raw socket paths, bypassing
@@ -1446,12 +1448,16 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugReadTerminalText(params: params))
         case "debug.terminal.render_stats":
             return v2Result(id: id, self.v2DebugRenderStats(params: params))
+        case "debug.terminal.render_token":
+            return v2Result(id: id, self.v2DebugRenderToken(params: params))
         case "debug.surface_free.status":
             return v2Result(id: id, self.v2DebugSurfaceFreeStatus(params: params))
         case "debug.terminal.drop_overlay_probe":
             return v2Result(id: id, self.v2DebugTerminalDropOverlayProbe(params: params))
         case "debug.layout":
             return v2Result(id: id, self.v2DebugLayout())
+        case "debug.layout_census":
+            return v2Result(id: id, self.v2DebugLayoutCensus())
         case "debug.bonsplit_underflow.count":
             return v2Result(id: id, self.v2DebugBonsplitUnderflowCount())
         case "debug.bonsplit_underflow.reset":
@@ -1649,6 +1655,7 @@ class TerminalController {
             "surface.send_key",
             "surface.read_text",
             "surface.read_screen_grid",
+            "surface.font_resolve",
             "peer.host.list",
             "peer.host.connect",
             "peer.host.retry",
@@ -1793,9 +1800,11 @@ class TerminalController {
             "debug.terminal.is_focused",
             "debug.terminal.read_text",
             "debug.terminal.render_stats",
+            "debug.terminal.render_token",
             "debug.surface_free.status",
             "debug.terminal.drop_overlay_probe",
             "debug.layout",
+            "debug.layout_census",
             "debug.bonsplit_underflow.count",
             "debug.bonsplit_underflow.reset",
             "debug.empty_panel.count",

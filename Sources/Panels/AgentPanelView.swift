@@ -410,7 +410,11 @@ struct AgentPanelView: View {
                             )
                     }
                     if session.rows.isEmpty { emptyState }
-                    ForEach(AgentSession.transcriptItems(for: session.rows)) { item in
+                    let items = AgentSession.transcriptItems(for: session.rows)
+                    let selectableIDs = TranscriptSelection.selectableLeafIDs(
+                        items, groupIsOpen: toolGroupIsOpen
+                    )
+                    ForEach(items) { item in
                         switch item {
                         case .row(let row):
                             TranscriptRow(
@@ -418,6 +422,7 @@ struct AgentPanelView: View {
                                 streaming: session.streamingIds.contains(row.id),
                                 open: openTools.contains(row.id),
                                 root: panel.workingDirectory,
+                                selectable: selectableIDs.contains(row.id),
                                 setOpen: { setToolOpen(row.id, $0) }
                             )
                             .equatable()
@@ -428,6 +433,7 @@ struct AgentPanelView: View {
                                 open: toolGroupIsOpen(group),
                                 root: panel.workingDirectory,
                                 openTools: openTools,
+                                selectableIDs: selectableIDs,
                                 setOpen: { setToolGroupOpen(group, $0) },
                                 setToolOpen: setToolOpen
                             )
@@ -448,15 +454,19 @@ struct AgentPanelView: View {
                 }
                 .padding(12)
                 .frame(width: transcriptWidth, alignment: .leading)
-                // Native panes are SwiftUI transcript views rather than
-                // Ghostty surfaces, so terminal selection does not apply.
-                // Enable the standard macOS text-selection environment at
-                // the transcript boundary: dragging selects across all row
-                // kinds and Cmd+C copies through the system pasteboard,
-                // while the composer remains an independent text field.
-                // Inside the held width, so the selection layout's
-                // container keeps its size while the pane is resized.
-                .textSelection(.enabled)
+                // Native panes are SwiftUI transcripts, so terminal selection
+                // does not apply. Selection is per row and size-capped (see
+                // `TranscriptSelection`): one selection scope over the whole
+                // transcript made AppKit lay out every row's text
+                // synchronously on the main thread (Sentry TERM-MESH-3N, 4 s).
+                // Rows over the cap, and anything across rows, copy instead.
+                .contextMenu {
+                    Button("Copy Transcript") {
+                        TranscriptSelection.copy(
+                            TranscriptSelection.plainText(of: session.rows.map(\.entry))
+                        )
+                    }
+                }
                 // `minWidth: 0` so a held width wider than the viewport
                 // overflows here instead of widening the scroll view, whose
                 // size is what `transcript` watches.
@@ -1122,6 +1132,9 @@ private struct TranscriptRow: View, Equatable {
     let streaming: Bool
     let open: Bool
     let root: String
+    /// Whether this row is among the most recent ones that get a selection
+    /// source; see `TranscriptSelection.maxSelectableItems`.
+    let selectable: Bool
     let setOpen: (Bool) -> Void
 
     /// `setOpen` is deliberately not compared: the parent rebuilds that closure
@@ -1136,10 +1149,13 @@ private struct TranscriptRow: View, Equatable {
             && lhs.streaming == rhs.streaming
             && lhs.open == rhs.open
             && lhs.root == rhs.root
+            && lhs.selectable == rhs.selectable
     }
 
     var body: some View {
-        content.padding(.top, item.topGap)
+        content
+            .padding(.top, item.topGap)
+            .environment(\.transcriptRowSelectable, selectable)
     }
 
     @ViewBuilder
@@ -1190,6 +1206,7 @@ private func transcriptGlyphLabel(_ glyph: String, _ text: String, muted: Bool,
         Text(streaming ? String(text.suffix(120)) : text)
             .font(.system(size: 11))
             .lineLimit(muted ? 2 : nil)
+            .transcriptSelectable(text)
         if streaming { Caret() }
     }
     .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
@@ -1329,12 +1346,18 @@ private struct TurnFooter: View {
                                 .font(.system(size: 9, weight: .semibold).monospaced())
                                 .foregroundStyle(.tertiary)
                                 .frame(width: 76, alignment: .leading)
+                            // Not selectable: a selection source outside
+                            // `TranscriptSelectable` would sit beyond its recent-row
+                            // budget. The Copy below takes the whole block instead.
                             Text(value)
                                 .font(.system(size: 10).monospaced())
-                                .textSelection(.enabled)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                    Button("Copy") { TranscriptSelection.copy(TranscriptSelection.detailsText(v.details)) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tint)
                 }
                 .padding(.leading, 2)
             }
@@ -1572,6 +1595,7 @@ struct MarkdownText: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .transcriptSelectable(text)
         .task(id: "\(streaming):\(text)") {
             guard !streaming else { presentation = nil; return }
             let source = text
@@ -1652,6 +1676,20 @@ private struct PreparedCodeBlock: View {
     let language: String?
     let code: AttributedString
 
+    /// Characters, not bytes: an `AttributedString` is cut by character offset.
+    /// The byte limit divided by 4 (worst case UTF-8 width) keeps it under the cap.
+    private var shown: AttributedString {
+        let limit = TranscriptSelection.maxDisplayedBytes / 4
+        guard code.characters.count > limit else { return code }
+        let half = limit / 2
+        let headEnd = code.index(code.startIndex, offsetByCharacters: half)
+        let tailStart = code.index(code.endIndex, offsetByCharacters: -half)
+        var cut = AttributedString(code[code.startIndex..<headEnd])
+        cut.append(AttributedString("\n… \(code.characters.count - 2 * half) characters not shown, right-click to copy …\n"))
+        cut.append(AttributedString(code[tailStart..<code.endIndex]))
+        return cut
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let language, !language.isEmpty {
@@ -1659,8 +1697,13 @@ private struct PreparedCodeBlock: View {
                     .foregroundStyle(.tertiary).padding(.horizontal, 8).padding(.top, 5)
             }
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(code).font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled).padding(.horizontal, 8).padding(.vertical, 6)
+                // Selection comes from `MarkdownText`; an `.enabled` here would
+                // override its size cap for this block.
+                Text(shown).font(.system(size: 11, design: .monospaced))
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+            }
+            .contextMenu {
+                Button("Copy") { TranscriptSelection.copy(String(code.characters)) }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1888,6 +1931,9 @@ private struct ToolGroupRow: View {
     let open: Bool
     let root: String
     let openTools: Set<UUID>
+    /// Rows of this group that may hold a selection source, from the transcript-wide
+    /// recent-row limit; the group itself is not one source but many.
+    let selectableIDs: Set<UUID>
     let setOpen: (Bool) -> Void
     let setToolOpen: (UUID, Bool) -> Void
 
@@ -1939,8 +1985,10 @@ private struct ToolGroupRow: View {
                                     root: root,
                                     open: toolBinding(row.id)
                                 )
+                                .environment(\.transcriptRowSelectable, selectableIDs.contains(row.id))
                             } else {
                                 ToolRow(call: call, open: toolBinding(row.id))
+                                    .environment(\.transcriptRowSelectable, selectableIDs.contains(row.id))
                             }
                         } else if case .thought(_, let body) = row.entry {
                             // Reasoning folded into the run is still the
@@ -2021,13 +2069,19 @@ private struct ToolRow: View {
                 // Folded by default. A tool result can be thousands of lines,
                 // and in a terminal all of them are in the way of the answer.
                 ScrollView(.horizontal) {
-                    Text(result)
+                    Text(TranscriptSelection.displayExcerpt(result))
                         .font(.system(size: 10).monospaced())
-                        .textSelection(.enabled)
+                        .transcriptSelectable(result)
                 }
                 .frame(maxHeight: 200)
                 .padding(6)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 4))
+                if TranscriptSelection.isTruncated(result) {
+                    Button("copy full result") { TranscriptSelection.copy(result) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tint)
+                }
             }
         }
     }
@@ -2271,7 +2325,6 @@ private struct DiffLineRow: View {
             Spacer(minLength: 0)
         }
         .font(.system(size: 10).monospaced())
-        .textSelection(.enabled)
         .padding(.vertical, 0.5)
         // Inside a horizontal scroller the tint ends where the line does, since
         // nothing here proposes a width to stretch to. Left as is: the sign
@@ -2315,5 +2368,161 @@ private enum DiffPalette {
                Color(red: 0.88, green: 0.30, blue: 0.32).opacity(0.16))
             : (Color(red: 0.60, green: 0.11, blue: 0.13),
                Color(red: 0.85, green: 0.25, blue: 0.28).opacity(0.10))
+    }
+}
+
+
+/// Which transcript text may be dragged across, and how the rest gets out.
+///
+/// `.textSelection(.enabled)` makes AppKit build a TextKit 2 data source for the
+/// text, laying all of it out synchronously on the main thread. Over a whole
+/// transcript that was a 4 s stall (Sentry TERM-MESH-3N). Selection stays on
+/// text up to `maxSelectableBytes`; larger text keeps a Copy command instead,
+/// as the Review Board patch pane does (`LargeTextSelectionSourceTests`).
+enum TranscriptSelection {
+    /// An answer of a few paragraphs fits; a pasted log or a tool dump does not.
+    /// Chosen from the 4-8 KB range the Sentry analysis suggested, at its low end
+    /// because up to `AgentSession.maxRenderedEntries` rows can be mounted at once.
+    static let maxSelectableBytes = 4 * 1024
+
+    /// Only the newest transcript items get a selection source at all. Each source
+    /// is a TextKit object with its own layout, so 300 of them are the same cost
+    /// the container-wide scope had, paid per row. Older rows copy through their
+    /// context menu or "Copy Transcript". 20 is a guess that covers what is on
+    /// screen while following the bottom; it has not been measured.
+    static let maxSelectableItems = 20
+
+    /// The ids, out of `ids` in display order, that may be selected.
+    static func selectableItemIDs(_ ids: [UUID], limit: Int = maxSelectableItems) -> Set<UUID> {
+        Set(ids.suffix(limit))
+    }
+
+    /// The same limit over the rows that can hold a source: a tool group is many
+    /// rows, not one, so its children are counted individually. A collapsed group
+    /// mounts none of them and takes no share.
+    static func selectableLeafIDs(
+        _ items: [AgentSession.TranscriptItem],
+        groupIsOpen: (AgentSession.ToolGroup) -> Bool,
+        limit: Int = maxSelectableItems
+    ) -> Set<UUID> {
+        var leaves: [UUID] = []
+        for item in items {
+            switch item {
+            case .row(let row): leaves.append(row.id)
+            case .toolGroup(let group): if groupIsOpen(group) { leaves += group.rows.map(\.id) }
+            }
+        }
+        return selectableItemIDs(leaves, limit: limit)
+    }
+
+    /// A footer's detail fields as the plain text its Copy puts on the pasteboard.
+    static func detailsText(_ details: [(String, String)]) -> String {
+        details.map { "\($0.0): \($0.1)" }.joined(separator: "\n")
+    }
+
+    static func isSelectable(_ text: String, recentRow: Bool = true) -> Bool {
+        recentRow && text.utf8.count <= maxSelectableBytes
+    }
+
+    /// The whole transcript as plain text, for the one copy that spans rows.
+    static func plainText(of entries: [AgentSession.Entry]) -> String {
+        entries.compactMap { entry -> String? in
+            switch entry {
+            case .said(_, let speaker, let text):
+                return "\(speaker == .person ? "you" : "leader"): \(text)"
+            case .answered(_, let text):
+                return text
+            case .thought(_, let body):
+                return body.flatMap { $0.isEmpty ? nil : "thinking: \($0)" }
+            case .tool(_, let call):
+                // Same order the row draws: headline, the diff, then a result —
+                // which `ChangeRow` shows only when the edit failed.
+                var parts = ["\(call.name) \(call.headline)"]
+                if let change = call.change { parts.append(AgentDiff.text(change)) }
+                if let result = call.result, !result.isEmpty, call.change == nil || call.failed {
+                    parts.append(result)
+                }
+                return parts.joined(separator: "\n")
+            case .turnEnded:
+                return nil
+            case .notice(_, let text):
+                return "! \(text)"
+            }
+        }.joined(separator: "\n\n")
+    }
+
+    /// How much of one block (a tool result, a code block) is laid out. A single
+    /// 200 KB line with no newline makes TextKit insert one run at a time into a
+    /// growing vector, which is quadratic; the 8V hang stack was inside that.
+    static let maxDisplayedBytes = 32 * 1024
+
+    /// `text` itself when it fits, else its first and last half-limit of bytes
+    /// around a marker saying how much was left out. Cut on scalar boundaries.
+    static func displayExcerpt(_ text: String, limit: Int = maxDisplayedBytes) -> String {
+        guard text.utf8.count > limit else { return text }
+        let half = limit / 2
+        // By Character, so a combining mark, a ZWJ sequence or a flag is kept whole or left out.
+        var head = ""
+        var headBytes = 0
+        for character in text {
+            let width = String(character).utf8.count
+            if headBytes + width > half { break }
+            head.append(character)
+            headBytes += width
+        }
+        var tail: [Character] = []
+        var tailBytes = 0
+        for character in text.reversed() {
+            let width = String(character).utf8.count
+            if tailBytes + width > half { break }
+            tail.append(character)
+            tailBytes += width
+        }
+        let omitted = text.utf8.count - headBytes - tailBytes
+        return head + "\n… \(omitted / 1024) KB not shown, use copy for the full text …\n" + String(tail.reversed())
+    }
+
+    static func isTruncated(_ text: String, limit: Int = maxDisplayedBytes) -> Bool {
+        text.utf8.count > limit
+    }
+
+    static func copy(_ text: String) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+    }
+}
+
+private struct TranscriptRowSelectableKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    fileprivate var transcriptRowSelectable: Bool {
+        get { self[TranscriptRowSelectableKey.self] }
+        set { self[TranscriptRowSelectableKey.self] = newValue }
+    }
+}
+
+private struct TranscriptSelectable: ViewModifier {
+    let text: String
+    @Environment(\.transcriptRowSelectable) private var recentRow
+
+    func body(content: Content) -> some View {
+        if TranscriptSelection.isSelectable(text, recentRow: recentRow) {
+            content.textSelection(.enabled)
+        } else {
+            content
+                .textSelection(.disabled)
+                .contextMenu {
+                    Button("Copy") { TranscriptSelection.copy(text) }
+                }
+        }
+    }
+}
+
+extension View {
+    fileprivate func transcriptSelectable(_ text: String) -> some View {
+        modifier(TranscriptSelectable(text: text))
     }
 }

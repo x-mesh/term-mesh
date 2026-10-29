@@ -282,6 +282,7 @@
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */; };
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */; };
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */; };
+			4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4704CF490000000000000001 /* RenderTokenProbeTests.swift */; };
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */; };
 				F6000000A1B2C3D4E5F60718 /* SplitNodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */; };
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */; };
@@ -323,6 +324,8 @@
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
 				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */; };
 				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */; };
+				F9000096A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */; };
+				F9000094A1B2C3D4E5F60718 /* ProgramStatusReducerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000095A1B2C3D4E5F60718 /* ProgramStatusReducerTests.swift */; };
 				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */; };
@@ -680,6 +683,7 @@
 			F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CJKIMEInputTests.swift; sourceTree = "<group>"; };
 			F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalViewComposingTests.swift; sourceTree = "<group>"; };
 			F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyConfigTests.swift; sourceTree = "<group>"; };
+			4704CF490000000000000001 /* RenderTokenProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderTokenProbeTests.swift; sourceTree = "<group>"; };
 			F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEArrowKeyTests.swift; sourceTree = "<group>"; };
 			F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplitNodeTests.swift; sourceTree = "<group>"; };
 			F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEHistoryTests.swift; sourceTree = "<group>"; };
@@ -722,6 +726,8 @@
 			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
 			F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LargeTextSelectionSourceTests.swift; sourceTree = "<group>"; };
 			F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostResyncTests.swift; sourceTree = "<group>"; };
+			F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayoutCensusTallyTests.swift; sourceTree = "<group>"; };
+			F9000095A1B2C3D4E5F60718 /* ProgramStatusReducerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramStatusReducerTests.swift; sourceTree = "<group>"; };
 			D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessTreeSnapshotTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostBinaryInventoryTests.swift; sourceTree = "<group>"; };
@@ -1145,6 +1151,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */,
 				F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */,
 				F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */,
+				4704CF490000000000000001 /* RenderTokenProbeTests.swift */,
 				F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */,
 				F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */,
 				F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */,
@@ -1187,6 +1194,8 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
 				F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */,
 				F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */,
+				F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */,
+				F9000095A1B2C3D4E5F60718 /* ProgramStatusReducerTests.swift */,
 				D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
 				FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */,
@@ -1628,6 +1637,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */,
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */,
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */,
+				4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */,
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */,
 				F6000000A1B2C3D4E5F60718 /* SplitNodeTests.swift in Sources */,
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */,
@@ -1670,6 +1680,8 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,
 				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */,
 				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */,
+				F9000096A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift in Sources */,
+				F9000094A1B2C3D4E5F60718 /* ProgramStatusReducerTests.swift in Sources */,
 				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */,
