@@ -448,15 +448,19 @@ struct AgentPanelView: View {
                 }
                 .padding(12)
                 .frame(width: transcriptWidth, alignment: .leading)
-                // Native panes are SwiftUI transcript views rather than
-                // Ghostty surfaces, so terminal selection does not apply.
-                // Enable the standard macOS text-selection environment at
-                // the transcript boundary: dragging selects across all row
-                // kinds and Cmd+C copies through the system pasteboard,
-                // while the composer remains an independent text field.
-                // Inside the held width, so the selection layout's
-                // container keeps its size while the pane is resized.
-                .textSelection(.enabled)
+                // Native panes are SwiftUI transcripts, so terminal selection
+                // does not apply. Selection is per row and size-capped (see
+                // `TranscriptSelection`): one selection scope over the whole
+                // transcript made AppKit lay out every row's text
+                // synchronously on the main thread (Sentry TERM-MESH-3N, 4 s).
+                // Rows over the cap, and anything across rows, copy instead.
+                .contextMenu {
+                    Button("Copy Transcript") {
+                        TranscriptSelection.copy(
+                            TranscriptSelection.plainText(of: session.rows.map(\.entry))
+                        )
+                    }
+                }
                 // `minWidth: 0` so a held width wider than the viewport
                 // overflows here instead of widening the scroll view, whose
                 // size is what `transcript` watches.
@@ -1190,6 +1194,7 @@ private func transcriptGlyphLabel(_ glyph: String, _ text: String, muted: Bool,
         Text(streaming ? String(text.suffix(120)) : text)
             .font(.system(size: 11))
             .lineLimit(muted ? 2 : nil)
+            .transcriptSelectable(text)
         if streaming { Caret() }
     }
     .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
@@ -1572,6 +1577,7 @@ struct MarkdownText: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .transcriptSelectable(text)
         .task(id: "\(streaming):\(text)") {
             guard !streaming else { presentation = nil; return }
             let source = text
@@ -1659,8 +1665,10 @@ private struct PreparedCodeBlock: View {
                     .foregroundStyle(.tertiary).padding(.horizontal, 8).padding(.top, 5)
             }
             ScrollView(.horizontal, showsIndicators: false) {
+                // Selection comes from `MarkdownText`; an `.enabled` here would
+                // override its size cap for this block.
                 Text(code).font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled).padding(.horizontal, 8).padding(.vertical, 6)
+                    .padding(.horizontal, 8).padding(.vertical, 6)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2023,7 +2031,7 @@ private struct ToolRow: View {
                 ScrollView(.horizontal) {
                     Text(result)
                         .font(.system(size: 10).monospaced())
-                        .textSelection(.enabled)
+                        .transcriptSelectable(result)
                 }
                 .frame(maxHeight: 200)
                 .padding(6)
@@ -2271,7 +2279,6 @@ private struct DiffLineRow: View {
             Spacer(minLength: 0)
         }
         .font(.system(size: 10).monospaced())
-        .textSelection(.enabled)
         .padding(.vertical, 0.5)
         // Inside a horizontal scroller the tint ends where the line does, since
         // nothing here proposes a width to stretch to. Left as is: the sign
@@ -2315,5 +2322,74 @@ private enum DiffPalette {
                Color(red: 0.88, green: 0.30, blue: 0.32).opacity(0.16))
             : (Color(red: 0.60, green: 0.11, blue: 0.13),
                Color(red: 0.85, green: 0.25, blue: 0.28).opacity(0.10))
+    }
+}
+
+
+/// Which transcript text may be dragged across, and how the rest gets out.
+///
+/// `.textSelection(.enabled)` makes AppKit build a TextKit 2 data source for the
+/// text, laying all of it out synchronously on the main thread. Over a whole
+/// transcript that was a 4 s stall (Sentry TERM-MESH-3N). Selection stays on
+/// text up to `maxSelectableBytes`; larger text keeps a Copy command instead,
+/// as the Review Board patch pane does (`LargeTextSelectionSourceTests`).
+enum TranscriptSelection {
+    /// An answer of a few paragraphs fits; a pasted log or a tool dump does not.
+    /// Chosen from the 4-8 KB range the Sentry analysis suggested, at its low end
+    /// because up to `AgentSession.maxRenderedEntries` rows can be mounted at once.
+    static let maxSelectableBytes = 4 * 1024
+
+    static func isSelectable(_ text: String) -> Bool {
+        text.utf8.count <= maxSelectableBytes
+    }
+
+    /// The whole transcript as plain text, for the one copy that spans rows.
+    static func plainText(of entries: [AgentSession.Entry]) -> String {
+        entries.compactMap { entry -> String? in
+            switch entry {
+            case .said(_, let speaker, let text):
+                return "\(speaker == .person ? "you" : "leader"): \(text)"
+            case .answered(_, let text):
+                return text
+            case .thought(_, let body):
+                return body.flatMap { $0.isEmpty ? nil : "thinking: \($0)" }
+            case .tool(_, let call):
+                let head = "\(call.name) \(call.headline)"
+                guard let result = call.result, !result.isEmpty else { return head }
+                return "\(head)\n\(result)"
+            case .turnEnded:
+                return nil
+            case .notice(_, let text):
+                return "! \(text)"
+            }
+        }.joined(separator: "\n\n")
+    }
+
+    static func copy(_ text: String) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+    }
+}
+
+private struct TranscriptSelectable: ViewModifier {
+    let text: String
+
+    func body(content: Content) -> some View {
+        if TranscriptSelection.isSelectable(text) {
+            content.textSelection(.enabled)
+        } else {
+            content
+                .textSelection(.disabled)
+                .contextMenu {
+                    Button("Copy") { TranscriptSelection.copy(text) }
+                }
+        }
+    }
+}
+
+extension View {
+    fileprivate func transcriptSelectable(_ text: String) -> some View {
+        modifier(TranscriptSelectable(text: text))
     }
 }

@@ -6769,3 +6769,42 @@ extension AgentSessionTests {
         XCTAssertEqual(AgentSlashProfileField.effort.controlFrameKey, "effort")
     }
 }
+
+
+/// Transcript selection is size-capped (Sentry TERM-MESH-3N); what is over the
+/// cap has to be copyable some other way.
+final class TranscriptSelectionTests: XCTestCase {
+    func testSelectabilityFollowsTheUTF8ByteCap() {
+        let cap = TranscriptSelection.maxSelectableBytes
+        XCTAssertTrue(TranscriptSelection.isSelectable(""))
+        XCTAssertTrue(TranscriptSelection.isSelectable(String(repeating: "a", count: cap)))
+        XCTAssertFalse(TranscriptSelection.isSelectable(String(repeating: "a", count: cap + 1)))
+        // 3 bytes per Hangul syllable: character count alone would let this through.
+        XCTAssertFalse(TranscriptSelection.isSelectable(String(repeating: "한", count: cap / 3 + 1)))
+    }
+
+    func testPlainTextCoversEveryRowKindInOrder() {
+        let call = AgentSession.ToolCall(name: "Bash", headline: "ls", result: "a\nb")
+        let entries: [AgentSession.Entry] = [
+            .said(id: UUID(), .person, "hi"),
+            .thought(id: UUID(), "hmm"),
+            .tool(id: UUID(), call),
+            .answered(id: UUID(), "done"),
+            .notice(id: UUID(), "careful"),
+        ]
+        XCTAssertEqual(
+            TranscriptSelection.plainText(of: entries),
+            "you: hi\n\nthinking: hmm\n\nBash ls\na\nb\n\ndone\n\n! careful"
+        )
+    }
+
+    func testPlainTextSkipsEmptyThoughtsAndKeepsRunningTools() {
+        let running = AgentSession.ToolCall(name: "Read", headline: "f.swift")
+        let entries: [AgentSession.Entry] = [
+            .thought(id: UUID(), nil),
+            .thought(id: UUID(), ""),
+            .tool(id: UUID(), running),
+        ]
+        XCTAssertEqual(TranscriptSelection.plainText(of: entries), "Read f.swift")
+    }
+}

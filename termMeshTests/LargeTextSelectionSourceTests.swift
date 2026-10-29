@@ -34,6 +34,27 @@ final class LargeTextSelectionSourceTests: XCTestCase {
             "Text(bundle)",
             "the whole diagnostics bundle; Copy and Save already hand it over"
         ),
+        (
+            "Panels/AgentPanelView.swift",
+            ".frame(width: transcriptWidth, alignment: .leading)",
+            "one selection scope over every mounted transcript row (Sentry TERM-MESH-3N, "
+                + "a 4 s synchronous layout); rows gate themselves with transcriptSelectable"
+        ),
+        (
+            "Panels/AgentPanelView.swift",
+            "Text(result)",
+            "a tool result of any length; transcriptSelectable caps it and offers Copy"
+        ),
+        (
+            "Panels/AgentPanelView.swift",
+            "Text(code).font",
+            "a code block, which inherits the cap from MarkdownText"
+        ),
+        (
+            "Panels/AgentPanelView.swift",
+            "Text(text.replacingOccurrences",
+            "one diff line, repeated per line of a diff; \"copy diff\" covers it"
+        ),
     ]
 
     func testTheLargestTextViewsAreNotSelectable() throws {
@@ -72,6 +93,26 @@ final class LargeTextSelectionSourceTests: XCTestCase {
             mouse-moved event and wedges the main thread (issue #321). Give the view a
             Copy button instead of selection.
             """
+        )
+    }
+
+    /// The transcript's selection scope used to be one `.textSelection(.enabled)` a
+    /// dozen lines below the container's frame, beyond what the window above sees.
+    /// Count the real call sites instead: the size-capped modifier and the short
+    /// verdict fields in the turn footer are the only ones allowed.
+    func testAgentTranscriptHasNoUncappedSelectionScope() throws {
+        let source = try String(
+            contentsOf: findProjectRoot().appendingPathComponent("Sources/Panels/AgentPanelView.swift"),
+            encoding: .utf8
+        )
+        let callSites = source.components(separatedBy: "\n").filter {
+            let line = $0.trimmingCharacters(in: .whitespaces)
+            return !line.hasPrefix("//") && line.contains(".textSelection(.enabled)")
+        }
+        XCTAssertEqual(
+            callSites.count, 2,
+            "AgentPanelView may enable selection only in TranscriptSelectable (size-capped) "
+                + "and the turn footer's verdict fields; got \(callSites)"
         )
     }
 
