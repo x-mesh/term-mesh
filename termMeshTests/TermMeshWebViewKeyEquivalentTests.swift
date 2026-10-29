@@ -7537,6 +7537,70 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
         assertOpensFile(resolve("example.com/docs", existing: ["/work/repo/example.com/docs"]), "/work/repo/example.com/docs")
     }
 
+
+    // MARK: - Web host judged from the normalized URL
+
+    private let directories: [String?] = ["/work/repo", nil]
+
+    private func assertBrowserReading(_ raw: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        for directory in directories {
+            let target = try XCTUnwrap(
+                resolve(raw, existing: [], directory: directory),
+                "\(raw) dir=\(String(describing: directory))",
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(target, try XCTUnwrap(resolveTerminalOpenURLTarget(raw), file: file, line: line), raw, file: file, line: line)
+            guard case .embeddedBrowser = target else {
+                return XCTFail("Expected embedded browser for \(raw)", file: file, line: line)
+            }
+        }
+    }
+
+    func testInternationalizedHostsOpenBrowserWhenNoFileExists() throws {
+        try assertBrowserReading("münich.example/docs")
+        try assertBrowserReading("例え.テスト/docs")
+    }
+
+    func testHostWithUserinfoOpensBrowserWhenNoFileExists() throws {
+        try assertBrowserReading("user@example.com/docs")
+    }
+
+    func testFullyQualifiedHostWithTrailingDotOpensBrowserWhenNoFileExists() throws {
+        try assertBrowserReading("example.com./docs")
+    }
+
+    func testUppercaseLocalhostOpensBrowserWhenNoFileExists() throws {
+        for directory in directories {
+            let target = try XCTUnwrap(resolve("LOCALHOST/path", existing: [], directory: directory))
+            XCTAssertEqual(target.url.path, "/path")
+        }
+    }
+
+    func testBracketedIPv6WithPortOpensBrowserWhenNoFileExists() throws {
+        try assertBrowserReading("[2001:db8::1]:8080/x")
+    }
+
+    func testFileNamedLikeDomainStillOpensBrowserWhenMissing() throws {
+        try assertBrowserReading("foo.swift/bar")
+        try assertBrowserReading("README.md/x")
+    }
+
+    func testMissingHomePathKeepsOpeningFileURL() {
+        for directory in directories {
+            assertOpensFile(resolve("~/nope", existing: [], directory: directory), NSString(string: "~/nope").expandingTildeInPath)
+        }
+    }
+
+    func testFileCheckIsNeededOnlyForSchemeLessRelativeText() {
+        for raw in ["Sources/Foo.swift:12:5", "docs/x.md", "example.com/docs", "./a", "../a", "[::1]:8080/x", "127.0.0.1:3000/x"] {
+            XCTAssertTrue(terminalLinkNeedsFileCheck(raw), raw)
+        }
+        for raw in ["/tmp/x", "~/nope", "https://example.com/docs", "file:23", "mailto:a@b.c", "plain"] {
+            XCTAssertFalse(terminalLinkNeedsFileCheck(raw), raw)
+        }
+    }
+
 }
 
 final class BrowserExternalNavigationSchemeTests: XCTestCase {
