@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,19 +32,14 @@ impl PaneTracker {
     /// Spawns the background poll loop. Returns self for chaining.
     pub fn start(self) -> Self {
         let state = self.state.clone();
-        let system = Arc::new(Mutex::new(System::new()));
+        let scanner = Arc::new(Mutex::new(PaneScanner::new()));
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
             interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
-                let system = system.clone();
-                match tokio::task::spawn_blocking(move || {
-                    let mut system = system.lock().unwrap();
-                    scan_pane_sessions(&mut system)
-                })
-                .await
-                {
+                let scanner = scanner.clone();
+                match tokio::task::spawn_blocking(move || scanner.lock().unwrap().scan()).await {
                     Ok(map) => *state.lock().unwrap() = map,
                     Err(e) => tracing::debug!("pane_tracker.scan panicked: {e}"),
                 }
@@ -58,54 +53,178 @@ impl PaneTracker {
     }
 }
 
-fn scan_pane_sessions(system: &mut System) -> HashMap<String, PaneInfo> {
-    // First discover the process roster without paying to fetch environment
-    // and cwd for unrelated processes.
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
-    );
-    let targets: Vec<(Pid, String)> = system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| cli_name(process).map(|cli| (*pid, cli.to_string())))
-        .collect();
+/// Incremental process scanner.
+///
+/// Refreshing every process on each tick costs about 30 ms of CPU for a
+/// ~900-process table, almost all of it spent on processes that can never be
+/// a pane CLI. The pid list is one cheap call, and a process keeps its name
+/// and executable path for its whole life (the full refresh never rewrote
+/// them either), so each pid is classified once, when it first appears.
+struct PaneScanner {
+    system: System,
+    /// Every live pid that has already been classified.
+    inspected: HashSet<u32>,
+    /// The subset of `inspected` that is a `claude` or `codex` CLI.
+    targets: HashMap<Pid, &'static str>,
+}
 
-    let target_pids: Vec<Pid> = targets.iter().map(|(pid, _)| *pid).collect();
-    if target_pids.is_empty() {
-        return HashMap::new();
+/// Splits a fresh pid list into pids not seen before and pids that went away.
+fn diff_roster(live: &HashSet<u32>, inspected: &HashSet<u32>) -> (Vec<u32>, Vec<u32>) {
+    let appeared = live.difference(inspected).copied().collect();
+    let gone = inspected.difference(live).copied().collect();
+    (appeared, gone)
+}
+
+impl PaneScanner {
+    fn new() -> Self {
+        Self {
+            system: System::new(),
+            inspected: HashSet::new(),
+            targets: HashMap::new(),
+        }
     }
 
-    // sysinfo uses proc_pidinfo/sysctl on macOS for these fields. Refresh only
-    // the target CLI processes and always update cwd because a CLI may chdir.
-    let refresh_kind = ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always);
-    #[cfg(not(target_os = "macos"))]
-    let refresh_kind = refresh_kind.with_environ(UpdateKind::Always);
-    system.refresh_processes_specifics(ProcessesToUpdate::Some(&target_pids), false, refresh_kind);
+    fn scan(&mut self) -> HashMap<String, PaneInfo> {
+        match list_pids() {
+            Some(live) => self.update_roster(&live),
+            // Without a pid list, fall back to refreshing the whole table.
+            None => self.rebuild_roster(),
+        }
+        self.collect_panes()
+    }
 
-    let mut result = HashMap::new();
-    for (pid, cli) in targets {
-        let Some(process) = system.process(pid) else {
-            continue;
-        };
-        let Some(panel_id) = process_panel_id(pid, process.environ()) else {
-            continue;
-        };
-        let Some(cwd) = process.cwd() else {
-            continue;
-        };
-        result.insert(
-            panel_id,
-            PaneInfo {
-                cli,
-                cwd: cwd.to_string_lossy().into_owned(),
-                pid: pid.as_u32(),
-                proc_start_unix: i64::try_from(process.start_time()).unwrap_or(0),
-            },
+    fn update_roster(&mut self, live: &HashSet<u32>) {
+        let (appeared, gone) = diff_roster(live, &self.inspected);
+        if !gone.is_empty() {
+            for pid in &gone {
+                self.inspected.remove(pid);
+                self.targets.remove(&Pid::from_u32(*pid));
+            }
+            // Drop the dead entries so the table does not grow without bound.
+            let gone: Vec<Pid> = gone.into_iter().map(Pid::from_u32).collect();
+            self.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&gone),
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+        }
+        if appeared.is_empty() {
+            return;
+        }
+        let appeared: Vec<Pid> = appeared.into_iter().map(Pid::from_u32).collect();
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&appeared),
+            false,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
         );
+        for pid in appeared {
+            self.inspected.insert(pid.as_u32());
+            if let Some(cli) = self.system.process(pid).and_then(cli_name) {
+                self.targets.insert(pid, cli);
+            }
+        }
     }
-    result
+
+    fn rebuild_roster(&mut self) {
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+        );
+        self.inspected.clear();
+        self.targets.clear();
+        for (pid, process) in self.system.processes() {
+            self.inspected.insert(pid.as_u32());
+            if let Some(cli) = cli_name(process) {
+                self.targets.insert(*pid, cli);
+            }
+        }
+    }
+
+    fn collect_panes(&mut self) -> HashMap<String, PaneInfo> {
+        let system = &mut self.system;
+        let targets: Vec<(Pid, String)> = self
+            .targets
+            .iter()
+            .map(|(pid, cli)| (*pid, (*cli).to_string()))
+            .collect();
+
+        let target_pids: Vec<Pid> = targets.iter().map(|(pid, _)| *pid).collect();
+        if target_pids.is_empty() {
+            return HashMap::new();
+        }
+
+        // sysinfo uses proc_pidinfo/sysctl on macOS for these fields. Refresh only
+        // the target CLI processes and always update cwd because a CLI may chdir.
+        let refresh_kind = ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always);
+        #[cfg(not(target_os = "macos"))]
+        let refresh_kind = refresh_kind.with_environ(UpdateKind::Always);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&target_pids),
+            false,
+            refresh_kind,
+        );
+
+        let mut result = HashMap::new();
+        for (pid, cli) in targets {
+            let Some(process) = system.process(pid) else {
+                continue;
+            };
+            let Some(panel_id) = process_panel_id(pid, process.environ()) else {
+                continue;
+            };
+            let Some(cwd) = process.cwd() else {
+                continue;
+            };
+            result.insert(
+                panel_id,
+                PaneInfo {
+                    cli,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    pid: pid.as_u32(),
+                    proc_start_unix: i64::try_from(process.start_time()).unwrap_or(0),
+                },
+            );
+        }
+        result
+    }
+}
+
+/// Lists every live pid with one call.
+#[cfg(target_os = "macos")]
+fn list_pids() -> Option<HashSet<u32>> {
+    // SAFETY: a null buffer asks proc_listallpids for the size it needs.
+    let needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return None;
+    }
+    // The call reports a pid count. Leave room for processes that start
+    // between the two calls.
+    let capacity = usize::try_from(needed).ok()? + 64;
+    let mut pids = vec![0 as libc::pid_t; capacity];
+    let buffer_bytes = libc::c_int::try_from(capacity * std::mem::size_of::<libc::pid_t>()).ok()?;
+    // SAFETY: `pids` owns `buffer_bytes` writable bytes.
+    let written = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), buffer_bytes) };
+    if written <= 0 {
+        return None;
+    }
+    let count = usize::try_from(written).ok()?.min(capacity);
+    Some(
+        pids[..count]
+            .iter()
+            .filter_map(|pid| u32::try_from(*pid).ok().filter(|pid| *pid > 0))
+            .collect(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn list_pids() -> Option<HashSet<u32>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    Some(
+        entries
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .collect(),
+    )
 }
 
 fn cli_name(process: &sysinfo::Process) -> Option<&'static str> {
@@ -311,17 +430,18 @@ mod tests {
             .unwrap();
         let child_pid = child.id();
 
-        let mut system = System::new();
+        let mut scanner = PaneScanner::new();
         let mut found = None;
         for _ in 0..20 {
-            let snapshot = scan_pane_sessions(&mut system);
+            let snapshot = scanner.scan();
             if let Some(info) = snapshot.get(&panel_id) {
                 found = Some(info.clone());
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let diagnostic = system
+        let diagnostic = scanner
+            .system
             .process(Pid::from_u32(child_pid))
             .map(|process| {
                 format!(
@@ -345,5 +465,73 @@ mod tests {
             temp.path().canonicalize().unwrap().to_string_lossy()
         );
         assert!(info.proc_start_unix > 0);
+    }
+
+    #[test]
+    fn diff_roster_reports_appeared_and_gone_pids() {
+        let live: HashSet<u32> = [1, 2, 4].into_iter().collect();
+        let inspected: HashSet<u32> = [2, 3].into_iter().collect();
+        let (mut appeared, mut gone) = diff_roster(&live, &inspected);
+        appeared.sort_unstable();
+        gone.sort_unstable();
+        assert_eq!(appeared, vec![1, 4]);
+        assert_eq!(gone, vec![3]);
+    }
+
+    #[test]
+    fn list_pids_includes_this_process() {
+        let pids = list_pids().expect("pid list");
+        assert!(pids.contains(&std::process::id()));
+    }
+
+    #[test]
+    fn scan_tracks_a_cli_that_starts_and_exits_between_scans() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("claude");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &executable).unwrap();
+        let panel_id = format!("pane-tracker-churn-{}", std::process::id());
+
+        let mut scanner = PaneScanner::new();
+        assert!(!scanner.scan().contains_key(&panel_id));
+
+        let mut child = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "pane_tracker::tests::pane_tracker_fixture_process",
+                "--nocapture",
+            ])
+            .env("TERMMESH_PANE_TRACKER_FIXTURE", "1")
+            .env("TERMMESH_PANEL_ID", &panel_id)
+            .current_dir(temp.path())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+
+        let mut seen = false;
+        for _ in 0..40 {
+            if scanner.scan().get(&panel_id).map(|info| info.cli.as_str()) == Some("claude") {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            seen,
+            "a CLI that appears after the first scan must be found"
+        );
+
+        let mut gone = false;
+        for _ in 0..40 {
+            if !scanner.scan().contains_key(&panel_id) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "an exited CLI must leave the snapshot");
+        assert!(!scanner.inspected.contains(&child_pid));
+        assert!(!scanner.targets.contains_key(&Pid::from_u32(child_pid)));
     }
 }
