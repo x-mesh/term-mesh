@@ -2028,3 +2028,33 @@ final class PeerAttachRedrawTests: XCTestCase {
         XCTAssertNil(PeerAttachRedraw.signalTarget(foregroundProcessGroup: UInt64(Int32.max) + 1))
     }
 }
+
+/// The resync loop can run for 12 s after its pane closed; every read must re-check liveness.
+final class PtyTapHubResyncLivenessTests: XCTestCase {
+    func testResyncCaptureDoesNotReadWhenSurfaceIsGone() async {
+        let reads = ReadCounter()
+        let snapshot = await PtyTapHub.captureLiveSnapshot(
+            liveSurface: { nil },
+            read: { _ in
+                reads.count += 1
+                return (Data("screen".utf8), 1)
+            }
+        )
+        XCTAssertNil(snapshot)
+        XCTAssertEqual(reads.count, 0, "a freed surface must never be read")
+    }
+
+    func testResyncCaptureReadsTheLiveSurface() async {
+        let surface = UnsafeMutableRawPointer(bitPattern: 0x1000)
+        let snapshot = await PtyTapHub.captureLiveSnapshot(
+            liveSurface: { surface },
+            read: { _ in (Data("screen".utf8), 7) }
+        )
+        XCTAssertEqual(snapshot?.bytes, Data("screen".utf8))
+        XCTAssertEqual(snapshot?.rawEnd, 7)
+    }
+}
+
+private final class ReadCounter: @unchecked Sendable {
+    var count = 0
+}
