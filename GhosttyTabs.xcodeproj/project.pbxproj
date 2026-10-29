@@ -282,6 +282,7 @@
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */; };
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */; };
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */; };
+			4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4704CF490000000000000001 /* RenderTokenProbeTests.swift */; };
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */; };
 				F6000000A1B2C3D4E5F60718 /* SplitNodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */; };
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */; };
@@ -681,6 +682,7 @@
 			F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CJKIMEInputTests.swift; sourceTree = "<group>"; };
 			F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalViewComposingTests.swift; sourceTree = "<group>"; };
 			F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyConfigTests.swift; sourceTree = "<group>"; };
+			4704CF490000000000000001 /* RenderTokenProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderTokenProbeTests.swift; sourceTree = "<group>"; };
 			F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEArrowKeyTests.swift; sourceTree = "<group>"; };
 			F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplitNodeTests.swift; sourceTree = "<group>"; };
 			F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEHistoryTests.swift; sourceTree = "<group>"; };
@@ -1147,6 +1149,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */,
 				F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */,
 				F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */,
+				4704CF490000000000000001 /* RenderTokenProbeTests.swift */,
 				F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */,
 				F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */,
 				F7000001A1B2C3D4E5F60718 /* IMEHistoryTests.swift */,
@@ -1631,6 +1634,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */,
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */,
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */,
+				4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */,
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */,
 				F6000000A1B2C3D4E5F60718 /* SplitNodeTests.swift in Sources */,
 				F7000000A1B2C3D4E5F60718 /* IMEHistoryTests.swift in Sources */,
