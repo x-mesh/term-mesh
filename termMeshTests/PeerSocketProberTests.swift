@@ -38,6 +38,13 @@ final class PeerSocketProberTests: XCTestCase {
         )
     }
 
+    func test_defaultPeerDisplayNameLowercasesTheMachineName() {
+        XCTAssertEqual(
+            PeerFederationSettings.normalizedDefaultDisplayName("jinwoo-MeshStudio-2.local"),
+            "jinwoo-meshstudio-2.local"
+        )
+    }
+
     // MARK: - Script invariants
 
     /// The remote command rides inside `sh -c '…'`. A single quote in

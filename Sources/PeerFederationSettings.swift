@@ -13,6 +13,7 @@ import SystemConfiguration
 
 enum MachineNameCache {
     private static let lock = NSLock()
+    // Cached names refresh on the next app launch.
     private static var cachedHostName: String?
     private static var cachedComputerName: String?
     private static var didScheduleWarmUp = false
@@ -179,7 +180,11 @@ enum PeerFederationSettings {
     }
 
     static var defaultDisplayName: String {
-        MachineNameCache.hostName
+        normalizedDefaultDisplayName(MachineNameCache.hostName)
+    }
+
+    static func normalizedDefaultDisplayName(_ hostName: String) -> String {
+        hostName.lowercased()
     }
 
     static var autoStart: Bool {
