@@ -1355,6 +1355,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceReadText(params: params))
         case "surface.read_screen_grid":
             return v2Result(id: id, self.v2SurfaceReadScreenGrid(params: params))
+        case "surface.font_resolve":
+            return v2Result(id: id, self.v2SurfaceFontResolve(params: params))
 
         // Peer-federation saved hosts. Not DEBUG-gated: unlike the
         // `debug.peer.*` family below (raw socket paths, bypassing
@@ -1649,6 +1651,7 @@ class TerminalController {
             "surface.send_key",
             "surface.read_text",
             "surface.read_screen_grid",
+            "surface.font_resolve",
             "peer.host.list",
             "peer.host.connect",
             "peer.host.retry",
