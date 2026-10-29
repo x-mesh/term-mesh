@@ -6,6 +6,60 @@ private func windowDragHandleFormatPoint(_ point: NSPoint) -> String {
     String(format: "(%.1f,%.1f)", point.x, point.y)
 }
 
+/// What a title-bar double-click does, as chosen in System Settings > Desktop & Dock.
+enum TitlebarDoubleClickAction: Equatable {
+    case zoom
+    case minimize
+    case none
+
+    static func resolve(actionOnDoubleClick: String?, miniaturizeOnDoubleClick: Bool) -> Self {
+        switch actionOnDoubleClick {
+        case "Minimize": return .minimize
+        case "None": return .none
+        // "Fill" has no public API; zoom is the closest window-sized action.
+        case .some: return .zoom
+        case nil: return miniaturizeOnDoubleClick ? .minimize : .zoom
+        }
+    }
+
+    static var current: Self {
+        let defaults = UserDefaults.standard
+        return resolve(
+            actionOnDoubleClick: defaults.string(forKey: "AppleActionOnDoubleClick"),
+            miniaturizeOnDoubleClick: defaults.bool(forKey: "AppleMiniaturizeOnDoubleClick")
+        )
+    }
+
+    func perform(on window: NSWindow) {
+        switch self {
+        case .zoom: window.zoom(nil)
+        case .minimize: window.miniaturize(nil)
+        case .none: break
+        }
+    }
+}
+
+/// macOS 27.0 runs the double-click action from a title-frame gesture recognizer
+/// that consumes the second click's mouse-up, so it never reaches our views. macOS
+/// 27.2 delivers that mouse-up to the view that took the mouse-down and does
+/// nothing itself. Acting only on a delivered mouse-up therefore runs the action
+/// exactly once on both; acting on the mouse-down zoomed twice on 27.0.
+func handleTitlebarDoubleClickMouseUp(
+    _ event: NSEvent,
+    pending: inout Bool,
+    window: NSWindow?
+) -> Bool {
+    let isDoubleClick = pending && event.clickCount == 2
+    pending = false
+    guard isDoubleClick, let window else { return false }
+    let action = TitlebarDoubleClickAction.current
+    #if DEBUG
+    dlog("titlebar.doubleClick action=\(action)")
+    #endif
+    action.perform(on: window)
+    return true
+}
+
 private var windowDragSuppressionDepthKey: UInt8 = 0
 
 func beginWindowDragSuppression(window: NSWindow?) -> Int? {
@@ -216,9 +270,7 @@ struct WindowDragHandleView: NSViewRepresentable {
             )
             #endif
 
-            // AppKit zooms the window on a title-bar double-click by itself, even
-            // though this view takes the mouse-down. A zoom(nil) here ran a second
-            // zoom that undid the first, so the window grew and shrank back.
+            pendingDoubleClick = event.clickCount == 2
             if event.clickCount >= 2 {
                 pendingDragEvent = nil
                 return
@@ -255,9 +307,13 @@ struct WindowDragHandleView: NSViewRepresentable {
 
         override func mouseUp(with event: NSEvent) {
             pendingDragEvent = nil
+            if handleTitlebarDoubleClickMouseUp(event, pending: &pendingDoubleClick, window: window) {
+                return
+            }
             super.mouseUp(with: event)
         }
 
         private var pendingDragEvent: NSEvent?
+        private var pendingDoubleClick = false
     }
 }

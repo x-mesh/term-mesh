@@ -6412,6 +6412,37 @@ final class WindowDragHandleHitTests: XCTestCase {
     }
 }
 
+final class TitlebarDoubleClickActionTests: XCTestCase {
+    func testResolvesSystemDoubleClickSetting() {
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: nil, miniaturizeOnDoubleClick: false), .zoom)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: nil, miniaturizeOnDoubleClick: true), .minimize)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "Maximize", miniaturizeOnDoubleClick: true), .zoom)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "Fill", miniaturizeOnDoubleClick: false), .zoom)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "Minimize", miniaturizeOnDoubleClick: false), .minimize)
+        XCTAssertEqual(TitlebarDoubleClickAction.resolve(actionOnDoubleClick: "None", miniaturizeOnDoubleClick: true), .none)
+    }
+
+    private func mouseUp(clickCount: Int) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .leftMouseUp, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 0, clickCount: clickCount, pressure: 0
+        )!
+    }
+
+    func testActsOnlyOnDeliveredSecondMouseUpAfterOwnDoubleClickMouseDown() {
+        var pending = false
+        XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 2), pending: &pending, window: nil))
+
+        pending = true
+        XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 1), pending: &pending, window: nil))
+        XCTAssertFalse(pending)
+
+        pending = true
+        XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 3), pending: &pending, window: nil))
+        XCTAssertFalse(pending)
+    }
+}
+
 @MainActor
 final class DraggableFolderHitTests: XCTestCase {
     func testFolderHitTestReturnsContainerWhenInsideBounds() {
