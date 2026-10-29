@@ -7501,6 +7501,42 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
         XCTAssertEqual(url.scheme, "https")
     }
 
+
+    // MARK: - Web hosts without a scheme keep their browser reading
+
+    func testSchemeLessWebAddressesKeepBrowserReadingWithAndWithoutDirectory() throws {
+        for directory in [Optional("/work/repo"), nil] {
+            for raw in ["example.com/docs", "github.com/a/b", "127.0.0.1:3000/x", "[::1]:8080/x", "localhost:3000/x"] {
+                XCTAssertEqual(
+                    try XCTUnwrap(resolve(raw, existing: [], directory: directory), "\(raw) dir=\(String(describing: directory))"),
+                    try XCTUnwrap(resolveTerminalOpenURLTarget(raw)),
+                    raw
+                )
+            }
+        }
+    }
+
+    func testSchemeLessWebAddressesOpenEmbeddedBrowser() throws {
+        for raw in ["example.com/docs", "github.com/a/b", "127.0.0.1:3000/x", "[::1]:8080/x"] {
+            guard case .embeddedBrowser? = resolve(raw, existing: []) else {
+                return XCTFail("Expected embedded browser for \(raw)")
+            }
+        }
+    }
+
+    func testFileShapedPathsOpenNothingWhenMissingWithAndWithoutDirectory() {
+        for directory in [Optional("/work/repo"), nil] {
+            for raw in ["Sources/Foo.swift:12:5", ".github/workflows/ci.yml", "docs/x.md", "tests/a.py::t"] {
+                XCTAssertNil(resolve(raw, existing: [], directory: directory), raw)
+            }
+        }
+    }
+
+    func testExistingFileWinsOverWebHostShape() {
+        assertOpensFile(resolve("docs/x.md", existing: ["/work/repo/docs/x.md"]), "/work/repo/docs/x.md")
+        assertOpensFile(resolve("example.com/docs", existing: ["/work/repo/example.com/docs"]), "/work/repo/example.com/docs")
+    }
+
 }
 
 final class BrowserExternalNavigationSchemeTests: XCTestCase {

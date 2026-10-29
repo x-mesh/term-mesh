@@ -154,6 +154,36 @@ private func terminalLinkLooksLikeRelativePath(_ value: String) -> Bool {
     value.hasPrefix("./") || value.hasPrefix("../") || value.hasPrefix("~/") || value.contains("/")
 }
 
+/// True when the part before the first `/` is `localhost`, an IPv4 or bracketed
+/// IPv6 literal, or a dotted name whose last label is two or more letters, each
+/// optionally followed by `:port`. `Sources/Foo.swift` and `.github/ci.yml` are not.
+func terminalLinkStartsWithWebHost(_ value: String) -> Bool {
+    let first = value.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
+    var host = first
+    if first.hasPrefix("[") {
+        guard let close = first.firstIndex(of: "]") else { return false }
+        let inner = first[first.index(after: first.startIndex)..<close]
+        let rest = first[first.index(after: close)...]
+        let portOK = rest.isEmpty || (rest.hasPrefix(":") && rest.dropFirst().allSatisfy(\.isASCII) && rest.dropFirst().allSatisfy(\.isNumber) && rest.count > 1)
+        return portOK && inner.contains(":") && inner.allSatisfy { $0.isHexDigit || $0 == ":" || $0 == "." }
+    }
+    if let colon = first.firstIndex(of: ":") {
+        let port = first[first.index(after: colon)...]
+        guard !port.isEmpty, port.allSatisfy(\.isASCII), port.allSatisfy(\.isNumber),
+              first.firstIndex(of: ":") == first.lastIndex(of: ":") else { return false }
+        host = String(first[..<colon])
+    }
+    if host == "localhost" { return true }
+    let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+    if labels.count == 4, labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isASCII) && $0.allSatisfy(\.isNumber) && Int($0).map { $0 <= 255 } == true }) {
+        return true
+    }
+    guard labels.count >= 2, !host.hasPrefix("."),
+          labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy { ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" } }),
+          let last = labels.last, last.count >= 2, last.allSatisfy({ $0.isASCII && $0.isLetter }) else { return false }
+    return true
+}
+
 /// `relativePaths` turns on reading scheme-less paths as files. With it nil a
 /// scheme-less value is treated as a web address, the behaviour relay panes keep.
 func resolveTerminalOpenURLTarget(
@@ -190,19 +220,19 @@ func resolveTerminalOpenURLTarget(
     if let relativePaths, terminalLinkLooksLikeRelativePath(trimmed) {
         let path = strippingTerminalPathSuffix(trimmed)
         guard !path.isEmpty else { return nil }
-        let resolved: String
+        var resolved: String?
         if path.hasPrefix("~/") {
             resolved = NSString(string: path).expandingTildeInPath
         } else if let directory = relativePaths.workingDirectory, !directory.isEmpty {
             resolved = URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: directory, isDirectory: true))
                 .standardizedFileURL.path
-        } else {
-            return nil
         }
-        // Nothing opens for a path that is not there: sending it to the
-        // browser would only produce `https://` plus the path.
-        guard relativePaths.fileExists(resolved) else { return nil }
-        return .external(URL(fileURLWithPath: resolved))
+        if let resolved, relativePaths.fileExists(resolved) {
+            return .external(URL(fileURLWithPath: resolved))
+        }
+        // A file that is not there opens nothing, unless the text starts with
+        // a web host: `example.com/docs` has no file behind it and is a page.
+        guard terminalLinkStartsWithWebHost(trimmed) else { return nil }
     }
 
     if let webURL = resolveBrowserNavigableURL(trimmed) {
