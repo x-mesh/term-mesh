@@ -53,6 +53,10 @@ enum LayoutHangDiagnostics {
 
     private static var sampleTimer: DispatchSourceTimer?
     private static var watchdogTimer: DispatchSourceTimer?
+    private static var screenObserver: NSObjectProtocol?
+    /// Keyed by the owning `TabManager`. ContentView keeps the mounted set in
+    /// view state, so it reports the count here whenever that set changes.
+    private static var mountedWorkspaceCounts: [ObjectIdentifier: Int] = [:]
 
     /// Call once after `SentrySDK.start`, on the main thread.
     static func start() {
@@ -75,6 +79,27 @@ enum LayoutHangDiagnostics {
         watchdog.setEventHandler { checkStall() }
         watchdog.resume()
         watchdogTimer = watchdog
+
+        // Every 1D event sampled so far starts in AppKit's display-reconfiguration
+        // handler, so record when the screen set or scale changed.
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            let summary = MainActor.assumeIsolated {
+                LayoutCensusTally.screenSummary(
+                    scales: NSScreen.screens.map(\.backingScaleFactor),
+                    appActive: NSApp.isActive
+                )
+            }
+            sentryBreadcrumb("screen.parameters.changed", category: "hang", data: summary)
+        }
+    }
+
+    /// Called by ContentView whenever its mounted workspace set changes.
+    static func noteMountedWorkspaceCount(_ count: Int, for tabManager: TabManager) {
+        lock.lock(); mountedWorkspaceCounts[ObjectIdentifier(tabManager)] = count; lock.unlock()
     }
 
     /// Cheap hook for AppKit hosts that SwiftUI measures (called on the main thread
@@ -110,7 +135,7 @@ enum LayoutHangDiagnostics {
         let windowState = String(describing: census["window"] ?? "none")
         if windowState != lastLoggedWindowState {
             lastLoggedWindowState = windowState
-            dlog("layout.census window=\(windowState) active=\(census["app_active"] ?? "?") views=\(census["views"] ?? "-") constraints=\(census["constraints"] ?? "-") hosting=\(census["hosting_views"] ?? "-") top_hosts=\(census["top_hosts"] ?? "-")")
+            dlog("layout.census window=\(windowState) active=\(census["app_active"] ?? "?") views=\(census["views"] ?? "-") constraints=\(census["constraints"] ?? "-") hosting=\(census["hosting_views"] ?? "-") top_hosts=\(census["top_hosts"] ?? "-") views_by_window=\(census["views_by_window"] ?? "-") hidden_subtree_views=\(census["hidden_subtree_views"] ?? "-") portal_views=\(census["portal_views"] ?? "-") portal_terminals=\(census["portal_terminals"] ?? "-")/\(census["portal_terminals_hidden"] ?? "-") workspaces=\(census["workspaces"] ?? "-")/\(census["mounted_workspaces"] ?? "-")")
         }
         #endif
     }
@@ -120,87 +145,93 @@ enum LayoutHangDiagnostics {
     /// Deliberately not keyWindow/mainWindow: both are nil while the app is in the
     /// background, which is when these hangs are sampled. See the type doc.
     private static func computeCensus() -> [String: Any] {
+        let startedAt = CACurrentMediaTime()
         let allWindows = NSApp.windows
         let windows = allWindows.filter { $0.isVisible && $0.contentView != nil }
-        guard !windows.isEmpty else {
+        var census: [String: Any]
+        if windows.isEmpty {
             // Now distinguishable from the old blind "none": if the app really has no
             // visible window, windows_total says so.
-            return [
+            census = [
                 "window": "none",
                 "app_active": NSApp.isActive,
                 "windows_total": allWindows.count,
             ]
-        }
-
-        var constraintCount = 0
-        var viewCount = 0
-        var hostingCount = 0
-        var maxDepth = 0
-        var budget = 20_000  // node cap, shared across windows, to keep the walk cheap
-        // Descendants are attributed to the outermost hosting view above them, so the
-        // biggest SwiftUI subtree is identifiable by name rather than by guesswork.
-        var hostSubtree: [String: Int] = [:]
-
-        for window in windows {
-            if budget <= 0 { break }
-            guard let root = window.contentView else { continue }
-            var stack: [(view: NSView, depth: Int, host: String?)] = [(root, 0, nil)]
-            while let node = stack.popLast() {
+        } else {
+            var tally = LayoutCensusTally()
+            var budget = 20_000  // node cap, shared across windows, to keep the walk cheap
+            for window in windows {
+                guard let root = window.contentView else { continue }
+                LayoutCensusTally.walk(
+                    root: root,
+                    windowKey: "\(window.windowNumber):\(String(describing: type(of: window)))",
+                    budget: &budget,
+                    into: &tally,
+                    isTerminalHost: { $0 is GhosttySurfaceScrollView }
+                )
                 if budget <= 0 { break }
-                budget -= 1
-                viewCount += 1
-                constraintCount += node.view.constraints.count
-                if node.depth > maxDepth { maxDepth = node.depth }
-
-                var host = node.host
-                // This runs on every node up to the budget. Building a demangled
-                // Swift type name per node and then calling String.contains -
-                // which resolves to Foundation's locale-aware search - was 44% of
-                // this census in main-thread profiles. The raw class name matches
-                // the same two markers, allocates nothing, and only the rare
-                // hosting node pays for the readable name.
-                let rawName = class_getName(type(of: node.view))
-                if strstr(rawName, "HostingView") != nil
-                    || strstr(rawName, "PlatformViewHost") != nil {
-                    hostingCount += 1
-                    if host == nil {
-                        host = shortHostName(String(describing: type(of: node.view)))
-                    }
-                }
-                if let host { hostSubtree[host, default: 0] += 1 }
-
-                for sub in node.view.subviews {
-                    stack.append((sub, node.depth + 1, host))
-                }
             }
+            census = tally.contextFields()
+            census["window"] = "\(windows.count) visible"
+            census["app_active"] = NSApp.isActive
+            census["windows_total"] = allWindows.count
+            census["truncated"] = budget <= 0
         }
 
-        let topHosts = hostSubtree
-            .sorted { $0.value > $1.value }
-            .prefix(3)
-            .map { "\($0.key)=\($0.value)" }
-            .joined(separator: " ")
-
-        return [
-            "window": "\(windows.count) visible",
-            "app_active": NSApp.isActive,
-            "windows_total": allWindows.count,
-            "constraints": constraintCount,
-            "views": viewCount,
-            "hosting_views": hostingCount,
-            "max_depth": maxDepth,
-            "truncated": budget <= 0,
-            "top_hosts": topHosts.isEmpty ? "none" : topHosts,
-        ]
+        // The sampler's timer fires on the main queue.
+        let (portal, workspaceCounts) = MainActor.assumeIsolated {
+            (TerminalWindowPortalRegistry.censusRoots(), collectWorkspaceCounts())
+        }
+        // Walked separately so the content-view fields stay comparable with events
+        // from earlier releases, which never counted the portal.
+        var portalTally = LayoutCensusTally()
+        var portalBudget = 20_000
+        for root in portal.roots {
+            LayoutCensusTally.walk(
+                root: root,
+                windowKey: "portal",
+                budget: &portalBudget,
+                into: &portalTally,
+                isTerminalHost: { $0 is GhosttySurfaceScrollView }
+            )
+            if portalBudget <= 0 { break }
+        }
+        census.merge(portalTally.portalFields(entries: portal.entries, truncated: portalBudget <= 0)) { _, new in new }
+        census.merge(workspaceCounts.contextFields()) { _, new in new }
+        // The census runs on the main thread every 2 s; this keeps its own cost visible.
+        census["census_ms"] = (CACurrentMediaTime() - startedAt) * 1_000
+        return census
     }
 
-    /// SwiftUI spells a hosting view as `NSHostingView<ModifiedContent<…>>`, hundreds of
-    /// characters of nested generics. The head carries the identity; keep that and drop
-    /// the rest so the context value stays small enough to be worth reading.
-    private static func shortHostName(_ cls: String) -> String {
-        let head = cls.prefix(60)
-        return head.count < cls.count ? head + "…" : String(head)
+    @MainActor
+    private static func collectWorkspaceCounts() -> LayoutCensusWorkspaceCounts {
+        var counts = LayoutCensusWorkspaceCounts()
+        guard let appDelegate = AppDelegate.shared else { return counts }
+        let managers = appDelegate.mainWindowContexts.values.map(\.tabManager)
+        let liveOwners = Set(managers.map { ObjectIdentifier($0) })
+        lock.lock()
+        mountedWorkspaceCounts = mountedWorkspaceCounts.filter { liveOwners.contains($0.key) }
+        let mounted = mountedWorkspaceCounts
+        lock.unlock()
+        for manager in managers {
+            counts.add(
+                workspaces: manager.tabs.count,
+                mountedWorkspaces: mounted[ObjectIdentifier(manager)] ?? 0,
+                panes: manager.tabs.reduce(0) { $0 + $1.bonsplitController.allPaneIds.count },
+                surfaces: manager.tabs.reduce(0) { $0 + $1.panels.count }
+            )
+        }
+        return counts
     }
+
+    #if DEBUG
+    /// The census the main-thread sampler last produced. Readable off-main, so a
+    /// socket query never waits on the thread whose layout it describes.
+    static func latestCensusSnapshot() -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        return lastCensus
+    }
+    #endif
 
     // MARK: - Background watchdog
 
@@ -232,5 +263,149 @@ enum LayoutHangDiagnostics {
         crumb.message = "main-thread stall \(String(format: "%.1f", since))s; last_host=\(host)"
         crumb.data = ctx
         SentrySDK.addBreadcrumb(crumb)
+    }
+}
+
+/// Counts gathered by the census walk, kept apart from AppKit window enumeration so
+/// the arithmetic can be tested on plain view trees.
+struct LayoutCensusTally {
+    var views = 0
+    var constraints = 0
+    var hostingViews = 0
+    var maxDepth = 0
+    /// Terminal hosts inside the walked windows, and those hidden themselves or by an
+    /// ancestor. Hidden terminals still sit in the hierarchy AppKit lays out.
+    var terminalHosts = 0
+    var hiddenTerminalHosts = 0
+    /// Every view at or below a hidden view. Tests whether the 1D trees are large
+    /// because of content nobody can see.
+    var hiddenSubtreeViews = 0
+    var hostSubtree: [String: Int] = [:]
+    /// Keyed by window number and class rather than the hosting view's name: the
+    /// name is a 60-character prefix that every main window shares.
+    var viewsByWindow: [String: Int] = [:]
+
+    static func walk(
+        root: NSView,
+        windowKey: String,
+        budget: inout Int,
+        into tally: inout LayoutCensusTally,
+        isTerminalHost: (NSView) -> Bool
+    ) {
+        var windowViews = 0
+        defer { tally.viewsByWindow[windowKey, default: 0] += windowViews }
+        var stack: [(view: NSView, depth: Int, host: String?, hidden: Bool)] = [(root, 0, nil, false)]
+        while let node = stack.popLast() {
+            if budget <= 0 { break }
+            budget -= 1
+            tally.views += 1
+            windowViews += 1
+            tally.constraints += node.view.constraints.count
+            if node.depth > tally.maxDepth { tally.maxDepth = node.depth }
+
+            let hidden = node.hidden || node.view.isHidden
+            if hidden { tally.hiddenSubtreeViews += 1 }
+            if isTerminalHost(node.view) {
+                tally.terminalHosts += 1
+                if hidden { tally.hiddenTerminalHosts += 1 }
+            }
+
+            var host = node.host
+            // This runs on every node up to the budget. Building a demangled
+            // Swift type name per node and then calling String.contains -
+            // which resolves to Foundation's locale-aware search - was 44% of
+            // this census in main-thread profiles. The raw class name matches
+            // the same two markers, allocates nothing, and only the rare
+            // hosting node pays for the readable name.
+            let rawName = class_getName(type(of: node.view))
+            if strstr(rawName, "HostingView") != nil
+                || strstr(rawName, "PlatformViewHost") != nil {
+                tally.hostingViews += 1
+                if host == nil {
+                    host = shortHostName(String(describing: type(of: node.view)))
+                }
+            }
+            if let host { tally.hostSubtree[host, default: 0] += 1 }
+
+            for sub in node.view.subviews {
+                stack.append((sub, node.depth + 1, host, hidden))
+            }
+        }
+    }
+
+    func contextFields() -> [String: Any] {
+        let topHosts = Self.topEntries(hostSubtree, limit: 3)
+        let byWindow = Self.topEntries(viewsByWindow, limit: 5)
+        return [
+            "constraints": constraints,
+            "views": views,
+            "hosting_views": hostingViews,
+            "max_depth": maxDepth,
+            "top_hosts": topHosts.isEmpty ? "none" : topHosts,
+            "views_by_window": byWindow.isEmpty ? "none" : byWindow,
+            "hidden_subtree_views": hiddenSubtreeViews,
+        ]
+    }
+
+    /// Fields for a walk of the terminal portal host views.
+    func portalFields(entries: Int, truncated: Bool) -> [String: Any] {
+        [
+            "portal_entries": entries,
+            "portal_views": views,
+            "portal_constraints": constraints,
+            "portal_hidden_subtree_views": hiddenSubtreeViews,
+            "portal_terminals": terminalHosts,
+            "portal_terminals_hidden": hiddenTerminalHosts,
+            "portal_truncated": truncated,
+        ]
+    }
+
+    /// Largest first, ties by key, so two samples of the same tree read the same.
+    static func topEntries(_ counts: [String: Int], limit: Int) -> String {
+        counts
+            .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            .prefix(limit)
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+    }
+
+    static func screenSummary(scales: [CGFloat], appActive: Bool) -> [String: Any] {
+        [
+            "screens": scales.count,
+            "scales": scales.map { String(format: "%.1f", Double($0)) }.joined(separator: ","),
+            "app_active": appActive,
+        ]
+    }
+
+    /// SwiftUI spells a hosting view as `NSHostingView<ModifiedContent<…>>`, hundreds of
+    /// characters of nested generics. The head carries the identity; keep that and drop
+    /// the rest so the context value stays small enough to be worth reading.
+    static func shortHostName(_ cls: String) -> String {
+        let head = cls.prefix(60)
+        return head.count < cls.count ? head + "…" : String(head)
+    }
+}
+
+/// Workspace and pane totals across every main window's `TabManager`.
+struct LayoutCensusWorkspaceCounts {
+    var workspaces = 0
+    var mountedWorkspaces = 0
+    var panes = 0
+    var surfaces = 0
+
+    mutating func add(workspaces: Int, mountedWorkspaces: Int, panes: Int, surfaces: Int) {
+        self.workspaces += workspaces
+        self.mountedWorkspaces += mountedWorkspaces
+        self.panes += panes
+        self.surfaces += surfaces
+    }
+
+    func contextFields() -> [String: Any] {
+        [
+            "workspaces": workspaces,
+            "mounted_workspaces": mountedWorkspaces,
+            "panes": panes,
+            "surfaces": surfaces,
+        ]
     }
 }

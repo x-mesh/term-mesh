@@ -2385,6 +2385,9 @@ struct ContentView: View {
             isCycleHot: isCycleHot,
             maxMounted: maxMounted
         )
+        if mountedWorkspaceIds.count != previousMountedIds.count {
+            LayoutHangDiagnostics.noteMountedWorkspaceCount(mountedWorkspaceIds.count, for: tabManager)
+        }
 #if DEBUG
         if mountedWorkspaceIds != previousMountedIds {
             let added = mountedWorkspaceIds.filter { !previousMountedIds.contains($0) }
