@@ -12,13 +12,13 @@ struct DoubleClickZoomView: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     private final class DoubleClickZoomNSView: NSView {
-        private var pendingDoubleClick = false
+        private var pendingDoubleClick: TitlebarDoubleClickSnapshot?
 
         override var mouseDownCanMoveWindow: Bool { true }
         override func hitTest(_ point: NSPoint) -> NSView? { self }
 
         override func mouseDown(with event: NSEvent) {
-            pendingDoubleClick = event.clickCount == 2
+            pendingDoubleClick = event.clickCount == 2 ? window.map(TitlebarDoubleClickSnapshot.init) : nil
             super.mouseDown(with: event)
         }
 

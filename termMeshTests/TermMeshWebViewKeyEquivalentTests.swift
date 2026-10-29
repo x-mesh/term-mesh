@@ -6429,17 +6429,36 @@ final class TitlebarDoubleClickActionTests: XCTestCase {
         )!
     }
 
-    func testActsOnlyOnDeliveredSecondMouseUpAfterOwnDoubleClickMouseDown() {
-        var pending = false
+    func testSkipsActionWhenAppKitAlreadyChangedTheWindow() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: true
+        )
+        let snapshot = TitlebarDoubleClickSnapshot(window: window)
+        XCTAssertFalse(snapshot.appKitActed(on: window))
+
+        window.setFrame(NSRect(x: 0, y: 0, width: 800, height: 600), display: false)
+        XCTAssertTrue(snapshot.appKitActed(on: window))
+
+        var pending: TitlebarDoubleClickSnapshot? = snapshot
+        let frameBefore = window.frame
+        XCTAssertTrue(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 2), pending: &pending, window: window))
+        XCTAssertNil(pending)
+        XCTAssertEqual(window.frame, frameBefore, "AppKit already acted, so the window must not change again")
+    }
+
+    func testIgnoresMouseUpsThatAreNotTheSecondClickOfOwnDoubleClick() {
+        var pending: TitlebarDoubleClickSnapshot?
         XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 2), pending: &pending, window: nil))
 
-        pending = true
+        let snapshot = TitlebarDoubleClickSnapshot(frame: .zero, isMiniaturized: false)
+        pending = snapshot
         XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 1), pending: &pending, window: nil))
-        XCTAssertFalse(pending)
+        XCTAssertNil(pending)
 
-        pending = true
+        pending = snapshot
         XCTAssertFalse(handleTitlebarDoubleClickMouseUp(mouseUp(clickCount: 3), pending: &pending, window: nil))
-        XCTAssertFalse(pending)
+        XCTAssertNil(pending)
     }
 }
 

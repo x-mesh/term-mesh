@@ -39,19 +39,45 @@ enum TitlebarDoubleClickAction: Equatable {
     }
 }
 
-/// macOS 27.0 runs the double-click action from a title-frame gesture recognizer
-/// that consumes the second click's mouse-up, so it never reaches our views. macOS
-/// 27.2 delivers that mouse-up to the view that took the mouse-down and does
-/// nothing itself. Acting only on a delivered mouse-up therefore runs the action
-/// exactly once on both; acting on the mouse-down zoomed twice on 27.0.
+/// The window state at the second click's mouse-down, to tell whether AppKit acted.
+struct TitlebarDoubleClickSnapshot: Equatable {
+    let frame: NSRect
+    let isMiniaturized: Bool
+
+    init(window: NSWindow) {
+        frame = window.frame
+        isMiniaturized = window.isMiniaturized
+    }
+
+    init(frame: NSRect, isMiniaturized: Bool) {
+        self.frame = frame
+        self.isMiniaturized = isMiniaturized
+    }
+
+    /// macOS 27.0 runs the title-bar double-click action from a title-frame gesture
+    /// recognizer inside `sendEvent`, before the second mouse-up reaches our view,
+    /// and the zoom has finished by then. macOS 27.2 does nothing and still delivers
+    /// that mouse-up. Both deliver it, so only a window change since the mouse-down
+    /// shows that AppKit already acted; acting again zoomed the window back.
+    func appKitActed(on window: NSWindow) -> Bool {
+        window.frame != frame || window.isMiniaturized != isMiniaturized
+    }
+}
+
 func handleTitlebarDoubleClickMouseUp(
     _ event: NSEvent,
-    pending: inout Bool,
+    pending: inout TitlebarDoubleClickSnapshot?,
     window: NSWindow?
 ) -> Bool {
-    let isDoubleClick = pending && event.clickCount == 2
-    pending = false
-    guard isDoubleClick, let window else { return false }
+    let snapshot = pending
+    pending = nil
+    guard let snapshot, event.clickCount == 2, let window else { return false }
+    if snapshot.appKitActed(on: window) {
+        #if DEBUG
+        dlog("titlebar.doubleClick action=appKit")
+        #endif
+        return true
+    }
     let action = TitlebarDoubleClickAction.current
     #if DEBUG
     dlog("titlebar.doubleClick action=\(action)")
@@ -270,7 +296,7 @@ struct WindowDragHandleView: NSViewRepresentable {
             )
             #endif
 
-            pendingDoubleClick = event.clickCount == 2
+            pendingDoubleClick = event.clickCount == 2 ? window.map(TitlebarDoubleClickSnapshot.init) : nil
             if event.clickCount >= 2 {
                 pendingDragEvent = nil
                 return
@@ -314,6 +340,6 @@ struct WindowDragHandleView: NSViewRepresentable {
         }
 
         private var pendingDragEvent: NSEvent?
-        private var pendingDoubleClick = false
+        private var pendingDoubleClick: TitlebarDoubleClickSnapshot?
     }
 }
