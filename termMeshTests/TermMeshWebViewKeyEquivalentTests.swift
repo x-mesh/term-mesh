@@ -7392,6 +7392,151 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
             XCTFail("Expected hostless HTTPS URL to open externally")
         }
     }
+
+    // MARK: - Scheme-less paths read against the pane directory
+
+    private let paneDirectory = "/work/repo"
+
+    private func resolve(_ raw: String, existing: Set<String>, directory: String? = "/work/repo") -> TerminalOpenURLTarget? {
+        resolveTerminalOpenURLTarget(
+            raw,
+            relativePaths: TerminalRelativePathContext(
+                workingDirectory: directory,
+                fileExists: { existing.contains($0) }
+            )
+        )
+    }
+
+    private func assertOpensFile(_ target: TerminalOpenURLTarget?, _ path: String, file: StaticString = #filePath, line: UInt = #line) {
+        guard case let .external(url)? = target else {
+            return XCTFail("Expected file URL \(path), got \(String(describing: target))", file: file, line: line)
+        }
+        XCTAssertTrue(url.isFileURL, file: file, line: line)
+        XCTAssertEqual(url.path, path, file: file, line: line)
+    }
+
+    func testGitDiffStatPathOpensFileUnderPaneDirectory() {
+        assertOpensFile(
+            resolve("Sources/GhosttyApp.swift", existing: ["/work/repo/Sources/GhosttyApp.swift"]),
+            "/work/repo/Sources/GhosttyApp.swift"
+        )
+    }
+
+    func testGitStatusPathOpensFileUnderPaneDirectory() {
+        assertOpensFile(
+            resolve("docs/ghostty-fork.md", existing: ["/work/repo/docs/ghostty-fork.md"]),
+            "/work/repo/docs/ghostty-fork.md"
+        )
+    }
+
+    func testSwiftDiagnosticDropsLineAndColumn() {
+        assertOpensFile(
+            resolve("Sources/Foo.swift:12:5", existing: ["/work/repo/Sources/Foo.swift"]),
+            "/work/repo/Sources/Foo.swift"
+        )
+    }
+
+    func testRustDiagnosticDropsLine() {
+        assertOpensFile(
+            resolve("daemon/term-meshd/src/peer/surface.rs:985", existing: ["/work/repo/daemon/term-meshd/src/peer/surface.rs"]),
+            "/work/repo/daemon/term-meshd/src/peer/surface.rs"
+        )
+    }
+
+    func testPytestNodeIdDropsNode() {
+        assertOpensFile(
+            resolve("tests_v2/test_a.py::test_slow_hup", existing: ["/work/repo/tests_v2/test_a.py"]),
+            "/work/repo/tests_v2/test_a.py"
+        )
+    }
+
+    func testMissingRelativePathOpensNothing() {
+        XCTAssertNil(resolve("missing/nowhere.md:12", existing: []))
+    }
+
+    func testFileSchemeWithoutPathOpensNothing() {
+        XCTAssertNil(resolve("file:23", existing: []))
+        XCTAssertNil(resolveTerminalOpenURLTarget("file:23"))
+    }
+
+    func testWebURLKeepsEmbeddedBrowserWithPathContext() throws {
+        let target = try XCTUnwrap(resolve("https://example.com/docs", existing: []))
+        guard case let .embeddedBrowser(url) = target else {
+            return XCTFail("Expected embedded browser, got \(target)")
+        }
+        XCTAssertEqual(url.host, "example.com")
+    }
+
+    func testHostPortKeepsCurrentRouteWithPathContext() throws {
+        let raw = "localhost:3777/status"
+        XCTAssertEqual(
+            try XCTUnwrap(resolve(raw, existing: [])),
+            try XCTUnwrap(resolveTerminalOpenURLTarget(raw))
+        )
+    }
+
+    func testDotSlashAndParentPathsResolveAgainstPaneDirectory() {
+        assertOpensFile(resolve("./a/b.txt:3", existing: ["/work/repo/a/b.txt"]), "/work/repo/a/b.txt")
+        assertOpensFile(resolve("../other/c.txt", existing: ["/work/other/c.txt"]), "/work/other/c.txt")
+    }
+
+    func testRelativePathWithoutKnownDirectoryOpensNothing() {
+        XCTAssertNil(resolve("Sources/Foo.swift", existing: ["/Sources/Foo.swift"], directory: nil))
+    }
+
+    func testAbsolutePathDropsLineSuffixWithoutExistenceCheck() {
+        assertOpensFile(resolve("/tmp/x.swift:7:2", existing: []), "/tmp/x.swift")
+    }
+
+    func testTildePathExpandsHome() {
+        let home = NSString(string: "~").expandingTildeInPath
+        assertOpensFile(resolve("~/notes.md", existing: [home + "/notes.md"], directory: nil), home + "/notes.md")
+    }
+
+    func testPathContextAbsentKeepsBrowserReadingForRelay() throws {
+        let target = try XCTUnwrap(resolveTerminalOpenURLTarget("Sources/Foo.swift"))
+        guard case let .embeddedBrowser(url) = target else {
+            return XCTFail("Expected legacy browser route, got \(target)")
+        }
+        XCTAssertEqual(url.scheme, "https")
+    }
+
+
+    // MARK: - Web hosts without a scheme keep their browser reading
+
+    func testSchemeLessWebAddressesKeepBrowserReadingWithAndWithoutDirectory() throws {
+        for directory in [Optional("/work/repo"), nil] {
+            for raw in ["example.com/docs", "github.com/a/b", "127.0.0.1:3000/x", "[::1]:8080/x", "localhost:3000/x"] {
+                XCTAssertEqual(
+                    try XCTUnwrap(resolve(raw, existing: [], directory: directory), "\(raw) dir=\(String(describing: directory))"),
+                    try XCTUnwrap(resolveTerminalOpenURLTarget(raw)),
+                    raw
+                )
+            }
+        }
+    }
+
+    func testSchemeLessWebAddressesOpenEmbeddedBrowser() throws {
+        for raw in ["example.com/docs", "github.com/a/b", "127.0.0.1:3000/x", "[::1]:8080/x"] {
+            guard case .embeddedBrowser? = resolve(raw, existing: []) else {
+                return XCTFail("Expected embedded browser for \(raw)")
+            }
+        }
+    }
+
+    func testFileShapedPathsOpenNothingWhenMissingWithAndWithoutDirectory() {
+        for directory in [Optional("/work/repo"), nil] {
+            for raw in ["Sources/Foo.swift:12:5", ".github/workflows/ci.yml", "docs/x.md", "tests/a.py::t"] {
+                XCTAssertNil(resolve(raw, existing: [], directory: directory), raw)
+            }
+        }
+    }
+
+    func testExistingFileWinsOverWebHostShape() {
+        assertOpensFile(resolve("docs/x.md", existing: ["/work/repo/docs/x.md"]), "/work/repo/docs/x.md")
+        assertOpensFile(resolve("example.com/docs", existing: ["/work/repo/example.com/docs"]), "/work/repo/example.com/docs")
+    }
+
 }
 
 final class BrowserExternalNavigationSchemeTests: XCTestCase {
