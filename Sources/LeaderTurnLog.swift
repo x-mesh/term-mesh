@@ -1059,6 +1059,7 @@ enum LeaderTurnLog {
     private static var rotatedRecordsCache: (stamp: LogFileStamp, decoded: DecodedGeneration)?
     private static var recentCache: (stamp: LogFileStamp, entries: [RecentKey: [Record]])?
     private static var policyCache: (stamp: LogFileStamp, entries: [String: PolicyReport])?
+    private static var policyIndexes: [String: PolicyIndex] = [:]
 
     /// The rotated generation `gc.rotate_log` leaves beside the live file.
     /// `tm-agent` folds both into one reading. Reading only the live file makes
@@ -1108,6 +1109,7 @@ enum LeaderTurnLog {
         rotatedRecordsCache = nil
         recentCache = nil
         policyCache = nil
+        policyIndexes.removeAll()
         logCacheLock.unlock()
         return moved
     }
@@ -1610,12 +1612,161 @@ enum LeaderTurnLog {
         return report
     }
 
+    /// The fields `computePolicyReport` reads, for the three events it counts.
+    /// The log is append-only and shared by every Project, so keeping only
+    /// these keeps the resident set small however long the history grows.
+    struct PolicyRecord: Equatable {
+        let event: Event
+        let team: String
+        let cohort: String?
+        let waveID: String?
+        let taskWaveID: String?
+        let taskID: String?
+        let taskStatus: String?
+        let policyApplied: Bool?
+        let suggestedRoute: String?
+        let actualRoute: String?
+        let policyMode: String?
+
+        init?(_ record: Record) {
+            switch record.event {
+            case .turnRoute, .taskDispatch, .taskLifecycle: break
+            default: return nil
+            }
+            event = record.event
+            team = record.team
+            cohort = record.cohort
+            waveID = record.waveID
+            taskWaveID = record.taskWaveID
+            taskID = record.taskID
+            taskStatus = record.taskStatus
+            policyApplied = record.policyApplied
+            suggestedRoute = record.suggestedRoute
+            actualRoute = record.actualRoute
+            policyMode = record.policyMode
+        }
+    }
+
+    /// Reads only the bytes appended since the last call. A different file
+    /// identity, a size below the consumed offset, or a changed tail where the
+    /// last read ended means the file was rotated, truncated, or rewritten, and
+    /// the index starts over from byte 0. A final line without its newline is
+    /// left for the next read, as `readAll` drops it.
+    private final class PolicyIndex {
+        private static let anchorLength = 512
+        private static let headLength = 256
+        private let lock = NSLock()
+        private var identity: (device: dev_t, file: ino_t, createdSeconds: Int, createdNanoseconds: Int)?
+        private var offset = 0
+        private var anchor = Data()
+        private var head = Data()
+        private var records: [PolicyRecord] = []
+        private(set) var decodedLineCount = 0
+
+        func refresh(_ logFile: URL) -> [PolicyRecord] {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let stamp = LogFileStamp(path: logFile.path) else {
+                reset()
+                return []
+            }
+            let current = (stamp.deviceID, stamp.fileID, stamp.createdSeconds, stamp.createdNanoseconds)
+            if let identity, identity == current, Int(stamp.size) >= offset {
+                // Same file and no shrink: still verify the tail, which catches an in-place rewrite.
+            } else {
+                reset()
+            }
+            identity = current
+            guard let handle = try? FileHandle(forReadingFrom: logFile) else { return records }
+            defer { try? handle.close() }
+            if offset > 0 {
+                // Lines share a shape, so the tail alone can match a rewritten
+                // file; the head carries the first turn id and timestamp.
+                let tailStart = offset - anchor.count
+                guard (try? handle.seek(toOffset: 0)) != nil,
+                      let first = try? handle.read(upToCount: head.count), first == head,
+                      (try? handle.seek(toOffset: UInt64(tailStart))) != nil,
+                      let tail = try? handle.read(upToCount: anchor.count), tail == anchor else {
+                    reset()
+                    identity = current
+                    return readFromStart(handle)
+                }
+            }
+            return readAppended(handle)
+        }
+
+        func decodedLines() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return decodedLineCount
+        }
+
+        private func reset() {
+            identity = nil
+            offset = 0
+            anchor = Data()
+            head = Data()
+            records = []
+        }
+
+        private func readFromStart(_ handle: FileHandle) -> [PolicyRecord] {
+            guard (try? handle.seek(toOffset: 0)) != nil else { return records }
+            return readAppended(handle)
+        }
+
+        private func readAppended(_ handle: FileHandle) -> [PolicyRecord] {
+            guard let chunk = try? handle.readToEnd(), let lastNewline = chunk.lastIndex(of: 0x0A) else {
+                return records
+            }
+            let consumed = chunk[chunk.startIndex...lastNewline]
+            let decoder = JSONDecoder()
+            for line in consumed.split(separator: 0x0A) {
+                decodedLineCount += 1
+                guard let record = try? decoder.decode(Record.self, from: Data(line)),
+                      let projected = PolicyRecord(record) else { continue }
+                records.append(projected)
+            }
+            if offset == 0 { head = Data(consumed.prefix(Self.headLength)) }
+            offset += consumed.count
+            anchor = Data((anchor + consumed).suffix(Self.anchorLength))
+            return records
+        }
+    }
+
+    private static func policyRecords(from logFile: URL) -> [PolicyRecord] {
+        let key = logFile.standardizedFileURL.path
+        logCacheLock.lock()
+        let index: PolicyIndex
+        if let existing = policyIndexes[key] {
+            index = existing
+        } else {
+            index = PolicyIndex()
+            policyIndexes[key] = index
+        }
+        logCacheLock.unlock()
+        return index.refresh(logFile)
+    }
+
+    /// Decode the existing history off the main thread at launch, so the first
+    /// `fleet.state` reads only what was appended since.
+    static func warmPolicyIndex(from logFile: URL = logFile) {
+        _ = policyRecords(from: logFile)
+    }
+
+    static func policyIndexDecodedLineCount(for logFile: URL) -> Int {
+        logCacheLock.lock()
+        let index = policyIndexes[logFile.standardizedFileURL.path]
+        logCacheLock.unlock()
+        return index?.decodedLines() ?? 0
+    }
+
     private static func computePolicyReport(from logFile: URL, team: String?) -> PolicyReport {
-        let records = readAll(from: logFile).filter { record in
+        let records = policyRecords(from: logFile).filter { record in
             guard let team else { return true }
             return record.team == team
         }
         let routes = records.filter { $0.event == .turnRoute }
+        let routeWaves = Set(routes.compactMap(\.waveID))
         let dispatches = records.filter { $0.event == .taskDispatch }
         let lifecycles = records.filter { $0.event == .taskLifecycle }
         let cohorts = Dictionary(grouping: routes.compactMap(\.cohort), by: { $0 })
@@ -1635,7 +1786,7 @@ enum LeaderTurnLog {
         }.count
         let unlinkedDelegatedTasks = dispatches.filter { dispatch in
             guard let wave = dispatch.taskWaveID else { return true }
-            return !routes.contains { $0.waveID == wave }
+            return !routeWaves.contains(wave)
         }.count
         let delegationRateByCohort = Dictionary(grouping: routes, by: { $0.cohort ?? "unknown" })
             .mapValues { cohortRoutes in

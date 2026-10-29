@@ -706,6 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                         "turn log quarantine moved \(moved, privacy: .public) line(s)"
                     )
                 }
+                LeaderTurnLog.warmPolicyIndex()
             }
         }
 
