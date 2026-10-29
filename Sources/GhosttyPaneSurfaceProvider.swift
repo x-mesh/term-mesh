@@ -1003,15 +1003,33 @@ final class PtyTapHub: @unchecked Sendable {
         rawDrainLock.unlock()
     }
 
-    func atomicResyncSnapshot(surface: ghostty_surface_t) async -> PeerSurfaceResync? {
+    typealias RawSnapshot = (bytes: Data, rawEnd: UInt64)
+
+    /// One capture, taken only while the surface is still alive. `liveSurface` is
+    /// asked on the main actor for every read: the surface is freed on a main turn
+    /// after its panel closes, and this loop can outlive that for up to 12 s.
+    static func captureLiveSnapshot(
+        liveSurface: @escaping @MainActor @Sendable () -> ghostty_surface_t?,
+        read: @escaping @MainActor @Sendable (ghostty_surface_t) -> RawSnapshot?
+    ) async -> RawSnapshot? {
+        await MainActor.run {
+            guard let surface = liveSurface() else { return nil }
+            return read(surface)
+        }
+    }
+
+    func atomicResyncSnapshot(
+        liveSurface: @escaping @MainActor @Sendable () -> ghostty_surface_t?
+    ) async -> PeerSurfaceResync? {
         let retryPeriod: UInt64 = 5_000_000
         let deadline = ProcessInfo.processInfo.systemUptime + 12
         setResyncBoundaryTracking(true)
         defer { setResyncBoundaryTracking(false) }
         while ProcessInfo.processInfo.systemUptime < deadline {
-            let snapshot = await MainActor.run {
-                readPaneSnapshotWithRawOutputSequence(surface)
-            }
+            let snapshot = await Self.captureLiveSnapshot(
+                liveSurface: liveSurface,
+                read: { readPaneSnapshotWithRawOutputSequence($0) }
+            )
             guard let snapshot else { return nil }
             // Wait for the drain to map this capture. Once the drain has
             // moved past it without a checkpoint it never will be — it fell
@@ -1830,9 +1848,15 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             },
             workspaceMeta: meta,
             initialByteSeq: initialSeq,
-            resync: { [weak hub] in
+            resync: { [weak hub, weakTS, sfcPtrKey] in
                 guard let hub else { return nil }
-                return await hub.atomicResyncSnapshot(surface: sfcPtr)
+                // Same surface as at attach, by address: a surface recreated on the same
+                // TerminalSurface has its own output-sequence space.
+                return await hub.atomicResyncSnapshot(liveSurface: {
+                    guard let ptr = weakTS.value?.surface,
+                          UInt(bitPattern: ptr) == sfcPtrKey else { return nil }
+                    return ptr
+                })
             },
             observeInputPathRawCallback: { boundary, timestamp in
                 inputPathTracker.observeRawCallback(boundary: boundary, at: timestamp)
