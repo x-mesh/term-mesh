@@ -4,6 +4,28 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.280.0] - 2026-10-29
+
+### Added
+
+- Settings > Terminal has a new Fallback Font option. It draws the characters that the primary font does not have, such as Korean, Japanese, and Chinese text. Fonts that support your preferred macOS languages are listed first. Before, Korean text in a font without Hangul fell back to a macOS font that the updated Ghostty engine scales up, so it looked larger than the rest of the line. Choosing a primary font in term-mesh also removed the fallback fonts that you set in the Ghostty config. The option is available after you choose a primary font.
+- The sidebar now shows what Claude Code or Codex is doing in a workspace: Working, Done, or a waiting state such as "Waiting for permission", "Waiting for an answer", or "Waiting for sign-in". term-mesh reads the status that these agents report through the terminal, so it also works in panes that the status hooks do not reach. The status clears when the agent exits or when you close the pane.
+- Cmd-clicking a relative path in terminal output now opens the file. This covers paths from `git status`, `git diff --stat`, and compiler or test output such as `Sources/App.swift:12:5`. The path is resolved against the pane's current directory, so the shell must report its directory through shell integration. Before, term-mesh opened these paths as web addresses such as `https://Sources/App.swift:12:5`. A path that does not exist now opens nothing. Web addresses without a scheme, such as `example.com/docs`, still open in the browser.
+
+### Fixed
+
+- The agent panel no longer stops responding for several seconds when it shows a long transcript or when the app becomes active again. Text selection now covers only the 20 most recent rows and text up to 4 KB. To copy older or longer text, use Copy on the row or Copy Transcript in the transcript's context menu. Copy Transcript includes the file changes that the transcript shows. Long tool results and code blocks show their first and last 16 KB, and Copy still copies the full text.
+- term-mesh no longer stops responding for up to 10 seconds while it looks up this Mac's host name on a slow network. The name is now read without a DNS lookup. The default peer name that other Macs see does not change.
+- term-meshd uses less CPU while idle. It no longer reads every process on the Mac every 3 seconds, and it reads only the token usage files that changed.
+- Agent team status no longer reads the whole team log again each time the log grows.
+- Fixed a race in which a peer viewer that resynced a pane could read the pane after you closed it.
+
+### Changed
+
+- App hang reports sent to Sentry now include window, workspace, and pane counts, to help find the cause of a frequent hang. They do not include paths, titles, or commands.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.279.0] - 2026-10-29
 
 ### Fixed
