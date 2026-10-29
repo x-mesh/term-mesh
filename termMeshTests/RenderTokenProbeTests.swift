@@ -27,9 +27,9 @@ final class RenderTokenProbeTests: XCTestCase {
         )
     }
 
-    func testRejectProducesRejectedOutcome() {
+    func testRejectProducesRejectedOutcome() throws {
         let probe = RenderTokenProbe()
-        let token = try! XCTUnwrap(probe.begin())
+        let token = try XCTUnwrap(probe.begin())
 
         probe.reject(token: token)
 
@@ -39,31 +39,57 @@ final class RenderTokenProbeTests: XCTestCase {
         XCTAssertNil(result.callbackStatus)
     }
 
-    func testSecondRequestIsRejectedWhileTokenIsPending() {
+    func testSecondRequestIsRejectedWhileTokenIsPending() throws {
         let probe = RenderTokenProbe()
-        let token = try! XCTUnwrap(probe.begin())
+        let token = try XCTUnwrap(probe.begin())
 
         XCTAssertNil(probe.begin())
         probe.reject(token: token)
     }
 
-    func testLateCallbackDoesNotCompleteNextToken() {
+    func testLateFailureDoesNotCompleteNextToken() throws {
         let probe = RenderTokenProbe()
-        let firstToken = try! XCTUnwrap(probe.begin())
+        let firstToken = try XCTUnwrap(probe.begin())
 
         XCTAssertEqual(probe.wait(token: firstToken, timeout: 0).outcome, .timeout)
-        let secondToken = try! XCTUnwrap(probe.begin())
+        let secondToken = try XCTUnwrap(probe.begin())
+        let callbacksFinished = expectation(description: "late callbacks finished")
 
         DispatchQueue.global().async {
-            probe.present(token: firstToken)
+            probe.fail(token: firstToken, status: GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED)
             probe.present(token: secondToken)
+            callbacksFinished.fulfill()
         }
+        wait(for: [callbacksFinished], timeout: 1)
 
         let result = probe.wait(token: secondToken, timeout: 1)
         XCTAssertEqual(result.token, secondToken)
         XCTAssertEqual(result.outcome, .presented)
         XCTAssertFalse(result.callbackOnMain ?? true)
         XCTAssertEqual(result.callbackStatus, 0)
+    }
+
+    func testLatePresentationDoesNotCompleteNextToken() throws {
+        let probe = RenderTokenProbe()
+        let firstToken = try XCTUnwrap(probe.begin())
+
+        XCTAssertEqual(probe.wait(token: firstToken, timeout: 0).outcome, .timeout)
+        let secondToken = try XCTUnwrap(probe.begin())
+        let callbackFinished = expectation(description: "late presentation finished")
+
+        DispatchQueue.global().async {
+            probe.present(token: firstToken)
+            callbackFinished.fulfill()
+        }
+        wait(for: [callbackFinished], timeout: 1)
+
+        XCTAssertNil(probe.begin())
+
+        let result = probe.wait(token: secondToken, timeout: 0.01)
+        XCTAssertEqual(result.token, secondToken)
+        XCTAssertEqual(result.outcome, .timeout)
+        XCTAssertNil(result.callbackOnMain)
+        XCTAssertNil(result.callbackStatus)
     }
 }
 #endif
