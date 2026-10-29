@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.281.0] - 2026-10-29
+
+### Fixed
+
+- Double-clicking the title bar now zooms the window again on macOS 27.2. Before, nothing happened there, because macOS 27.2 no longer runs the double-click action for the area that term-mesh draws in the title bar. term-mesh now runs the action that you chose in System Settings > Desktop & Dock: zoom, minimize, or nothing. On earlier macOS versions the system still runs it, and term-mesh does not run it a second time.
+
+### Changed
+
+- The Review Board on the right side of the window now starts closed. Before, it opened every time term-mesh started. When you open or close it, term-mesh keeps that choice for the next start. After this update, the board starts closed once, even if you left it open before.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.280.0] - 2026-10-29
 
 ### Added
