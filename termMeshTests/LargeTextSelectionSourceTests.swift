@@ -34,6 +34,28 @@ final class LargeTextSelectionSourceTests: XCTestCase {
             "Text(bundle)",
             "the whole diagnostics bundle; Copy and Save already hand it over"
         ),
+        (
+            "Panels/AgentPanelView.swift",
+            ".frame(width: transcriptWidth, alignment: .leading)",
+            "one selection scope over every mounted transcript row (Sentry TERM-MESH-3N, "
+                + "a 4 s synchronous layout); rows gate themselves with transcriptSelectable"
+        ),
+        (
+            "Panels/AgentPanelView.swift",
+            "Text(result)",
+            "a tool result of any length; displayExcerpt caps what is laid out and "
+                + "transcriptSelectable caps selection"
+        ),
+        (
+            "Panels/AgentPanelView.swift",
+            "Text(shown).font",
+            "a code block, which inherits the selection cap from MarkdownText and is truncated by `shown`"
+        ),
+        (
+            "Panels/AgentPanelView.swift",
+            "Text(text.replacingOccurrences",
+            "one diff line, repeated per line of a diff; \"copy diff\" covers it"
+        ),
     ]
 
     func testTheLargestTextViewsAreNotSelectable() throws {
@@ -72,6 +94,46 @@ final class LargeTextSelectionSourceTests: XCTestCase {
             mouse-moved event and wedges the main thread (issue #321). Give the view a
             Copy button instead of selection.
             """
+        )
+    }
+
+    /// Selection in the agent transcript has one door: `TranscriptSelectable`, which
+    /// applies the 20-leaf budget and the byte cap. A direct `.textSelection(.enabled)`
+    /// anywhere else in the file makes a source outside both limits — a transcript
+    /// footer did exactly that — so the call is allowed only inside that type.
+    func testAgentTranscriptSelectionIsOnlyEnabledInsideTranscriptSelectable() throws {
+        let source = try String(
+            contentsOf: findProjectRoot().appendingPathComponent("Sources/Panels/AgentPanelView.swift"),
+            encoding: .utf8
+        )
+        let lines = source.components(separatedBy: "\n")
+
+        let start = try XCTUnwrap(
+            lines.firstIndex { $0.hasPrefix("private struct TranscriptSelectable") },
+            "TranscriptSelectable is gone — update this test to name what replaced it"
+        )
+        let end = try XCTUnwrap(lines[start...].firstIndex { $0 == "}" })
+        let allowed = start...end
+
+        var offenders: [String] = []
+        var insideAllowed = 0
+        for (index, raw) in lines.enumerated() {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.hasPrefix("//"), line.contains(".textSelection(.enabled)") else { continue }
+            if allowed.contains(index) { insideAllowed += 1 } else {
+                offenders.append("AgentPanelView.swift:\(index + 1): \(line)")
+            }
+        }
+        XCTAssertEqual(
+            offenders, [],
+            "enable selection only through transcriptSelectable (20-leaf budget, 4KB cap)"
+        )
+        XCTAssertEqual(insideAllowed, 1, "TranscriptSelectable must be the one place that enables it")
+
+        let guarded = lines[allowed]
+        XCTAssertTrue(
+            guarded.contains { $0.contains("TranscriptSelection.isSelectable(text, recentRow: recentRow)") },
+            "TranscriptSelectable must apply both the byte cap and the recent-row limit"
         )
     }
 

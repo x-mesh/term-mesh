@@ -1136,6 +1136,16 @@
         }
       }
     },
+    "Copy Transcript": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "대화 내용 복사"
+          }
+        }
+      }
+    },
     "Copy Update Logs": {
       "localizations": {
         "ko": {
