@@ -6834,6 +6834,40 @@ final class TranscriptSelectionTests: XCTestCase {
         XCTAssertTrue(TranscriptSelection.selectableItemIDs([]).isEmpty)
     }
 
+    @MainActor
+    func testALongToolGroupDoesNotMultiplySelectionSources() {
+        let entries: [AgentSession.Entry] = (0..<25).map { i in
+            .tool(id: UUID(), AgentSession.ToolCall(name: "Bash", headline: "cmd \(i)", result: "ok"))
+        } + [.answered(id: UUID(), "done")]
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+        guard case .toolGroup(let group) = items.first else { return XCTFail("tools should fold into one group") }
+        XCTAssertEqual(group.rows.count, 25)
+
+        let open = TranscriptSelection.selectableLeafIDs(items, groupIsOpen: { _ in true })
+        XCTAssertEqual(open.count, TranscriptSelection.maxSelectableItems, "a group is 25 rows, not 1")
+        XCTAssertTrue(open.contains(items.last!.id), "the newest row keeps its share")
+
+        let collapsed = TranscriptSelection.selectableLeafIDs(items, groupIsOpen: { _ in false })
+        XCTAssertEqual(collapsed, [items.last!.id], "a collapsed group mounts no rows and takes no share")
+    }
+
+    func testExcerptKeepsGraphemeClustersWhole() {
+        let clusters = ["e\u{301}", "👩‍👩‍👧‍👦", "🇰🇷", "한"]
+        for cluster in clusters {
+            for pad in 0..<12 {
+                let text = String(repeating: "a", count: pad) + String(repeating: cluster, count: 40)
+                    + String(repeating: "b", count: pad)
+                let shown = TranscriptSelection.displayExcerpt(text, limit: 64)
+                let head = shown.components(separatedBy: "\n… ").first ?? ""
+                let tail = shown.components(separatedBy: " …\n").last ?? ""
+                XCTAssertTrue(text.hasPrefix(head), "head split a cluster: \(cluster) pad \(pad)")
+                XCTAssertTrue(text.hasSuffix(tail), "tail split a cluster: \(cluster) pad \(pad)")
+                XCTAssertFalse(head.isEmpty)
+                XCTAssertFalse(tail.isEmpty)
+            }
+        }
+    }
+
     func testSelectionNeedsBothARecentRowAndASmallText() {
         XCTAssertTrue(TranscriptSelection.isSelectable("short", recentRow: true))
         XCTAssertFalse(TranscriptSelection.isSelectable("short", recentRow: false))

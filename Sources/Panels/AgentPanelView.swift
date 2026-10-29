@@ -411,7 +411,9 @@ struct AgentPanelView: View {
                     }
                     if session.rows.isEmpty { emptyState }
                     let items = AgentSession.transcriptItems(for: session.rows)
-                    let selectableIDs = TranscriptSelection.selectableItemIDs(items.map(\.id))
+                    let selectableIDs = TranscriptSelection.selectableLeafIDs(
+                        items, groupIsOpen: toolGroupIsOpen
+                    )
                     ForEach(items) { item in
                         switch item {
                         case .row(let row):
@@ -431,10 +433,10 @@ struct AgentPanelView: View {
                                 open: toolGroupIsOpen(group),
                                 root: panel.workingDirectory,
                                 openTools: openTools,
+                                selectableIDs: selectableIDs,
                                 setOpen: { setToolGroupOpen(group, $0) },
                                 setToolOpen: setToolOpen
                             )
-                            .environment(\.transcriptRowSelectable, selectableIDs.contains(group.id))
                             .id(group.id)
                         }
                     }
@@ -1923,6 +1925,9 @@ private struct ToolGroupRow: View {
     let open: Bool
     let root: String
     let openTools: Set<UUID>
+    /// Rows of this group that may hold a selection source, from the transcript-wide
+    /// recent-row limit; the group itself is not one source but many.
+    let selectableIDs: Set<UUID>
     let setOpen: (Bool) -> Void
     let setToolOpen: (UUID, Bool) -> Void
 
@@ -1974,8 +1979,10 @@ private struct ToolGroupRow: View {
                                     root: root,
                                     open: toolBinding(row.id)
                                 )
+                                .environment(\.transcriptRowSelectable, selectableIDs.contains(row.id))
                             } else {
                                 ToolRow(call: call, open: toolBinding(row.id))
+                                    .environment(\.transcriptRowSelectable, selectableIDs.contains(row.id))
                             }
                         } else if case .thought(_, let body) = row.entry {
                             // Reasoning folded into the run is still the
@@ -2384,6 +2391,24 @@ enum TranscriptSelection {
         Set(ids.suffix(limit))
     }
 
+    /// The same limit over the rows that can hold a source: a tool group is many
+    /// rows, not one, so its children are counted individually. A collapsed group
+    /// mounts none of them and takes no share.
+    static func selectableLeafIDs(
+        _ items: [AgentSession.TranscriptItem],
+        groupIsOpen: (AgentSession.ToolGroup) -> Bool,
+        limit: Int = maxSelectableItems
+    ) -> Set<UUID> {
+        var leaves: [UUID] = []
+        for item in items {
+            switch item {
+            case .row(let row): leaves.append(row.id)
+            case .toolGroup(let group): if groupIsOpen(group) { leaves += group.rows.map(\.id) }
+            }
+        }
+        return selectableItemIDs(leaves, limit: limit)
+    }
+
     static func isSelectable(_ text: String, recentRow: Bool = true) -> Bool {
         recentRow && text.utf8.count <= maxSelectableBytes
     }
@@ -2425,26 +2450,25 @@ enum TranscriptSelection {
     static func displayExcerpt(_ text: String, limit: Int = maxDisplayedBytes) -> String {
         guard text.utf8.count > limit else { return text }
         let half = limit / 2
-        var head = String.UnicodeScalarView()
+        // By Character, so a combining mark, a ZWJ sequence or a flag is kept whole or left out.
+        var head = ""
         var headBytes = 0
-        for scalar in text.unicodeScalars {
-            let width = String(scalar).utf8.count
+        for character in text {
+            let width = String(character).utf8.count
             if headBytes + width > half { break }
-            head.append(scalar)
+            head.append(character)
             headBytes += width
         }
-        var tail: [Unicode.Scalar] = []
+        var tail: [Character] = []
         var tailBytes = 0
-        for scalar in text.unicodeScalars.reversed() {
-            let width = String(scalar).utf8.count
+        for character in text.reversed() {
+            let width = String(character).utf8.count
             if tailBytes + width > half { break }
-            tail.append(scalar)
+            tail.append(character)
             tailBytes += width
         }
-        var tailText = String.UnicodeScalarView()
-        tailText.append(contentsOf: tail.reversed())
         let omitted = text.utf8.count - headBytes - tailBytes
-        return String(head) + "\n… \(omitted / 1024) KB not shown, use copy for the full text …\n" + String(tailText)
+        return head + "\n… \(omitted / 1024) KB not shown, use copy for the full text …\n" + String(tail.reversed())
     }
 
     static func isTruncated(_ text: String, limit: Int = maxDisplayedBytes) -> Bool {
