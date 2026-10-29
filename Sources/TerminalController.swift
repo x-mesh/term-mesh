@@ -1456,6 +1456,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugTerminalDropOverlayProbe(params: params))
         case "debug.layout":
             return v2Result(id: id, self.v2DebugLayout())
+        case "debug.layout_census":
+            return v2Result(id: id, self.v2DebugLayoutCensus())
         case "debug.bonsplit_underflow.count":
             return v2Result(id: id, self.v2DebugBonsplitUnderflowCount())
         case "debug.bonsplit_underflow.reset":
@@ -1802,6 +1804,7 @@ class TerminalController {
             "debug.surface_free.status",
             "debug.terminal.drop_overlay_probe",
             "debug.layout",
+            "debug.layout_census",
             "debug.bonsplit_underflow.count",
             "debug.bonsplit_underflow.reset",
             "debug.empty_panel.count",
