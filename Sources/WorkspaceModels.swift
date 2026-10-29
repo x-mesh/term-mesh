@@ -64,6 +64,126 @@ struct SidebarStatusEntry {
     let timestamp: Date
 }
 
+/// Declaration order is display priority: a later case outranks an earlier one.
+enum ProgramStatusState: Int {
+    case idle
+    case done
+    case working
+    case error
+    case blocked
+
+    var wireName: String {
+        switch self {
+        case .idle: return "idle"
+        case .done: return "done"
+        case .working: return "working"
+        case .error: return "error"
+        case .blocked: return "blocked"
+        }
+    }
+}
+
+/// Declaration order is priority among blocked surfaces.
+enum ProgramStatusKind: Int {
+    case auth
+    case question
+    case permission
+
+    var wireName: String {
+        switch self {
+        case .auth: return "auth"
+        case .question: return "question"
+        case .permission: return "permission"
+        }
+    }
+}
+
+/// An agent's latest OSC 7501 report for one surface. `msg` and `title` are
+/// deliberately not kept: they carry command text the sidebar must not show.
+struct SurfaceProgramStatus: Equatable {
+    let state: ProgramStatusState
+    let kind: ProgramStatusKind?
+    let app: String?
+}
+
+enum ProgramStatusReport: Equatable {
+    case set(SurfaceProgramStatus)
+    case clear
+}
+
+enum ProgramStatusReducer {
+    enum Event {
+        case report
+        /// Ghostty sends this on every shell prompt mark, including the one the
+        /// shell draws right after a reporting command returns, so it is not
+        /// evidence that an agent's status ended.
+        case promptStart
+    }
+
+    enum RawState {
+        case idle, working, done, blocked, error, clear
+    }
+
+    static func report(
+        event: Event,
+        state: RawState,
+        kind: ProgramStatusKind?,
+        app: String?
+    ) -> ProgramStatusReport? {
+        if event == .promptStart { return nil }
+        let resolved: ProgramStatusState
+        switch state {
+        case .clear: return .clear
+        case .idle: resolved = .idle
+        case .working: resolved = .working
+        case .done: resolved = .done
+        case .blocked: resolved = .blocked
+        case .error: resolved = .error
+        }
+        let trimmedApp = app?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .set(SurfaceProgramStatus(
+            state: resolved,
+            kind: resolved == .blocked ? kind : nil,
+            app: (trimmedApp?.isEmpty ?? true) ? nil : trimmedApp
+        ))
+    }
+
+    /// Returns nil when the report changes nothing, so a repeated report (Claude
+    /// sends `state=clear` three times on exit) does not invalidate observers.
+    static func applying(
+        _ report: ProgramStatusReport,
+        surfaceId: UUID,
+        to statuses: [UUID: SurfaceProgramStatus]
+    ) -> [UUID: SurfaceProgramStatus]? {
+        var next = statuses
+        switch report {
+        case .clear:
+            guard next.removeValue(forKey: surfaceId) != nil else { return nil }
+        case .set(let status):
+            guard next[surfaceId] != status else { return nil }
+            next[surfaceId] = status
+        }
+        return next
+    }
+
+    /// Statuses of surfaces that are no longer live are ignored even if a close
+    /// path failed to remove them.
+    static func dominant(
+        _ statuses: [UUID: SurfaceProgramStatus],
+        liveSurfaceIds: Set<UUID>
+    ) -> SurfaceProgramStatus? {
+        statuses
+            .filter { liveSurfaceIds.contains($0.key) }
+            .max { lhs, rhs in
+                let l = (lhs.value.state.rawValue, lhs.value.kind?.rawValue ?? -1)
+                let r = (rhs.value.state.rawValue, rhs.value.kind?.rawValue ?? -1)
+                if l != r { return l < r }
+                return lhs.key.uuidString > rhs.key.uuidString
+            }?
+            .value
+    }
+}
+
 enum SidebarLogLevel: String {
     case info
     case progress
