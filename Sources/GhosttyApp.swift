@@ -119,16 +119,65 @@ final class GhosttyDefaultBackgroundNotificationDispatcher {
     }
 }
 
-func resolveTerminalOpenURLTarget(_ rawValue: String) -> TerminalOpenURLTarget? {
+/// What a terminal link needs to be read as a path: the pane's directory as the
+/// shell last reported it (nil when unknown) and how to ask whether a path exists.
+struct TerminalRelativePathContext {
+    let workingDirectory: String?
+    let fileExists: (String) -> Bool
+
+    static func live(workingDirectory: String?) -> TerminalRelativePathContext {
+        TerminalRelativePathContext(
+            workingDirectory: workingDirectory,
+            fileExists: { FileManager.default.fileExists(atPath: $0) }
+        )
+    }
+}
+
+/// Drops the position a compiler or test runner appends to a path: a pytest
+/// `::node` and a trailing `:line[:col]`, plus the colon that ends a diagnostic.
+func strippingTerminalPathSuffix(_ value: String) -> String {
+    var path = value
+    if let node = path.range(of: "::") {
+        path = String(path[..<node.lowerBound])
+    }
+    while path.hasSuffix(":") { path.removeLast() }
+    for _ in 0..<2 {
+        guard let colon = path.lastIndex(of: ":") else { break }
+        let tail = path[path.index(after: colon)...]
+        guard !tail.isEmpty, tail.allSatisfy(\.isASCII), tail.allSatisfy(\.isNumber) else { break }
+        path = String(path[..<colon])
+    }
+    return path
+}
+
+private func terminalLinkLooksLikeRelativePath(_ value: String) -> Bool {
+    value.hasPrefix("./") || value.hasPrefix("../") || value.hasPrefix("~/") || value.contains("/")
+}
+
+/// `relativePaths` turns on reading scheme-less paths as files. With it nil a
+/// scheme-less value is treated as a web address, the behaviour relay panes keep.
+func resolveTerminalOpenURLTarget(
+    _ rawValue: String,
+    relativePaths: TerminalRelativePathContext? = nil
+) -> TerminalOpenURLTarget? {
     let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
 
     if NSString(string: trimmed).isAbsolutePath {
-        return .external(URL(fileURLWithPath: trimmed))
+        guard relativePaths != nil else {
+            return .external(URL(fileURLWithPath: trimmed))
+        }
+        let path = strippingTerminalPathSuffix(trimmed)
+        guard !path.isEmpty else { return nil }
+        return .external(URL(fileURLWithPath: path))
     }
 
     if let parsed = URL(string: trimmed),
        let scheme = parsed.scheme?.lowercased() {
+        if scheme == "file", !parsed.path.hasPrefix("/") {
+            // `file:23` from a diagnostic is a line number, not a location.
+            return nil
+        }
         if scheme == "http" || scheme == "https" {
             guard BrowserInsecureHTTPSettings.normalizeHost(parsed.host ?? "") != nil else {
                 return .external(parsed)
@@ -136,6 +185,24 @@ func resolveTerminalOpenURLTarget(_ rawValue: String) -> TerminalOpenURLTarget? 
             return .embeddedBrowser(parsed)
         }
         return .external(parsed)
+    }
+
+    if let relativePaths, terminalLinkLooksLikeRelativePath(trimmed) {
+        let path = strippingTerminalPathSuffix(trimmed)
+        guard !path.isEmpty else { return nil }
+        let resolved: String
+        if path.hasPrefix("~/") {
+            resolved = NSString(string: path).expandingTildeInPath
+        } else if let directory = relativePaths.workingDirectory, !directory.isEmpty {
+            resolved = URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: directory, isDirectory: true))
+                .standardizedFileURL.path
+        } else {
+            return nil
+        }
+        // Nothing opens for a path that is not there: sending it to the
+        // browser would only produce `https://` plus the path.
+        guard relativePaths.fileExists(resolved) else { return nil }
+        return .external(URL(fileURLWithPath: resolved))
     }
 
     if let webURL = resolveBrowserNavigableURL(trimmed) {
@@ -1437,6 +1504,7 @@ class GhosttyApp {
             #if DEBUG
             dlog("pwd.action pwd=\(pwd) tabId=\(surfaceView.tabId?.uuidString.prefix(8) ?? "<nil>") surfaceId=\(surfaceView.terminalSurface?.id.uuidString.prefix(8) ?? "<nil>")")
             #endif
+            surfaceView.recordReportedWorkingDirectory(pwd)
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id else { return true }
             DispatchQueue.main.async {
@@ -1544,13 +1612,21 @@ class GhosttyApp {
             let openUrl = action.action.open_url
             // ghostty_action_open_url_s is pointer + length, not a C string.
             // Copy it while the synchronous Ghostty callback still owns the bytes.
-            guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len),
-                  let resolvedTarget = resolveTerminalOpenURLTarget(urlString) else {
+            guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len) else {
                 return false
             }
             let context: TerminalOpenURLContext = surfaceView.window is PeerRelayWorkspaceWindow
                 ? .peerRelay
                 : .standard
+            // Relay panes keep the old reading; their directory is not on this machine.
+            let relativePaths: TerminalRelativePathContext? = context == .peerRelay
+                ? nil
+                : .live(workingDirectory: surfaceView.reportedWorkingDirectory())
+            guard let resolvedTarget = resolveTerminalOpenURLTarget(urlString, relativePaths: relativePaths) else {
+                // Handled with nothing to open. Returning false would let Ghostty
+                // run its own opener on the raw text, which is the wrong target.
+                return true
+            }
             let target = routeTerminalOpenURLTarget(resolvedTarget, context: context)
 
             // A relay surface has no local workspace in which to create an

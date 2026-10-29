@@ -2648,6 +2648,25 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     ]
     private static let shellEscapeCharacters = "\\ ()[]{}<>\"'`!#$&;|*?\t"
 
+    // The open-URL action runs on a Ghostty thread while the renderer lock is
+    // held, so it cannot ask the main-actor workspace for this pane's directory.
+    private let reportedWorkingDirectoryLock = NSLock()
+    private var reportedWorkingDirectoryValue: String?
+
+    func recordReportedWorkingDirectory(_ directory: String) {
+        let trimmed = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        reportedWorkingDirectoryLock.lock()
+        reportedWorkingDirectoryValue = trimmed
+        reportedWorkingDirectoryLock.unlock()
+    }
+
+    func reportedWorkingDirectory() -> String? {
+        reportedWorkingDirectoryLock.lock()
+        defer { reportedWorkingDirectoryLock.unlock() }
+        return reportedWorkingDirectoryValue
+    }
+
     // MARK: - TERM-MESH-1: Startup NSTextInputContext gate
     //
     // NSApplication.updateWindows fires on every run-loop cycle and calls
