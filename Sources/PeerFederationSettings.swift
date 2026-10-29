@@ -9,6 +9,60 @@
 import Foundation
 import Darwin
 import PeerProto
+import SystemConfiguration
+
+enum MachineNameCache {
+    private static let lock = NSLock()
+    private static var cachedHostName: String?
+    private static var cachedComputerName: String?
+    private static var didScheduleWarmUp = false
+
+    static var hostName: String {
+        let cached = lock.withLock { cachedHostName }
+        return resolvedName(cached: cached, fallback: dnsFreeHostName)
+    }
+
+    static var computerName: String {
+        let cached = lock.withLock { cachedComputerName }
+        return resolvedName(cached: cached, fallback: { hostName })
+    }
+
+    static func warmUp() {
+        let shouldStart = lock.withLock {
+            guard !didScheduleWarmUp else { return false }
+            didScheduleWarmUp = true
+            return true
+        }
+        guard shouldStart else { return }
+
+        DispatchQueue.global(qos: .utility).async {
+            let hostName = dnsFreeHostName()
+            let computerName = SCDynamicStoreCopyComputerName(nil, nil) as String?
+            lock.withLock {
+                cachedHostName = nonEmptyName(hostName)
+                cachedComputerName = nonEmptyName(computerName)
+            }
+        }
+    }
+
+    static func resolvedName(cached: String?, fallback: () -> String) -> String {
+        nonEmptyName(cached) ?? nonEmptyName(fallback()) ?? "localhost"
+    }
+
+    private static func dnsFreeHostName() -> String {
+        var buffer = [CChar](repeating: 0, count: Int(MAXHOSTNAMELEN))
+        guard gethostname(&buffer, buffer.count) == 0 else { return "" }
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(bytes: bytes, encoding: .utf8) ?? ""
+    }
+
+    private static func nonEmptyName(_ name: String?) -> String? {
+        guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return name
+    }
+}
 
 enum PeerKeepAwakeMode: String, CaseIterable, Identifiable {
     case never
@@ -125,7 +179,7 @@ enum PeerFederationSettings {
     }
 
     static var defaultDisplayName: String {
-        ProcessInfo.processInfo.hostName
+        MachineNameCache.hostName
     }
 
     static var autoStart: Bool {

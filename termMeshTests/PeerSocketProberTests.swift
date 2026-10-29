@@ -9,6 +9,35 @@ import XCTest
 
 final class PeerSocketProberTests: XCTestCase {
 
+    func test_machineName_prefersCachedValueWithoutRunningFallback() {
+        var fallbackCalls = 0
+        let name = MachineNameCache.resolvedName(cached: "cached-host") {
+            fallbackCalls += 1
+            return "fallback-host"
+        }
+
+        XCTAssertEqual(name, "cached-host")
+        XCTAssertEqual(fallbackCalls, 0)
+    }
+
+    func test_machineName_usesFallbackForMissingOrWhitespaceCache() {
+        XCTAssertEqual(
+            MachineNameCache.resolvedName(cached: nil) { "fallback-host" },
+            "fallback-host"
+        )
+        XCTAssertEqual(
+            MachineNameCache.resolvedName(cached: "  \n\t " ) { "fallback-host" },
+            "fallback-host"
+        )
+    }
+
+    func test_machineName_usesLocalhostForEmptyValues() {
+        XCTAssertEqual(
+            MachineNameCache.resolvedName(cached: "") { "  \n" },
+            "localhost"
+        )
+    }
+
     // MARK: - Script invariants
 
     /// The remote command rides inside `sh -c '…'`. A single quote in
