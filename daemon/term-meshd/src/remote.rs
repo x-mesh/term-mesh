@@ -79,6 +79,8 @@ pub struct Entry {
     /// case must keep answering `session_unavailable` so the page retries.
     #[serde(default)]
     pub remote_pane: bool,
+    #[serde(default)]
+    pub relay_host: String,
     /// Required for `kind = leader`: the team whose durable request board
     /// receives the text. Required for `kind = agent` together with
     /// `agent_name`.
@@ -135,6 +137,8 @@ pub struct EnableSpec {
     /// case must keep answering `session_unavailable` so the page retries.
     #[serde(default)]
     pub remote_pane: bool,
+    #[serde(default)]
+    pub relay_host: String,
     #[serde(default)]
     pub team_name: Option<String>,
     #[serde(default)]
@@ -261,6 +265,7 @@ impl Registry {
             kind: spec.kind,
             chat_capable: spec.chat_capable || spec.kind == TargetKind::Agent,
             remote_pane: spec.remote_pane,
+            relay_host: spec.relay_host.trim().to_string(),
             team_name: spec
                 .team_name
                 .map(|t| t.trim().to_string())

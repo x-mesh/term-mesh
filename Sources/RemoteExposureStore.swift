@@ -366,6 +366,7 @@ extension RemoteExposureStore {
         /// log lives there, so the transcript is fetched over the pane's own
         /// peer session rather than read locally.
         var isRemotePane: Bool = false
+        var relayHost: String = ""
     }
 
     /// How much the phone may send back to a terminal-backed pane.
@@ -430,6 +431,7 @@ extension RemoteExposureStore {
             "kind": kind,
             "chat_capable": chatCapable,
             "remote_pane": remotePane,
+            "relay_host": pane.relayHost,
             "agent_cli": pane.agentCLI,
             "title": pane.title,
             "cwd": pane.cwd,

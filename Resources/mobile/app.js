@@ -74,6 +74,7 @@
     promptStatus: $('prompt-status'),
     questionCard: $('question-card'), questionTitle: $('question-title'), questionOptions: $('question-options'), questionSubmit: $('question-submit'), questionStatus: $('question-status'),
     buildTag: $('build-tag'),
+    relayOrigin: $('relay-origin'),
     chatLive: $('chat-live'),
     chatJump: $('chat-jump'),
     emptyApp: $('empty-app'),
@@ -256,6 +257,7 @@
     if (t.kind === 'leader') { bits.push('leader'); }
     if (t.kind === 'agent') { bits.push('chat'); }
     if (t.agent_cli) { bits.push(t.agent_cli); }
+    if (t.remote_pane) { bits.push((t.relay_host || '다른 Mac') + ' relay'); }
     var head = t.title || t.surface_id.slice(0, 8);
     return bits.length ? head + ' · ' + bits.join(' ') : head;
   }
@@ -427,6 +429,12 @@
     // the target select plus this dot now, so the bar is the only chrome above
     // the transcript.
     el.presence.hidden = !agent;
+    if (t && t.remote_pane) {
+      el.relayOrigin.textContent = '모바일 gateway: ' + window.location.hostname + ' · 실제 terminal: ' + (t.relay_host || '다른 Mac') + ' (relay)';
+      el.relayOrigin.hidden = false;
+    } else {
+      el.relayOrigin.hidden = true;
+    }
     if (agent) {
       var chatName = t.agent_name || t.agent_cli || 'agent';
       setStatus('chat · ' + chatName + (t.team_name ? ' @ ' + t.team_name : ''));

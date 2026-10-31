@@ -700,7 +700,10 @@ final class Workspace: Identifiable {
                 workspaceDirectory: currentDirectory
             )
         )
-        identity.isRemotePane = terminalPanel(for: panelId)?.peerPaneSession != nil
+        if let terminal = terminalPanel(for: panelId), let hostKey = terminal.remoteHostKey {
+            identity.isRemotePane = true
+            identity.relayHost = PeerHostProfileStore.shared.displayLabel(for: hostKey)
+        }
         if let teamName = TeamOrchestrator.shared.teamName(containingPanelId: panelId),
            let team = TeamOrchestrator.shared.teams[teamName] {
             if team.leaderPanelId == panelId {

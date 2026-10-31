@@ -2794,6 +2794,51 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
         // --- General ---
         "ping" => Ok(serde_json::json!({"status": "pong"})),
 
+        "mobile.surface_transcript" => {
+            #[derive(Deserialize)]
+            struct P {
+                surface_id: String,
+                #[serde(default = "default_mobile_transcript_limit")]
+                limit: usize,
+            }
+            fn default_mobile_transcript_limit() -> usize { 200 }
+
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let surface_id = p.surface_id.trim();
+                    let panes = ctx.pane_tracker.snapshot();
+                    let pane_id = panes
+                        .keys()
+                        .find(|id| {
+                            id.eq_ignore_ascii_case(surface_id)
+                                || id.replace('-', "").eq_ignore_ascii_case(surface_id)
+                        })
+                        .cloned()
+                        .ok_or_else(|| "no claude or codex session for this surface".to_string());
+                    let resolver = crate::mobile_session_resolver(
+                        ctx.pane_tracker.clone(),
+                        ctx.usage_tracker.clone(),
+                    );
+                    match pane_id.and_then(|pane_id| {
+                        resolver(&pane_id).map(|session| (pane_id, session))
+                            .ok_or_else(|| "no claude or codex session for this surface".to_string())
+                    }) {
+                        Ok((pane_id, session)) => crate::http_mobile::transcript_for_peer(
+                            &session.cli,
+                            session.session_id.as_deref(),
+                            &panes
+                                .get(&pane_id)
+                                .map(|pane| pane.cwd.as_str())
+                                .unwrap_or_default(),
+                            p.limit.clamp(1, 2_000),
+                        ),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(format!("invalid params: {error}")),
+            }
+        }
+
         // --- Durable sync operations (off-main, non-focus) ---
         "operation.start" => {
             match serde_json::from_value::<crate::sync::OperationStartParams>(req.params.clone()) {
