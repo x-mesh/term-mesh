@@ -357,6 +357,11 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// Returning nil means the host has no team subsystem at all.
     func callTeamMethod(_ method: String, paramsJSON: String) async -> Result<String, PeerTeamCallFailure>?
 
+    func readSurfaceTranscript(
+        surfaceID: Data,
+        limit: Int
+    ) async -> Result<String, PeerTeamCallFailure>?
+
     /// Resolve a project identifier to an already-created authoritative
     /// team UUID. This lookup must not create panes, activate the app or
     /// accept any executable configuration from the peer.
@@ -413,6 +418,10 @@ public extension PeerSurfaceProvider {
     func callTeamMethod(
         _ method: String,
         paramsJSON: String
+    ) async -> Result<String, PeerTeamCallFailure>? { nil }
+    func readSurfaceTranscript(
+        surfaceID: Data,
+        limit: Int
     ) async -> Result<String, PeerTeamCallFailure>? { nil }
     func resolveTeamLeaderProject(_ projectID: String) async -> String? { nil }
     func callScopedTeamLeaderMethod(
@@ -2573,6 +2582,13 @@ actor PeerServerSession {
             }
 
         case (.ready, .teamCallRequest(let request)):
+            if request.method == "surface.transcript" {
+                let response = await surfaceTranscriptResponse(request)
+                try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                    inner.teamCallResponse = response
+                }
+                return
+            }
             // The allow-list is checked HERE, before the provider is reached:
             // a refusal must not depend on every provider remembering to
             // implement it.
@@ -2807,6 +2823,56 @@ actor PeerServerSession {
             // Silent drop matches the Rust server's behavior.
             break
         }
+    }
+
+    private func surfaceTranscriptResponse(
+        _ request: Termmesh_Peer_V1_TeamCallRequest
+    ) async -> Termmesh_Peer_V1_TeamCallResponse {
+        func failure(_ code: String, _ message: String) -> Termmesh_Peer_V1_TeamCallResponse {
+            var response = Termmesh_Peer_V1_TeamCallResponse()
+            response.ok = false
+            response.errorCode = code
+            response.errorMessage = message
+            return response
+        }
+        guard let data = request.paramsJson.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hex = object["surface_id"] as? String,
+              let surfaceID = Self.dataFromHex(hex) else {
+            return failure(PeerTeamCall.ErrorCode.invalidParams, "surface_id must be hex")
+        }
+        guard attachments[surfaceID] != nil else {
+            return failure("not_attached", "this connection is not attached to that surface")
+        }
+        let limit = min(max(object["limit"] as? Int ?? 200, 1), 2_000)
+        guard let outcome = await provider.readSurfaceTranscript(surfaceID: surfaceID, limit: limit) else {
+            return failure("unsupported", "this host cannot read transcripts")
+        }
+        var response = Termmesh_Peer_V1_TeamCallResponse()
+        switch outcome {
+        case .success(let json):
+            response.ok = true
+            response.resultJson = json
+        case .failure(let error):
+            response.ok = false
+            response.errorCode = error.code
+            response.errorMessage = error.message
+        }
+        return response
+    }
+
+    private static func dataFromHex(_ value: String) -> Data? {
+        guard !value.isEmpty, value.count.isMultiple(of: 2) else { return nil }
+        var bytes = Data()
+        bytes.reserveCapacity(value.count / 2)
+        var index = value.startIndex
+        while index < value.endIndex {
+            let end = value.index(index, offsetBy: 2)
+            guard let byte = UInt8(value[index..<end], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = end
+        }
+        return bytes
     }
 
     // MARK: - attach plumbing

@@ -1414,6 +1414,19 @@ final class TermMeshDaemon: ObservableObject {
         }
     }
 
+    func mobileSurfaceTranscript(surfaceID: String, limit: Int) async -> String? {
+        await withCheckedContinuation { continuation in
+            telemetryQueue.async { [weak self] in
+                guard let self else { return continuation.resume(returning: nil) }
+                continuation.resume(returning: self.rpcCallRaw(
+                    method: "mobile.surface_transcript",
+                    params: ["surface_id": surfaceID, "limit": min(max(limit, 1), 2_000)],
+                    timeout: 10
+                ))
+            }
+        }
+    }
+
     // MARK: - Watcher (F-05)
 
     /// Normalize a file-watch target and reject paths whose recursive event
