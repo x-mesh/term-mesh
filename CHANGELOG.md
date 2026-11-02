@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.282.0] - 2026-11-02
+
+### Added
+
+- The README now shows native agent panes working in parallel and documents mobile remote control and recent team features.
+
+### Changed
+
+- The app icon now features a flowing mesh between terminal prompts, including in Debug and Nightly builds.
+
+### Fixed
+
+- Mobile Chat can display conversations from Claude and Codex panes connected through a peer relay.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.281.0] - 2026-10-29
 
 ### Fixed
