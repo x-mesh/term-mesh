@@ -5,18 +5,22 @@
 <h1 align="center">term-mesh</h1>
 
 <p align="center">
+  <img src="docs/assets/native-agent-panes.gif" width="800" alt="Two native agent panes responding to tasks in parallel">
+</p>
+
+<p align="center">
   <strong>AI Agent Control Plane for macOS</strong>
 </p>
 
 <p align="center">
-  Run a team of AI coding agents in parallel — each in its own sandboxed worktree, on this Mac or on any machine you can SSH into — from one native, GPU-accelerated terminal.
+  Run AI coding agents together in a native macOS terminal, with isolated Git worktrees and peers on other machines.
 </p>
 
 <p align="center">
   <a href="https://term-mesh.dev">Website</a> &middot;
   <a href="https://github.com/x-mesh/term-mesh/releases/latest">Download</a> &middot;
   <a href="#features">Features</a> &middot;
-  <a href="#quick-start">Quick Start</a>
+  <a href="#install">Install</a>
 </p>
 
 <p align="center">
@@ -25,27 +29,21 @@
 
 ---
 
-<p align="center">
-  <img src="docs/assets/main-first-image.png" width="800" alt="term-mesh screenshot">
-</p>
-
 ## Features
 
-### Sandbox Worktree Orchestration
-Agents get physically isolated `git worktree` environments. Each agent session runs in its own directory, preventing accidental modifications to the main repository. Worktrees are automatically cleaned up when tabs close.
+### Worktrees
+Projects can give agents separate Git worktrees, so each agent can work in its own checkout. A non-Git folder uses a shared directory instead. Worktrees isolate working directories, not processes or system access.
 
 ### Multi-Agent Native Terminal
 Built on [Ghostty](https://ghostty.org) (libghostty) for Metal GPU-accelerated terminal rendering. Vertical sidebar tabs show git branch, working directory, and notification status for each agent session.
-
-<p align="center">
-  <img src="docs/assets/vertical-horizontal-tabs-and-splits.png" width="800" alt="Vertical tabs and split panes">
-</p>
 
 ### Agent Panes
 An agent does not have to be a terminal you read. A native pane renders the conversation itself: streaming answers, tool calls you can fold away, file edits drawn as a coloured diff, and the cost and elapsed time of each finished turn. Claude speaks the protocol directly; codex, kiro, cursor and agy go through a bridge. Prefer the raw terminal? Settings → Agent Teams → Agent Panes switches back.
 
 ### Agent Teams
 One leader, several workers, and a task board they share. The leader delegates, the workers reply with a fixed five-field header (`STATUS` / `FILES` / `VERIFY` / `NEXT` / `FULL_REPORT`), and the app files each reply where the leader can collect it. Workers can sit on different machines than the leader.
+
+The Review Board shows work ready for review. Native agent panes also surface failed tool calls and session health, and `tm-agent send --task` can send a follow-up on an existing task.
 
 ```bash
 tm-agent create 3 --adopt          # this pane becomes the leader, three workers join
@@ -61,24 +59,18 @@ Point at a repository and a machine, and term-mesh does the rest: clone (or reus
 A Project created on a peer belongs to that host, not to the Mac window that created it. As long as the host's `term-meshd` and its sessions are running, you can quit the local app, connect again from this or another Mac, select the Project in the sidebar, and reattach its exact leader and member panes. Closing a viewer only detaches that Mac; deleting the Project from its owner ends the remote resources.
 
 ### Notification Rings
-Visual notification rings on sidebar tabs alert you when agents need attention — completed tasks, errors, or prompts waiting for input.
-
-<p align="center">
-  <img src="docs/assets/notification-rings.png" width="800" alt="Notification rings on sidebar tabs">
-</p>
+Sidebar indicators show when Claude Code or Codex is working, done, or waiting for permission, an answer, or sign-in. Notification rings also draw attention to completed tasks and errors.
 
 ### Built-in Browser
 Open web pages, documentation, or dashboards directly in a split panel without leaving the terminal.
 
-<p align="center">
-  <img src="docs/assets/built-in-browser.png" width="800" alt="Built-in browser panel">
-</p>
+### Mobile Remote Control
+Expose a pane to a phone over Tailscale Serve. Read a native agent conversation, send a turn or interrupt it, or use the terminal view and its limited key controls. In a terminal-backed Claude or Codex session, switch between Chat and Terminal. Enable Mobile Remote Control in Settings, then use `/rc on` in Claude Code or `$rc on` in Codex; `/rc off` or `$rc off` removes the exposure. See the [setup guide](docs/mobile-remote-control.md) for authentication and Tailscale configuration.
 
 ### Budget Guard & Resource Monitoring
 - **CPU/Memory monitoring** with automatic process discovery
 - **SIGSTOP/SIGCONT** process control when thresholds are exceeded
 - **Real API cost tracking** by parsing Claude Code's JSONL logs with incremental reads
-- Model-specific pricing: Opus $5/$25, Sonnet $3/$15, Haiku $1/$5 per MTok
 
 ### File Access Heatmap
 FSEvents-based file watcher tracks create/modify/remove events across watched directories. The dashboard renders a heatmap with top-10 hot files, recent events, and per-minute timeline buckets.
@@ -205,7 +197,9 @@ xattr -dr com.apple.quarantine /Applications/term-mesh.app
 
 Auto-updates (Sparkle) handle subsequent versions.
 
-## Prerequisites
+## Build from source
+
+The following tools are needed to build the app from source. The Homebrew and DMG installs above do not require Xcode, Rust, or Zig.
 
 | Component | Version | Notes |
 |-----------|---------|-------|
@@ -214,9 +208,9 @@ Auto-updates (Sparkle) handle subsequent versions.
 | Rust | stable 1.88+ | edition 2021 |
 | Zig | 0.15+ | For libghostty build |
 
-A peer host needs none of the above — see [Peer hosts](#peer-hosts-mac-and-linux).
+A Linux peer can use the prebuilt daemon — see [Peer hosts](#peer-hosts-mac-and-linux).
 
-## Quick Start
+### Development quick start
 
 ```bash
 # 1. Clone and setup
