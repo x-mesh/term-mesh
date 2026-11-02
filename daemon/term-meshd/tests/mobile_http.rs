@@ -394,6 +394,8 @@ async fn targets_lists_live_entries_and_prunes_dead_sockets() {
     );
     assert_eq!(targets[0]["kind"], "pane");
     assert_eq!(targets[0]["source"], "gui");
+    assert_eq!(targets[0]["remote_pane"], false);
+    assert_eq!(targets[0]["relay_host"], "");
     assert_eq!(targets[0]["keys"], "safe");
     assert_eq!(targets[1]["kind"], "leader");
     assert_eq!(targets[1]["team_name"], "live-team");
@@ -431,6 +433,7 @@ async fn a_transcript_with_no_local_session_is_asked_of_the_pane_owner() {
                 keys: KeysPolicy::Safe,
                 chat_capable: true,
                 remote_pane: true,
+                relay_host: "mac-studio-t".to_string(),
                 ..EnableSpec::default()
             },
             remote::now_unix(),
@@ -441,6 +444,9 @@ async fn a_transcript_with_no_local_session_is_asked_of_the_pane_owner() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.json()["entries"][0]["text"], "pong");
     assert_eq!(r.json()["terminal_backed"], true);
+    let targets = get(&h, "/api/targets").await;
+    assert_eq!(targets.json()["targets"][0]["remote_pane"], true);
+    assert_eq!(targets.json()["targets"][0]["relay_host"], "mac-studio-t");
 }
 
 #[tokio::test]
@@ -1302,6 +1308,10 @@ fn mobile_page_keeps_chat_and_terminal_wired_for_chat_capable_targets() {
     assert!(
         !js.contains("el.viewSwitch.hidden = !has || isAgent(t) || !t.chat_capable;"),
         "the old native-agent terminal suppression must not return"
+    );
+    assert!(
+        js.contains("실제 terminal:"),
+        "relay targets must identify their actual terminal host separately from the gateway URL"
     );
 }
 

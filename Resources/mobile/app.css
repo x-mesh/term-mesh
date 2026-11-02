@@ -165,6 +165,16 @@ button.icon {
   text-overflow: ellipsis;
 }
 
+.relay-origin {
+  margin: 0 2px 5px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* In the bar row, not under it: the switch used to own a second line, and
    with the session heading gone too the whole header is one row. */
 .view-switch {

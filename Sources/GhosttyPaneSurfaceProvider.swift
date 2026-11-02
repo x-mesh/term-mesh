@@ -1311,6 +1311,28 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return .success(resultJSON)
     }
 
+    func readSurfaceTranscript(
+        surfaceID: Data,
+        limit: Int
+    ) async -> Result<String, PeerTeamCallFailure>? {
+        guard uuidFromSurfaceID(surfaceID) != nil else {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.invalidParams,
+                message: "surface_id must be a UUID"
+            ))
+        }
+        guard let transcript = await TermMeshDaemon.shared.mobileSurfaceTranscript(
+            surfaceID: surfaceID.map { String(format: "%02x", $0) }.joined(),
+            limit: limit
+        ) else {
+            return .failure(PeerTeamCallFailure(
+                code: "session_unavailable",
+                message: "the CLI session transcript is not available"
+            ))
+        }
+        return .success(transcript)
+    }
+
     /// Resolve only teams already owned by this app. `name:<team>` is the
     /// project identifier emitted by New Project; accepting the stable team
     /// UUID as well makes reconnect restore independent of a display-name

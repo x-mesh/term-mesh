@@ -604,6 +604,8 @@ fn target_json(state: &MobileState, entry: &Entry) -> Value {
         "title": entry.title,
         "cwd": entry.cwd,
         "source": if entry.app_socket.is_some() { "gui" } else { "headless" },
+        "remote_pane": entry.remote_pane,
+        "relay_host": entry.relay_host,
         "keys": entry.keys,
         "owner": entry.owner,
         "created_at": entry.created_at,

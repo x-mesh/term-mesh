@@ -1450,6 +1450,36 @@ final class PeerServerTests: XCTestCase {
         }
     }
 
+    func testSurfaceTranscriptRequiresAttachmentAndBypassesTeamAllowList() async throws {
+        let socket = "/tmp/tm-peer-transcript-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: socket) }
+        let provider = TranscriptProvider()
+        let server = PeerServer(socketPath: socket, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let transport = try await UnixSocketTransport.connect(socketPath: socket)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        let surfaceID = await provider.surfaceID
+        let hex = surfaceID.map { String(format: "%02x", $0) }.joined()
+        let params = "{\"surface_id\":\"\(hex)\",\"limit\":7}"
+        let before = try await session.callTeam(method: "surface.transcript", paramsJSON: params, requiring: PeerCapability.surfaceTranscriptV1)
+        XCTAssertFalse(before.ok)
+        XCTAssertEqual(before.errorCode, "not_attached")
+        let beforeReads = await provider.reads
+        XCTAssertTrue(beforeReads.isEmpty)
+        _ = try await session.attachSurface(id: surfaceID, mode: .readOnly, cols: 80, rows: 24)
+        let response = try await session.callTeam(method: "surface.transcript", paramsJSON: params, requiring: PeerCapability.surfaceTranscriptV1)
+        XCTAssertTrue(response.ok)
+        XCTAssertTrue(response.resultJson.contains("answer-1"))
+        let reads = await provider.reads
+        XCTAssertEqual(reads.count, 1)
+        XCTAssertEqual(reads.first?.0, surfaceID)
+        XCTAssertEqual(reads.first?.1, 7)
+        try await session.sendGoodbye(reason: "transcript test done")
+        await transport.close()
+    }
+
     /// Full `team.leader.v1` loopback over a real Unix socket.
     ///
     /// The control plane is injected once into the server and therefore
@@ -2233,6 +2263,29 @@ private actor TeamCallProvider: PeerSurfaceProvider {
     ) async -> Result<String, PeerTeamCallFailure>? {
         lastCall = (method, paramsJSON)
         return .success(#"{"sent":true}"#)
+    }
+}
+
+private actor TranscriptProvider: PeerSurfaceProvider {
+    let surfaceID = Data(repeating: 0xA4, count: 16)
+    private(set) var reads: [(Data, Int)] = []
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = surfaceID
+        surface.attachable = true
+        return [surface]
+    }
+
+    func attach(surfaceID: Data, clientCols: UInt32, clientRows: UInt32, resumeFromSeq: UInt64) async -> PeerSurfaceAttachment? {
+        guard surfaceID == self.surfaceID else { return nil }
+        let pair = AsyncStream<PtyTapChunk>.makeStream()
+        return PeerSurfaceAttachment(byteStream: pair.stream, input: { _ in }, detach: { pair.continuation.finish() })
+    }
+
+    func readSurfaceTranscript(surfaceID: Data, limit: Int) async -> Result<String, PeerTeamCallFailure>? {
+        reads.append((surfaceID, limit))
+        return .success(#"{"entries":[{"id":"answer-1","kind":"answered","text":"pong"}]}"#)
     }
 }
 
