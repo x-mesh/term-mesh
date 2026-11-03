@@ -409,7 +409,7 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("does not intercept arbitrary"))
         XCTAssertTrue(policy.contains("wait --mode any --tasks"))
         XCTAssertFalse(policy.contains("at most one additional wait/collect"))
-        XCTAssertTrue(policy.contains("--mode any --task <id> per dispatched task"))
+        XCTAssertTrue(policy.contains("--mode any --task <id> per task or a per-task result wake"))
         XCTAssertTrue(policy.contains("assign the next dependency-ready unit from the decision or DAG to the freed worker"))
         XCTAssertTrue(policy.contains("Never start mutating work that the answer could cancel or change"))
         XCTAssertTrue(policy.contains("instead of ending the turn to wait for a 'next' prompt"))

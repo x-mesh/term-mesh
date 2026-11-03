@@ -323,7 +323,7 @@ enum LeaderParallelPolicy {
         ),
         (
             "rolling-refill",
-            "Treat the dependency-ready units of the routing decision as a queue, not one batch. tm-agent wait --mode any --tasks <ids> returns only after every listed task settles, so a wave-wide wait leaves early finishers idle. When the harness re-invokes the leader on background completion (Claude Code Bash `run_in_background:true`), start one tm-agent wait --timeout <seconds> --mode any --task <id> per dispatched task. When term-mesh wakes the leader per finished task with a `[term-mesh] task` line, use those wakes. A leader that can wait only in the foreground waits on the task expected to finish first. Each time a task settles, collect that task's result, then assign the next dependency-ready unit from the decision or DAG to the freed worker before waiting again, within the worker limit. Refill only with useful units that are already dependency-ready; never manufacture work solely to occupy capacity."
+            "Treat the dependency-ready units of the routing decision as a queue, not one batch. tm-agent wait --mode any --tasks <ids> returns only after every listed task settles, so a wave-wide wait leaves early finishers idle. Track each dispatched task on its own, with one tm-agent wait --mode any --task <id> per task or a per-task result wake, as this leader's collect procedure describes. Each time a task settles, collect that task's result, then assign the next dependency-ready unit from the decision or DAG to the freed worker before waiting again, within the worker limit. Refill only with useful units that are already dependency-ready; never manufacture work solely to occupy capacity."
         ),
         (
             "approval-prefetch",
