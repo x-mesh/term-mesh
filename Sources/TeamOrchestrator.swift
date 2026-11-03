@@ -9287,17 +9287,9 @@ final class TeamOrchestrator: ObservableObject {
                 for (key, value) in nativeAgentHealth(
                     teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId
                 ) { info[key] = value }
-                // Only a native pane reports when its turn starts and ends. A
-                // terminal or headless agent has no such signal, so `wait`
-                // must not read its quiet board state as an idle worker.
-                if let session = nativeAgentSession(
+                for (key, value) in nativeAgentTurnSignal(
                     teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId
-                ) {
-                    info["turn_tracked"] = true
-                    info["turn_in_flight"] = session.isThinking
-                } else {
-                    info["turn_tracked"] = false
-                }
+                ) { info[key] = value }
                 if let pid = agent.panelId {
                     info["panel_id"] = pid.uuidString
                 }
@@ -10982,6 +10974,19 @@ final class TeamOrchestrator: ObservableObject {
             workspaceId: agent.workspaceId,
             panelId: panelId
         )?.session
+    }
+
+    /// Only a native pane reports when its turn starts and ends. A terminal or
+    /// headless agent has no such signal, so `tm-agent wait` must not read its
+    /// quiet board state as an idle worker. `team.status` has two handlers,
+    /// `TerminalController.asyncTeamStatus` and `teamStatus(name:)`; both use this.
+    func nativeAgentTurnSignal(
+        teamName: String, agentName: String, agentInstanceId: String
+    ) -> [String: Any] {
+        guard let session = nativeAgentSession(
+            teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+        ) else { return ["turn_tracked": false] }
+        return ["turn_tracked": true, "turn_in_flight": session.isThinking]
     }
 
     func nativeAgentHealth(
