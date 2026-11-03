@@ -198,8 +198,9 @@ Read ALL agents' terminal output at once:
 tm-agent collect --lines 100
 \`\`\`
 
-Start a task-scoped result wait in the background when the harness supports it (Claude Code Bash `run_in_background:true`); continue leader-lane work or return interim status until completion notification:
+Start one task-scoped result wait per dispatched task in the background when the harness supports it (Claude Code Bash `run_in_background:true`); continue leader-lane work or return interim status until each completion notification. Use the multi-task form only when no next step can start before every listed task finishes:
 \`\`\`bash
+tm-agent wait --timeout 1800 --mode any --task <task-id>
 tm-agent wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>
 \`\`\`
 
@@ -253,7 +254,7 @@ tm-agent task done <id> '<result summary>'
 - Before dispatch, form the Leader Adaptive Execution Policy structured task contract with worker, goal, done criteria, dependencies, verify command, mutation flag, and estimate, plus owned/forbidden paths when workers share a checkout; dispatch only those tasks
 - For admitted parallel writes, use task-scoped worktrees and one bounded dispatch/collect wave
 - For admitted mutating tasks, delegate with --worktree always --from <base>; collect results, then integrate completed worktrees serially with tm-agent task finish-worktree
-- While workers run, prepare acceptance checks and integration order without editing their owned paths; wait with --mode any --tasks <ids>, process the first result, and wait/collect at most once more when required
+- While workers run, prepare acceptance checks and integration order without editing their owned paths; process each result as its task settles and give the freed worker the next dependency-ready unit before waiting again
 - Do not reserve a reviewer in the implementation wave. After integration, use one bounded read-only reviewer only for a high-risk actual diff; leader-review small local diffs directly
 - The CLI has no task-cancel primitive. Never claim cancellation; before one recovery reassign, preserve the worktree and actually stop the original worker through the supported restart path
 - Commit policy: when you or an agent writes a commit message, NEVER wrap it in \`\`\` fenced code-block markers. The .githooks/commit-msg hook strips them as a backstop, but messages must read cleanly without relying on it.

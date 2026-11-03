@@ -4838,8 +4838,9 @@ final class TeamOrchestrator: ObservableObject {
 
         Direct execution is the explicit exception for trivial, same-file, dependency-serial, or worker-ineligible
         work. State the concrete constraint when choosing it; never create artificial work merely to fill idle
-        capacity. For parallel work, record the positive decomposition evidence, dispatch one bounded wave,
-        collect once, then review and integrate worktrees serially. Use worker follow-ups only for blockers or
+        capacity. For parallel work, record the positive decomposition evidence, dispatch the ready units,
+        collect each result once as its task settles, give a freed worker the next dependency-ready unit,
+        then review and integrate worktrees serially. Use worker follow-ups only for blockers or
         ownership expansion.
         Classify the request as direct, probe, or parallel using the canonical structured decision below.
         Dispatch exactly the tasks in that decision: zero for direct, one read-only worker for probe, and two
@@ -4939,6 +4940,7 @@ final class TeamOrchestrator: ObservableObject {
         ```
         \(tmAgent) read <agent_name> --lines 100
         \(tmAgent) collect --lines 100
+        \(tmAgent) wait --timeout 1800 --mode any --task <task-id>
         \(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>
         \(tmAgent) wait --mode blocked --timeout 120
         \(tmAgent) wait --mode review_ready --timeout 120
@@ -4974,9 +4976,9 @@ final class TeamOrchestrator: ObservableObject {
         3. Form the structured direct/probe/parallel decision from the canonical policy
         4. Execute direct yourself, run one 60-90 second read-only probe, or dispatch the admitted two-to-three-task parallel wave
         5. While workers run, prepare acceptance checks and integration order without editing worker-owned paths
-        6. Start `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the background when supported (Claude Code Bash `run_in_background:true`); then finish leader-lane work or send a short interim status and end the turn. On its completion notification, collect headers and process the result. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
+        6. Start one `\(tmAgent) wait --timeout 1800 --mode any --task <task-id>` per dispatched task in the background when supported (Claude Code Bash `run_in_background:true`); then finish leader-lane work or send a short interim status and end the turn. On each completion notification, collect that task's headers and process the result. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
         If the harness cannot re-invoke you on background completion (e.g. Codex), finish leader-lane work first, then run the wait in the foreground; never end a turn with uncollected required results and no background wait running.
-        7. Process the first completed result; wait/collect at most once more only for results required to finish
+        7. Process each result as its task settles, then give the freed worker the next dependency-ready unit before waiting again; collect each task at most once
         8. Review and integrate completed worktrees serially, validate, and respond to the user
         9. For a high-risk integrated diff only, run one bounded read-only reviewer gate against the actual diff
         10. For a durable request, after all work and validation succeed, run exactly `\(tmAgent) leader request complete <id>` once, immediately before the final response, with no verification command afterward. Do not complete blocked or failed work.
@@ -5477,10 +5479,10 @@ final class TeamOrchestrator: ObservableObject {
         let collectSteps = codexLeaderWake
             ? """
             6. **Collect** — After dispatch, prepare acceptance checks, then end your turn instead of a foreground `\(tmAgent) wait`.
-            7. **Integrate** — When a line starting `[term-mesh] task` arrives, run `\(tmAgent) collect --headers` for those ids only, review completed worktrees serially, integrate, and end the turn again until every dispatched task is collected. For a `blocked` task, read it and unblock, answer, or reassign it. Never claim completion before all are collected.
+            7. **Integrate** — When a line starting `[term-mesh] task` arrives, run `\(tmAgent) collect --headers` for those ids only, review completed worktrees serially, integrate, give each freed worker the next dependency-ready unit, and end the turn again until every dispatched task is collected. For a `blocked` task, read it and unblock, answer, or reassign it. Never claim completion before all are collected.
             """
             : """
-            6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>` in the foreground. Never end a turn with uncollected required results and no background wait running. Collect and process the first result; wait/collect at most once more only if required. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
+            6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --task <task-id>` in the foreground for the task expected to finish first. Never end a turn with uncollected required results and no background wait running. Collect and process that result, give the freed worker the next dependency-ready unit, then wait on the next pending task; collect each task at most once. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
             7. **Integrate** — Review completed worktrees serially and validate the combined result
             """
         return """
@@ -5496,8 +5498,9 @@ final class TeamOrchestrator: ObservableObject {
 
         Direct execution is the explicit exception for trivial, same-file, dependency-serial, or worker-ineligible
         work. State the concrete constraint when choosing it; never create artificial work merely to fill idle
-        capacity. For parallel work, record the positive decomposition evidence, dispatch one bounded wave,
-        collect once, then review and integrate worktrees serially. Use worker follow-ups only for blockers or
+        capacity. For parallel work, record the positive decomposition evidence, dispatch the ready units,
+        collect each result once as its task settles, give a freed worker the next dependency-ready unit,
+        then review and integrate worktrees serially. Use worker follow-ups only for blockers or
         ownership expansion.
         Classify the request as direct, probe, or parallel using the canonical structured decision below.
         Dispatch exactly the tasks in that decision: zero for direct, one read-only worker for probe, and two
@@ -5571,6 +5574,7 @@ final class TeamOrchestrator: ObservableObject {
         ```
         \(tmAgent) read <agent_name> --lines 100
         \(tmAgent) collect --lines 100
+        \(tmAgent) wait --timeout 1800 --mode any --task <task-id>
         \(tmAgent) wait --timeout 1800 --mode any --tasks <comma-separated-task-ids>
         \(tmAgent) wait --mode blocked --timeout 120
         \(tmAgent) wait --mode review_ready --timeout 120

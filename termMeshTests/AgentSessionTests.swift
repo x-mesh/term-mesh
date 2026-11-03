@@ -337,12 +337,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "15")
+        XCTAssertEqual(LeaderParallelPolicy.version, "16")
         XCTAssertEqual(LeaderParallelPolicy.activation, "request-boundary-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 15"))
+        XCTAssertTrue(first.contains("policy_version: 16"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: request-boundary-enforced"))
     }
@@ -384,6 +384,9 @@ final class AgentSessionTests: XCTestCase {
             "policy-parity",
             "timebox-convergence",
             "external-event-wait",
+            "rolling-refill",
+            "approval-prefetch",
+            "continue-authorized-steps",
         ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
         XCTAssertTrue(policy.contains("This policy is active."))
         XCTAssertTrue(policy.contains("start each non-trivial request by decomposing"))
@@ -405,7 +408,12 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("always returns mandatory guidance"))
         XCTAssertTrue(policy.contains("does not intercept arbitrary"))
         XCTAssertTrue(policy.contains("wait --mode any --tasks"))
-        XCTAssertTrue(policy.contains("at most one additional wait/collect"))
+        XCTAssertFalse(policy.contains("at most one additional wait/collect"))
+        XCTAssertTrue(policy.contains("--mode any --task <id> per task or a per-task result wake"))
+        XCTAssertTrue(policy.contains("assign the next dependency-ready unit from the decision or DAG to the freed worker"))
+        XCTAssertTrue(policy.contains("Never start mutating work that the answer could cancel or change"))
+        XCTAssertTrue(policy.contains("instead of ending the turn to wait for a 'next' prompt"))
+        XCTAssertTrue(policy.contains("stay user-owned gates"))
         XCTAssertTrue(policy.contains("After the actual diff is integrated"))
         XCTAssertTrue(policy.contains("bounded manifest-level triage"))
         XCTAssertTrue(policy.contains("same frozen target"))
