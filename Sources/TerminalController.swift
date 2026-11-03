@@ -4105,7 +4105,7 @@ class TerminalController {
         // and `checkout` falling back to a workspace UUID. Derived here, on the
         // actor that owns the member, so both status implementations answer
         // with the same value.
-        let teamInfo: (leaderSessionId: String, leaderEffort: String, workspaceId: String, workingDirectory: String, integrationTargetPath: String, worktreeMode: String, checkoutMode: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, effort: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?, toolHealth: [String: Any])], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, leaderEffort: String, workspaceId: String, workingDirectory: String, integrationTargetPath: String, worktreeMode: String, checkoutMode: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, effort: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?, toolHealth: [String: Any], turnSignal: [String: Any])], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -4126,6 +4126,9 @@ class TerminalController {
                         teamWorkingDirectory: team.workingDirectory
                      ),
                      toolHealth: TeamOrchestrator.shared.nativeAgentHealth(
+                        teamName: teamName, agentName: a.name, agentInstanceId: a.agentInstanceId
+                     ),
+                     turnSignal: TeamOrchestrator.shared.nativeAgentTurnSignal(
                         teamName: teamName, agentName: a.name, agentInstanceId: a.agentInstanceId
                      ))
                 },
@@ -4166,6 +4169,7 @@ class TerminalController {
             }
             // Merge data enrichment (task, heartbeat, agent_state)
             for (key, value) in enrichment { info[key] = value }
+            for (key, value) in agent.turnSignal { info[key] = value }
             if let branch = agent.worktreeBranch { info["worktree_branch"] = branch }
             // Worktree lifecycle only — present when a task created one.
             // `working_directory` is where the pane is, and is always answered.
