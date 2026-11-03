@@ -259,6 +259,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertTrue(prompt.contains("If the wait ends with `timeout`"))
             XCTAssertTrue(prompt.contains("re-arm it only for task ids still pending"))
             XCTAssertTrue(prompt.contains("If it ends with `blocked`, read the blocked task"))
+            XCTAssertTrue(prompt.contains("If it ends with `stalled`, the assignee has been idle"))
         }
     }
 
