@@ -23767,6 +23767,98 @@ fn should_discover_wait_tasks(
 /// Statuses after which the worker no longer works on the task, so a wait
 /// scoped to it has nothing left to wait for. Leaving `failed` out made a
 /// wait run to its timeout whenever one tracked task failed.
+/// Seconds an assignee may sit idle on an unsettled task before `wait` reports
+/// it. Hand-off takes tens of seconds before a worker's first output, and a
+/// terminal pane reads as idle after six quiet seconds, so a shorter grace would
+/// flag workers that are about to start or are thinking silently.
+const WAIT_STALL_GRACE: Duration = Duration::from_secs(90);
+
+#[derive(Debug, Clone, PartialEq)]
+struct WaitTaskRef {
+    assignee: String,
+    agent_instance_id: Option<String>,
+    status: String,
+}
+
+impl WaitTaskRef {
+    fn from_task(task: &Value) -> Option<Self> {
+        let assignee = task["assignee"].as_str().filter(|name| !name.is_empty())?;
+        Some(Self {
+            assignee: assignee.to_string(),
+            agent_instance_id: task["agent_instance_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(String::from),
+            status: task["status"].as_str().unwrap_or("").to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StalledWaitTask {
+    task_id: String,
+    assignee: String,
+    status: String,
+    idle_seconds: u64,
+}
+
+/// `agent_state` cannot answer this: a terminal or headless agent reads `idle`
+/// while it works, and a started task reads `running` after the turn ended.
+/// Only a native pane reports its turn (`turn_tracked`), so only it, or a
+/// daemon-parked agent, can be called idle. An app without these fields, or an
+/// assignee absent from the roster, is never evidence of a stall.
+fn wait_assignee_is_idle(task: &WaitTaskRef, agents: &[Value]) -> bool {
+    let agent = match &task.agent_instance_id {
+        Some(instance) => agents
+            .iter()
+            .find(|agent| agent["agent_instance_id"].as_str() == Some(instance.as_str())),
+        None => agents
+            .iter()
+            .find(|agent| agent["name"].as_str() == Some(task.assignee.as_str())),
+    };
+    let Some(agent) = agent else {
+        return false;
+    };
+    if agent["agent_state"].as_str() == Some("parked") {
+        return true;
+    }
+    agent["turn_tracked"].as_bool() == Some(true)
+        && agent["turn_in_flight"].as_bool() == Some(false)
+}
+
+fn update_wait_stall_tracker(
+    tasks: &std::collections::HashMap<String, WaitTaskRef>,
+    agents: &[Value],
+    idle_since: &mut std::collections::HashMap<String, Instant>,
+    now: Instant,
+    grace: Duration,
+) -> Vec<StalledWaitTask> {
+    idle_since.retain(|task_id, _| {
+        tasks
+            .get(task_id)
+            .is_some_and(|task| !wait_task_settled(&task.status))
+    });
+    let mut stalled = Vec::new();
+    for (task_id, task) in tasks {
+        if wait_task_settled(&task.status) || !wait_assignee_is_idle(task, agents) {
+            idle_since.remove(task_id);
+            continue;
+        }
+        let since = *idle_since.entry(task_id.clone()).or_insert(now);
+        let idle = now.saturating_duration_since(since);
+        if idle >= grace {
+            stalled.push(StalledWaitTask {
+                task_id: task_id.clone(),
+                assignee: task.assignee.clone(),
+                status: task.status.clone(),
+                idle_seconds: idle.as_secs(),
+            });
+        }
+    }
+    stalled.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    stalled
+}
+
 fn wait_task_settled(status: &str) -> bool {
     matches!(
         status,
@@ -24561,6 +24653,10 @@ fn run_wait(
     // report come from here, not from another round of RPCs.
     let mut tracked_statuses: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut stall_tasks: std::collections::HashMap<String, WaitTaskRef> =
+        std::collections::HashMap::new();
+    let mut stall_idle_since: std::collections::HashMap<String, Instant> =
+        std::collections::HashMap::new();
     while elapsed < timeout {
         if current_interval > 0 {
             // B1: a push event ends the sleep early; a quiet stream keeps the
@@ -24638,6 +24734,9 @@ fn run_wait(
                             }
                             let status = task["status"].as_str().unwrap_or("");
                             tracked_statuses.insert(tid.to_string(), status.to_string());
+                            if let Some(task_ref) = WaitTaskRef::from_task(task) {
+                                stall_tasks.insert(tid.to_string(), task_ref);
+                            }
                         }
                         let done = wait_settled_count(&tracked_task_ids, &tracked_statuses);
                         report_done = total > 0 && done >= total;
@@ -24764,6 +24863,9 @@ fn run_wait(
                         if r["ok"].as_bool().unwrap_or(false) {
                             task_obj = r["result"].clone();
                             task_status = task_obj["status"].as_str().map(String::from);
+                            if let Some(task_ref) = WaitTaskRef::from_task(&task_obj) {
+                                stall_tasks.insert(tid.to_string(), task_ref);
+                            }
                         }
                     }
                     Err(e) => eprintln!("  Warning: task.get RPC failed for {tid}: {e}"),
@@ -24804,6 +24906,46 @@ fn run_wait(
                     pretty(&json!({ "result": { "team_name": team, "task": task_obj } }))
                 );
                 finish_wait!(wait_outcome_for_status(st));
+            }
+        }
+
+        if explicit_task_scope && matches!(mode, "report" | "any") && !stall_tasks.is_empty() {
+            if let Ok(r) = rpc_call(sock, "team.status", json!({ "team_name": team })) {
+                let agents = r["result"]["agents"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let stalled = update_wait_stall_tracker(
+                    &stall_tasks,
+                    &agents,
+                    &mut stall_idle_since,
+                    Instant::now(),
+                    WAIT_STALL_GRACE,
+                );
+                if !stalled.is_empty() {
+                    let items: Vec<Value> = stalled
+                        .iter()
+                        .map(|task| {
+                            json!({
+                                "task_id": task.task_id,
+                                "assignee": task.assignee,
+                                "status": task.status,
+                                "idle_seconds": task.idle_seconds,
+                            })
+                        })
+                        .collect();
+                    eprintln!(
+                        "An assignee has been idle for {}s or more with an unsettled task.",
+                        WAIT_STALL_GRACE.as_secs()
+                    );
+                    println!(
+                        "{}",
+                        pretty(&json!({
+                            "result": { "team_name": team, "outcome": "stalled", "stalled": items }
+                        }))
+                    );
+                    finish_wait!("stalled");
+                }
             }
         }
 
@@ -25181,6 +25323,164 @@ mod wait_any_scope_tests {
     fn messages_end_any_only_without_a_task_scope() {
         assert!(!messages_end_any_wait(true));
         assert!(messages_end_any_wait(false));
+    }
+
+    fn stall_task(assignee: &str, instance: Option<&str>, status: &str) -> WaitTaskRef {
+        WaitTaskRef {
+            assignee: assignee.to_string(),
+            agent_instance_id: instance.map(String::from),
+            status: status.to_string(),
+        }
+    }
+
+    fn native_agent(name: &str, instance: &str, in_flight: bool) -> Value {
+        json!({
+            "name": name,
+            "agent_instance_id": instance,
+            "agent_state": if in_flight { "running" } else { "idle" },
+            "turn_tracked": true,
+            "turn_in_flight": in_flight,
+        })
+    }
+
+    fn one_task(task: WaitTaskRef) -> std::collections::HashMap<String, WaitTaskRef> {
+        std::collections::HashMap::from([("t1".to_string(), task)])
+    }
+
+    fn stalls_now(agent: Value) -> bool {
+        let tasks = one_task(stall_task("reviewer", None, "assigned"));
+        let mut since = std::collections::HashMap::new();
+        !update_wait_stall_tracker(&tasks, &[agent], &mut since, Instant::now(), Duration::ZERO)
+            .is_empty()
+    }
+
+    #[test]
+    fn stall_is_reported_only_after_the_grace_elapses() {
+        let tasks = one_task(stall_task("reviewer", None, "assigned"));
+        let agents = vec![native_agent("reviewer", "r1", false)];
+        let mut since = std::collections::HashMap::new();
+        let start = Instant::now();
+        let grace = Duration::from_secs(90);
+
+        assert!(update_wait_stall_tracker(&tasks, &agents, &mut since, start, grace).is_empty());
+        let before = start + Duration::from_secs(89);
+        assert!(update_wait_stall_tracker(&tasks, &agents, &mut since, before, grace).is_empty());
+        let after = start + Duration::from_secs(90);
+        let stalled = update_wait_stall_tracker(&tasks, &agents, &mut since, after, grace);
+        assert_eq!(
+            stalled,
+            vec![StalledWaitTask {
+                task_id: "t1".to_string(),
+                assignee: "reviewer".to_string(),
+                status: "assigned".to_string(),
+                idle_seconds: 90,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_turn_in_flight_resets_the_stall_timer() {
+        let tasks = one_task(stall_task("reviewer", None, "in_progress"));
+        let idle = vec![native_agent("reviewer", "r1", false)];
+        let running = vec![native_agent("reviewer", "r1", true)];
+        let mut since = std::collections::HashMap::new();
+        let start = Instant::now();
+        let grace = Duration::from_secs(90);
+
+        update_wait_stall_tracker(&tasks, &idle, &mut since, start, grace);
+        let mid = start + Duration::from_secs(60);
+        update_wait_stall_tracker(&tasks, &running, &mut since, mid, grace);
+        let later = start + Duration::from_secs(120);
+        assert!(update_wait_stall_tracker(&tasks, &idle, &mut since, later, grace).is_empty());
+        let end = later + Duration::from_secs(90);
+        assert_eq!(
+            update_wait_stall_tracker(&tasks, &idle, &mut since, end, grace).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_a_tracked_turn_that_ended_or_a_parked_agent_counts_as_stalled() {
+        assert!(stalls_now(native_agent("reviewer", "r1", false)));
+        assert!(!stalls_now(native_agent("reviewer", "r1", true)));
+        // A started task reads `running` on the board after the turn ended;
+        // the turn signal still says nobody is working it.
+        let mut started = native_agent("reviewer", "r1", false);
+        started["agent_state"] = json!("running");
+        assert!(stalls_now(started));
+        let mut stale = native_agent("reviewer", "r1", false);
+        stale["agent_state"] = json!("assigned_stale");
+        assert!(stalls_now(stale));
+        assert!(stalls_now(json!({
+            "name": "reviewer", "agent_instance_id": "r1", "agent_state": "parked",
+        })));
+    }
+
+    #[test]
+    fn an_agent_without_a_turn_signal_is_never_stalled() {
+        // Terminal and headless agents read `idle` while they work.
+        assert!(!stalls_now(json!({
+            "name": "reviewer", "agent_instance_id": "r1", "agent_state": "idle",
+            "turn_tracked": false,
+        })));
+        // An app that predates these fields says nothing either way.
+        assert!(!stalls_now(json!({
+            "name": "reviewer", "agent_instance_id": "r1", "agent_state": "idle",
+        })));
+    }
+
+    #[test]
+    fn an_unknown_assignee_or_settled_task_is_never_stalled() {
+        let grace = Duration::ZERO;
+        let mut since = std::collections::HashMap::new();
+        let absent = one_task(stall_task("ghost", None, "assigned"));
+        let agents = vec![native_agent("reviewer", "r1", false)];
+        assert!(
+            update_wait_stall_tracker(&absent, &agents, &mut since, Instant::now(), grace)
+                .is_empty()
+        );
+
+        let settled = one_task(stall_task("reviewer", None, "completed"));
+        assert!(
+            update_wait_stall_tracker(&settled, &agents, &mut since, Instant::now(), grace)
+                .is_empty()
+        );
+        assert!(since.is_empty());
+    }
+
+    #[test]
+    fn the_instance_id_selects_between_agents_that_share_a_name() {
+        let grace = Duration::ZERO;
+        let agents = vec![
+            native_agent("reviewer", "r1", true),
+            native_agent("reviewer", "r2", false),
+        ];
+        let mut since = std::collections::HashMap::new();
+        let busy = one_task(stall_task("reviewer", Some("r1"), "assigned"));
+        assert!(
+            update_wait_stall_tracker(&busy, &agents, &mut since, Instant::now(), grace).is_empty()
+        );
+        let quiet = one_task(stall_task("reviewer", Some("r2"), "assigned"));
+        assert_eq!(
+            update_wait_stall_tracker(&quiet, &agents, &mut since, Instant::now(), grace).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_task_without_an_assignee_is_not_tracked() {
+        assert_eq!(
+            WaitTaskRef::from_task(&json!({ "status": "assigned" })),
+            None
+        );
+        assert_eq!(
+            WaitTaskRef::from_task(&json!({
+                "assignee": "reviewer",
+                "agent_instance_id": "",
+                "status": "assigned",
+            })),
+            Some(stall_task("reviewer", None, "assigned"))
+        );
     }
 
     #[test]

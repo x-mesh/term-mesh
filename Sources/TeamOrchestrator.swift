@@ -4976,7 +4976,7 @@ final class TeamOrchestrator: ObservableObject {
         3. Form the structured direct/probe/parallel decision from the canonical policy
         4. Execute direct yourself, run one 60-90 second read-only probe, or dispatch the admitted two-to-three-task parallel wave
         5. While workers run, prepare acceptance checks and integration order without editing worker-owned paths
-        6. Start one `\(tmAgent) wait --timeout 1800 --mode any --task <task-id>` per dispatched task in the background when supported (Claude Code Bash `run_in_background:true`); then finish leader-lane work or send a short interim status and end the turn. On each completion notification, collect that task's headers and process the result. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
+        6. Start one `\(tmAgent) wait --timeout 1800 --mode any --task <task-id>` per dispatched task in the background when supported (Claude Code Bash `run_in_background:true`); then finish leader-lane work or send a short interim status and end the turn. On each completion notification, collect that task's headers and process the result. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming. If it ends with `stalled`, the assignee has been idle with that task unsettled: read that worker's transcript tail, and reassign the task once if its turn ended without the final reply.
         If the harness cannot re-invoke you on background completion (e.g. Codex), finish leader-lane work first, then run the wait in the foreground; never end a turn with uncollected required results and no background wait running.
         7. Process each result as its task settles, then give the freed worker the next dependency-ready unit before waiting again; collect each task at most once
         8. Review and integrate completed worktrees serially, validate, and respond to the user
@@ -5482,7 +5482,7 @@ final class TeamOrchestrator: ObservableObject {
             7. **Integrate** — When a line starting `[term-mesh] task` arrives, run `\(tmAgent) collect --headers` for those ids only, review completed worktrees serially, integrate, give each freed worker the next dependency-ready unit, and end the turn again until every dispatched task is collected. For a `blocked` task, read it and unblock, answer, or reassign it. Never claim completion before all are collected.
             """
             : """
-            6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --task <task-id>` in the foreground for the task expected to finish first. Never end a turn with uncollected required results and no background wait running. Collect and process that result, give the freed worker the next dependency-ready unit, then wait on the next pending task; collect each task at most once. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming.
+            6. **Collect** — Finish leader-lane work first, then run `\(tmAgent) wait --timeout 1800 --mode any --task <task-id>` in the foreground for the task expected to finish first. Never end a turn with uncollected required results and no background wait running. Collect and process that result, give the freed worker the next dependency-ready unit, then wait on the next pending task; collect each task at most once. If the wait ends with `timeout`, run `\(tmAgent) status`, re-arm it only for task ids still pending, and report partial evidence at the soft deadline. If it ends with `blocked`, read the blocked task and unblock, answer, or reassign it before re-arming. If it ends with `stalled`, the assignee has been idle with that task unsettled: read that worker's transcript tail, and reassign the task once if its turn ended without the final reply.
             7. **Integrate** — Review completed worktrees serially and validate the combined result
             """
         return """
@@ -9287,6 +9287,17 @@ final class TeamOrchestrator: ObservableObject {
                 for (key, value) in nativeAgentHealth(
                     teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId
                 ) { info[key] = value }
+                // Only a native pane reports when its turn starts and ends. A
+                // terminal or headless agent has no such signal, so `wait`
+                // must not read its quiet board state as an idle worker.
+                if let session = nativeAgentSession(
+                    teamName: team.id, agentName: agent.name, agentInstanceId: agent.agentInstanceId
+                ) {
+                    info["turn_tracked"] = true
+                    info["turn_in_flight"] = session.isThinking
+                } else {
+                    info["turn_tracked"] = false
+                }
                 if let pid = agent.panelId {
                     info["panel_id"] = pid.uuidString
                 }
