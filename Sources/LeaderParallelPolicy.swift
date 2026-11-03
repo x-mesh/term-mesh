@@ -242,7 +242,7 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "15"
+    static let version = "16"
     static let activation = "request-boundary-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -279,11 +279,11 @@ enum LeaderParallelPolicy {
         ),
         (
             "bounded-handoff",
-            "Use one dispatch, one independent work interval, and one result collection per parallel wave. Worker-to-worker communication is for blockers or ownership expansion only; avoid turn-by-turn ping-pong. The leader reviews and integrates completed worktrees serially, validating after each merge boundary and once across the integrated result."
+            "Dispatch each task once and collect each task's result once. Worker-to-worker communication is for blockers or ownership expansion only; avoid turn-by-turn ping-pong. The leader reviews and integrates completed worktrees serially, validating after each merge boundary and once across the integrated result."
         ),
         (
             "leader-integration-lane",
-            "After dispatch, the leader remains active: prepare acceptance checks, inspect only unowned paths, stage integration order, and review completed evidence. Never edit a worker-owned path concurrently. A leader mutation lane requires explicit disjoint ownership, isolated writes, zero overlap, and serial integration. Wait for named task IDs with tm-agent wait --mode any --tasks, process the first completed result, and perform at most one additional wait/collect for results still required to finish."
+            "After dispatch, the leader remains active: prepare acceptance checks, inspect only unowned paths, stage integration order, and review completed evidence. Never edit a worker-owned path concurrently. A leader mutation lane requires explicit disjoint ownership, isolated writes, zero overlap, and serial integration. Wait for named task IDs as `rolling-refill` describes and process each result as its task settles. Use one tm-agent wait --mode any --tasks <ids> only when no next step can start before every listed task finishes, such as a merge or final validation gate."
         ),
         (
             "actual-diff-review-gate",
@@ -320,6 +320,18 @@ enum LeaderParallelPolicy {
         (
             "external-event-wait",
             "Events outside the team bus (CI runs, deploys, remote builds) cannot be awaited with team wait primitives. Before watching one, verify that the watched resource exists; absence after its explicit discovery window is a terminal finding to report, not a retry loop. Never start an unbounded watch or end a turn silently waiting on an external event. Either poll with an explicit attempt cap and report state plus the next action at the cap, or delegate a bounded watch to a worker whose deadline is shorter than the leader's tm-agent wait timeout and whose reply covers success, failure, absence, and timeout. If the leader wait expires first, report partial state; do not claim that the ended turn will resume automatically."
+        ),
+        (
+            "rolling-refill",
+            "Treat the dependency-ready units of the routing decision as a queue, not one batch. tm-agent wait --mode any --tasks <ids> returns only after every listed task settles, so a wave-wide wait leaves early finishers idle. Track each dispatched task on its own, with one tm-agent wait --mode any --task <id> per task or a per-task result wake, as this leader's collect procedure describes. Each time a task settles, collect that task's result, then assign the next dependency-ready unit from the decision or DAG to the freed worker before waiting again, within the worker limit. Refill only with useful units that are already dependency-ready; never manufacture work solely to occupy capacity."
+        ),
+        (
+            "approval-prefetch",
+            "Before asking the user for approval, a choice, or confirmation (for example publishing a PR, merging, or releasing), first dispatch the useful dependency-ready units whose validity does not depend on the answer: read-only checks, investigation of the next step, or test preparation. Never start mutating work that the answer could cancel or change. Then ask. Workers finish during the wait, and the leader collects their results after the answer arrives, so a pending question blocks only the work that depends on it. If no such unit exists, ask without dispatching."
+        ),
+        (
+            "continue-authorized-steps",
+            "When a step finishes and the next dependency-ready step is already inside the user's approved request or plan, start it in the same turn instead of ending the turn to wait for a 'next' prompt. Give a short progress note at each step boundary rather than stopping. End the turn only when the request is done, the next step needs a user decision, or a timebox expires; then state the remaining queue and what the user must decide. Steps that publish, merge, release, or are otherwise irreversible stay user-owned gates and still require the confirmation their workflow defines."
         ),
     ]
 

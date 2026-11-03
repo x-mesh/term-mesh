@@ -259,6 +259,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertTrue(prompt.contains("If the wait ends with `timeout`"))
             XCTAssertTrue(prompt.contains("re-arm it only for task ids still pending"))
             XCTAssertTrue(prompt.contains("If it ends with `blocked`, read the blocked task"))
+            XCTAssertTrue(prompt.contains("If it ends with `stalled`, the assignee has been idle"))
         }
     }
 
@@ -282,7 +283,8 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertTrue(prompt.contains("\"route\": \"direct|probe|parallel|delegated\""))
             XCTAssertTrue(prompt.contains("--worktree always --from <base_ref>"))
             XCTAssertTrue(prompt.contains("wait --mode any --tasks"))
-            XCTAssertTrue(prompt.contains("at most once more"))
+            XCTAssertTrue(prompt.contains("next dependency-ready unit"))
+            XCTAssertTrue(prompt.contains("--mode any --task <"))
             XCTAssertTrue(prompt.contains("actual diff is integrated"))
             XCTAssertTrue(prompt.contains("security plus tester"))
             XCTAssertTrue(prompt.contains("differs from every implementation owner"))
