@@ -4,6 +4,19 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.283.0] - 2026-11-03
+
+### Changed
+
+- Team leaders now give a worker its next task as soon as that worker finishes, instead of waiting for every task in the batch to finish. Before a leader asks you to approve something, it first starts the work that does not depend on your answer. When the next step is already part of what you asked for, the leader continues without waiting for you to type "next".
+
+### Fixed
+
+- The app icon no longer shows a light-blue frame on dark backgrounds such as the About window. The area around the icon is now transparent.
+- A team leader now learns within about 90 seconds when a native agent ends its turn without reporting a result. Before, the leader waited until its wait timed out, which could take 30 minutes. `tm-agent wait --task` reports such a task with the outcome `stalled`.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.282.0] - 2026-11-02
 
 ### Added
