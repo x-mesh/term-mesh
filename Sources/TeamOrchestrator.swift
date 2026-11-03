@@ -10978,9 +10978,8 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Only a native pane reports when its turn starts and ends. A terminal or
     /// headless agent has no such signal, so `tm-agent wait` must not read its
-    /// quiet board state as an idle worker. Both `team.status` serializers use
-    /// this, because the RPC is answered by `TerminalController`, not by
-    /// `teamStatus(name:)`.
+    /// quiet board state as an idle worker. `team.status` has two handlers,
+    /// `TerminalController.asyncTeamStatus` and `teamStatus(name:)`; both use this.
     func nativeAgentTurnSignal(
         teamName: String, agentName: String, agentInstanceId: String
     ) -> [String: Any] {
