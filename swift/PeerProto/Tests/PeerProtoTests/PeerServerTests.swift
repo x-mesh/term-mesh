@@ -2737,7 +2737,7 @@ final class PeerServerResizeClaimTests: XCTestCase {
         let ended = await server.disconnectInbound(peerID: machineA)
         XCTAssertEqual(ended, 2)
         for viewer in [a1, a2] {
-            let reason = try await Self.nextGoodbyeReason(viewer.0)
+            let reason = try await Self.nextGoodbyeReason(viewer.0, closingOnTimeout: viewer.1)
             XCTAssertEqual(reason, PeerGoodbyeReason.disconnectedByHost)
         }
 
@@ -2752,7 +2752,12 @@ final class PeerServerResizeClaimTests: XCTestCase {
         for viewer in [a1, a2, b] { await viewer.1.close() }
     }
 
-    private static func nextGoodbyeReason(_ session: PeerSession) async throws -> String? {
+    /// A task group waits for every child before returning, and a pending
+    /// read does not end on cancellation. Closing the transport at the
+    /// deadline is what ends that read when no Goodbye ever comes.
+    private static func nextGoodbyeReason(
+        _ session: PeerSession, closingOnTimeout transport: UnixSocketTransport
+    ) async throws -> String? {
         try await withThrowingTaskGroup(of: String?.self) { group in
             group.addTask {
                 while true {
@@ -2763,10 +2768,12 @@ final class PeerServerResizeClaimTests: XCTestCase {
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: 3_000_000_000)
+                await transport.close()
                 return nil
             }
-            let first = try await group.next() ?? nil
+            let first = (try? await group.next()) ?? nil
             group.cancelAll()
+            while (try? await group.next()) != nil {}
             return first
         }
     }
