@@ -310,3 +310,37 @@ final class IMEArrowKeyTests: XCTestCase {
         XCTAssertTrue(capturedKeys.isEmpty, "Should NOT send to terminal during IME composition")
     }
 }
+
+@MainActor
+final class SurfaceVisibleFocusReclaimTests: XCTestCase {
+    func testRefreshDoesNotTakeFocusFromActiveTextField() {
+        let editor = NSTextView()
+        editor.isFieldEditor = true
+        XCTAssertFalse(GhosttySurfaceScrollView.shouldReclaimFocus(
+            isTransition: false, firstResponder: editor
+        ))
+    }
+
+    func testTransitionStillTakesFocusFromTextField() {
+        let editor = NSTextView()
+        editor.isFieldEditor = true
+        XCTAssertTrue(GhosttySurfaceScrollView.shouldReclaimFocus(
+            isTransition: true, firstResponder: editor
+        ))
+    }
+
+    func testRefreshStillHealsMissingFocus() {
+        XCTAssertTrue(GhosttySurfaceScrollView.shouldReclaimFocus(
+            isTransition: false, firstResponder: nil
+        ))
+        XCTAssertTrue(GhosttySurfaceScrollView.shouldReclaimFocus(
+            isTransition: false, firstResponder: NSWindow()
+        ))
+    }
+
+    func testRefreshStillTakesFocusFromNonFieldTextView() {
+        XCTAssertTrue(GhosttySurfaceScrollView.shouldReclaimFocus(
+            isTransition: false, firstResponder: NSTextView()
+        ))
+    }
+}
