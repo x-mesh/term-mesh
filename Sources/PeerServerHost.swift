@@ -205,6 +205,7 @@ final class PeerHostCoordinator: NSObject {
     /// watches the roster) is one row with no pane.
     struct InboundConnectionRow: Equatable {
         let sessionID: UUID
+        let peerID: Data
         let machine: String
         let workspaceTitle: String?
         let paneTitle: String?
@@ -224,7 +225,7 @@ final class PeerHostCoordinator: NSObject {
                 : session.clientName
             if session.attachments.isEmpty {
                 rows.append(InboundConnectionRow(
-                    sessionID: session.id, machine: machine,
+                    sessionID: session.id, peerID: session.clientPeerID, machine: machine,
                     workspaceTitle: nil, paneTitle: nil,
                     viewerCols: 0, viewerRows: 0, sizeOwner: nil,
                     connectedAt: session.connectedAt
@@ -234,7 +235,7 @@ final class PeerHostCoordinator: NSObject {
             for attachment in session.attachments {
                 let target = provider.inboundTarget(surfaceID: attachment.surfaceID)
                 rows.append(InboundConnectionRow(
-                    sessionID: session.id, machine: machine,
+                    sessionID: session.id, peerID: session.clientPeerID, machine: machine,
                     workspaceTitle: target?.workspaceTitle,
                     paneTitle: target?.paneTitle ?? "(closed)",
                     viewerCols: attachment.cols, viewerRows: attachment.rows,
@@ -243,7 +244,18 @@ final class PeerHostCoordinator: NSObject {
                 ))
             }
         }
-        return rows
+        // Grouped by machine: Disconnect acts on a whole machine, so its rows
+        // have to sit together under the one button.
+        return rows.sorted {
+            ($0.machine, $0.peerID.base64EncodedString(), $0.workspaceTitle ?? "", $0.paneTitle ?? "")
+                < ($1.machine, $1.peerID.base64EncodedString(), $1.workspaceTitle ?? "", $1.paneTitle ?? "")
+        }
+    }
+
+    func disconnectInbound(peerID: Data) async {
+        guard let server else { return }
+        let ended = await server.disconnectInbound(peerID: peerID)
+        RemoteWorkLog.info("Disconnected \(ended) inbound connection(s) from a viewer machine")
     }
 
     /// `true` while the server is listening. Lets Settings reflect

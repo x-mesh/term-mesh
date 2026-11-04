@@ -29,6 +29,13 @@ final class DisconnectButton: NSButton {
     }
 }
 
+/// Carries the viewer machine's peer ID rather than a row index, so a list
+/// that changed between render and click cannot disconnect the wrong machine.
+@MainActor
+final class InboundDisconnectButton: NSButton {
+    var peerID: Data?
+}
+
 @MainActor
 final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = PeerConnectionsWindowController()
@@ -132,6 +139,7 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
             ("viewerSize", "Viewer size", 80),
             ("sizeOwner", "Size follows", 110),
             ("connected", "Connected", 80),
+            ("action", "", 90),
         ])
         inboundTableView = incoming.table
 
@@ -229,7 +237,12 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
                    row: Int) -> NSView? {
         if tableView === inboundTableView {
             guard let column = tableColumn, row < inboundRows.count else { return nil }
-            return inboundCell(column: column.identifier.rawValue, row: inboundRows[row])
+            let isFirstOfMachine = row == 0 || inboundRows[row - 1].peerID != inboundRows[row].peerID
+            return inboundCell(
+                column: column.identifier.rawValue,
+                row: inboundRows[row],
+                isFirstOfMachine: isFirstOfMachine
+            )
         }
         guard let column = tableColumn, row < rows.count else { return nil }
         let info = rows[row]
@@ -249,10 +262,27 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
         }
     }
 
-    private func inboundCell(column: String, row: PeerHostCoordinator.InboundConnectionRow) -> NSView? {
+    private func inboundCell(
+        column: String,
+        row: PeerHostCoordinator.InboundConnectionRow,
+        isFirstOfMachine: Bool
+    ) -> NSView? {
         switch column {
         case "machine":
-            return makeLabel(row.machine)
+            return makeLabel(isFirstOfMachine ? row.machine : "")
+        case "action":
+            // One button per machine: a viewer holds a connection per pane
+            // plus one per mirrored workspace, and ending only some of them
+            // leaves the rest attached.
+            guard isFirstOfMachine, !row.peerID.isEmpty else { return nil }
+            let button = InboundDisconnectButton(title: "Disconnect", target: self,
+                                                 action: #selector(inboundDisconnectClicked(_:)))
+            button.peerID = row.peerID
+            button.controlSize = .small
+            button.bezelStyle = .rounded
+            button.font = .systemFont(ofSize: 11)
+            button.toolTip = "End every connection from \(row.machine). It stays disconnected until someone reconnects from that machine."
+            return button
         case "workspace":
             return makeLabel(row.workspaceTitle ?? "—")
         case "pane":
@@ -274,6 +304,14 @@ extension PeerConnectionsWindowController: NSTableViewDelegate {
         case .remote: return "Viewer"
         case .smallest: return "Smaller of both"
         case nil: return "—"
+        }
+    }
+
+    @objc private func inboundDisconnectClicked(_ sender: InboundDisconnectButton) {
+        guard let peerID = sender.peerID else { return }
+        Task { @MainActor in
+            await PeerHostCoordinator.shared.disconnectInbound(peerID: peerID)
+            reloadInbound()
         }
     }
 

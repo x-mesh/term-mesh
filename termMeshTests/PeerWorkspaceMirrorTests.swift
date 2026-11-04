@@ -434,6 +434,24 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertEqual(action, .ignore)
     }
 
+    func test_receiveLoopAction_hostDisconnectGoodbyeStopsInsteadOfReconnecting() {
+        let hostID = Data([1])
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.receiveLoopAction(
+                for: .goodbye(reason: PeerGoodbyeReason.disconnectedByHost),
+                hostWorkspaceID: hostID
+            ),
+            .disconnectedByHost
+        )
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.receiveLoopAction(
+                for: .goodbye(reason: "shutting down"),
+                hostWorkspaceID: hostID
+            ),
+            .lost(reason: "host closed connection: shutting down")
+        )
+    }
+
     func test_receiveLoopAction_marksHostGoneForOwnWorkspaceRemoved() {
         let hostID = Data([1])
         let action = PeerWorkspaceMirrorController.receiveLoopAction(

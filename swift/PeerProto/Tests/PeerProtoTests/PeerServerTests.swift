@@ -2644,4 +2644,52 @@ final class PeerServerResizeClaimTests: XCTestCase {
         try await session.sendGoodbye(reason: "claim test done")
         await transport.close()
     }
+
+    func testDisconnectInboundSendsHostGoodbyeAndDropsTheSession() async throws {
+        let sockPath = "/tmp/tm-peer-swift-kick-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = ResizeRecordingProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let socketDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > socketDeadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake()
+        _ = try await session.attachSurface(id: provider.surfaceID, mode: .coWrite, cols: 80, rows: 24)
+
+        let inbound = await server.inboundSessions()
+        let target = try XCTUnwrap(inbound.first)
+        let disconnected = await server.disconnectInbound(peerID: target.clientPeerID)
+        XCTAssertEqual(disconnected, 1)
+
+        var goodbyeReason: String?
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            guard let message = try? await session.receiveNextMessage() else { break }
+            if case .goodbye(let reason) = message {
+                goodbyeReason = reason
+                break
+            }
+        }
+        XCTAssertEqual(goodbyeReason, PeerGoodbyeReason.disconnectedByHost)
+
+        var remaining = await server.inboundSessions()
+        while !remaining.isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            remaining = await server.inboundSessions()
+        }
+        XCTAssertTrue(remaining.isEmpty)
+        let again = await server.disconnectInbound(peerID: target.clientPeerID)
+        XCTAssertEqual(again, 0)
+        await transport.close()
+    }
 }

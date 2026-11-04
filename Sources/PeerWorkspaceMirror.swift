@@ -350,6 +350,9 @@ final class PeerWorkspaceMirrorController {
         /// path that `reconnectLoop`/`forceResync` already use for that
         /// same "workspace not found" outcome.
         case hostGone
+        /// The person at the host ended this connection. Reconnecting on our
+        /// own would undo that, so the mirror waits for Reconnect Host.
+        case disconnectedByHost
         case lost(reason: String)
         case ignore
     }
@@ -363,6 +366,8 @@ final class PeerWorkspaceMirrorController {
             return .applyLayout(layout)
         case .workspaceRemoved(let wid) where wid == hostWorkspaceID:
             return .hostGone
+        case .goodbye(let reason) where reason == PeerGoodbyeReason.disconnectedByHost:
+            return .disconnectedByHost
         case .goodbye(let reason):
             return .lost(reason: "host closed connection: \(reason)")
         default:
@@ -376,6 +381,7 @@ final class PeerWorkspaceMirrorController {
         receiveTask = Task { [weak self] in
             var lostReason: String?
             var hostGone = false
+            var disconnectedByHost = false
             while let self, !Task.isCancelled, !self.isTornDown {
                 let msg: PeerIncomingMessage
                 do {
@@ -398,12 +404,14 @@ final class PeerWorkspaceMirrorController {
                     self.scheduleApply(layout)
                 case .hostGone:
                     hostGone = true
+                case .disconnectedByHost:
+                    disconnectedByHost = true
                 case .lost(let reason):
                     lostReason = reason
                 case .ignore:
                     break
                 }
-                if hostGone || lostReason != nil { break }
+                if hostGone || disconnectedByHost || lostReason != nil { break }
             }
             if let self, self.receiveLoopSession === session {
                 self.receiveLoopSession = nil
@@ -411,6 +419,8 @@ final class PeerWorkspaceMirrorController {
             guard let self, !self.isTornDown, self.subscriptionSession === session else { return }
             if hostGone {
                 self.markHostWorkspaceGone()
+            } else if disconnectedByHost {
+                self.handleDisconnectedByHost()
             } else if let reason = lostReason {
                 self.handleConnectionLost(reason: reason)
             }
@@ -997,6 +1007,21 @@ final class PeerWorkspaceMirrorController {
     }
 
     // MARK: - Connection loss / reconnect
+
+    private func handleDisconnectedByHost() {
+        guard !isTornDown else { return }
+        subscriptionAlive = false
+        subscriptionSession = nil
+        let staleTransport = subscriptionTransport
+        subscriptionTransport = nil
+        Task { await staleTransport?.close() }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        markWorkspaceTitle(suffix: "disconnected by host")
+        RemoteWorkLog.info(
+            "The host ended this workspace mirror. Right-click the host in the sidebar and choose Reconnect Host to attach again."
+        )
+    }
 
     private func handleConnectionLost(reason: String) {
         guard !isTornDown else { return }

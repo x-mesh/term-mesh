@@ -712,6 +712,13 @@ public struct PeerServerConfig: Sendable {
     }
 }
 
+/// Goodbye reasons a viewer acts on, not just logs.
+public enum PeerGoodbyeReason {
+    /// The person at the host ended this viewer's connection. A viewer must
+    /// not reconnect on its own after this; its user reconnects explicitly.
+    public static let disconnectedByHost = "disconnected by host"
+}
+
 /// One surface an inbound viewer has attached, with the size it last asked for.
 public struct PeerServerInboundAttachment: Sendable, Equatable {
     public let surfaceID: Data
@@ -969,6 +976,24 @@ public actor PeerServer {
             config.onActiveSessionCountChange?(activeSessions.count)
             config.onInboundSessionsChange?()
         }
+    }
+
+    /// Ends every connection one viewer machine holds on the host's say-so.
+    /// A viewer opens one connection per pane plus one per mirrored
+    /// workspace, so ending only one of them leaves the rest attached. The
+    /// Goodbye is what keeps each from treating this as a dropped socket and
+    /// reconnecting by itself. Returns how many connections were ended.
+    @discardableResult
+    public func disconnectInbound(peerID: Data) async -> Int {
+        guard !peerID.isEmpty else { return 0 }
+        var targets: [PeerServerSession] = []
+        for session in activeSessions where await session.inboundSnapshot()?.clientPeerID == peerID {
+            targets.append(session)
+        }
+        for session in targets {
+            await session.endByHost()
+        }
+        return targets.count
     }
 
     /// Connected viewers that completed the handshake. A connection still
@@ -2251,6 +2276,15 @@ actor PeerServerSession {
             connectedAt: connectedAt,
             attachments: attached
         )
+    }
+
+    func endByHost() async {
+        try? await sendEnvelope { env in
+            var goodbye = Termmesh_Peer_V1_Goodbye()
+            goodbye.reason = PeerGoodbyeReason.disconnectedByHost
+            env.goodbye = goodbye
+        }
+        await close()
     }
 
     func close() async {
