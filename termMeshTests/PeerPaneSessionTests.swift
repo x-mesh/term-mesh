@@ -7086,6 +7086,21 @@ final class PeerCleanupLifecycleInvariantTests: XCTestCase {
 /// and an attached remote viewer.
 final class RemoteViewerSizeArbitrationTests: XCTestCase {
 
+    func test_size_owner_names_the_side_resolvePixelSize_picks() {
+        func owner(_ local: Bool, _ remote: Bool, _ onScreen: Bool, _ typed: Bool?) -> SharedPTYSizeOwner? {
+            TerminalSurface.sharedSizeOwner(
+                hasLocalSize: local, hasRemoteSize: remote,
+                localOnScreen: onScreen, remoteTypedLast: typed
+            )
+        }
+        XCTAssertNil(owner(true, false, true, nil))
+        XCTAssertEqual(owner(true, true, true, nil), .smallest)
+        XCTAssertEqual(owner(true, true, true, false), .local)
+        XCTAssertEqual(owner(true, true, true, true), .remote)
+        XCTAssertEqual(owner(true, true, false, false), .remote)
+        XCTAssertEqual(owner(false, true, true, false), .remote)
+    }
+
     /// While both are on screen the smaller wins, so neither has to render a
     /// line wrapped for a width it does not have.
     ///

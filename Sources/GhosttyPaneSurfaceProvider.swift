@@ -2628,6 +2628,40 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return result
     }
 
+    struct InboundTarget: Equatable {
+        let workspaceTitle: String
+        let paneTitle: String
+        let sizeOwner: SharedPTYSizeOwner?
+    }
+
+    /// Names the pane an inbound viewer attached, for the Peer Connections
+    /// window. Nil when the surface has since closed.
+    func inboundTarget(surfaceID: Data) -> InboundTarget? {
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                for (_, panel) in workspace.panels {
+                    let workspaceTitle = workspace.customTitle ?? workspace.title
+                    if let terminal = panel as? TerminalPanel, !terminal.isRemoteOrigin,
+                       surfaceIDBytes(terminal.surface.id) == surfaceID {
+                        return InboundTarget(
+                            workspaceTitle: workspaceTitle,
+                            paneTitle: workspace.panelTitles[terminal.id] ?? "Terminal",
+                            sizeOwner: terminal.surface.sharedSizeOwner
+                        )
+                    }
+                    if let native = panel as? AgentPanel, surfaceIDBytes(native.id) == surfaceID {
+                        return InboundTarget(
+                            workspaceTitle: workspaceTitle,
+                            paneTitle: native.title,
+                            sizeOwner: nil
+                        )
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
     private func findSurface(id: Data) -> (ghostty_surface_t, TerminalSurface)? {
         for ctx in allWindowContexts() {
             for workspace in ctx.tabManager.tabs {

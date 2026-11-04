@@ -2633,6 +2633,14 @@ final class PeerServerResizeClaimTests: XCTestCase {
         XCTAssertEqual(recorded.last?.cols, 100)
         XCTAssertEqual(recorded.last?.claim, false)
 
+        let inbound = await server.inboundSessions()
+        XCTAssertEqual(inbound.count, 1)
+        XCTAssertEqual(inbound.first?.attachments, [
+            PeerServerInboundAttachment(
+                surfaceID: provider.surfaceID, cols: 100, rows: 30, claimedAuthority: false
+            ),
+        ])
+
         try await session.sendGoodbye(reason: "claim test done")
         await transport.close()
     }

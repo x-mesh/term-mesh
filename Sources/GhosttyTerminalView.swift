@@ -1425,6 +1425,33 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
     }
 
+    /// Which side's size the shared PTY currently follows, or nil when no
+    /// remote viewer is attached.
+    var sharedSizeOwner: SharedPTYSizeOwner? {
+        Self.sharedSizeOwner(
+            hasLocalSize: localPixelSize != nil,
+            hasRemoteSize: remoteViewerPixelSize != nil,
+            localOnScreen: isLocallyOnScreen,
+            remoteTypedLast: remoteViewerTypedLast
+        )
+    }
+
+    /// The owner `resolvePixelSize` picks, named instead of computed.
+    static func sharedSizeOwner(
+        hasLocalSize: Bool,
+        hasRemoteSize: Bool,
+        localOnScreen: Bool,
+        remoteTypedLast: Bool?
+    ) -> SharedPTYSizeOwner? {
+        guard hasRemoteSize else { return nil }
+        guard hasLocalSize, localOnScreen else { return .remote }
+        switch remoteTypedLast {
+        case .some(true): return .remote
+        case .some(false): return .local
+        case .none: return .smallest
+        }
+    }
+
     /// Whether a person could actually be looking at the local pane. A pane
     /// parked in an unselected workspace has a view but no window, and one
     /// hidden behind a portal swap is marked not-visible; neither is somebody
@@ -4800,4 +4827,10 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
         nsView.subviews.forEach { $0.removeFromSuperview() }
     }
+}
+
+enum SharedPTYSizeOwner: Equatable {
+    case local
+    case remote
+    case smallest
 }
