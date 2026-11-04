@@ -802,7 +802,7 @@ final class GhosttySurfaceScrollView: NSView {
             object: window,
             queue: .main
         ) { [weak self] _ in
-            self?.applyFirstResponderIfNeeded()
+            self?.applyFirstResponderIfNeeded(isTransition: false)
         })
         windowObservers.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification,
@@ -817,7 +817,7 @@ final class GhosttySurfaceScrollView: NSView {
                 window.makeFirstResponder(nil)
             }
         })
-        if window.isKeyWindow { applyFirstResponderIfNeeded() }
+        if window.isKeyWindow { applyFirstResponderIfNeeded(isTransition: false) }
     }
 
     func attachSurface(_ terminalSurface: TerminalSurface) {
@@ -1914,8 +1914,21 @@ final class GhosttySurfaceScrollView: NSView {
                 window.makeFirstResponder(nil)
             }
         } else {
-            applyFirstResponderIfNeeded()
+            applyFirstResponderIfNeeded(isTransition: !wasVisible)
         }
+    }
+
+    /// SwiftUI re-runs `updateNSView` on unrelated redraws, and the window
+    /// regaining key or the portal reparenting re-enter this path too. None
+    /// of those may take focus from a text field the user is typing in; only
+    /// becoming visible or active may.
+    static func shouldReclaimFocus(
+        isTransition: Bool,
+        firstResponder: NSResponder?
+    ) -> Bool {
+        if isTransition { return true }
+        guard let editor = firstResponder as? NSTextView else { return true }
+        return !editor.isFieldEditor
     }
 
     /// Send a synthetic key press/release directly to the surface NSView.
@@ -1953,7 +1966,7 @@ final class GhosttySurfaceScrollView: NSView {
         }
 #endif
         if active {
-            applyFirstResponderIfNeeded()
+            applyFirstResponderIfNeeded(isTransition: !wasActive)
         } else if let window,
                   let fr = window.firstResponder as? NSView,
                   fr === surfaceView || fr.isDescendant(of: surfaceView) {
@@ -2204,7 +2217,7 @@ final class GhosttySurfaceScrollView: NSView {
         return fr === surfaceView || fr.isDescendant(of: surfaceView)
     }
 
-    private func applyFirstResponderIfNeeded() {
+    private func applyFirstResponderIfNeeded(isTransition: Bool) {
         let hasUsablePortalGeometry: Bool = {
             let size = bounds.size
             return size.width > 1 && size.height > 1
@@ -2227,6 +2240,9 @@ final class GhosttySurfaceScrollView: NSView {
         guard let window, window.isKeyWindow else { return }
         if let fr = window.firstResponder as? NSView,
            fr === surfaceView || fr.isDescendant(of: surfaceView) {
+            return
+        }
+        guard Self.shouldReclaimFocus(isTransition: isTransition, firstResponder: window.firstResponder) else {
             return
         }
         // Temporarily remove the onFocus callback to prevent re-entrant layout loop:
