@@ -409,6 +409,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// actually working in it can do — enlarging just re-loses the min. Whoever
     /// is typing is the one reading, so they get the grid.
     private var remoteViewerTypedLast: Bool?
+    /// The attached viewer's own name, for saying whose size this pane is
+    /// following when it has been shrunk to fit it.
+    private var remoteViewerName: String?
     private var lastXScale: CGFloat = 0
     private var lastYScale: CGFloat = 0
     private var pendingTextQueue: [Data] = []
@@ -1250,6 +1253,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
         Self.sizeLog("updateSize-call surface=\(id.uuidString.prefix(8)) size=\(resolved.w)x\(resolved.h) prev=\(lastPixelWidth)x\(lastPixelHeight) changed=\((scaleChanged || sizeChanged) ? 1 : 0)")
         #endif
 
+        if !sizeChanged, remoteViewerPixelSize != nil {
+            // The window can grow or shrink while the viewer's size keeps
+            // winning; the PTY does not change, but whether it is shrunk does.
+            refreshRemoteSizeIndicator()
+        }
         guard scaleChanged || sizeChanged else { return }
 
         #if DEBUG
@@ -1282,9 +1290,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// value the surface no longer has, concludes nothing changed, and the
     /// two views drift apart silently.
     @discardableResult
-    func applyRemoteViewerPixelSize(width: UInt32, height: UInt32, claimsAttention: Bool) -> Bool {
+    func applyRemoteViewerPixelSize(
+        width: UInt32, height: UInt32, claimsAttention: Bool, viewerName: String
+    ) -> Bool {
         guard let surface = surface, width > 0, height > 0 else { return false }
         remoteViewerPixelSize = (width, height)
+        remoteViewerName = viewerName.isEmpty ? nil : viewerName
         // The viewer claims when its pane gains focus. That is the person
         // moving to that machine, which counts as much as a keystroke there.
         if claimsAttention { remoteViewerTypedLast = true }
@@ -1337,7 +1348,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         )
         guard let surface else { return }
         let resolved = resolvedPixelSize()
-        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return }
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else {
+            refreshRemoteSizeIndicator()
+            return
+        }
         applyResolvedSize(resolved, to: surface)
     }
 
@@ -1363,6 +1377,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
     func clearRemoteViewerPixelSize() {
         guard remoteViewerPixelSize != nil else { return }
         remoteViewerPixelSize = nil
+        remoteViewerName = nil
+        defer { refreshRemoteSizeIndicator() }
         // The arbitration this recorded is over with the viewer that caused it.
         remoteViewerTypedLast = nil
         guard let surface = surface else { return }
@@ -1375,6 +1391,39 @@ final class TerminalSurface: Identifiable, ObservableObject {
         ghostty_surface_set_size(surface, size.w, size.h)
         lastPixelWidth = size.w
         lastPixelHeight = size.h
+        refreshRemoteSizeIndicator()
+    }
+
+    /// Shown only while the pane is drawn smaller than its own window because
+    /// a viewer's size won. Without it the empty margin has no visible cause.
+    private func refreshRemoteSizeIndicator() {
+        let visible = Self.isShrunkForRemoteViewer(
+            local: localPixelSize,
+            remote: remoteViewerPixelSize,
+            applied: (lastPixelWidth, lastPixelHeight),
+            localOnScreen: isLocallyOnScreen
+        )
+        hostedView.setRemoteSizeIndicator(
+            viewerName: visible ? (remoteViewerName ?? "a remote viewer") : nil,
+            onTakeBack: { [weak self] in self?.takeSizeBackFromViewer() }
+        )
+    }
+
+    static func isShrunkForRemoteViewer(
+        local: (w: UInt32, h: UInt32)?,
+        remote: (w: UInt32, h: UInt32)?,
+        applied: (w: UInt32, h: UInt32),
+        localOnScreen: Bool
+    ) -> Bool {
+        guard remote != nil, let local, localOnScreen else { return false }
+        return applied.w < local.w || applied.h < local.h
+    }
+
+    private func takeSizeBackFromViewer() {
+        if let view = attachedView, let window = view.window, window.firstResponder !== view {
+            window.makeFirstResponder(view)
+        }
+        noteLocalFocus()
     }
 
     /// One PTY, two windows onto it — so one size has to win.

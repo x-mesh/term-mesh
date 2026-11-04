@@ -2584,8 +2584,8 @@ private actor ResizeRecordingProvider: PeerSurfaceProvider {
         return PeerSurfaceAttachment(
             byteStream: pair.stream,
             input: { _ in },
-            resize: { [weak self] cols, rows, claim in
-                await self?.record(cols: cols, rows: rows, claim: claim)
+            resize: { [weak self] request in
+                await self?.record(cols: request.cols, rows: request.rows, claim: request.claimsAuthority)
             },
             detach: { pair.continuation.finish() }
         )

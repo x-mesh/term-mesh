@@ -161,10 +161,8 @@ public struct PeerSurfaceAttachment: Sendable {
     public let byteStream: AsyncStream<PtyTapChunk>
     /// Client → host: raw keystroke bytes from an Input frame.
     public let input: @Sendable (Data) async -> Void
-    /// Client → host: resize from a Resize frame (cols, rows,
-    /// claim_authority). A claim marks the viewer as the side the person is
-    /// now using, which the host weighs when the PTY's one size is contested.
-    public let resize: @Sendable (UInt32, UInt32, Bool) async -> Void
+    /// Client → host: resize from a Resize frame.
+    public let resize: @Sendable (PeerResizeRequest) async -> Void
     /// Optional initial `WorkspaceUpdate.meta` to push to the client
     /// right after the AttachResult. Mirrors Phase 2.4b on the Rust side.
     public let workspaceMeta: PeerWorkspaceMeta?
@@ -200,7 +198,7 @@ public struct PeerSurfaceAttachment: Sendable {
     public init(
         byteStream: AsyncStream<PtyTapChunk>,
         input: @escaping @Sendable (Data) async -> Void,
-        resize: @escaping @Sendable (UInt32, UInt32, Bool) async -> Void = { _, _, _ in },
+        resize: @escaping @Sendable (PeerResizeRequest) async -> Void = { _ in },
         workspaceMeta: PeerWorkspaceMeta? = nil,
         initialByteSeq: UInt64 = 0,
         resync: (@Sendable () async -> PeerSurfaceResync?)? = nil,
@@ -500,7 +498,7 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
         return PeerSurfaceAttachment(
             byteStream: stream,
             input: input,
-            resize: { _, _, _ in },
+            resize: { _ in },
             workspaceMeta: nil,
             detach: detach
         )
@@ -709,6 +707,25 @@ public struct PeerServerConfig: Sendable {
         self.resolveSessionHostSocket = resolveSessionHostSocket
         self.hostStatsProvider = hostStatsProvider
         self.relayTelemetryProvider = relayTelemetryProvider
+    }
+}
+
+/// A viewer's Resize, with who sent it.
+public struct PeerResizeRequest: Sendable, Equatable {
+    public let cols: UInt32
+    public let rows: UInt32
+    /// The viewer's pane had focus: the person is now using that machine,
+    /// which the host weighs when the PTY's one size is contested.
+    public let claimsAuthority: Bool
+    /// What the viewer called itself in its Hello, so the host can say whose
+    /// size a shrunken pane is following.
+    public let viewerName: String
+
+    public init(cols: UInt32, rows: UInt32, claimsAuthority: Bool, viewerName: String) {
+        self.cols = cols
+        self.rows = rows
+        self.claimsAuthority = claimsAuthority
+        self.viewerName = viewerName
     }
 }
 
@@ -2905,7 +2922,10 @@ actor PeerServerSession {
                 )
                 lastResizes[r.surfaceID] = current
                 if previous != current { config.onInboundSessionsChange?() }
-                await attachment.resize(r.cols, r.rows, r.claimAuthority)
+                await attachment.resize(PeerResizeRequest(
+                    cols: r.cols, rows: r.rows, claimsAuthority: r.claimAuthority,
+                    viewerName: clientDisplayName
+                ))
             }
 
         case (.ready, .ping(let p)):

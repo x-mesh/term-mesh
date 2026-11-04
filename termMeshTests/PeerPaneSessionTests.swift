@@ -7086,6 +7086,21 @@ final class PeerCleanupLifecycleInvariantTests: XCTestCase {
 /// and an attached remote viewer.
 final class RemoteViewerSizeArbitrationTests: XCTestCase {
 
+    func test_shrunk_indicator_shows_only_while_a_viewer_size_is_smaller_on_screen() {
+        func shrunk(_ local: (w: UInt32, h: UInt32)?, _ remote: (w: UInt32, h: UInt32)?,
+                    _ applied: (w: UInt32, h: UInt32), _ onScreen: Bool) -> Bool {
+            TerminalSurface.isShrunkForRemoteViewer(
+                local: local, remote: remote, applied: applied, localOnScreen: onScreen
+            )
+        }
+        XCTAssertTrue(shrunk((1200, 800), (900, 800), (900, 800), true))
+        XCTAssertTrue(shrunk((1200, 800), (1200, 600), (1200, 600), true))
+        XCTAssertFalse(shrunk((1200, 800), (900, 800), (1200, 800), true), "this window owns the grid")
+        XCTAssertFalse(shrunk((1200, 800), nil, (1200, 800), true), "no viewer attached")
+        XCTAssertFalse(shrunk((1200, 800), (900, 800), (900, 800), false), "nobody is looking here")
+        XCTAssertFalse(shrunk(nil, (900, 800), (900, 800), true))
+    }
+
     func test_size_owner_names_the_side_resolvePixelSize_picks() {
         func owner(_ local: Bool, _ remote: Bool, _ onScreen: Bool, _ typed: Bool?) -> SharedPTYSizeOwner? {
             TerminalSurface.sharedSizeOwner(

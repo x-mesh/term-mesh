@@ -1786,7 +1786,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return PeerSurfaceAttachment(
             byteStream: stream,
             input: input,
-            resize: { [weakTS, hub] cols, rows, claimAuthority in
+            resize: { [weakTS, hub] request in
+                let cols = request.cols
+                let rows = request.rows
                 await MainActor.run {
                     guard let terminalSurface = weakTS.value,
                           let ptr = terminalSurface.surface else { return }
@@ -1847,7 +1849,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     // repaint. Skipped on a no-op resize so plain shells don't
                     // lose their view.
                     let sizeChanged = terminalSurface.applyRemoteViewerPixelSize(
-                        width: w, height: h, claimsAttention: claimAuthority
+                        width: w, height: h, claimsAttention: request.claimsAuthority,
+                        viewerName: request.viewerName
                     )
                     if sizeChanged {
                         // ESC[2J (erase screen) + ESC[H (cursor home).
