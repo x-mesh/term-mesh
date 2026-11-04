@@ -452,6 +452,27 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_hostDisconnect_cancelsAReconnectInProgressAndLabelsTheWorkspace() async throws {
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/psp-unit-\(getpid())-host-disconnect.sock")
+        let lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        let workspace = Workspace(title: "mirror")
+        let mirror = PeerWorkspaceMirrorController(
+            workspace: workspace, lease: lease, spec: spec,
+            hostWorkspaceID: Data([1]), hostWorkspaceTitle: "remote-ws"
+        )
+        defer { mirror.teardown() }
+
+        mirror.handleConnectionLost(reason: "socket dropped")
+        XCTAssertTrue(mirror.debugHasReconnectTask, "an ordinary loss reconnects by itself")
+        XCTAssertTrue(workspace.title.hasSuffix("— reconnecting…"))
+
+        mirror.handleDisconnectedByHost()
+        XCTAssertFalse(mirror.debugHasReconnectTask, "the host ended it, so nothing reconnects")
+        XCTAssertFalse(mirror.subscriptionAlive)
+        XCTAssertTrue(workspace.title.hasSuffix("— disconnected by host"), workspace.title)
+    }
+
     func test_receiveLoopAction_marksHostGoneForOwnWorkspaceRemoved() {
         let hostID = Data([1])
         let action = PeerWorkspaceMirrorController.receiveLoopAction(

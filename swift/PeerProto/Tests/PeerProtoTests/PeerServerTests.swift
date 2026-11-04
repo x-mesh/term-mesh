@@ -2736,6 +2736,10 @@ final class PeerServerResizeClaimTests: XCTestCase {
 
         let ended = await server.disconnectInbound(peerID: machineA)
         XCTAssertEqual(ended, 2)
+        for viewer in [a1, a2] {
+            let reason = try await Self.nextGoodbyeReason(viewer.0)
+            XCTAssertEqual(reason, PeerGoodbyeReason.disconnectedByHost)
+        }
 
         let deadline = Date().addingTimeInterval(3)
         var remaining = await server.inboundSessions()
@@ -2746,6 +2750,35 @@ final class PeerServerResizeClaimTests: XCTestCase {
         XCTAssertEqual(remaining.map(\.clientPeerID), [machineB])
 
         for viewer in [a1, a2, b] { await viewer.1.close() }
+    }
+
+    private static func nextGoodbyeReason(_ session: PeerSession) async throws -> String? {
+        try await withThrowingTaskGroup(of: String?.self) { group in
+            group.addTask {
+                while true {
+                    if case .goodbye(let reason) = try await session.receiveNextMessage() {
+                        return reason
+                    }
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+                return nil
+            }
+            let first = try await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private static func waitForChange(
+        from baseline: Int, _ read: () -> Int
+    ) async throws -> Int {
+        let deadline = Date().addingTimeInterval(3)
+        while read() == baseline, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return read()
     }
 
     func testInboundChangeCallbackFiresForHandshakeResizeAndLeave() async throws {
@@ -2764,24 +2797,26 @@ final class PeerServerResizeClaimTests: XCTestCase {
             Task { await server.stop() }
             try? FileManager.default.removeItem(atPath: sockPath)
         }
-        let viewer = try await connectViewer(
-            sockPath: sockPath, peerID: Data(repeating: 0xC3, count: 16), surfaceID: provider.surfaceID
+        let atStart = counter.count
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
         )
-        let afterAttach = counter.count
-        XCTAssertGreaterThanOrEqual(afterAttach, 2, "handshake and attach each notify")
+        _ = try await session.handshake(options: PeerSessionOptions(peerID: Data(repeating: 0xC3, count: 16)))
+        let afterHandshake = try await Self.waitForChange(from: atStart) { counter.count }
+        XCTAssertGreaterThan(afterHandshake, atStart, "finishing the handshake notifies")
 
-        try await viewer.0.sendResize(surfaceID: provider.surfaceID, cols: 90, rows: 30)
-        let deadline = Date().addingTimeInterval(3)
-        while counter.count == afterAttach, Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        let afterResize = counter.count
+        _ = try await session.attachSurface(id: provider.surfaceID, mode: .coWrite, cols: 80, rows: 24)
+        let afterAttach = try await Self.waitForChange(from: afterHandshake) { counter.count }
+        XCTAssertGreaterThan(afterAttach, afterHandshake, "attaching a surface notifies")
+
+        try await session.sendResize(surfaceID: provider.surfaceID, cols: 90, rows: 30)
+        let afterResize = try await Self.waitForChange(from: afterAttach) { counter.count }
         XCTAssertGreaterThan(afterResize, afterAttach, "a new size notifies")
 
-        await viewer.1.close()
-        while counter.count == afterResize, Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        XCTAssertGreaterThan(counter.count, afterResize, "the viewer leaving notifies")
+        await transport.close()
+        let afterLeave = try await Self.waitForChange(from: afterResize) { counter.count }
+        XCTAssertGreaterThan(afterLeave, afterResize, "the viewer leaving notifies")
     }
 }

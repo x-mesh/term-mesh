@@ -1008,7 +1008,7 @@ final class PeerWorkspaceMirrorController {
 
     // MARK: - Connection loss / reconnect
 
-    private func handleDisconnectedByHost() {
+    func handleDisconnectedByHost() {
         guard !isTornDown else { return }
         subscriptionAlive = false
         subscriptionSession = nil
@@ -1023,7 +1023,7 @@ final class PeerWorkspaceMirrorController {
         )
     }
 
-    private func handleConnectionLost(reason: String) {
+    func handleConnectionLost(reason: String) {
         guard !isTornDown else { return }
         subscriptionAlive = false
         subscriptionSession = nil
@@ -1461,6 +1461,8 @@ final class PeerWorkspaceMirrorController {
     // MARK: - Test actuators
 
     #if DEBUG
+    var debugHasReconnectTask: Bool { reconnectTask != nil }
+
     /// Set by `debugDropSubscription(holdReconnectSeconds:)`; `reconnectLoop`
     /// waits past it before its first attempt.
     var debugReconnectHoldUntil: Date?
