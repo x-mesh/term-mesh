@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.284.0] - 2026-11-04
+
+### Added
+
+- Peer Connections now has an Incoming list of the machines viewing this Mac through a relay. Each row shows the workspace and pane that machine opened, the size it asked for, and which side the pane size follows. A Disconnect button ends every connection from that machine. A workspace mirror on that machine stops and marks its title "disconnected by host" until you choose Reconnect Host there.
+- A pane drawn smaller than its window because a remote viewer's size won now shows "Sized for <machine> · Click to use this window". Click it to give the pane its full size again.
+
+### Changed
+
+- When another machine views a pane on this Mac, the pane size now follows the side you used last. Clicking a pane or returning to the app with a pane focused counts, as well as typing. Before, only a keystroke gave the size back to this Mac.
+
+### Fixed
+
+- Renaming a workspace in the sidebar no longer closes the name field after a second or two. A terminal redraw took focus from the field, so the rename kept the old name. This happened most often with workspaces opened through a peer relay.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.283.0] - 2026-11-03
 
 ### Changed
