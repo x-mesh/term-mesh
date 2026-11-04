@@ -1786,7 +1786,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         return PeerSurfaceAttachment(
             byteStream: stream,
             input: input,
-            resize: { [weakTS, hub] cols, rows in
+            resize: { [weakTS, hub] request in
+                let cols = request.cols
+                let rows = request.rows
                 await MainActor.run {
                     guard let terminalSurface = weakTS.value,
                           let ptr = terminalSurface.surface else { return }
@@ -1847,7 +1849,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     // repaint. Skipped on a no-op resize so plain shells don't
                     // lose their view.
                     let sizeChanged = terminalSurface.applyRemoteViewerPixelSize(
-                        width: w, height: h
+                        width: w, height: h, claimsAttention: request.claimsAuthority,
+                        viewerName: request.viewerName
                     )
                     if sizeChanged {
                         // ESC[2J (erase screen) + ESC[H (cursor home).
@@ -2626,6 +2629,40 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             }
         }
         return result
+    }
+
+    struct InboundTarget: Equatable {
+        let workspaceTitle: String
+        let paneTitle: String
+        let sizeOwner: SharedPTYSizeOwner?
+    }
+
+    /// Names the pane an inbound viewer attached, for the Peer Connections
+    /// window. Nil when the surface has since closed.
+    func inboundTarget(surfaceID: Data) -> InboundTarget? {
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                for (_, panel) in workspace.panels {
+                    let workspaceTitle = workspace.customTitle ?? workspace.title
+                    if let terminal = panel as? TerminalPanel, !terminal.isRemoteOrigin,
+                       surfaceIDBytes(terminal.surface.id) == surfaceID {
+                        return InboundTarget(
+                            workspaceTitle: workspaceTitle,
+                            paneTitle: workspace.panelTitles[terminal.id] ?? "Terminal",
+                            sizeOwner: terminal.surface.sharedSizeOwner
+                        )
+                    }
+                    if let native = panel as? AgentPanel, surfaceIDBytes(native.id) == surfaceID {
+                        return InboundTarget(
+                            workspaceTitle: workspaceTitle,
+                            paneTitle: native.title,
+                            sizeOwner: nil
+                        )
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     private func findSurface(id: Data) -> (ghostty_surface_t, TerminalSurface)? {

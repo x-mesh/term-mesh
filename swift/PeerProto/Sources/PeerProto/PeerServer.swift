@@ -161,8 +161,8 @@ public struct PeerSurfaceAttachment: Sendable {
     public let byteStream: AsyncStream<PtyTapChunk>
     /// Client → host: raw keystroke bytes from an Input frame.
     public let input: @Sendable (Data) async -> Void
-    /// Client → host: resize from a Resize frame (cols, rows).
-    public let resize: @Sendable (UInt32, UInt32) async -> Void
+    /// Client → host: resize from a Resize frame.
+    public let resize: @Sendable (PeerResizeRequest) async -> Void
     /// Optional initial `WorkspaceUpdate.meta` to push to the client
     /// right after the AttachResult. Mirrors Phase 2.4b on the Rust side.
     public let workspaceMeta: PeerWorkspaceMeta?
@@ -198,7 +198,7 @@ public struct PeerSurfaceAttachment: Sendable {
     public init(
         byteStream: AsyncStream<PtyTapChunk>,
         input: @escaping @Sendable (Data) async -> Void,
-        resize: @escaping @Sendable (UInt32, UInt32) async -> Void = { _, _ in },
+        resize: @escaping @Sendable (PeerResizeRequest) async -> Void = { _ in },
         workspaceMeta: PeerWorkspaceMeta? = nil,
         initialByteSeq: UInt64 = 0,
         resync: (@Sendable () async -> PeerSurfaceResync?)? = nil,
@@ -498,7 +498,7 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
         return PeerSurfaceAttachment(
             byteStream: stream,
             input: input,
-            resize: { _, _ in },
+            resize: { _ in },
             workspaceMeta: nil,
             detach: detach
         )
@@ -686,6 +686,11 @@ public struct PeerServerConfig: Sendable {
     /// its own actor.
     public var onActiveSessionCountChange: (@Sendable (Int) -> Void)?
 
+    /// Called whenever `PeerServer.inboundSessions()` would answer
+    /// differently: a viewer finished its handshake, attached or detached a
+    /// surface, resized one, or left. Runs off the main actor.
+    public var onInboundSessionsChange: (@Sendable () -> Void)?
+
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
@@ -703,6 +708,51 @@ public struct PeerServerConfig: Sendable {
         self.hostStatsProvider = hostStatsProvider
         self.relayTelemetryProvider = relayTelemetryProvider
     }
+}
+
+/// A viewer's Resize, with who sent it.
+public struct PeerResizeRequest: Sendable, Equatable {
+    public let cols: UInt32
+    public let rows: UInt32
+    /// The viewer's pane had focus: the person is now using that machine,
+    /// which the host weighs when the PTY's one size is contested.
+    public let claimsAuthority: Bool
+    /// What the viewer called itself in its Hello, so the host can say whose
+    /// size a shrunken pane is following.
+    public let viewerName: String
+
+    public init(cols: UInt32, rows: UInt32, claimsAuthority: Bool, viewerName: String) {
+        self.cols = cols
+        self.rows = rows
+        self.claimsAuthority = claimsAuthority
+        self.viewerName = viewerName
+    }
+}
+
+/// Goodbye reasons a viewer acts on, not just logs.
+public enum PeerGoodbyeReason {
+    /// The person at the host ended this viewer's connection. A viewer must
+    /// not reconnect on its own after this; its user reconnects explicitly.
+    public static let disconnectedByHost = "disconnected by host"
+}
+
+/// One surface an inbound viewer has attached, with the size it last asked for.
+public struct PeerServerInboundAttachment: Sendable, Equatable {
+    public let surfaceID: Data
+    /// Zero until the viewer sends its first Resize.
+    public let cols: UInt32
+    public let rows: UInt32
+    /// Whether that Resize claimed size authority (the viewer's pane had focus).
+    public let claimedAuthority: Bool
+}
+
+/// A machine connected to this host, as named in its Hello.
+public struct PeerServerInboundSession: Sendable, Equatable {
+    public let id: UUID
+    public let clientName: String
+    public let clientPeerID: Data
+    public let connectedAt: Date
+    public let attachments: [PeerServerInboundAttachment]
 }
 
 public actor PeerServer {
@@ -941,7 +991,38 @@ public actor PeerServer {
         activeSessions.removeAll { $0 === session }
         if activeSessions.count != before {
             config.onActiveSessionCountChange?(activeSessions.count)
+            config.onInboundSessionsChange?()
         }
+    }
+
+    /// Ends every connection one viewer machine holds on the host's say-so.
+    /// A viewer opens one connection per pane plus one per mirrored
+    /// workspace, so ending only one of them leaves the rest attached. The
+    /// Goodbye is what keeps each from treating this as a dropped socket and
+    /// reconnecting by itself. Returns how many connections were ended.
+    @discardableResult
+    public func disconnectInbound(peerID: Data) async -> Int {
+        guard !peerID.isEmpty else { return 0 }
+        var targets: [PeerServerSession] = []
+        for session in activeSessions where await session.inboundSnapshot()?.clientPeerID == peerID {
+            targets.append(session)
+        }
+        for session in targets {
+            await session.endByHost()
+        }
+        return targets.count
+    }
+
+    /// Connected viewers that completed the handshake. A connection still
+    /// authenticating has no name yet and is left out.
+    public func inboundSessions() async -> [PeerServerInboundSession] {
+        var result: [PeerServerInboundSession] = []
+        for session in activeSessions {
+            if let snapshot = await session.inboundSnapshot() {
+                result.append(snapshot)
+            }
+        }
+        return result
     }
 
     /// Atomic capacity-check + insert. The previous "canAcceptSession()
@@ -2132,6 +2213,9 @@ actor PeerServerSession {
     /// cannot answer "who kept connecting" after the fact, which is the one
     /// question a burst of dropped sessions raises.
     private var clientDisplayName = ""
+    let id = UUID()
+    private let connectedAt = Date()
+    private var lastResizes: [Data: PeerServerInboundAttachment] = [:]
     private var pendingLeaderCalls: [
         UInt64: CheckedContinuation<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>
     ] = [:]
@@ -2193,6 +2277,31 @@ actor PeerServerSession {
         await onEnded?(self)
         await teardownAttachments()
         await connection.close()
+    }
+
+    func inboundSnapshot() -> PeerServerInboundSession? {
+        guard state == .ready else { return nil }
+        let attached = attachments.keys.sorted { $0.lexicographicallyPrecedes($1) }.map { surfaceID in
+            lastResizes[surfaceID] ?? PeerServerInboundAttachment(
+                surfaceID: surfaceID, cols: 0, rows: 0, claimedAuthority: false
+            )
+        }
+        return PeerServerInboundSession(
+            id: id,
+            clientName: clientDisplayName,
+            clientPeerID: clientPeerID,
+            connectedAt: connectedAt,
+            attachments: attached
+        )
+    }
+
+    func endByHost() async {
+        try? await sendEnvelope { env in
+            var goodbye = Termmesh_Peer_V1_Goodbye()
+            goodbye.reason = PeerGoodbyeReason.disconnectedByHost
+            env.goodbye = goodbye
+        }
+        await close()
     }
 
     func close() async {
@@ -2390,6 +2499,7 @@ actor PeerServerSession {
         }
         let snapshot = attachments
         attachments.removeAll()
+        lastResizes.removeAll()
         writableAttachments.removeAll()
         relayTasks.removeAll()
         for (_, attachment) in snapshot {
@@ -2512,6 +2622,7 @@ actor PeerServerSession {
                 inner.authResult = r
             }
             state = .ready
+            config.onInboundSessionsChange?()
 
         case (.authSent, _):
             try await sendError(code: 103, message: "expected Auth")
@@ -2804,7 +2915,17 @@ actor PeerServerSession {
         case (.ready, .resize(let r)):
             guard let attachment = attachments[r.surfaceID] else { return }
             if r.cols > 0 && r.rows > 0 {
-                await attachment.resize(r.cols, r.rows)
+                let previous = lastResizes[r.surfaceID]
+                let current = PeerServerInboundAttachment(
+                    surfaceID: r.surfaceID, cols: r.cols, rows: r.rows,
+                    claimedAuthority: r.claimAuthority
+                )
+                lastResizes[r.surfaceID] = current
+                if previous != current { config.onInboundSessionsChange?() }
+                await attachment.resize(PeerResizeRequest(
+                    cols: r.cols, rows: r.rows, claimsAuthority: r.claimAuthority,
+                    viewerName: clientDisplayName
+                ))
             }
 
         case (.ready, .ping(let p)):
@@ -2970,6 +3091,7 @@ actor PeerServerSession {
         // mid-handshake.
         attachments[req.surfaceID] = attachment
         if grantedMode == .coWrite { writableAttachments.insert(req.surfaceID) }
+        config.onInboundSessionsChange?()
 
         try await sendEnvelopeWithCorrelation(correlationID) { inner in
             var r = Termmesh_Peer_V1_AttachResult()
@@ -3403,8 +3525,10 @@ actor PeerServerSession {
     private func detachSurface(id: Data) async {
         writableAttachments.remove(id)
         relayTasks.removeValue(forKey: id)?.cancel()
+        lastResizes.removeValue(forKey: id)
         if let attachment = attachments.removeValue(forKey: id) {
             attachment.invalidateInputPath()
+            config.onInboundSessionsChange?()
             await attachment.detach()
         }
     }

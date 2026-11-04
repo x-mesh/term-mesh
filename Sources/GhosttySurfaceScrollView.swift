@@ -306,6 +306,8 @@ final class GhosttySurfaceScrollView: NSView {
     private var remotePasteTransferCount = 0
     private var searchOverlayHostingView: NSHostingView<TermMeshHostedRoot<SurfaceSearchOverlay>>?
     private var scrollToBottomHostingView: NSHostingView<TermMeshHostedRoot<ScrollToBottomButton>>?
+    private var remoteSizeIndicatorHostingView: NSHostingView<TermMeshHostedRoot<RemoteSizeIndicatorPill>>?
+    private var remoteSizeIndicatorViewerName: String?
     private var pasteShelfContainerView: PasteShelfWindowContainerView?
     private let pasteShelfOverlayState = PasteShelfOverlayState()
     private var pasteShelfKeyMonitor: Any?
@@ -771,6 +773,19 @@ final class GhosttySurfaceScrollView: NSView {
                 height: size
             )
         }
+        if let indicator = remoteSizeIndicatorHostingView {
+            let size = indicator.fittingSize
+            let margin = RemoteSizeIndicatorPill.margin
+            // Same right inset as the scroll-to-bottom button, which also
+            // keeps the label clear of the unread badge in the corner.
+            let scrollerInset = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay)
+            indicator.frame = NSRect(
+                x: max(terminalBounds.minX + margin, terminalBounds.maxX - scrollerInset - size.width - margin),
+                y: terminalBounds.maxY - size.height - margin,
+                width: min(size.width, max(0, terminalBounds.width - margin * 2)),
+                height: size.height
+            )
+        }
         notificationRingOverlayView.frame = bounds
         peerRingOverlayView.frame = bounds
         flashOverlayView.frame = bounds
@@ -802,7 +817,7 @@ final class GhosttySurfaceScrollView: NSView {
             object: window,
             queue: .main
         ) { [weak self] _ in
-            self?.applyFirstResponderIfNeeded()
+            self?.applyFirstResponderIfNeeded(isTransition: false)
         })
         windowObservers.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification,
@@ -817,7 +832,7 @@ final class GhosttySurfaceScrollView: NSView {
                 window.makeFirstResponder(nil)
             }
         })
-        if window.isKeyWindow { applyFirstResponderIfNeeded() }
+        if window.isKeyWindow { applyFirstResponderIfNeeded(isTransition: false) }
     }
 
     func attachSurface(_ terminalSurface: TerminalSurface) {
@@ -1023,6 +1038,27 @@ final class GhosttySurfaceScrollView: NSView {
         let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
         addSubview(overlay, positioned: .above, relativeTo: nil)
         scrollToBottomHostingView = overlay
+        needsLayout = true
+    }
+
+    /// Names the viewer whose size this pane is following while it is drawn
+    /// smaller than its own bounds; nil removes the label.
+    func setRemoteSizeIndicator(viewerName: String?, onTakeBack: @escaping () -> Void) {
+        guard viewerName != remoteSizeIndicatorViewerName else { return }
+        remoteSizeIndicatorViewerName = viewerName
+        guard let viewerName else {
+            remoteSizeIndicatorHostingView?.removeFromSuperview()
+            remoteSizeIndicatorHostingView = nil
+            return
+        }
+        let rootView = RemoteSizeIndicatorPill(viewerName: viewerName, onTap: onTakeBack)
+        if let overlay = remoteSizeIndicatorHostingView {
+            overlay.rootView = TermMeshHostedRoot(rootView)
+        } else {
+            let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
+            addSubview(overlay, positioned: .above, relativeTo: nil)
+            remoteSizeIndicatorHostingView = overlay
+        }
         needsLayout = true
     }
 
@@ -1914,8 +1950,21 @@ final class GhosttySurfaceScrollView: NSView {
                 window.makeFirstResponder(nil)
             }
         } else {
-            applyFirstResponderIfNeeded()
+            applyFirstResponderIfNeeded(isTransition: !wasVisible)
         }
+    }
+
+    /// SwiftUI re-runs `updateNSView` on unrelated redraws, and the window
+    /// regaining key or the portal reparenting re-enter this path too. None
+    /// of those may take focus from a text field the user is typing in; only
+    /// becoming visible or active may.
+    static func shouldReclaimFocus(
+        isTransition: Bool,
+        firstResponder: NSResponder?
+    ) -> Bool {
+        if isTransition { return true }
+        guard let editor = firstResponder as? NSTextView else { return true }
+        return !editor.isFieldEditor
     }
 
     /// Send a synthetic key press/release directly to the surface NSView.
@@ -1953,7 +2002,7 @@ final class GhosttySurfaceScrollView: NSView {
         }
 #endif
         if active {
-            applyFirstResponderIfNeeded()
+            applyFirstResponderIfNeeded(isTransition: !wasActive)
         } else if let window,
                   let fr = window.firstResponder as? NSView,
                   fr === surfaceView || fr.isDescendant(of: surfaceView) {
@@ -2204,7 +2253,7 @@ final class GhosttySurfaceScrollView: NSView {
         return fr === surfaceView || fr.isDescendant(of: surfaceView)
     }
 
-    private func applyFirstResponderIfNeeded() {
+    private func applyFirstResponderIfNeeded(isTransition: Bool) {
         let hasUsablePortalGeometry: Bool = {
             let size = bounds.size
             return size.width > 1 && size.height > 1
@@ -2227,6 +2276,9 @@ final class GhosttySurfaceScrollView: NSView {
         guard let window, window.isKeyWindow else { return }
         if let fr = window.firstResponder as? NSView,
            fr === surfaceView || fr.isDescendant(of: surfaceView) {
+            return
+        }
+        guard Self.shouldReclaimFocus(isTransition: isTransition, firstResponder: window.firstResponder) else {
             return
         }
         // Temporarily remove the onFocus callback to prevent re-entrant layout loop:
@@ -2649,5 +2701,41 @@ final class GhosttySurfaceScrollView: NSView {
             return documentGridHeight + padding
         }
         return contentHeight
+    }
+}
+
+/// The label over a pane that a remote viewer's size has shrunk. Clicking it
+/// does what clicking the pane does: this window takes the grid back.
+struct RemoteSizeIndicatorPill: View {
+    static let margin: CGFloat = 8
+
+    let viewerName: String
+    let onTap: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 5) {
+                Image(systemName: "rectangle.compress.vertical")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("Sized for \(viewerName) · Click to use this window")
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .foregroundStyle(.primary.opacity(isHovering ? 0.95 : 0.75))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .fill(.regularMaterial)
+                    .overlay(Capsule().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .help("This pane is drawn at \(viewerName)'s size because that viewer was used last. Click to size it for this window.")
+        .accessibilityLabel("Sized for \(viewerName). Use this window's size")
     }
 }
