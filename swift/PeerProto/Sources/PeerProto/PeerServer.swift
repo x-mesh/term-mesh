@@ -161,8 +161,10 @@ public struct PeerSurfaceAttachment: Sendable {
     public let byteStream: AsyncStream<PtyTapChunk>
     /// Client → host: raw keystroke bytes from an Input frame.
     public let input: @Sendable (Data) async -> Void
-    /// Client → host: resize from a Resize frame (cols, rows).
-    public let resize: @Sendable (UInt32, UInt32) async -> Void
+    /// Client → host: resize from a Resize frame (cols, rows,
+    /// claim_authority). A claim marks the viewer as the side the person is
+    /// now using, which the host weighs when the PTY's one size is contested.
+    public let resize: @Sendable (UInt32, UInt32, Bool) async -> Void
     /// Optional initial `WorkspaceUpdate.meta` to push to the client
     /// right after the AttachResult. Mirrors Phase 2.4b on the Rust side.
     public let workspaceMeta: PeerWorkspaceMeta?
@@ -198,7 +200,7 @@ public struct PeerSurfaceAttachment: Sendable {
     public init(
         byteStream: AsyncStream<PtyTapChunk>,
         input: @escaping @Sendable (Data) async -> Void,
-        resize: @escaping @Sendable (UInt32, UInt32) async -> Void = { _, _ in },
+        resize: @escaping @Sendable (UInt32, UInt32, Bool) async -> Void = { _, _, _ in },
         workspaceMeta: PeerWorkspaceMeta? = nil,
         initialByteSeq: UInt64 = 0,
         resync: (@Sendable () async -> PeerSurfaceResync?)? = nil,
@@ -498,7 +500,7 @@ public actor EchoSurfaceProvider: PeerSurfaceProvider {
         return PeerSurfaceAttachment(
             byteStream: stream,
             input: input,
-            resize: { _, _ in },
+            resize: { _, _, _ in },
             workspaceMeta: nil,
             detach: detach
         )
@@ -2804,7 +2806,7 @@ actor PeerServerSession {
         case (.ready, .resize(let r)):
             guard let attachment = attachments[r.surfaceID] else { return }
             if r.cols > 0 && r.rows > 0 {
-                await attachment.resize(r.cols, r.rows)
+                await attachment.resize(r.cols, r.rows, r.claimAuthority)
             }
 
         case (.ready, .ping(let p)):

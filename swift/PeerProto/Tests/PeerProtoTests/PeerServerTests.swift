@@ -2559,3 +2559,81 @@ private final class SessionCountRecorder: @unchecked Sendable {
         }
     }
 }
+
+private actor ResizeRecordingProvider: PeerSurfaceProvider {
+    let surfaceID = Data(repeating: 0xC1, count: 16)
+    private(set) var resizes: [(cols: UInt32, rows: UInt32, claim: Bool)] = []
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        return [surface]
+    }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? {
+        guard surfaceID == self.surfaceID else { return nil }
+        let pair = AsyncStream<PtyTapChunk>.makeStream()
+        return PeerSurfaceAttachment(
+            byteStream: pair.stream,
+            input: { _ in },
+            resize: { [weak self] cols, rows, claim in
+                await self?.record(cols: cols, rows: rows, claim: claim)
+            },
+            detach: { pair.continuation.finish() }
+        )
+    }
+
+    private func record(cols: UInt32, rows: UInt32, claim: Bool) {
+        resizes.append((cols, rows, claim))
+    }
+}
+
+final class PeerServerResizeClaimTests: XCTestCase {
+    func testResizeForwardsClaimAuthorityToProvider() async throws {
+        let sockPath = "/tmp/tm-peer-swift-claim-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = ResizeRecordingProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let socketDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > socketDeadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake()
+        _ = try await session.attachSurface(id: provider.surfaceID, mode: .coWrite, cols: 80, rows: 24)
+
+        try await session.sendResize(surfaceID: provider.surfaceID, cols: 120, rows: 40, claimAuthority: true)
+        try await session.sendResize(surfaceID: provider.surfaceID, cols: 100, rows: 30, claimAuthority: false)
+
+        let deadline = Date().addingTimeInterval(3)
+        var recorded = await provider.resizes
+        while recorded.count < 2, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            recorded = await provider.resizes
+        }
+        XCTAssertEqual(recorded.count, 2)
+        XCTAssertEqual(recorded.first?.cols, 120)
+        XCTAssertEqual(recorded.first?.claim, true)
+        XCTAssertEqual(recorded.last?.cols, 100)
+        XCTAssertEqual(recorded.last?.claim, false)
+
+        try await session.sendGoodbye(reason: "claim test done")
+        await transport.close()
+    }
+}

@@ -1282,9 +1282,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// value the surface no longer has, concludes nothing changed, and the
     /// two views drift apart silently.
     @discardableResult
-    func applyRemoteViewerPixelSize(width: UInt32, height: UInt32) -> Bool {
+    func applyRemoteViewerPixelSize(width: UInt32, height: UInt32, claimsAttention: Bool) -> Bool {
         guard let surface = surface, width > 0, height > 0 else { return false }
         remoteViewerPixelSize = (width, height)
+        // The viewer claims when its pane gains focus. That is the person
+        // moving to that machine, which counts as much as a keystroke there.
+        if claimsAttention { remoteViewerTypedLast = true }
         let resolved = resolvedPixelSize()
         guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return false }
         #if DEBUG
@@ -1305,6 +1308,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// front of this pane, and treating it as one would hand the grid to a
     /// window nobody is reading.
     func noteLocalInput() { noteTypist(remote: false) }
+
+    /// Record that this pane gained keyboard focus in the frontmost window.
+    /// Clicking a pane is the person choosing to read it here, so it takes the
+    /// grid back from a remote viewer without waiting for a keystroke.
+    func noteLocalFocus() { noteTypist(remote: false) }
 
     /// Record that an attached remote viewer produced input, and re-arbitrate.
     func noteRemoteInput() { noteTypist(remote: true) }
@@ -2793,6 +2801,7 @@ static func focusLog(_ message: String) {
     private var eventMonitor: Any?
     private var trackingArea: NSTrackingArea?
     private var windowObserver: NSObjectProtocol?
+    private var windowKeyObserver: NSObjectProtocol?
 	    private var lastScrollEventTime: CFTimeInterval = 0
     private var visibleInUI: Bool = true
     private var pendingSurfaceSize: CGSize?
@@ -2946,6 +2955,10 @@ static func focusLog(_ message: String) {
             NotificationCenter.default.removeObserver(windowObserver)
             self.windowObserver = nil
         }
+        if let windowKeyObserver {
+            NotificationCenter.default.removeObserver(windowKeyObserver)
+            self.windowKeyObserver = nil
+        }
 #if DEBUG
         dlog(
             "surface.view.windowMove surface=\(terminalSurface?.id.uuidString.prefix(5) ?? "nil") " +
@@ -2965,6 +2978,16 @@ static func focusLog(_ message: String) {
             queue: .main
         ) { [weak self] notification in
             self?.windowDidChangeScreen(notification)
+        }
+        // Returning to this app with the pane already focused never passes
+        // through becomeFirstResponder, yet it is the same person coming back.
+        windowKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.window?.firstResponder === self else { return }
+            self.noteLocalFocusIfFrontmost()
         }
 
         if let surface = terminalSurface?.surface,
@@ -3276,6 +3299,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
             let hiddenInHierarchy = isHiddenOrHasHiddenAncestor
             if isVisibleInUI && hasUsableFocusGeometry && !hiddenInHierarchy {
                 onFocus?()
+                noteLocalFocusIfFrontmost()
             } else if isVisibleInUI && (!hasUsableFocusGeometry || hiddenInHierarchy) {
 #if DEBUG
                 dlog(
@@ -4288,7 +4312,17 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         if let windowObserver {
             NotificationCenter.default.removeObserver(windowObserver)
         }
+        if let windowKeyObserver {
+            NotificationCenter.default.removeObserver(windowKeyObserver)
+        }
         terminalSurface = nil
+    }
+
+    /// Focus taken while the app is in the background is not someone reading
+    /// this pane, so only the active app's key window counts.
+    private func noteLocalFocusIfFrontmost() {
+        guard NSApp.isActive, window?.isKeyWindow == true else { return }
+        terminalSurface?.noteLocalFocus()
     }
 
     override func updateTrackingAreas() {
