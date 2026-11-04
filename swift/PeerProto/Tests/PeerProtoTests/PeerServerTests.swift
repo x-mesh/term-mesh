@@ -2559,3 +2559,229 @@ private final class SessionCountRecorder: @unchecked Sendable {
         }
     }
 }
+
+private actor ResizeRecordingProvider: PeerSurfaceProvider {
+    let surfaceID = Data(repeating: 0xC1, count: 16)
+    private(set) var resizes: [(cols: UInt32, rows: UInt32, claim: Bool, viewer: String)] = []
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        return [surface]
+    }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? {
+        guard surfaceID == self.surfaceID else { return nil }
+        let pair = AsyncStream<PtyTapChunk>.makeStream()
+        return PeerSurfaceAttachment(
+            byteStream: pair.stream,
+            input: { _ in },
+            resize: { [weak self] request in
+                await self?.record(request)
+            },
+            detach: { pair.continuation.finish() }
+        )
+    }
+
+    private func record(_ request: PeerResizeRequest) {
+        resizes.append((request.cols, request.rows, request.claimsAuthority, request.viewerName))
+    }
+}
+
+final class PeerServerResizeClaimTests: XCTestCase {
+    func testResizeForwardsClaimAuthorityToProvider() async throws {
+        let sockPath = "/tmp/tm-peer-swift-claim-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = ResizeRecordingProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let socketDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > socketDeadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake(options: PeerSessionOptions(displayName: "viewer-mac"))
+        _ = try await session.attachSurface(id: provider.surfaceID, mode: .coWrite, cols: 80, rows: 24)
+
+        try await session.sendResize(surfaceID: provider.surfaceID, cols: 120, rows: 40, claimAuthority: true)
+        try await session.sendResize(surfaceID: provider.surfaceID, cols: 100, rows: 30, claimAuthority: false)
+
+        let deadline = Date().addingTimeInterval(3)
+        var recorded = await provider.resizes
+        while recorded.count < 2, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            recorded = await provider.resizes
+        }
+        XCTAssertEqual(recorded.count, 2)
+        XCTAssertEqual(recorded.first?.cols, 120)
+        XCTAssertEqual(recorded.first?.claim, true)
+        XCTAssertEqual(recorded.last?.cols, 100)
+        XCTAssertEqual(recorded.last?.claim, false)
+        XCTAssertEqual(recorded.first?.viewer, "viewer-mac")
+
+        let inbound = await server.inboundSessions()
+        XCTAssertEqual(inbound.count, 1)
+        XCTAssertEqual(inbound.first?.attachments, [
+            PeerServerInboundAttachment(
+                surfaceID: provider.surfaceID, cols: 100, rows: 30, claimedAuthority: false
+            ),
+        ])
+
+        try await session.sendGoodbye(reason: "claim test done")
+        await transport.close()
+    }
+
+    func testDisconnectInboundSendsHostGoodbyeAndDropsTheSession() async throws {
+        let sockPath = "/tmp/tm-peer-swift-kick-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = ResizeRecordingProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let socketDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > socketDeadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake()
+        _ = try await session.attachSurface(id: provider.surfaceID, mode: .coWrite, cols: 80, rows: 24)
+
+        let inbound = await server.inboundSessions()
+        let target = try XCTUnwrap(inbound.first)
+        let disconnected = await server.disconnectInbound(peerID: target.clientPeerID)
+        XCTAssertEqual(disconnected, 1)
+
+        var goodbyeReason: String?
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            guard let message = try? await session.receiveNextMessage() else { break }
+            if case .goodbye(let reason) = message {
+                goodbyeReason = reason
+                break
+            }
+        }
+        XCTAssertEqual(goodbyeReason, PeerGoodbyeReason.disconnectedByHost)
+
+        var remaining = await server.inboundSessions()
+        while !remaining.isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            remaining = await server.inboundSessions()
+        }
+        XCTAssertTrue(remaining.isEmpty)
+        let again = await server.disconnectInbound(peerID: target.clientPeerID)
+        XCTAssertEqual(again, 0)
+        await transport.close()
+    }
+
+    private func startServer(
+        provider: ResizeRecordingProvider,
+        config: PeerServerConfig = PeerServerConfig()
+    ) async throws -> (PeerServer, String) {
+        let sockPath = "/tmp/tm-peer-swift-inb-\(UUID().uuidString.prefix(8)).sock"
+        let server = PeerServer(socketPath: sockPath, provider: provider, config: config)
+        try await server.start()
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath), Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return (server, sockPath)
+    }
+
+    private func connectViewer(
+        sockPath: String, peerID: Data, surfaceID: Data
+    ) async throws -> (PeerSession, UnixSocketTransport) {
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(
+            read: { try await transport.read() },
+            write: { try await transport.write($0) }
+        )
+        _ = try await session.handshake(options: PeerSessionOptions(peerID: peerID))
+        _ = try await session.attachSurface(id: surfaceID, mode: .coWrite, cols: 80, rows: 24)
+        return (session, transport)
+    }
+
+    func testDisconnectInboundEndsEveryConnectionOfThatMachineOnly() async throws {
+        let provider = ResizeRecordingProvider()
+        let (server, sockPath) = try await startServer(provider: provider)
+        defer {
+            Task { await server.stop() }
+            try? FileManager.default.removeItem(atPath: sockPath)
+        }
+        let machineA = Data(repeating: 0xA1, count: 16)
+        let machineB = Data(repeating: 0xB2, count: 16)
+        let a1 = try await connectViewer(sockPath: sockPath, peerID: machineA, surfaceID: provider.surfaceID)
+        let a2 = try await connectViewer(sockPath: sockPath, peerID: machineA, surfaceID: provider.surfaceID)
+        let b = try await connectViewer(sockPath: sockPath, peerID: machineB, surfaceID: provider.surfaceID)
+
+        let ended = await server.disconnectInbound(peerID: machineA)
+        XCTAssertEqual(ended, 2)
+
+        let deadline = Date().addingTimeInterval(3)
+        var remaining = await server.inboundSessions()
+        while remaining.count != 1, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            remaining = await server.inboundSessions()
+        }
+        XCTAssertEqual(remaining.map(\.clientPeerID), [machineB])
+
+        for viewer in [a1, a2, b] { await viewer.1.close() }
+    }
+
+    func testInboundChangeCallbackFiresForHandshakeResizeAndLeave() async throws {
+        final class Counter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = 0
+            func bump() { lock.lock(); value += 1; lock.unlock() }
+            var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+        }
+        let counter = Counter()
+        var config = PeerServerConfig()
+        config.onInboundSessionsChange = { counter.bump() }
+        let provider = ResizeRecordingProvider()
+        let (server, sockPath) = try await startServer(provider: provider, config: config)
+        defer {
+            Task { await server.stop() }
+            try? FileManager.default.removeItem(atPath: sockPath)
+        }
+        let viewer = try await connectViewer(
+            sockPath: sockPath, peerID: Data(repeating: 0xC3, count: 16), surfaceID: provider.surfaceID
+        )
+        let afterAttach = counter.count
+        XCTAssertGreaterThanOrEqual(afterAttach, 2, "handshake and attach each notify")
+
+        try await viewer.0.sendResize(surfaceID: provider.surfaceID, cols: 90, rows: 30)
+        let deadline = Date().addingTimeInterval(3)
+        while counter.count == afterAttach, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let afterResize = counter.count
+        XCTAssertGreaterThan(afterResize, afterAttach, "a new size notifies")
+
+        await viewer.1.close()
+        while counter.count == afterResize, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertGreaterThan(counter.count, afterResize, "the viewer leaving notifies")
+    }
+}

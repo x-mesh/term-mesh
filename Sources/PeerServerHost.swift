@@ -194,6 +194,68 @@ final class PeerHostCoordinator: NSObject {
 
     private func postStateChange() {
         NotificationCenter.default.post(name: .peerServerStateDidChange, object: nil)
+        NotificationCenter.default.post(name: Self.inboundConnectionsDidChangeNotification, object: nil)
+    }
+
+    static let inboundConnectionsDidChangeNotification =
+        Notification.Name("PeerHostCoordinator.inboundConnectionsDidChange")
+
+    /// One machine connected to this Mac's peer server, flattened per
+    /// attached pane. A connection with nothing attached (a sidebar that only
+    /// watches the roster) is one row with no pane.
+    struct InboundConnectionRow: Equatable {
+        let sessionID: UUID
+        let peerID: Data
+        let machine: String
+        let workspaceTitle: String?
+        let paneTitle: String?
+        let viewerCols: UInt32
+        let viewerRows: UInt32
+        let sizeOwner: SharedPTYSizeOwner?
+        let connectedAt: Date
+    }
+
+    func inboundConnections() async -> [InboundConnectionRow] {
+        guard let server, let provider else { return [] }
+        let sessions = await server.inboundSessions()
+        var rows: [InboundConnectionRow] = []
+        for session in sessions {
+            let machine = session.clientName.isEmpty
+                ? "peer " + session.clientPeerID.prefix(4).map { String(format: "%02x", $0) }.joined()
+                : session.clientName
+            if session.attachments.isEmpty {
+                rows.append(InboundConnectionRow(
+                    sessionID: session.id, peerID: session.clientPeerID, machine: machine,
+                    workspaceTitle: nil, paneTitle: nil,
+                    viewerCols: 0, viewerRows: 0, sizeOwner: nil,
+                    connectedAt: session.connectedAt
+                ))
+                continue
+            }
+            for attachment in session.attachments {
+                let target = provider.inboundTarget(surfaceID: attachment.surfaceID)
+                rows.append(InboundConnectionRow(
+                    sessionID: session.id, peerID: session.clientPeerID, machine: machine,
+                    workspaceTitle: target?.workspaceTitle,
+                    paneTitle: target?.paneTitle ?? "(closed)",
+                    viewerCols: attachment.cols, viewerRows: attachment.rows,
+                    sizeOwner: target?.sizeOwner,
+                    connectedAt: session.connectedAt
+                ))
+            }
+        }
+        // Grouped by machine: Disconnect acts on a whole machine, so its rows
+        // have to sit together under the one button.
+        return rows.sorted {
+            ($0.machine, $0.peerID.base64EncodedString(), $0.workspaceTitle ?? "", $0.paneTitle ?? "")
+                < ($1.machine, $1.peerID.base64EncodedString(), $1.workspaceTitle ?? "", $1.paneTitle ?? "")
+        }
+    }
+
+    func disconnectInbound(peerID: Data) async {
+        guard let server else { return }
+        let ended = await server.disconnectInbound(peerID: peerID)
+        RemoteWorkLog.info("Disconnected \(ended) inbound connection(s) from a viewer machine")
     }
 
     /// `true` while the server is listening. Lets Settings reflect
@@ -465,6 +527,13 @@ final class PeerHostCoordinator: NSObject {
                 MainActor.assumeIsolated {
                     PeerKeepAwakeController.shared.attachedPeerCountDidChange(count)
                 }
+            }
+        }
+        config.onInboundSessionsChange = {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: PeerHostCoordinator.inboundConnectionsDidChangeNotification, object: nil
+                )
             }
         }
 
