@@ -1300,7 +1300,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // moving to that machine, which counts as much as a keystroke there.
         if claimsAttention { remoteViewerTypedLast = true }
         let resolved = resolvedPixelSize()
-        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return false }
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else {
+            // The grid is unchanged, but the viewer it follows may not be.
+            refreshRemoteSizeIndicator()
+            return false
+        }
         #if DEBUG
         Self.sizeLog(
             "viewerSize surface=\(id.uuidString.prefix(8)) asked=\(width)x\(height) "
