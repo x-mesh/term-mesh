@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.285.0] - 2026-11-08
+
+### Changed
+
+- Agent panes now open with the newest part of the transcript, up to about 32 KB of text. A "Show earlier" link above it loads older events in that pane. The pane returns to the newest part when you leave its workspace. `tm-agent read` still returns the full transcript window.
+- Hang reports now include MetricKit diagnostics, which cover the whole hang instead of one moment.
+
+### Fixed
+
+- Switching to or away from a workspace with long agent transcripts no longer freezes the app for several seconds. With four agents holding long answers, selecting their workspace took 15-32 s before and 3.5 s now.
+- Adding an agent to a team no longer times out after 5 seconds, and opening a team workspace for the first time no longer pauses. The app read the whole shared turn log on the main thread for each Project. It now reads it in the background.
+- After the app had been open for hours or woke from sleep, a team status refresh could freeze it while it re-read the turn log. It now keeps the last reading on screen while it refreshes in the background.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.284.0] - 2026-11-04
 
 ### Added
