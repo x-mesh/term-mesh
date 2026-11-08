@@ -700,6 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // whole history. The trace goes to the unified log rather than the
             // debug one: a shipped build is where this repair matters, and
             // `dlog` does not exist outside DEBUG.
+            let warmHealth = LeaderTurnLog.reserveHealthWarmup()
             DispatchQueue.global(qos: .utility).async {
                 let moved = LeaderTurnLog.quarantineMalformedLines()
                 if moved > 0 {
@@ -708,6 +709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     )
                 }
                 LeaderTurnLog.warmPolicyIndex()
+                warmHealth()
             }
         }
 
