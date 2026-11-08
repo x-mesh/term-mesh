@@ -533,6 +533,48 @@ final class LeaderTurnLogTests: XCTestCase {
     }
 
     @MainActor
+    /// Every control-file refresh asks for each Project's health on the main
+    /// thread. Cold, the answer is nil while the read runs in the background,
+    /// and the caller is asked to write again once it lands.
+    func testTeamCachedHealthIsNilWhenColdAndReadsOffMain() throws {
+        let log = try temporaryLog()
+        let lock = NSLock()
+        var readsOnMain: [Bool] = []
+        let measured = LeaderTurnLog.Health(
+            supportedTurns: 3, linkedTurns: 3, statedTurns: 3, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 1
+        )
+        let start = Date(timeIntervalSince1970: 1_800_000_300)
+        LeaderTurnLog.configureHealthRefreshForTesting(
+            reader: { url in
+                lock.lock()
+                if url == log { readsOnMain.append(Thread.isMainThread) }
+                lock.unlock()
+                return measured
+            },
+            clock: { start }
+        )
+        defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
+
+        let changed = expectation(description: "caller asked to write again")
+        XCTAssertNil(LeaderTurnLog.cachedHealth(from: log, team: "p", now: start) {
+            changed.fulfill()
+        })
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        wait(for: [changed], timeout: 2)
+
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, team: "p", now: start.addingTimeInterval(1)) {
+                XCTFail("a value read within the interval must not start another read")
+            },
+            measured
+        )
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        lock.lock()
+        defer { lock.unlock() }
+        XCTAssertEqual(readsOnMain, [false])
+    }
+
     func testCachedHealthServesStaleValueWithoutReadingOnMain() throws {
         let log = try temporaryLog()
         let lock = NSLock()

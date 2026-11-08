@@ -5421,11 +5421,12 @@ extension TeamOrchestrator {
             turnHookFile = nil
         }
         let participationControlFile: String?
+        let measurement = await Task.detached { LeaderTurnLog.health(team: teamName) }.value
         if Self.supportsLeaderTurnMeasurement(cli: cli), turnHookFile != nil,
            let controlData = Self.leaderParticipationControlData(
                teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true,
                delegationState: team.delegationState,
-               healthScope: .executionHost
+               healthScope: .executionHost, measurement: measurement
            ) {
             participationControlFile = await Self.writeRemoteLeaderFileOverSSH(
                 host: host, data: controlData,

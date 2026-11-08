@@ -903,14 +903,55 @@ enum LeaderTurnLog {
         return generation
     }
 
+    /// Per-Project health for callers on the main thread, which must never
+    /// decode turns.log: one Project's aggregate scans every line of the
+    /// shared file, and adding an agent spent 5 s there before `tm-agent add`
+    /// gave up. Returns nil until the first background read for `team` lands,
+    /// then the last value while later reads run. `onChange` runs on the main
+    /// actor when a background read produces a different value, so a caller
+    /// that skipped on nil, or wrote a value that is now stale, can write again.
+    static func cachedHealth(
+        from logFile: URL = logFile,
+        team: String,
+        capabilities: [MeasurementCapability] = [],
+        now: Date = Date(),
+        onChange: @escaping @MainActor @Sendable () -> Void
+    ) -> Health? {
+        let key = logFile.standardizedFileURL.path + "\n" + team
+        healthRefreshLock.lock()
+        let existing = healthRefreshCache[key]
+        let value = existing?.value
+        let idle = existing?.inFlightGenerations.isEmpty ?? true
+        let age = existing?.refreshedAt.map { now.timeIntervalSince($0) } ?? .infinity
+        var refreshGeneration: UInt64?
+        if idle, value == nil || age >= healthRefreshInterval {
+            refreshGeneration = reserveHealthRefreshLocked(key: key)
+        }
+        let reader = healthRefreshReaderForTesting
+        let clock = healthRefreshClockForTesting
+        healthRefreshLock.unlock()
+
+        if let refreshGeneration {
+            healthRefreshQueue.async {
+                let refreshed = performHealthRefresh(
+                    logFile: logFile, team: team, key: key, generation: refreshGeneration,
+                    reader: reader, clock: clock
+                )
+                if refreshed != value { Task { @MainActor in onChange() } }
+            }
+        }
+        return value.map { health(from: $0, capabilities: capabilities) }
+    }
+
     private static func performHealthRefresh(
         logFile: URL,
+        team: String? = nil,
         key: String,
         generation: UInt64,
         reader: ((URL) -> Health)?,
         clock: (() -> Date)?
     ) -> FileDerivedHealth {
-        let refreshed = reader?(logFile) ?? health(from: logFile)
+        let refreshed = reader?(logFile) ?? health(from: logFile, team: team)
         let derived = FileDerivedHealth(refreshed)
         completeHealthRefresh(
             key: key,
@@ -980,7 +1021,7 @@ enum LeaderTurnLog {
     /// The part of `Health` that depends only on the log bytes. `capabilities`
     /// is a live runtime signal supplied by the caller, so it stays out of the
     /// cache below.
-    private struct FileDerivedHealth {
+    private struct FileDerivedHealth: Equatable {
         let supportedTurns: Int
         let linkedTurns: Int
         let statedTurns: Int
