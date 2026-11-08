@@ -821,70 +821,145 @@ enum LeaderTurnLog {
         capabilities: [MeasurementCapability] = [],
         now: Date = Date()
     ) -> Health {
-        // Fleet status returns cached data for at most sixty seconds, then pays one synchronous refresh.
+        // Fleet status runs on the main thread every few seconds. Only a cold
+        // cache with nothing already computing reads the log on the caller's
+        // thread; a stale value is returned while the queue refreshes it. The
+        // former sixty-second synchronous fallback fired after sleep or a slow
+        // refresh and decoded the whole log on main (Sentry TERM-MESH-DT).
         let key = logFile.standardizedFileURL.path
         healthRefreshLock.lock()
         let existing = healthRefreshCache[key]
         let value = existing?.value
+        let idle = existing?.inFlightGenerations.isEmpty ?? true
         let age = existing?.refreshedAt.map {
             now.timeIntervalSince($0)
         } ?? .infinity
-        let requiresSynchronousRefresh = value == nil || age >= healthRefreshMaxAge
-        let startBackgroundRefresh = !requiresSynchronousRefresh
-            && age >= healthRefreshInterval
-            && (existing?.inFlightGenerations.isEmpty ?? true)
+        let requiresSynchronousRefresh = value == nil && idle
+        let startBackgroundRefresh = value != nil && idle && age >= healthRefreshInterval
         var refreshGeneration: UInt64?
         if requiresSynchronousRefresh || startBackgroundRefresh {
-            let previous = existing ?? HealthRefreshEntry(
-                value: nil,
-                refreshedAt: nil,
-                cachedGeneration: 0,
-                latestGeneration: 0,
-                inFlightGenerations: []
-            )
-            let generation = previous.latestGeneration + 1
-            refreshGeneration = generation
-            healthRefreshCache[key] = HealthRefreshEntry(
-                value: previous.value,
-                refreshedAt: previous.refreshedAt,
-                cachedGeneration: previous.cachedGeneration,
-                latestGeneration: generation,
-                inFlightGenerations: previous.inFlightGenerations.union([generation])
-            )
+            refreshGeneration = reserveHealthRefreshLocked(key: key)
         }
         let reader = healthRefreshReaderForTesting
         let clock = healthRefreshClockForTesting
         healthRefreshLock.unlock()
 
-        if requiresSynchronousRefresh {
-            let refreshed = reader?(logFile) ?? health(from: logFile)
-            let derived = FileDerivedHealth(refreshed)
-            let completedAt = clock?() ?? Date()
-            if let refreshGeneration {
-                completeHealthRefresh(
-                    key: key,
-                    generation: refreshGeneration,
-                    value: derived,
-                    completedAt: completedAt
-                )
-            }
+        if requiresSynchronousRefresh, let refreshGeneration {
+            let derived = performHealthRefresh(
+                logFile: logFile, key: key, generation: refreshGeneration,
+                reader: reader, clock: clock
+            )
             return health(from: derived, capabilities: capabilities)
         }
 
         if let refreshGeneration {
             healthRefreshQueue.async {
-                let refreshed = reader?(logFile) ?? health(from: logFile)
-                let completedAt = clock?() ?? Date()
-                completeHealthRefresh(
-                    key: key,
-                    generation: refreshGeneration,
-                    value: FileDerivedHealth(refreshed),
-                    completedAt: completedAt
+                _ = performHealthRefresh(
+                    logFile: logFile, key: key, generation: refreshGeneration,
+                    reader: reader, clock: clock
                 )
             }
         }
 
         return health(from: value ?? .empty, capabilities: capabilities)
+    }
+
+    /// Mark the fleet cache as filling before anything else can ask, then
+    /// run the returned work off the main thread. Until the reservation
+    /// exists, a `fleet.state` on main would find the cache cold and idle and
+    /// decode the whole history there.
+    static func reserveHealthWarmup(from logFile: URL = logFile) -> () -> Void {
+        let key = logFile.standardizedFileURL.path
+        healthRefreshLock.lock()
+        let generation = reserveHealthRefreshLocked(key: key)
+        let reader = healthRefreshReaderForTesting
+        let clock = healthRefreshClockForTesting
+        healthRefreshLock.unlock()
+        return {
+            _ = performHealthRefresh(
+                logFile: logFile, key: key, generation: generation,
+                reader: reader, clock: clock
+            )
+        }
+    }
+
+    /// Caller holds `healthRefreshLock`.
+    private static func reserveHealthRefreshLocked(key: String) -> UInt64 {
+        let previous = healthRefreshCache[key] ?? HealthRefreshEntry(
+            value: nil,
+            refreshedAt: nil,
+            cachedGeneration: 0,
+            latestGeneration: 0,
+            inFlightGenerations: []
+        )
+        let generation = previous.latestGeneration + 1
+        healthRefreshCache[key] = HealthRefreshEntry(
+            value: previous.value,
+            refreshedAt: previous.refreshedAt,
+            cachedGeneration: previous.cachedGeneration,
+            latestGeneration: generation,
+            inFlightGenerations: previous.inFlightGenerations.union([generation])
+        )
+        return generation
+    }
+
+    /// Per-Project health for callers on the main thread, which must never
+    /// decode turns.log: one Project's aggregate scans every line of the
+    /// shared file, and adding an agent spent 5 s there before `tm-agent add`
+    /// gave up. Returns nil until the first background read for `team` lands,
+    /// then the last value while later reads run. `onChange` runs on the main
+    /// actor when a background read produces a different value, so a caller
+    /// that skipped on nil, or wrote a value that is now stale, can write again.
+    static func cachedHealth(
+        from logFile: URL = logFile,
+        team: String,
+        capabilities: [MeasurementCapability] = [],
+        now: Date = Date(),
+        onChange: @escaping @MainActor @Sendable () -> Void
+    ) -> Health? {
+        let key = logFile.standardizedFileURL.path + "\n" + team
+        healthRefreshLock.lock()
+        let existing = healthRefreshCache[key]
+        let value = existing?.value
+        let idle = existing?.inFlightGenerations.isEmpty ?? true
+        let age = existing?.refreshedAt.map { now.timeIntervalSince($0) } ?? .infinity
+        var refreshGeneration: UInt64?
+        if idle, value == nil || age >= healthRefreshInterval {
+            refreshGeneration = reserveHealthRefreshLocked(key: key)
+        }
+        let reader = healthRefreshReaderForTesting
+        let clock = healthRefreshClockForTesting
+        healthRefreshLock.unlock()
+
+        if let refreshGeneration {
+            healthRefreshQueue.async {
+                let refreshed = performHealthRefresh(
+                    logFile: logFile, team: team, key: key, generation: refreshGeneration,
+                    reader: reader, clock: clock
+                )
+                if refreshed != value { Task { @MainActor in onChange() } }
+            }
+        }
+        return value.map { health(from: $0, capabilities: capabilities) }
+    }
+
+    private static func performHealthRefresh(
+        logFile: URL,
+        team: String? = nil,
+        key: String,
+        generation: UInt64,
+        reader: ((URL) -> Health)?,
+        clock: (() -> Date)?
+    ) -> FileDerivedHealth {
+        let refreshed = reader?(logFile) ?? health(from: logFile, team: team)
+        let derived = FileDerivedHealth(refreshed)
+        completeHealthRefresh(
+            key: key,
+            generation: generation,
+            value: derived,
+            completedAt: clock?() ?? Date()
+        )
+        return derived
     }
 
     static func configureHealthRefreshForTesting(
@@ -946,7 +1021,7 @@ enum LeaderTurnLog {
     /// The part of `Health` that depends only on the log bytes. `capabilities`
     /// is a live runtime signal supplied by the caller, so it stays out of the
     /// cache below.
-    private struct FileDerivedHealth {
+    private struct FileDerivedHealth: Equatable {
         let supportedTurns: Int
         let linkedTurns: Int
         let statedTurns: Int
@@ -1031,7 +1106,6 @@ enum LeaderTurnLog {
 
     private static let logCacheLock = NSLock()
     private static let healthRefreshInterval: TimeInterval = 10
-    private static let healthRefreshMaxAge: TimeInterval = 60
     private static let healthRefreshLock = NSLock()
     private static let healthRefreshQueue = DispatchQueue(
         label: "com.term-mesh.leader-turn-health", qos: .utility

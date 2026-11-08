@@ -400,14 +400,21 @@ struct AgentPanelView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     banner
                     if session.omittedEntryCount > 0 {
-                        Text("Showing latest \(session.rows.count) events · "
-                             + "\(session.omittedEntryCount) earlier events hidden")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                            .padding(.top, 10)
-                            .accessibilityLabel(
-                                "\(session.omittedEntryCount) earlier transcript events hidden"
-                            )
+                        HStack(spacing: 8) {
+                            Text("Showing latest \(session.rows.count) events · "
+                                 + "\(session.omittedEntryCount) earlier events hidden")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityLabel(
+                                    "\(session.omittedEntryCount) earlier transcript events hidden"
+                                )
+                            if session.canShowEarlierEntries {
+                                Button("Show earlier") { session.showEarlierEntries() }
+                                    .buttonStyle(.link)
+                                    .font(.system(size: 10))
+                            }
+                        }
+                        .padding(.top, 10)
                     }
                     if session.rows.isEmpty { emptyState }
                     let items = AgentSession.transcriptItems(for: session.rows)

@@ -700,6 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // whole history. The trace goes to the unified log rather than the
             // debug one: a shipped build is where this repair matters, and
             // `dlog` does not exist outside DEBUG.
+            let warmHealth = LeaderTurnLog.reserveHealthWarmup()
             DispatchQueue.global(qos: .utility).async {
                 let moved = LeaderTurnLog.quarantineMalformedLines()
                 if moved > 0 {
@@ -708,6 +709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     )
                 }
                 LeaderTurnLog.warmPolicyIndex()
+                warmHealth()
             }
         }
 
@@ -797,6 +799,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             #else
             options.appHangTimeoutInterval = 5.0
             #endif
+            // A legacy App Hang event holds only the stack at the timeout mark,
+            // and TERM-MESH-1D's carry no app frames. MetricKit hang diagnostics
+            // cover the whole hang. Legacy capture stays on: LayoutHangDiagnostics
+            // attaches its census to those events at the moment of the hang.
+            options.enableMetricKit = true
             // Attach stack traces to all events
             options.attachStacktrace = true
             // Capture failed HTTP requests

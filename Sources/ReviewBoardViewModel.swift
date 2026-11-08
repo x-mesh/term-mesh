@@ -93,6 +93,8 @@ final class ReviewBoardViewModel: ObservableObject {
     private var remoteCollaborationRecords: [String: [LeaderTurnLog.Record]] = [:]
     private var remoteCollaborationFetches: [String: Task<Void, Never>] = [:]
     private var remoteCollaborationFetchedAt: [String: Date] = [:]
+    private var localCollaborationRecords: [String: [LeaderTurnLog.Record]] = [:]
+    private var localCollaborationFetches: [String: Task<Void, Never>] = [:]
 
     /// The Overlap canary health reading for the active team, kept apart from
     /// `delegation` because it lands on its own throttled schedule (see
@@ -1100,6 +1102,7 @@ final class ReviewBoardViewModel: ObservableObject {
         if delegation != next { delegation = next }
         let nextCollaboration = Self.collaborationPanel(
             for: resolved,
+            localRecords: resolved.flatMap { localCollaborationRecords[$0] } ?? [],
             remoteRecords: resolved.flatMap { remoteCollaborationRecords[$0] } ?? []
         )
         if collaboration != nextCollaboration { collaboration = nextCollaboration }
@@ -1118,6 +1121,7 @@ final class ReviewBoardViewModel: ObservableObject {
             }
         } ?? .checking
         if overlapHealthReading != nextOverlapHealthReading { overlapHealthReading = nextOverlapHealthReading }
+        refreshLocalCollaborationIfNeeded(for: resolved)
         refreshRemoteCollaborationIfNeeded(for: resolved)
         refreshLocalOverlapHealthIfNeeded(for: resolved)
         refreshRemoteOverlapHealthIfNeeded(for: resolved)
@@ -1264,11 +1268,13 @@ final class ReviewBoardViewModel: ObservableObject {
     }
 
     private static func collaborationPanel(
-        for teamName: String?, remoteRecords: [LeaderTurnLog.Record]
+        for teamName: String?,
+        localRecords: [LeaderTurnLog.Record],
+        remoteRecords: [LeaderTurnLog.Record]
     ) -> CollaborationPanel? {
         guard let teamName, !teamName.isEmpty,
               let team = TeamOrchestrator.shared.teams[teamName] else { return nil }
-        let records = LeaderTurnLog.readRecent(team: teamName) + remoteRecords
+        let records = localRecords + remoteRecords
         let leaderSurfaceID = team.remoteLeaderSurfaceID?.map {
             String(format: "%02x", $0)
         }.joined()
@@ -1331,10 +1337,48 @@ final class ReviewBoardViewModel: ObservableObject {
                 return
             }
             let next = Self.collaborationPanel(
-                for: teamName, remoteRecords: self.remoteCollaborationRecords[teamName] ?? []
+                for: teamName,
+                localRecords: self.localCollaborationRecords[teamName] ?? [],
+                remoteRecords: self.remoteCollaborationRecords[teamName] ?? []
             )
             if self.collaboration != next { self.collaboration = next }
         }
+    }
+
+    /// `readRecent` decodes the shared turns.log back to front until it has
+    /// this team's newest records, which for a young team is the whole file:
+    /// 7 MB took about a second on the main thread each time a team workspace
+    /// was first selected. Detached for the reason the Overlap health read
+    /// gives below; the records land through the same team guard as the
+    /// remote fetch.
+    private func refreshLocalCollaborationIfNeeded(for teamName: String?) {
+        guard let teamName, let team = TeamOrchestrator.shared.teams[teamName],
+              localCollaborationFetches[teamName] == nil else { return }
+        let expectedUUID = team.teamUuid
+        localCollaborationFetches[teamName] = Task.detached { [weak self] in
+            let records = LeaderTurnLog.readRecent(team: teamName)
+            await self?.publishLocalCollaborationRecords(
+                records, teamName: teamName, expectedUUID: expectedUUID
+            )
+        }
+    }
+
+    private func publishLocalCollaborationRecords(
+        _ records: [LeaderTurnLog.Record], teamName: String, expectedUUID: String?
+    ) {
+        localCollaborationFetches[teamName] = nil
+        guard TeamOrchestrator.shared.teams[teamName]?.teamUuid == expectedUUID,
+              localCollaborationRecords[teamName] != records else { return }
+        localCollaborationRecords[teamName] = records
+        guard Self.shouldPublishRemoteCollaboration(
+            fetchedTeam: teamName, activeTeam: activeTeamProvider() ?? activeTeamName
+        ) else { return }
+        let next = Self.collaborationPanel(
+            for: teamName,
+            localRecords: records,
+            remoteRecords: remoteCollaborationRecords[teamName] ?? []
+        )
+        if collaboration != next { collaboration = next }
     }
 
     static func shouldPublishRemoteCollaboration(
