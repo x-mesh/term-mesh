@@ -797,6 +797,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             #else
             options.appHangTimeoutInterval = 5.0
             #endif
+            // A legacy App Hang event holds only the stack at the timeout mark,
+            // and TERM-MESH-1D's carry no app frames. MetricKit hang diagnostics
+            // cover the whole hang. Legacy capture stays on: LayoutHangDiagnostics
+            // attaches its census to those events at the moment of the hang.
+            options.enableMetricKit = true
             // Attach stack traces to all events
             options.attachStacktrace = true
             // Capture failed HTTP requests
