@@ -3076,10 +3076,19 @@ final class TeamOrchestrator: ObservableObject {
             leaderEnv["TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE"] = participationControlFile
             // tm-agent accepts the control file only when its session_id matches this value.
             leaderEnv["TERMMESH_LEADER_SESSION_ID"] = leaderSessionId
-            Self.writeLeaderParticipationControl(
-                teamName: name, sessionID: leaderSessionId,
-                supportedLeader: leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil
-            )
+            // A cold cache skips this write; the background read that fills
+            // it, or the daemon sync after registration, writes it through
+            // `refreshLeaderParticipationControls`. That refresh skips a
+            // payload equal to the cached one, and a same-named Project
+            // removed earlier can leave one behind with its file gone.
+            leaderParticipationControlPayloads[name] = nil
+            if let measurement = Self.cachedLeaderHealth(teamName: name) {
+                Self.writeLeaderParticipationControl(
+                    teamName: name, sessionID: leaderSessionId,
+                    supportedLeader: leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil,
+                    measurement: measurement
+                )
+            }
         }
 
         // Worktree isolation based on team-level mode.
@@ -4452,15 +4461,25 @@ final class TeamOrchestrator: ObservableObject {
         return (base as NSString).appendingPathComponent("leader-participation-\(String(safe)).json")
     }
 
+    /// The Project's turn health without decoding turns.log on the caller's
+    /// thread. nil until the first background read lands; that read, and any
+    /// later one that changes the value, rewrites every control file.
+    static func cachedLeaderHealth(teamName: String) -> LeaderTurnLog.Health? {
+        LeaderTurnLog.cachedHealth(team: teamName) {
+            TeamOrchestrator.shared.refreshLeaderParticipationControls()
+        }
+    }
+
     static func writeLeaderParticipationControl(
         teamName: String, sessionID: String, supportedLeader: Bool,
         delegationState: ProjectDelegationState = .default,
+        measurement: LeaderTurnLog.Health? = nil,
         defaults: UserDefaults = LeaderParticipationSettings.defaultsForCurrentProcess()
     ) {
         guard let data = leaderParticipationControlData(
             teamName: teamName, sessionID: sessionID,
             supportedLeader: supportedLeader, delegationState: delegationState,
-            defaults: defaults
+            measurement: measurement, defaults: defaults
         ) else { return }
         let file = URL(fileURLWithPath: leaderParticipationControlFile(teamName: teamName))
         writeLeaderParticipationControlData(data, to: file)
@@ -4470,10 +4489,14 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String, sessionID: String, supportedLeader: Bool,
         delegationState: ProjectDelegationState = .default,
         healthScope: LeaderParticipationSettings.HealthScope = .controlHost,
+        measurement: LeaderTurnLog.Health? = nil,
         defaults: UserDefaults = LeaderParticipationSettings.defaultsForCurrentProcess()
     ) -> Data? {
         let settings = LeaderParticipationSettings.load(from: defaults)
-        let health = LeaderParticipationSettings.Health(measurement: LeaderTurnLog.health(team: teamName))
+        // nil reads the log here; main-thread callers pass a cached value.
+        let health = LeaderParticipationSettings.Health(
+            measurement: measurement ?? LeaderTurnLog.health(team: teamName)
+        )
         // Read the roster here rather than at each call site: every writer of
         // this file needs the same count, and `agentNames(for:)` already takes
         // the store's lock. A team with no registered roster yields zero, which
@@ -4527,16 +4550,20 @@ final class TeamOrchestrator: ObservableObject {
     func refreshLeaderParticipationControls() {
         for team in teams.values {
             let supported = leaderMeasurementCapability(for: team) == .supported
+            // Until this Project's first background read lands, keep whatever
+            // file is there: an empty measurement fails the promotion gate and
+            // would write `healthy: false` for turns that never saw it fail.
+            guard let measurement = Self.cachedLeaderHealth(teamName: team.id) else { continue }
             switch team.leaderEndpoint {
             case .local:
                 guard let data = Self.leaderParticipationControlData(
                     teamName: team.id, sessionID: team.leaderSessionId,
-                    supportedLeader: supported, delegationState: team.delegationState
+                    supportedLeader: supported, delegationState: team.delegationState,
+                    measurement: measurement
                 ), leaderParticipationControlPayloads[team.id] != data else { continue }
                 leaderParticipationControlPayloads[team.id] = data
-                Self.writeLeaderParticipationControl(
-                    teamName: team.id, sessionID: team.leaderSessionId,
-                    supportedLeader: supported, delegationState: team.delegationState
+                Self.writeLeaderParticipationControlData(
+                    data, to: URL(fileURLWithPath: Self.leaderParticipationControlFile(teamName: team.id))
                 )
             case .peer(let hostKey):
                 // Both of these used to `continue` in silence, which is how a
@@ -4568,7 +4595,7 @@ final class TeamOrchestrator: ObservableObject {
                 guard let data = Self.leaderParticipationControlData(
                     teamName: team.id, sessionID: team.leaderSessionId,
                     supportedLeader: supported, delegationState: delegationState,
-                    healthScope: .executionHost
+                    healthScope: .executionHost, measurement: measurement
                 ), leaderParticipationControlPayloads[team.id] != data else { continue }
                 let teamID = team.id
                 // Queue the newest payload, then start a writer only if none is

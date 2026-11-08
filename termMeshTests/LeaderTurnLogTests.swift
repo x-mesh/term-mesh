@@ -532,6 +532,72 @@ final class LeaderTurnLogTests: XCTestCase {
         )
     }
 
+    /// Every control-file refresh asks for each Project's health on the main
+    /// thread. Cold, the answer is nil while the read runs in the background,
+    /// and the caller is asked to write again once it lands.
+    @MainActor
+    func testTeamCachedHealthIsNilWhenColdAndReadsOffMain() throws {
+        let log = try temporaryLog()
+        let lock = NSLock()
+        var readsOnMain: [Bool] = []
+        let measured = LeaderTurnLog.Health(
+            supportedTurns: 3, linkedTurns: 3, statedTurns: 3, unstatedTurns: 0,
+            unsupportedTurns: 0, degradedTurns: 0, malformedLines: 0, observedDays: 1
+        )
+        let start = Date(timeIntervalSince1970: 1_800_000_300)
+        LeaderTurnLog.configureHealthRefreshForTesting(
+            reader: { url in
+                lock.lock()
+                if url == log { readsOnMain.append(Thread.isMainThread) }
+                lock.unlock()
+                return measured
+            },
+            clock: { start }
+        )
+        defer { LeaderTurnLog.configureHealthRefreshForTesting(reader: nil) }
+
+        let changed = expectation(description: "caller asked to write again")
+        XCTAssertNil(LeaderTurnLog.cachedHealth(from: log, team: "p", now: start) {
+            changed.fulfill()
+        })
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        wait(for: [changed], timeout: 2)
+
+        XCTAssertEqual(
+            LeaderTurnLog.cachedHealth(from: log, team: "p", now: start.addingTimeInterval(1)) {
+                XCTFail("a value read within the interval must not start another read")
+            },
+            measured
+        )
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        lock.lock()
+        defer { lock.unlock() }
+        XCTAssertEqual(readsOnMain, [false])
+    }
+
+    /// The background read must scope to the Project it was asked for: the
+    /// log holds every Project on the host.
+    @MainActor
+    func testTeamCachedHealthCountsOnlyThatProjectsTurns() throws {
+        let log = try temporaryLog()
+        for (team, prompt) in [("alpha", "one"), ("alpha", "two"), ("beta", "three")] {
+            try LeaderTurnLog.append(
+                .turnStart(team: team, surfaceID: "surface-\(prompt)", prompt: prompt), to: log
+            )
+        }
+        LeaderTurnLog.configureHealthRefreshForTesting(reader: nil)
+
+        let landed = expectation(description: "alpha read landed")
+        XCTAssertNil(LeaderTurnLog.cachedHealth(from: log, team: "alpha") { landed.fulfill() })
+        LeaderTurnLog.waitForHealthRefreshForTesting()
+        wait(for: [landed], timeout: 2)
+
+        let alpha = try XCTUnwrap(LeaderTurnLog.cachedHealth(from: log, team: "alpha") {})
+        XCTAssertEqual(alpha, LeaderTurnLog.health(from: log, team: "alpha"))
+        XCTAssertEqual(alpha.supportedTurns, 2)
+        XCTAssertNotEqual(alpha, LeaderTurnLog.health(from: log, team: "beta"))
+    }
+
     @MainActor
     func testCachedHealthServesStaleValueWithoutReadingOnMain() throws {
         let log = try temporaryLog()
