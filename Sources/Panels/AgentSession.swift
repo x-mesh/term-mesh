@@ -968,6 +968,14 @@ final class AgentSession {
     /// behaviour, never to a pane that silently stops updating.
     @ObservationIgnored var isVisible = true {
         didSet {
+            if !isVisible, oldValue, extraTextBudget > 0 {
+                // History opened with "Show earlier" would otherwise be laid
+                // out again on every later mount of this pane. Shrink while
+                // hidden, so the next mount starts from the default window.
+                extraTextBudget = 0
+                entriesDirty = true
+                publishEntries(whileHidden: true)
+            }
             guard isVisible, isVisible != oldValue, entriesDirty else { return }
             publishEntries()
         }
@@ -983,11 +991,11 @@ final class AgentSession {
         }
     }
 
-    private func publishEntries() {
+    private func publishEntries(whileHidden: Bool = false) {
         guard entriesDirty else { return }
         // Leave `entriesDirty` standing so the work resumes on the way back in;
         // `rowsStructureDirty` and `dirtyEntryIDs` keep accumulating with it.
-        guard isVisible else { return }
+        guard isVisible || whileHidden else { return }
         entriesDirty = false
         // The incremental branch below maps `rows[relative]` onto
         // `entries[displayStart + relative]` and uses `rows.count` as the width

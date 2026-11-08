@@ -2468,6 +2468,25 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.canShowEarlierEntries)
     }
 
+    func testHidingThePaneReturnsShownHistoryToTheDefaultBudget() {
+        let key = "agentRenderedTextBudget"
+        UserDefaults.standard.set(100, forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        let s = session([
+            blockStart(0, "text"), delta(0, String(repeating: "x", count: 5_000)), blockStop(0),
+            blockStart(0, "text"), delta(0, "short"), blockStop(0),
+        ])
+        s.showEarlierEntries()
+        XCTAssertEqual(s.rows.count, 2)
+
+        s.isVisible = false
+        XCTAssertEqual(s.rows.count, 1, "the next mount must not lay out the opened history")
+        s.isVisible = true
+        XCTAssertEqual(s.rows.count, 1)
+        XCTAssertTrue(s.canShowEarlierEntries)
+    }
+
     func testSocketTranscriptReadIsNotCutByTheTextBudget() {
         let key = "agentRenderedTextBudget"
         UserDefaults.standard.set(100, forKey: key)
