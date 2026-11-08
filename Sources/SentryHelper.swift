@@ -9,7 +9,9 @@ import Bonsplit  // dlog
 func sentryBreadcrumb(_ message: String, category: String = "ui", data: [String: Any]? = nil) {
     let crumb = Breadcrumb(level: .info, category: category)
     crumb.message = message
-    crumb.data = data
+    for (key, value) in data ?? [:] {
+        crumb.setData(value: value, key: key)
+    }
     SentrySDK.addBreadcrumb(crumb)
 }
 
@@ -261,7 +263,9 @@ enum LayoutHangDiagnostics {
 
         let crumb = Breadcrumb(level: .warning, category: "hang")
         crumb.message = "main-thread stall \(String(format: "%.1f", since))s; last_host=\(host)"
-        crumb.data = ctx
+        for (key, value) in ctx {
+            crumb.setData(value: value, key: key)
+        }
         SentrySDK.addBreadcrumb(crumb)
     }
 }
