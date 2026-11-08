@@ -3077,7 +3077,11 @@ final class TeamOrchestrator: ObservableObject {
             // tm-agent accepts the control file only when its session_id matches this value.
             leaderEnv["TERMMESH_LEADER_SESSION_ID"] = leaderSessionId
             // A cold cache skips this write; the background read that fills
-            // it calls `refreshLeaderParticipationControls`, which writes it.
+            // it, or the daemon sync after registration, writes it through
+            // `refreshLeaderParticipationControls`. That refresh skips a
+            // payload equal to the cached one, and a same-named Project
+            // removed earlier can leave one behind with its file gone.
+            leaderParticipationControlPayloads[name] = nil
             if let measurement = Self.cachedLeaderHealth(teamName: name) {
                 Self.writeLeaderParticipationControl(
                     teamName: name, sessionID: leaderSessionId,
