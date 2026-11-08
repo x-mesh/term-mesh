@@ -914,6 +914,36 @@ final class AgentSession {
     /// The bound `rows` was last built with. Only differs from
     /// `maxRenderedEntries` when the override moved between two publishes.
     @ObservationIgnored private var renderedBound = 0
+    /// The text budget `rows` was last built with, and the index in `entries`
+    /// of its first row. The budget makes the window's start depend on entry
+    /// sizes, so the incremental branch reads it here instead of deriving it
+    /// from the count.
+    @ObservationIgnored private var renderedBudget = 0
+    @ObservationIgnored private var renderedStart = 0
+    /// Budget added by "Show earlier" in this pane.
+    @ObservationIgnored private var extraTextBudget = 0
+
+    private var currentTextBudget: Int {
+        Self.renderedTextBudget + extraTextBudget
+    }
+
+    /// Whether the text budget, not the count bound, hides the oldest rows.
+    var canShowEarlierEntries: Bool {
+        omittedEntryCount > max(0, entries.count - Self.maxRenderedEntries)
+    }
+
+    /// Adds one more budget of history, and never less than the next older
+    /// entry: an answer larger than one step would otherwise leave the button
+    /// doing nothing.
+    func showEarlierEntries() {
+        guard renderedStart > 0, renderedStart <= entries.count else { return }
+        let shown = entries[renderedStart...].reduce(0) { $0 + Self.renderedTextBytes($1) }
+        let next = Self.renderedTextBytes(entries[renderedStart - 1])
+        extraTextBudget = max(extraTextBudget + Self.renderedTextBudget,
+                              shown + next - Self.renderedTextBudget)
+        entriesDirty = true
+        publishEntries()
+    }
 
     /// Whether this transcript is on screen — the pane's tab is selected, its
     /// workspace is showing, and no sibling pane is zoomed over it.
@@ -966,13 +996,16 @@ final class AgentSession {
         // full — otherwise `displayStart` moves under an array that did not,
         // and the branch reads past the end of `entries`.
         let bound = Self.maxRenderedEntries
-        if rowsStructureDirty || renderedBound != bound {
-            let display = Self.displayRows(for: entries)
+        let budget = currentTextBudget
+        if rowsStructureDirty || renderedBound != bound || renderedBudget != budget {
+            let display = Self.displayRows(for: entries, textBudget: budget)
             rows = display.rows
             omittedEntryCount = display.omitted
             renderedBound = bound
+            renderedBudget = budget
+            renderedStart = display.omitted
         } else if !dirtyEntryIDs.isEmpty {
-            let displayStart = max(0, entries.count - bound)
+            let displayStart = renderedStart
             var relativeIndexes = Set<Int>()
             for id in dirtyEntryIDs {
                 guard let absolute = entries.firstIndex(where: { $0.id == id }),
@@ -1191,9 +1224,41 @@ final class AgentSession {
     /// model history above. A native agent can emit hundreds of tool events in
     /// one task; mounting all 2,000 rich rows makes every streamed delta more
     /// expensive even after lazy placement is removed.
-    static func displayRows(for entries: [Entry]) -> (omitted: Int, rows: [Row]) {
-        let omitted = max(0, entries.count - maxRenderedEntries)
-        return (omitted, rows(for: Array(entries.suffix(maxRenderedEntries))))
+    ///
+    /// The count alone does not bound the work: an answer of a few hundred
+    /// lines costs as much as hundreds of short rows. Every mount and unmount
+    /// of the pane lays the whole window out again, so the window also stops
+    /// at `textBudget` bytes of entry text, counted from the newest entry. The
+    /// newest entry is always kept, whatever its size.
+    static func displayRows(
+        for entries: [Entry],
+        textBudget: Int? = nil
+    ) -> (omitted: Int, rows: [Row]) {
+        let textBudget = textBudget ?? renderedTextBudget
+        let countStart = max(0, entries.count - maxRenderedEntries)
+        var start = entries.count
+        var spent = 0
+        while start > countStart {
+            let cost = renderedTextBytes(entries[start - 1])
+            if start < entries.count, spent + cost > textBudget { break }
+            spent += cost
+            start -= 1
+        }
+        return (start, rows(for: Array(entries[start...])))
+    }
+
+    static func renderedTextBytes(_ entry: Entry) -> Int {
+        switch entry {
+        case .said(_, _, let text), .answered(_, let text), .notice(_, let text):
+            return text.utf8.count
+        case .thought(_, let text):
+            return text?.utf8.count ?? 0
+        case .tool(_, let call):
+            // A result sits under a fold that is closed by default.
+            return call.headline.utf8.count
+        case .turnEnded:
+            return 0
+        }
     }
 
     /// One shared projection for the collapsed tool row and socket reads.
@@ -1363,9 +1428,12 @@ final class AgentSession {
     /// `rows` intentionally stay stale during streaming to avoid SwiftUI work.
     /// Taking the projection on the main actor makes a streaming answer one
     /// coherent snapshot rather than a mix of two deltas.
+    ///
+    /// The text budget is left out: it bounds layout work in the pane, and
+    /// `tm-agent read` callers cannot press "Show earlier".
     func visibleTranscriptText(lineLimit: Int? = nil) -> String {
         Self.visibleTranscriptText(
-            rows: Self.displayRows(for: entries).rows,
+            rows: Self.displayRows(for: entries, textBudget: .max).rows,
             lineLimit: lineLimit,
             footer: toolFailureWarning
         )
@@ -1424,6 +1492,18 @@ final class AgentSession {
     static var maxRenderedEntries: Int {
         let override = UserDefaults.standard.integer(forKey: "agentMaxRenderedEntries")
         return override > 0 ? override : 300
+    }
+
+    /// UTF-8 bytes of entry text the window mounts by default. On a Release
+    /// build, four panes holding nine answers of about 22 KB each took 15-32 s
+    /// of main thread to mount when their workspace was selected and 7-17 s to
+    /// unmount. With this budget the same switch took 3.5 s to mount and
+    /// 1.4-2.7 s to unmount. Read live like the count above:
+    ///
+    ///   defaults write <bundle id> agentRenderedTextBudget -int 65536
+    static var renderedTextBudget: Int {
+        let override = UserDefaults.standard.integer(forKey: "agentRenderedTextBudget")
+        return override > 0 ? override : 32 * 1024
     }
 
     /// Changes on every mutation, not just every append.

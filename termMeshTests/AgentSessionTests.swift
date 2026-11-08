@@ -2397,6 +2397,92 @@ final class AgentSessionTests: XCTestCase {
                        "and must still be the tail of the transcript")
     }
 
+    /// The count bound alone let four panes of long answers hold the main
+    /// thread for seconds on every workspace switch. The window also stops at
+    /// a text budget, counted from the newest entry.
+    func testDisplayedRowsStopAtTheTextBudget() {
+        let long = String(repeating: "a", count: 20_000)
+        let entries: [AgentSession.Entry] = (0..<5).map { _ in .answered(id: UUID(), long) }
+            + [.said(id: UUID(), .leader, "next")]
+
+        let display = AgentSession.displayRows(for: entries, textBudget: 32 * 1024)
+
+        XCTAssertEqual(display.omitted, 4)
+        XCTAssertEqual(display.rows.map(\.id), Array(entries.suffix(2)).map(\.id))
+        XCTAssertEqual(display.rows.first?.topGap,
+                       AgentSession.topGap(before: entries[4], after: nil))
+    }
+
+    func testTheNewestEntryIsShownEvenWhenItAloneExceedsTheBudget() {
+        let entries: [AgentSession.Entry] = [
+            .answered(id: UUID(), "older"),
+            .answered(id: UUID(), String(repeating: "a", count: 100_000)),
+        ]
+
+        let display = AgentSession.displayRows(for: entries, textBudget: 32 * 1024)
+
+        XCTAssertEqual(display.omitted, 1)
+        XCTAssertEqual(display.rows.map(\.id), [entries[1].id])
+    }
+
+    func testShowEarlierAddsOneBudgetOfHistoryAndStreamingStaysOnTheTail() {
+        let key = "agentRenderedTextBudget"
+        UserDefaults.standard.set(1_000, forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        var lines: [String] = []
+        for index in 0..<6 {
+            lines += [blockStart(0, "text"),
+                      delta(0, "\(index)" + String(repeating: "x", count: 600)),
+                      blockStop(0)]
+        }
+        lines += [blockStart(0, "text"), delta(0, "the open one")]
+        let s = session(lines)
+        XCTAssertEqual(s.rows.count, 2, "the open answer and one 601-byte answer fit 1,000 bytes")
+        XCTAssertTrue(s.canShowEarlierEntries)
+
+        s.showEarlierEntries()
+        XCTAssertEqual(s.rows.count, 4, "a second budget adds two more answers")
+
+        // Growing the open answer takes the incremental branch, which must map
+        // rows onto the window the budget chose rather than onto the count.
+        s.ingestForTesting(delta(0, " and more of it"))
+        XCTAssertEqual(s.rows.map(\.id), Array(s.entries.suffix(4)).map(\.id))
+        XCTAssertEqual(s.visibleTranscriptText().contains("the open one and more of it"), true)
+    }
+
+    func testShowEarlierRevealsAnOlderEntryLargerThanOneBudget() {
+        let key = "agentRenderedTextBudget"
+        UserDefaults.standard.set(100, forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        let s = session([
+            blockStart(0, "text"), delta(0, String(repeating: "x", count: 5_000)), blockStop(0),
+            blockStart(0, "text"), delta(0, "short"), blockStop(0),
+        ])
+        XCTAssertEqual(s.rows.count, 1)
+
+        s.showEarlierEntries()
+
+        XCTAssertEqual(s.rows.count, 2, "one press must reveal the 5,000-byte answer above")
+        XCTAssertFalse(s.canShowEarlierEntries)
+    }
+
+    func testSocketTranscriptReadIsNotCutByTheTextBudget() {
+        let key = "agentRenderedTextBudget"
+        UserDefaults.standard.set(100, forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        let s = session([
+            blockStart(0, "text"), delta(0, "first answer " + String(repeating: "x", count: 5_000)), blockStop(0),
+            blockStart(0, "text"), delta(0, "short"), blockStop(0),
+        ])
+        XCTAssertEqual(s.rows.count, 1, "the pane mounts only the newest answer")
+
+        XCTAssertTrue(s.visibleTranscriptText().contains("first answer"),
+                      "a leader reading over the socket still gets the older answer")
+    }
+
     /// A streamed delta must announce itself once. The session used to publish
     /// both `entries` and `revision` for one mutation, and `AgentPanel`
     /// forwarded every announcement, so the transcript rebuilt itself twice per
