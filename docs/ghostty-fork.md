@@ -239,6 +239,23 @@ over this summary.
   threads.
 - Upstreamable: yes, if upstream also lets the host view outlive the renderer.
 
+### 8) End a link before Hangul that follows an ASCII letter or digit
+
+- Commit: `2d93bd277` (fix(link): end a link before Hangul that follows an ASCII letter or digit)
+- Files: `src/config/url.zig`
+- Korean prose attaches particles directly to a path or URL, for example
+  `/tmp/demo.gif에`. Oniguruma `\w` matches Hangul in UTF-8, so the link
+  included the particle and opening it failed.
+- The URL and path character classes now accept a non-ASCII word character
+  only when it does not directly follow `[A-Za-z0-9]`. Names such as
+  `보고서.pdf`, `한글폴더/notes.md` and `report_최종.pdf` still match.
+- Known limit: a particle that follows a Hangul file name, for example
+  `보고서.pdf를`, stays part of the link.
+- Merge note: if upstream changes these character classes, keep them built
+  with `linkChars`.
+- Upstreamable: maybe. Mixed names such as `v2한글.txt` now split at the
+  Hangul character.
+
 ## Merge conflict notes
 
 These files change frequently upstream; be careful when rebasing the fork:
