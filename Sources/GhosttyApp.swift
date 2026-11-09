@@ -759,17 +759,26 @@ class GhosttyApp {
         runtimeConfig.action_cb = { app, target, action in
             return GhosttyApp.shared.handleAction(target: target, action: action)
         }
-        runtimeConfig.read_clipboard_cb = { userdata, location, state in
-            // Read clipboard. Returns bool (ghostty ABI changed void -> bool):
-            // true means we accepted the request and will complete it, so ghostty
-            // keeps the request state alive; false means unhandled, so ghostty
-            // frees the request state. Mismatching this leaks or double-frees the
-            // request — see ghostty src/apprt/embedded.zig `readClipboard`.
+        runtimeConfig.read_clipboard_cb = { userdata, location, state, mimes, mimeCount, listOnly in
+            // STARTED means we will complete the request, so ghostty keeps the
+            // request state alive; any other result makes ghostty free it.
+            // Mismatching this leaks or double-frees the request — see ghostty
+            // src/apprt/embedded.zig `readClipboard`. term-mesh serves text only.
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata),
-                  let surface = callbackContext.runtimeSurface else { return false }
+                  let surface = callbackContext.runtimeSurface else {
+                return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
+            }
 
+            let textMime = GhosttyApp.requestedTextMime(mimes, count: mimeCount)
             let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location)
-            let value = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) } ?? ""
+            let text = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) }
+            if textMime == nil && !listOnly { return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE }
+            let available = text == nil ? [] : ["text/plain"]
+            guard let textMime, !listOnly else {
+                GhosttyApp.completeClipboardText(surface, mime: nil, text: "", available: available, state: state)
+                return GHOSTTY_CLIPBOARD_READ_STARTED
+            }
+            let value = text ?? ""
 
             // A picture or a Finder file pastes as a local PATH, which is what a
             // CLI agent can act on. That path is meaningless on a peer, so when
@@ -819,25 +828,35 @@ class GhosttyApp {
                             #endif
                             return
                         }
-                        pasted.withCString { ptr in
-                            ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
-                        }
+                        GhosttyApp.completeClipboardText(
+                            surface, mime: textMime, text: pasted, available: available, state: state)
                     }
                 }
-                return true
+                return GHOSTTY_CLIPBOARD_READ_STARTED
             }
 
-            value.withCString { ptr in
-                ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
-            }
-            return true
+            GhosttyApp.completeClipboardText(
+                surface, mime: textMime, text: value, available: available, state: state)
+            return GHOSTTY_CLIPBOARD_READ_STARTED
         }
-        runtimeConfig.confirm_read_clipboard_cb = { userdata, content, state, _ in
-            guard let content else { return }
+        runtimeConfig.confirm_read_clipboard_cb = { userdata, confirm, state, _ in
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata),
                   let surface = callbackContext.runtimeSurface else { return }
+            guard let confirm else {
+                ghostty_surface_deny_clipboard_request(surface, state)
+                return
+            }
 
-            ghostty_surface_complete_clipboard_request(surface, content, state, true)
+            // term-mesh approves clipboard reads without a dialog, as before the
+            // 2026-08 ghostty-org merge; complete with exactly what was offered.
+            var completion = ghostty_clipboard_complete_s(
+                contents: confirm.pointee.contents,
+                contents_len: confirm.pointee.contents_len,
+                available: confirm.pointee.available,
+                available_len: confirm.pointee.available_len,
+                confirmed: true,
+                remember: false)
+            ghostty_surface_complete_clipboard_request(surface, &completion, state)
         }
         runtimeConfig.write_clipboard_cb = { _, location, content, len, _ in
             // Write clipboard
@@ -847,7 +866,11 @@ class GhosttyApp {
             var fallback: String?
             for item in buffer {
                 guard let dataPtr = item.data else { continue }
-                let value = String(cString: dataPtr)
+                // Contents are length-delimited and not guaranteed to be
+                // null-terminated since the 2026-08 ghostty-org merge.
+                let value = String(
+                    decoding: UnsafeRawBufferPointer(start: dataPtr, count: item.len),
+                    as: UTF8.self)
 
                 if let mimePtr = item.mime {
                     let mime = String(cString: mimePtr)
@@ -1353,6 +1376,61 @@ class GhosttyApp {
     private static func callbackContext(from userdata: UnsafeMutableRawPointer?) -> GhosttySurfaceCallbackContext? {
         guard let userdata else { return nil }
         return Unmanaged<GhosttySurfaceCallbackContext>.fromOpaque(userdata).takeUnretainedValue()
+    }
+
+    /// The first requested MIME type term-mesh can serve, or nil. term-mesh only
+    /// reads text from the pasteboard, so only the `text/plain` family matches.
+    private static func requestedTextMime(
+        _ mimes: UnsafePointer<UnsafePointer<CChar>?>?,
+        count: Int
+    ) -> String? {
+        guard let mimes else { return nil }
+        for index in 0..<count {
+            guard let ptr = mimes[index] else { continue }
+            let mime = String(cString: ptr)
+            if mime.hasPrefix("text/plain") { return mime }
+        }
+        return nil
+    }
+
+    /// Complete a clipboard read with one text representation. The C strings
+    /// and buffers only need to live for the duration of the call.
+    private static func completeClipboardText(
+        _ surface: ghostty_surface_t,
+        mime: String?,
+        text: String,
+        available: [String],
+        state: UnsafeMutableRawPointer?
+    ) {
+        let mimeCString = mime.flatMap { strdup($0) }
+        let availableCStrings = available.compactMap { strdup($0) }
+        defer {
+            free(mimeCString)
+            availableCStrings.forEach { free($0) }
+        }
+        // utf8CString is NUL-terminated, so the buffer always has a base
+        // address; the length excludes the terminator.
+        let textCString = text.utf8CString
+        textCString.withUnsafeBufferPointer { textBuf in
+            var contents: [ghostty_clipboard_content_s] = []
+            if let mimeCString, let data = textBuf.baseAddress {
+                contents.append(ghostty_clipboard_content_s(
+                    mime: mimeCString, data: data, len: textBuf.count - 1))
+            }
+            let availablePtrs: [UnsafePointer<CChar>?] = availableCStrings.map { UnsafePointer($0) }
+            contents.withUnsafeBufferPointer { contentsBuf in
+                availablePtrs.withUnsafeBufferPointer { availableBuf in
+                    var completion = ghostty_clipboard_complete_s(
+                        contents: contentsBuf.baseAddress,
+                        contents_len: contentsBuf.count,
+                        available: availableBuf.baseAddress,
+                        available_len: availableBuf.count,
+                        confirmed: false,
+                        remember: false)
+                    ghostty_surface_complete_clipboard_request(surface, &completion, state)
+                }
+            }
+        }
     }
 
     private func handleAction(target: ghostty_target_s, action: ghostty_action_s) -> Bool {
