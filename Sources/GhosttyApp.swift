@@ -1893,6 +1893,17 @@ class GhosttyApp {
             guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len) else {
                 return false
             }
+            // OSC 8 targets and links detected in output are written by
+            // whatever runs in the terminal; only `text`/`html` come from
+            // Ghostty itself.
+            let untrusted = openUrl.kind == GHOSTTY_ACTION_OPEN_URL_KIND_OSC8
+                || openUrl.kind == GHOSTTY_ACTION_OPEN_URL_KIND_UNKNOWN
+            if untrusted, UntrustedURL.containsUnsafeCharacters(urlString) {
+                // Check the raw text: resolving it to a URL percent-encodes
+                // the invisible characters the block alert has to show.
+                DispatchQueue.main.async { UntrustedURLOpener.open(urlString) }
+                return true
+            }
             let context: TerminalOpenURLContext = surfaceView.window is PeerRelayWorkspaceWindow
                 ? .peerRelay
                 : .standard
@@ -1908,7 +1919,7 @@ class GhosttyApp {
                 Self.terminalLinkResolutionQueue.async {
                     guard let resolved = resolveTerminalOpenURLTarget(urlString, relativePaths: relativePaths) else { return }
                     DispatchQueue.main.async {
-                        _ = Self.openTerminalLink(resolved, context: context, tabId: tabId, surfaceId: surfaceId)
+                        _ = Self.openTerminalLink(resolved, context: context, untrusted: untrusted, tabId: tabId, surfaceId: surfaceId)
                     }
                 }
                 return true
@@ -1918,7 +1929,7 @@ class GhosttyApp {
                 // run its own opener on the raw text, which is the wrong target.
                 return true
             }
-            return Self.openTerminalLink(resolvedTarget, context: context, tabId: surfaceView.tabId, surfaceId: surfaceView.terminalSurface?.id)
+            return Self.openTerminalLink(resolvedTarget, context: context, untrusted: untrusted, tabId: surfaceView.tabId, surfaceId: surfaceView.terminalSurface?.id)
         default:
             return false
         }
@@ -1929,9 +1940,20 @@ class GhosttyApp {
         qos: .userInitiated
     )
 
+    /// Opens a terminal link outside term-mesh. Untrusted links go through
+    /// `UntrustedURLOpener` so executable targets never reach Launch Services.
+    private static func openTerminalLinkExternally(_ url: URL, untrusted: Bool) {
+        if untrusted {
+            UntrustedURLOpener.open(url.absoluteString)
+        } else {
+            _ = NSWorkspace.shared.open(url)
+        }
+    }
+
     private static func openTerminalLink(
         _ resolvedTarget: TerminalOpenURLTarget,
         context: TerminalOpenURLContext,
+        untrusted: Bool,
         tabId: UUID?,
         surfaceId: UUID?
     ) -> Bool {
@@ -1947,28 +1969,28 @@ class GhosttyApp {
             dlog("relay.link.open external scheme=\(urlToOpen.scheme ?? "unknown")")
             #endif
             DispatchQueue.main.async {
-                _ = NSWorkspace.shared.open(urlToOpen)
+                openTerminalLinkExternally(urlToOpen, untrusted: untrusted)
             }
             return true
         }
         if !BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser() {
             let urlToOpen = target.url
-            DispatchQueue.main.async { _ = NSWorkspace.shared.open(urlToOpen) }
+            DispatchQueue.main.async { openTerminalLinkExternally(urlToOpen, untrusted: untrusted) }
             return true
         }
         switch target {
         case let .external(url):
-            DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+            DispatchQueue.main.async { openTerminalLinkExternally(url, untrusted: untrusted) }
             return true
         case let .embeddedBrowser(url):
             guard let host = BrowserInsecureHTTPSettings.normalizeHost(url.host ?? "") else {
-                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+                DispatchQueue.main.async { openTerminalLinkExternally(url, untrusted: untrusted) }
                 return true
             }
 
             // If a host whitelist is configured and this host isn't in it, open externally.
             if !BrowserLinkOpenSettings.hostMatchesWhitelist(host) {
-                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+                DispatchQueue.main.async { openTerminalLinkExternally(url, untrusted: untrusted) }
                 return true
             }
             guard let tabId, let surfaceId else { return false }
@@ -1989,7 +2011,7 @@ class GhosttyApp {
                     return workspace.newBrowserSplit(from: surfaceId, orientation: .horizontal, url: url) != nil
                 }()
                 if !opened {
-                    _ = NSWorkspace.shared.open(url)
+                    openTerminalLinkExternally(url, untrusted: untrusted)
                 }
             }
             return true
