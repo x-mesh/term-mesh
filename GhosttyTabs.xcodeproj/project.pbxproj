@@ -1850,7 +1850,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 386;
+				CURRENT_PROJECT_VERSION = 387;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1859,7 +1859,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.285.0;
+				MARKETING_VERSION = 0.286.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1889,7 +1889,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 386;
+				CURRENT_PROJECT_VERSION = 387;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1898,7 +1898,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.285.0;
+				MARKETING_VERSION = 0.286.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1952,10 +1952,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 386;
+				CURRENT_PROJECT_VERSION = 387;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.285.0;
+				MARKETING_VERSION = 0.286.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1969,10 +1969,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 386;
+				CURRENT_PROJECT_VERSION = 387;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.285.0;
+				MARKETING_VERSION = 0.286.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1986,10 +1986,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 386;
+				CURRENT_PROJECT_VERSION = 387;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.285.0;
+				MARKETING_VERSION = 0.286.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -2005,10 +2005,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 386;
+				CURRENT_PROJECT_VERSION = 387;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.285.0;
+				MARKETING_VERSION = 0.286.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
