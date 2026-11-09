@@ -1070,7 +1070,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 Self.surfaceLog("createSurface diagnostics count=\(count)")
                 for i in 0..<count {
                     let diag = ghostty_config_get_diagnostic(cfg, UInt32(i))
-                    let msg = diag.message.flatMap { String(cString: $0) } ?? "(null)"
+                    let msg = String(cString: diag.message)
                     Self.surfaceLog("  [\(i)] \(msg)")
                 }
             } else {
@@ -2389,7 +2389,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 let data = chunk.utf8
                 let len = UInt(data.count)
                 data.withContiguousStorageIfAvailable { buf in
-                    ghostty_surface_text(surface, buf.baseAddress, len)
+                    guard let base = buf.baseAddress else { return }
+                    ghostty_surface_text(surface, base, len)
                 } ?? chunk.withCString { cstr in
                     ghostty_surface_text(surface, cstr, len)
                 }
@@ -4177,7 +4178,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         case GHOSTTY_KEY_TABLE_ACTIVATE:
             let namePtr = action.value.activate.name
             let nameLen = Int(action.value.activate.len)
-            if let namePtr, nameLen > 0 {
+            if nameLen > 0 {
                 let data = Data(bytes: namePtr, count: nameLen)
                 if let name = String(data: data, encoding: .utf8) {
                     keyTables.append(name)
