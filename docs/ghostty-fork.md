@@ -265,7 +265,7 @@ patches and merges `ghostty-org/main` in dated stages.
 
 | Stage | ghostty-org commit | Zig | Fork merge |
 |---|---|---|---|
-| 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` |
+| 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` + fixes |
 | 2 | 2026-10-20, before #14519 | 0.16 | not started |
 | 3 | latest | 0.17 | not started |
 
