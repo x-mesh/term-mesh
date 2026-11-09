@@ -769,9 +769,11 @@ class GhosttyApp {
                 return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
             }
 
+            guard let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location) else {
+                return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
+            }
             let textMime = GhosttyApp.requestedTextMime(mimes, count: mimeCount)
-            let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location)
-            let text = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) }
+            let text = GhosttyPasteboardHelper.stringContents(from: pasteboard)
             if textMime == nil && !listOnly { return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE }
             let available = text == nil ? [] : ["text/plain"]
             guard let textMime, !listOnly else {
