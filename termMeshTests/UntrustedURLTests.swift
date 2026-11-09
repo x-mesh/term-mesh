@@ -126,6 +126,24 @@ final class UntrustedURLTests: XCTestCase {
         XCTAssertEqual(UntrustedURL(link.absoluteString).decision, .deny(.unsafeFile))
     }
 
+    func testRejectsPercentEncodedUnsafeCharactersInFileNames() throws {
+        let file = try writeFile("report\u{202E}txt.sh", "safe")
+        let encoded = "file://" + file.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)!
+        XCTAssertFalse(UntrustedURL.containsUnsafeCharacters(encoded))
+        XCTAssertEqual(UntrustedURL(encoded).decision, .deny(.unsafeCharacters))
+    }
+
+    func testRejectsFileURLsWithQueryOrFragment() throws {
+        let file = try writeFile("document.txt", "safe")
+        for suffix in ["?open=1", "#section"] {
+            XCTAssertEqual(UntrustedURL(file.absoluteString + suffix).decision, .deny(.malformedURL), suffix)
+        }
+    }
+
+    func testRejectsFileURLsNamingRemoteHosts() {
+        XCTAssertEqual(UntrustedURL("file://example.com/tmp/file.txt").decision, .deny(.malformedURL))
+    }
+
     func testRejectsMissingFiles() {
         let missing = directory.appending(path: "missing.txt")
         XCTAssertEqual(UntrustedURL(missing.absoluteString).decision, .deny(.inaccessibleFile))

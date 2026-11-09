@@ -170,6 +170,12 @@ private extension UntrustedURL {
             return .deny(.malformedURL)
         }
 
+        // The raw-text check above cannot see percent-encoded characters, and
+        // Launch Services receives the decoded name, so check that name too.
+        guard !Self.containsUnsafeCharacters(url.path) else {
+            return .deny(.unsafeCharacters)
+        }
+
         // Classify the effective object, not the spelling supplied by terminal
         // output. This collapses dot traversal and prevents a harmless-looking
         // symlink name from hiding an executable target.
