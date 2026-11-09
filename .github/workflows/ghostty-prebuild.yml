@@ -4,7 +4,7 @@ name: ghostty-prebuild
 # ghostty submodule pin changes, then publishes the resulting tarball
 # as a GitHub Release asset keyed by the ghostty SHA. `scripts/setup.sh`
 # fetches that asset on cache miss so contributors don't need a working
-# zig toolchain. (ghostty requires zig 0.16.0 since the 2026-08 upstream
+# zig toolchain. (ghostty requires zig 0.17.0 since the 2026-11 upstream
 # sync; the old 0.15.2/macOS-26 SDK incompatibility no longer applies.)
 #
 # Trigger logic:
@@ -77,12 +77,12 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install zig 0.16.0
+      - name: Install zig 0.17.1
         if: steps.check.outputs.skip != 'true'
         run: |
-          curl -fsSL https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz \
+          curl -fsSL https://ziglang.org/download/0.17.1/zig-aarch64-macos-0.17.1.tar.xz \
             | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/zig-aarch64-macos-0.17.1" >> "$GITHUB_PATH"
 
       - name: Verify zig
         if: steps.check.outputs.skip != 'true'

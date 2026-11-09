@@ -7,6 +7,8 @@ When we change the fork, update this document and the parent submodule SHA.
 
 `origin` in `ghostty/` is **`JINWOO-J/ghostty`** — that is the fork we push to.
 `manaflow-ai/ghostty` is `upstream` and is read-only for us.
+`ghostty-org/ghostty` is the `ghostty-org` remote. Since 2026-11 the fork
+merges it directly in dated stages. See "ghostty-org sync".
 
 1) Make changes in `ghostty/`, on the `main` branch. Never on a detached HEAD:
    a commit made there is orphaned the moment anything re-checks-out the
@@ -238,6 +240,140 @@ over this summary.
   paths run inline on the main thread and use `dispatch_sync` only from other
   threads.
 - Upstreamable: yes, if upstream also lets the host view outlive the renderer.
+
+### 8) End a link before Hangul that follows an ASCII letter or digit
+
+- Commit: `2d93bd277` (fix(link): end a link before Hangul that follows an ASCII letter or digit)
+- Files: `src/config/url.zig`
+- Korean prose attaches particles directly to a path or URL, for example
+  `/tmp/demo.gif에`. Oniguruma `\w` matches Hangul in UTF-8, so the link
+  included the particle and opening it failed.
+- The URL and path character classes now accept a non-ASCII word character
+  only when it does not directly follow `[A-Za-z0-9]`. Names such as
+  `보고서.pdf`, `한글폴더/notes.md` and `report_최종.pdf` still match.
+- Known limit: a particle that follows a Hangul file name, for example
+  `보고서.pdf를`, stays part of the link.
+- Merge note: if upstream changes these character classes, keep them built
+  with `linkChars`.
+- Upstreamable: maybe. Mixed names such as `v2한글.txt` now split at the
+  Hangul character.
+
+## ghostty-org sync
+
+manaflow-ai stopped full syncs after 2026-07-22. The fork keeps the cmux
+patches and merges `ghostty-org/main` in dated stages.
+
+| Stage | ghostty-org commit | Zig | Fork merge |
+|---|---|---|---|
+| 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` + fixes |
+| 2 | `b58ef1d678` (2026-10-20, before #14519) | 0.16 | `e29bd7968` |
+| 3 | `cf5519b22f` (2026-11-08) | 0.17 | `2b65b2e243` |
+
+Stage 1 resolution rules. Use the same rules in later stages.
+
+- Renderer (`src/renderer/generic.zig`, `src/renderer/Thread.zig`): keep the
+  cmux swap chain, lease and frame-generation lifecycle. term-mesh calls
+  `ghostty_surface_set_renderer_realized` and `rebuild_renderer` on it.
+  Apply upstream renderer commits one at a time on top of it.
+  Stage 1 leaves out #14017 (GPU release for hidden surfaces), #14035 and
+  #14068 (display link parking), and the `Thread.zig` half of the kitty
+  animation driver (`aee7bf3475`). Kitty image animation does not advance.
+- Kitty graphics (`src/terminal/kitty/graphics_{storage,image,exec}.zig`):
+  use the upstream files. The cmux image and placement count limits are
+  removed. `executeTracked` is ported for replay tracking.
+  `ghostty_surface_restore_kitty_replay` always returns false. term-mesh does
+  not call it.
+- libghostty-vt C API (`src/terminal/c/terminal.zig`,
+  `include/ghostty/vt/terminal.h`): use the upstream files. Only
+  `ghostty_terminal_vt_stream_is_ground` is kept from cmux.
+  `GHOSTTY_OSC_COMMAND_PROGRAM_STATUS` moves to 27.
+- OSC 99: the upstream parser returns raw chunks.
+  `src/terminal/osc/parsers/kitty_notification.zig` joins them in
+  `stream.zig` and emits `show_desktop_notification`.
+- Sentry: use the upstream environ snapshot. The cmux pre-spawn cache
+  directory code is removed.
+- `Surface.occlusionCallback`: dedupe only the mode 2033 report. The cmux
+  renderer publish stays unconditional.
+- Formatter: the cmux cursor restore runs after the screen formatter, and
+  only in origin mode without pending wrap.
+- `src/config/url.zig`: keep the cmux trailing spaces at end of line.
+- Clipboard: the embedder API is MIME-aware. `Sources/GhosttyApp.swift`
+  serves `text/plain` only and approves read confirmations without a dialog.
+
+Known gap: term-mesh opens `GHOSTTY_ACTION_OPEN_URL_KIND_OSC8` links with its
+own opener. Upstream blocks the generic opener for OSC 8 links. This gap
+existed before stage 1.
+
+Test reference for stage 1: `zig build test -Demit-macos-app=false` gives
+4122 passed, 23 skipped, 1 failed. The failed test
+(`OpenGL acknowledges only after successful present and GPU completion`)
+also fails on the fork before the merge.
+
+Stage 2 adds these rules:
+
+- Display link: the cmux renderer uses the upstream
+  `src/renderer/DisplayLink.zig` (#14691). Start, stop and display changes
+  run on the main thread, because a CVDisplayLink stop on the render thread
+  can deadlock against CoreVideo's own reconfiguration on display sleep and
+  wake. The link is created lazily and bound to the surface's initial
+  display. `Surface.deinit` closes it before the renderer thread is freed,
+  also when it skips the GPU teardown. This also fixes a stage 1 leak of the
+  eagerly created per-display link.
+- Renderer: stage 2 leaves out #14446 (shared render device), the OpenGL and
+  EGL rework, and the upstream RenderState overscan. cmux keeps its own
+  pixel-scroll overscan in `src/terminal/render.zig`, so the libghostty-vt
+  render API (`src/terminal/c/render.zig`, `vt/render.h`) stays at stage 1.
+  The wide-char selection fix #14651 depends on that overscan and is left
+  out.
+- OSC 7501 program status: use the upstream parser and stream wiring. The
+  cmux `GHOSTTY_ACTION_PROGRAM_STATUS` app action stays.
+- DECSCUSR defaults: use upstream `Terminal.setCursorStyle`. The cmux
+  handler keeps only its cursor activity counter.
+- Formatter: upstream steps over gaps with CUF and erases background-only
+  cells with ECH. The cmux blank-cell tests now check the replayed cells.
+- `src/os/open.zig`: keep the cmux `drainStderr`, which also reaps the child.
+
+Test reference for stage 2: `zig build test -Demit-macos-app=false` gives
+4312 passed, 30 skipped, 1 failed (the same OpenGL test).
+`zig build test-lib-vt` passes.
+
+Stage 3 adds these rules:
+
+- Zig 0.17: `@hasDecl` only finds `pub` declarations. A check against a
+  private declaration is false without a compile error. cmux tests that
+  chose between a fix and the pre-fix path with `@hasDecl` now call the
+  fix directly, and test mocks that stand in for renderer types declare
+  their methods `pub`. Keep every declaration that a `@hasDecl` checks
+  `pub`.
+- Zig 0.17 also removes `**` array repetition (use `@splat`) and
+  `@cImport`. C headers come from build modules: `ghostty-h` for
+  `include/ghostty.h`, and `pty-c` for `sys/ioctl.h` and `sys/sysctl.h`
+  in `src/termio/Exec.zig`.
+- `include/ghostty.h` is `assume_nonnull` upstream. Every pointer in a
+  cmux declaration is non-null unless it is marked `GHOSTTY_NULLABLE`.
+- Action enum: upstream added `GHOSTTY_ACTION_SET_WINDOW_THEME`, so the
+  cmux actions move again. The ABI test now checks that the cmux actions
+  are last, not their numbers.
+- Render state: the upstream Kitty image placements read rows through
+  `RenderState.rowDataRange` and `viewportY`. cmux implements both for its
+  own overscan layout: the top band, the viewport, then the bottom rows.
+- libghostty-vt render API (`src/terminal/c/render.zig`, `vt/render.h`):
+  use the upstream files again. The stage 1 copy only added one cmux test,
+  which is kept. The C overscan option and data map to the cmux fields
+  through `RenderState.setOverscanRequest` and `overscanCaptured`.
+- `src/Surface.zig` exec path: use the upstream env ownership fix
+  inside the cmux manual-IO branch.
+
+- Wide-char selection #14651: ported after stage 3 (fork `4a79b29f28`).
+  The cmux render state loops over every `row_data` entry, so the change
+  applies without the upstream overscan range.
+
+Test reference for stage 3: `zig build test -Demit-macos-app=false` gives
+4557 passed, 31 skipped, 1 failed (the same OpenGL test).
+`zig build test-lib-vt` passes. The macOS app test step
+(`xcodebuild test -scheme Ghostty`) also fails
+`KeyboardLayoutTests.characterAppliesModifiers` when the active input
+source is Korean 2-Set, because Shift does not change that layout's key A.
 
 ## Merge conflict notes
 

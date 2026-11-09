@@ -704,7 +704,7 @@ class GhosttyApp {
         initLog("ghostty diagnostics (\(label)): count=\(count)")
         for i in 0..<count {
             let diag = ghostty_config_get_diagnostic(config, UInt32(i))
-            let msg = diag.message.flatMap { String(cString: $0) } ?? "(null)"
+            let msg = String(cString: diag.message)
             initLog("  [\(i)] \(msg)")
         }
     }
@@ -748,28 +748,36 @@ class GhosttyApp {
         updateDefaultBackground(from: primaryConfig, source: "initialize.primaryConfig")
 
         // Create runtime config with callbacks
-        var runtimeConfig = ghostty_runtime_config_s()
-        runtimeConfig.userdata = Unmanaged.passUnretained(self).toOpaque()
-        runtimeConfig.supports_selection_clipboard = true
-        runtimeConfig.wakeup_cb = { userdata in
+        let wakeupCallback: ghostty_runtime_wakeup_cb = { userdata in
             DispatchQueue.main.async {
                 GhosttyApp.shared.tick()
             }
         }
-        runtimeConfig.action_cb = { app, target, action in
+        let actionCallback: ghostty_runtime_action_cb = { app, target, action in
             return GhosttyApp.shared.handleAction(target: target, action: action)
         }
-        runtimeConfig.read_clipboard_cb = { userdata, location, state in
-            // Read clipboard. Returns bool (ghostty ABI changed void -> bool):
-            // true means we accepted the request and will complete it, so ghostty
-            // keeps the request state alive; false means unhandled, so ghostty
-            // frees the request state. Mismatching this leaks or double-frees the
-            // request — see ghostty src/apprt/embedded.zig `readClipboard`.
+        let readClipboardCallback: ghostty_runtime_read_clipboard_cb = { userdata, location, state, mimes, mimeCount, listOnly in
+            // STARTED means we will complete the request, so ghostty keeps the
+            // request state alive; any other result makes ghostty free it.
+            // Mismatching this leaks or double-frees the request — see ghostty
+            // src/apprt/embedded.zig `readClipboard`. term-mesh serves text only.
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata),
-                  let surface = callbackContext.runtimeSurface else { return false }
+                  let surface = callbackContext.runtimeSurface else {
+                return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
+            }
 
-            let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location)
-            let value = pasteboard.flatMap { GhosttyPasteboardHelper.stringContents(from: $0) } ?? ""
+            guard let pasteboard = GhosttyPasteboardHelper.pasteboard(for: location) else {
+                return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
+            }
+            let textMime = GhosttyApp.requestedTextMime(mimes, count: mimeCount)
+            let text = GhosttyPasteboardHelper.stringContents(from: pasteboard)
+            if textMime == nil && !listOnly { return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE }
+            let available = text == nil ? [] : ["text/plain"]
+            guard let textMime, !listOnly else {
+                GhosttyApp.completeClipboardText(surface, mime: nil, text: "", available: available, state: state)
+                return GHOSTTY_CLIPBOARD_READ_STARTED
+            }
+            let value = text ?? ""
 
             // A picture or a Finder file pastes as a local PATH, which is what a
             // CLI agent can act on. That path is meaningless on a peer, so when
@@ -819,42 +827,49 @@ class GhosttyApp {
                             #endif
                             return
                         }
-                        pasted.withCString { ptr in
-                            ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
-                        }
+                        GhosttyApp.completeClipboardText(
+                            surface, mime: textMime, text: pasted, available: available, state: state)
                     }
                 }
-                return true
+                return GHOSTTY_CLIPBOARD_READ_STARTED
             }
 
-            value.withCString { ptr in
-                ghostty_surface_complete_clipboard_request(surface, ptr, state, false)
-            }
-            return true
+            GhosttyApp.completeClipboardText(
+                surface, mime: textMime, text: value, available: available, state: state)
+            return GHOSTTY_CLIPBOARD_READ_STARTED
         }
-        runtimeConfig.confirm_read_clipboard_cb = { userdata, content, state, _ in
-            guard let content else { return }
+        let confirmReadClipboardCallback: ghostty_runtime_confirm_read_clipboard_cb = { userdata, confirm, state, _ in
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata),
                   let surface = callbackContext.runtimeSurface else { return }
 
-            ghostty_surface_complete_clipboard_request(surface, content, state, true)
+            // term-mesh approves clipboard reads without a dialog, as before the
+            // 2026-08 ghostty-org merge; complete with exactly what was offered.
+            var completion = ghostty_clipboard_complete_s(
+                contents: confirm.pointee.contents,
+                contents_len: confirm.pointee.contents_len,
+                available: confirm.pointee.available,
+                available_len: confirm.pointee.available_len,
+                confirmed: true,
+                remember: false)
+            ghostty_surface_complete_clipboard_request(surface, &completion, state)
         }
-        runtimeConfig.write_clipboard_cb = { _, location, content, len, _ in
+        let writeClipboardCallback: ghostty_runtime_write_clipboard_cb = { _, location, content, len, _ in
             // Write clipboard
-            guard let content = content, len > 0 else { return }
+            guard len > 0 else { return }
             let buffer = UnsafeBufferPointer(start: content, count: Int(len))
 
             var fallback: String?
             for item in buffer {
-                guard let dataPtr = item.data else { continue }
-                let value = String(cString: dataPtr)
+                let dataPtr = item.data
+                // Contents are length-delimited and not guaranteed to be
+                // null-terminated since the 2026-08 ghostty-org merge.
+                let value = String(
+                    decoding: UnsafeRawBufferPointer(start: dataPtr, count: item.len),
+                    as: UTF8.self)
 
-                if let mimePtr = item.mime {
-                    let mime = String(cString: mimePtr)
-                    if mime.hasPrefix("text/plain") {
-                        GhosttyPasteboardHelper.writeString(value, to: location)
-                        return
-                    }
+                if String(cString: item.mime).hasPrefix("text/plain") {
+                    GhosttyPasteboardHelper.writeString(value, to: location)
+                    return
                 }
 
                 if fallback == nil {
@@ -866,7 +881,7 @@ class GhosttyApp {
                 GhosttyPasteboardHelper.writeString(fallback, to: location)
             }
         }
-        runtimeConfig.close_surface_cb = { userdata, needsConfirmClose in
+        let closeSurfaceCallback: ghostty_runtime_close_surface_cb = { userdata, needsConfirmClose in
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata) else { return }
             let callbackSurfaceId = callbackContext.surfaceId
             let callbackTabId = callbackContext.tabId
@@ -904,6 +919,16 @@ class GhosttyApp {
                 }
             }
         }
+        var runtimeConfig = ghostty_runtime_config_s(
+            userdata: Unmanaged.passUnretained(self).toOpaque(),
+            supports_selection_clipboard: true,
+            wakeup_cb: wakeupCallback,
+            action_cb: actionCallback,
+            read_clipboard_cb: readClipboardCallback,
+            confirm_read_clipboard_cb: confirmReadClipboardCallback,
+            write_clipboard_cb: writeClipboardCallback,
+            close_surface_cb: closeSurfaceCallback,
+            tmux_control_cb: nil)
 
         // Create app
         if let created = ghostty_app_new(&runtimeConfig, primaryConfig) {
@@ -1355,6 +1380,59 @@ class GhosttyApp {
         return Unmanaged<GhosttySurfaceCallbackContext>.fromOpaque(userdata).takeUnretainedValue()
     }
 
+    /// The first requested MIME type term-mesh can serve, or nil. term-mesh only
+    /// reads text from the pasteboard, so only the `text/plain` family matches.
+    private static func requestedTextMime(
+        _ mimes: UnsafePointer<UnsafePointer<CChar>>,
+        count: Int
+    ) -> String? {
+        for index in 0..<count {
+            let mime = String(cString: mimes[index])
+            if mime.hasPrefix("text/plain") { return mime }
+        }
+        return nil
+    }
+
+    /// Complete a clipboard read with one text representation. The C strings
+    /// and buffers only need to live for the duration of the call.
+    private static func completeClipboardText(
+        _ surface: ghostty_surface_t,
+        mime: String?,
+        text: String,
+        available: [String],
+        state: UnsafeMutableRawPointer
+    ) {
+        let mimeCString = mime.flatMap { strdup($0) }
+        let availableCStrings = available.compactMap { strdup($0) }
+        defer {
+            free(mimeCString)
+            availableCStrings.forEach { free($0) }
+        }
+        // utf8CString is NUL-terminated, so the buffer always has a base
+        // address; the length excludes the terminator.
+        let textCString = text.utf8CString
+        textCString.withUnsafeBufferPointer { textBuf in
+            var contents: [ghostty_clipboard_content_s] = []
+            if let mimeCString, let data = textBuf.baseAddress {
+                contents.append(ghostty_clipboard_content_s(
+                    mime: mimeCString, data: data, len: textBuf.count - 1))
+            }
+            let availablePtrs: [UnsafePointer<CChar>] = availableCStrings.map { UnsafePointer($0) }
+            contents.withUnsafeBufferPointer { contentsBuf in
+                availablePtrs.withUnsafeBufferPointer { availableBuf in
+                    var completion = ghostty_clipboard_complete_s(
+                        contents: contentsBuf.baseAddress,
+                        contents_len: contentsBuf.count,
+                        available: availableBuf.baseAddress,
+                        available_len: availableBuf.count,
+                        confirmed: false,
+                        remember: false)
+                    ghostty_surface_complete_clipboard_request(surface, &completion, state)
+                }
+            }
+        }
+    }
+
     private func handleAction(target: ghostty_target_s, action: ghostty_action_s) -> Bool {
         if target.tag != GHOSTTY_TARGET_SURFACE {
             if action.tag == GHOSTTY_ACTION_RELOAD_CONFIG ||
@@ -1364,10 +1442,8 @@ class GhosttyApp {
             }
 
             if action.tag == GHOSTTY_ACTION_DESKTOP_NOTIFICATION {
-                let actionTitle = action.action.desktop_notification.title
-                    .flatMap { String(cString: $0) } ?? ""
-                let actionBody = action.action.desktop_notification.body
-                    .flatMap { String(cString: $0) } ?? ""
+                let actionTitle = String(cString: action.action.desktop_notification.title)
+                let actionBody = String(cString: action.action.desktop_notification.body)
                 // The app-wide arrival point, taken when the action carries no
                 // surface. Logged alongside the surface-scoped one so a missing
                 // notification can be told apart from one that arrived and was
@@ -1439,7 +1515,7 @@ class GhosttyApp {
 
             return false
         }
-        let callbackContext = Self.callbackContext(from: ghostty_surface_userdata(target.target.surface))
+        let callbackContext = Self.callbackContext(from: target.target.surface.flatMap { ghostty_surface_userdata($0) })
         let callbackTabId = callbackContext?.tabId
         let callbackSurfaceId = callbackContext?.surfaceId
 
@@ -1601,7 +1677,7 @@ class GhosttyApp {
             return true
         case GHOSTTY_ACTION_START_SEARCH:
             guard let terminalSurface = surfaceView.terminalSurface else { return true }
-            let needle = action.action.start_search.needle.flatMap { String(cString: $0) }
+            let needle: String? = String(cString: action.action.start_search.needle)
             DispatchQueue.main.async {
                 if let searchState = terminalSurface.searchState {
                     if let needle, !needle.isEmpty {
@@ -1636,8 +1712,7 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_SET_TITLE:
-            let title = action.action.set_title.title
-                .flatMap { String(cString: $0) } ?? ""
+            let title = String(cString: action.action.set_title.title)
             if let tabId = surfaceView.tabId,
                let surfaceId = surfaceView.terminalSurface?.id {
                 DispatchQueue.main.async {
@@ -1654,7 +1729,7 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_PWD:
-            let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
+            let pwd = String(cString: action.action.pwd.pwd)
             // The only place a working directory is learned from the terminal
             // stream, and it fires for local panes only: Ghostty refuses an
             // OSC 7 whose hostname is not local, so a pane hosted on another
@@ -1677,10 +1752,8 @@ class GhosttyApp {
             return true
         case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
             let surfaceId = surfaceView.terminalSurface?.id
-            let actionTitle = action.action.desktop_notification.title
-                .flatMap { String(cString: $0) } ?? ""
-            let actionBody = action.action.desktop_notification.body
-                .flatMap { String(cString: $0) } ?? ""
+            let actionTitle = String(cString: action.action.desktop_notification.title)
+            let actionBody = String(cString: action.action.desktop_notification.body)
             // A pane on another machine reports through the same OSC as a
             // local one, so this is also the arrival point for a remote
             // agent asking for a decision. Logged because a notification
@@ -1820,6 +1893,17 @@ class GhosttyApp {
             guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len) else {
                 return false
             }
+            // OSC 8 targets and links detected in output are written by
+            // whatever runs in the terminal; only `text`/`html` come from
+            // Ghostty itself.
+            let untrusted = openUrl.kind == GHOSTTY_ACTION_OPEN_URL_KIND_OSC8
+                || openUrl.kind == GHOSTTY_ACTION_OPEN_URL_KIND_UNKNOWN
+            if untrusted, UntrustedURL.containsUnsafeCharacters(urlString) {
+                // Check the raw text: resolving it to a URL percent-encodes
+                // the invisible characters the block alert has to show.
+                DispatchQueue.main.async { UntrustedURLOpener.open(urlString) }
+                return true
+            }
             let context: TerminalOpenURLContext = surfaceView.window is PeerRelayWorkspaceWindow
                 ? .peerRelay
                 : .standard
@@ -1835,7 +1919,7 @@ class GhosttyApp {
                 Self.terminalLinkResolutionQueue.async {
                     guard let resolved = resolveTerminalOpenURLTarget(urlString, relativePaths: relativePaths) else { return }
                     DispatchQueue.main.async {
-                        _ = Self.openTerminalLink(resolved, context: context, tabId: tabId, surfaceId: surfaceId)
+                        _ = Self.openTerminalLink(resolved, context: context, untrusted: untrusted, tabId: tabId, surfaceId: surfaceId)
                     }
                 }
                 return true
@@ -1845,7 +1929,7 @@ class GhosttyApp {
                 // run its own opener on the raw text, which is the wrong target.
                 return true
             }
-            return Self.openTerminalLink(resolvedTarget, context: context, tabId: surfaceView.tabId, surfaceId: surfaceView.terminalSurface?.id)
+            return Self.openTerminalLink(resolvedTarget, context: context, untrusted: untrusted, tabId: surfaceView.tabId, surfaceId: surfaceView.terminalSurface?.id)
         default:
             return false
         }
@@ -1856,9 +1940,20 @@ class GhosttyApp {
         qos: .userInitiated
     )
 
+    /// Opens a terminal link outside term-mesh. Untrusted links go through
+    /// `UntrustedURLOpener` so executable targets never reach Launch Services.
+    private static func openTerminalLinkExternally(_ url: URL, untrusted: Bool) {
+        if untrusted {
+            UntrustedURLOpener.open(url.absoluteString)
+        } else {
+            _ = NSWorkspace.shared.open(url)
+        }
+    }
+
     private static func openTerminalLink(
         _ resolvedTarget: TerminalOpenURLTarget,
         context: TerminalOpenURLContext,
+        untrusted: Bool,
         tabId: UUID?,
         surfaceId: UUID?
     ) -> Bool {
@@ -1874,28 +1969,28 @@ class GhosttyApp {
             dlog("relay.link.open external scheme=\(urlToOpen.scheme ?? "unknown")")
             #endif
             DispatchQueue.main.async {
-                _ = NSWorkspace.shared.open(urlToOpen)
+                openTerminalLinkExternally(urlToOpen, untrusted: untrusted)
             }
             return true
         }
         if !BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser() {
             let urlToOpen = target.url
-            DispatchQueue.main.async { _ = NSWorkspace.shared.open(urlToOpen) }
+            DispatchQueue.main.async { openTerminalLinkExternally(urlToOpen, untrusted: untrusted) }
             return true
         }
         switch target {
         case let .external(url):
-            DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+            DispatchQueue.main.async { openTerminalLinkExternally(url, untrusted: untrusted) }
             return true
         case let .embeddedBrowser(url):
             guard let host = BrowserInsecureHTTPSettings.normalizeHost(url.host ?? "") else {
-                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+                DispatchQueue.main.async { openTerminalLinkExternally(url, untrusted: untrusted) }
                 return true
             }
 
             // If a host whitelist is configured and this host isn't in it, open externally.
             if !BrowserLinkOpenSettings.hostMatchesWhitelist(host) {
-                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
+                DispatchQueue.main.async { openTerminalLinkExternally(url, untrusted: untrusted) }
                 return true
             }
             guard let tabId, let surfaceId else { return false }
@@ -1916,7 +2011,7 @@ class GhosttyApp {
                     return workspace.newBrowserSplit(from: surfaceId, orientation: .horizontal, url: url) != nil
                 }()
                 if !opened {
-                    _ = NSWorkspace.shared.open(url)
+                    openTerminalLinkExternally(url, untrusted: untrusted)
                 }
             }
             return true

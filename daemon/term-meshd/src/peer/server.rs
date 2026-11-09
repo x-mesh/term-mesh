@@ -2537,7 +2537,7 @@ mod integration_tests {
             "/bin/sh",
             &[
                 "-c",
-                "trap 'printf GOT-SIGINT; exit 0' INT; while :; do sleep 10; done",
+                "trap 'printf GOT-SIGINT; exit 0' INT; printf SIGINT-READY; while :; do sleep 10; done",
             ],
             80,
             24,
@@ -2562,7 +2562,15 @@ mod integration_tests {
         }
 
         let (mut reader, mut writer, surface_id) = attach_one(&sock_path, "sigint-test").await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // A Ctrl-C that lands before the shell installs its trap kills the
+        // shell instead, so wait for the shell to say the trap is in place.
+        let ready = wait_for_marker(
+            &mut reader,
+            b"SIGINT-READY",
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert!(ready, "shell never reported its SIGINT trap");
         write_envelope(
             &mut writer,
             &Envelope {

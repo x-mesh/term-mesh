@@ -127,6 +127,8 @@
 			CVB00037 /* ConfigProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00037 /* ConfigProvider.swift */; };
 			CVB00038 /* ServiceContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00038 /* ServiceContainer.swift */; };
 			F511D9CB8F68D9D9B0341314 /* NSAlert+Sheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A043BAE1603803A839C0CB52 /* NSAlert+Sheet.swift */; };
+			59A37A5CA2AAD3701A1DC4EE /* UntrustedURLOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84B5027DEDAC067CC3DE29D3 /* UntrustedURLOpener.swift */; };
+			07314D9A52D2B11998B2C7E1 /* UntrustedURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8BB6653630E7BDCDB32323E /* UntrustedURL.swift */; };
 		E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */; };
 			B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */; };
 			A5001003 /* TabManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001013 /* TabManager.swift */; };
@@ -316,6 +318,7 @@
 		CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CS210000000000000006 /* ControlSocketFramingP1Tests.swift */; };
 		RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */; };
 		A5009020 /* AgentSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009021 /* AgentSessionTests.swift */; };
+		34D5FE20C3967F9AA72F817D /* UntrustedURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 672D2B977DA48F96BDC4A7FE /* UntrustedURLTests.swift */; };
 		AGA1000000000001 /* AgentLiveAppendTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AGA1000000000002 /* AgentLiveAppendTests.swift */; };
 		D7E7DE01 /* SidebarDetachedProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E7DE02 /* SidebarDetachedProjectTests.swift */; };
 		A5009120 /* WorkspaceObservationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009121 /* WorkspaceObservationTests.swift */; };
@@ -528,6 +531,8 @@
 			CVS00037 /* ConfigProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigProvider.swift; sourceTree = "<group>"; };
 			CVS00038 /* ServiceContainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceContainer.swift; sourceTree = "<group>"; };
 			A043BAE1603803A839C0CB52 /* NSAlert+Sheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSAlert+Sheet.swift"; sourceTree = "<group>"; };
+			84B5027DEDAC067CC3DE29D3 /* UntrustedURLOpener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UntrustedURLOpener.swift; sourceTree = "<group>"; };
+			E8BB6653630E7BDCDB32323E /* UntrustedURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UntrustedURL.swift; sourceTree = "<group>"; };
 		9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarSelectionState.swift; sourceTree = "<group>"; };
 			B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowDragHandleView.swift; sourceTree = "<group>"; };
 			A5001013 /* TabManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabManager.swift; sourceTree = "<group>"; };
@@ -718,6 +723,7 @@
 		CS210000000000000006 /* ControlSocketFramingP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlSocketFramingP1Tests.swift; sourceTree = "<group>"; };
 		RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLeaderReattachTriStateTests.swift; sourceTree = "<group>"; };
 		A5009021 /* AgentSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionTests.swift; sourceTree = "<group>"; };
+		672D2B977DA48F96BDC4A7FE /* UntrustedURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UntrustedURLTests.swift; sourceTree = "<group>"; };
 		AGA1000000000002 /* AgentLiveAppendTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentLiveAppendTests.swift; sourceTree = "<group>"; };
 		D7E7DE02 /* SidebarDetachedProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarDetachedProjectTests.swift; sourceTree = "<group>"; };
 		A5009121 /* WorkspaceObservationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceObservationTests.swift; sourceTree = "<group>"; };
@@ -966,6 +972,8 @@ A1740000000000000000000C /* ProcessRun.swift */,
 					CVS00037 /* ConfigProvider.swift */,
 					CVS00038 /* ServiceContainer.swift */,
 					A043BAE1603803A839C0CB52 /* NSAlert+Sheet.swift */,
+					84B5027DEDAC067CC3DE29D3 /* UntrustedURLOpener.swift */,
+					E8BB6653630E7BDCDB32323E /* UntrustedURL.swift */,
 				9AD52285508B1D6A9875E7B3 /* SidebarSelectionState.swift */,
 					B9000017A1B2C3D4E5F60719 /* WindowDragHandleView.swift */,
 					A50012F0 /* Backport.swift */,
@@ -1186,6 +1194,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				CS210000000000000006 /* ControlSocketFramingP1Tests.swift */,
 				RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */,
 				A5009021 /* AgentSessionTests.swift */,
+				672D2B977DA48F96BDC4A7FE /* UntrustedURLTests.swift */,
 				AGA1000000000002 /* AgentLiveAppendTests.swift */,
 				D7E7DE02 /* SidebarDetachedProjectTests.swift */,
 				A5009121 /* WorkspaceObservationTests.swift */,
@@ -1480,6 +1489,8 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 					CVB00037 /* ConfigProvider.swift in Sources */,
 					CVB00038 /* ServiceContainer.swift in Sources */,
 					F511D9CB8F68D9D9B0341314 /* NSAlert+Sheet.swift in Sources */,
+					59A37A5CA2AAD3701A1DC4EE /* UntrustedURLOpener.swift in Sources */,
+					07314D9A52D2B11998B2C7E1 /* UntrustedURL.swift in Sources */,
 				E62155868BB29FEB5DAAAF25 /* SidebarSelectionState.swift in Sources */,
 					B9000018A1B2C3D4E5F60719 /* WindowDragHandleView.swift in Sources */,
 					A50012F1 /* Backport.swift in Sources */,
@@ -1672,6 +1683,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */,
 				RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */,
 				A5009020 /* AgentSessionTests.swift in Sources */,
+				34D5FE20C3967F9AA72F817D /* UntrustedURLTests.swift in Sources */,
 				AGA1000000000001 /* AgentLiveAppendTests.swift in Sources */,
 				D7E7DE01 /* SidebarDetachedProjectTests.swift in Sources */,
 				A5009120 /* WorkspaceObservationTests.swift in Sources */,
