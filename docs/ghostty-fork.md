@@ -267,7 +267,7 @@ patches and merges `ghostty-org/main` in dated stages.
 |---|---|---|---|
 | 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` + fixes |
 | 2 | `b58ef1d678` (2026-10-20, before #14519) | 0.16 | `e29bd7968` |
-| 3 | `cf5519b22f` (2026-11-08) | 0.17 | in progress |
+| 3 | `cf5519b22f` (2026-11-08) | 0.17 | `2b65b2e243` |
 
 Stage 1 resolution rules. Use the same rules in later stages.
 
@@ -363,6 +363,13 @@ Stage 3 adds these rules:
   through `RenderState.setOverscanRequest` and `overscanCaptured`.
 - `src/Surface.zig` exec path: use the upstream env ownership fix
   inside the cmux manual-IO branch.
+
+Test reference for stage 3: `zig build test -Demit-macos-app=false` gives
+4557 passed, 31 skipped, 1 failed (the same OpenGL test).
+`zig build test-lib-vt` passes. The macOS app test step
+(`xcodebuild test -scheme Ghostty`) also fails
+`KeyboardLayoutTests.characterAppliesModifiers` when the active input
+source is Korean 2-Set, because Shift does not change that layout's key A.
 
 ## Merge conflict notes
 
