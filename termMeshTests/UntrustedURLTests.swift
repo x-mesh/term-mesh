@@ -133,6 +133,13 @@ final class UntrustedURLTests: XCTestCase {
         XCTAssertEqual(UntrustedURL(encoded).decision, .deny(.unsafeCharacters))
     }
 
+    func testRejectsSymlinksToNamesWithUnsafeCharacters() throws {
+        let target = try writeFile("report\u{202E}txt.sh", "safe")
+        let link = directory.appending(path: "notes.txt")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        XCTAssertEqual(UntrustedURL(link.absoluteString).decision, .deny(.unsafeCharacters))
+    }
+
     func testRejectsFileURLsWithQueryOrFragment() throws {
         let file = try writeFile("document.txt", "safe")
         for suffix in ["?open=1", "#section"] {

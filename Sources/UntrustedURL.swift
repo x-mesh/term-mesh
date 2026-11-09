@@ -180,6 +180,11 @@ private extension UntrustedURL {
         // output. This collapses dot traversal and prevents a harmless-looking
         // symlink name from hiding an executable target.
         let canonicalURL = url.standardizedFileURL.resolvingSymlinksInPath()
+        // A symlink with a plain name can point at a name that hides
+        // characters, and the target is what Launch Services opens.
+        guard !Self.containsUnsafeCharacters(canonicalURL.path) else {
+            return .deny(.unsafeCharacters)
+        }
         let resourceValues: URLResourceValues
         do {
             // Reading all relevant resource keys together also proves that the
