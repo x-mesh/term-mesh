@@ -7,6 +7,8 @@ When we change the fork, update this document and the parent submodule SHA.
 
 `origin` in `ghostty/` is **`JINWOO-J/ghostty`** — that is the fork we push to.
 `manaflow-ai/ghostty` is `upstream` and is read-only for us.
+`ghostty-org/ghostty` is the `ghostty-org` remote. Since 2026-11 the fork
+merges it directly in dated stages. See "ghostty-org sync".
 
 1) Make changes in `ghostty/`, on the `main` branch. Never on a detached HEAD:
    a commit made there is orphaned the moment anything re-checks-out the
@@ -255,6 +257,57 @@ over this summary.
   with `linkChars`.
 - Upstreamable: maybe. Mixed names such as `v2한글.txt` now split at the
   Hangul character.
+
+## ghostty-org sync
+
+manaflow-ai stopped full syncs after 2026-07-22. The fork keeps the cmux
+patches and merges `ghostty-org/main` in dated stages.
+
+| Stage | ghostty-org commit | Zig | Fork merge |
+|---|---|---|---|
+| 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` + fixes |
+| 2 | 2026-10-20, before #14519 | 0.16 | not started |
+| 3 | latest | 0.17 | not started |
+
+Stage 1 resolution rules. Use the same rules in later stages.
+
+- Renderer (`src/renderer/generic.zig`, `src/renderer/Thread.zig`): keep the
+  cmux swap chain, lease and frame-generation lifecycle. term-mesh calls
+  `ghostty_surface_set_renderer_realized` and `rebuild_renderer` on it.
+  Apply upstream renderer commits one at a time on top of it.
+  Stage 1 leaves out #14017 (GPU release for hidden surfaces), #14035 and
+  #14068 (display link parking), and the `Thread.zig` half of the kitty
+  animation driver (`aee7bf3475`). Kitty image animation does not advance.
+- Kitty graphics (`src/terminal/kitty/graphics_{storage,image,exec}.zig`):
+  use the upstream files. The cmux image and placement count limits are
+  removed. `executeTracked` is ported for replay tracking.
+  `ghostty_surface_restore_kitty_replay` always returns false. term-mesh does
+  not call it.
+- libghostty-vt C API (`src/terminal/c/terminal.zig`,
+  `include/ghostty/vt/terminal.h`): use the upstream files. Only
+  `ghostty_terminal_vt_stream_is_ground` is kept from cmux.
+  `GHOSTTY_OSC_COMMAND_PROGRAM_STATUS` moves to 27.
+- OSC 99: the upstream parser returns raw chunks.
+  `src/terminal/osc/parsers/kitty_notification.zig` joins them in
+  `stream.zig` and emits `show_desktop_notification`.
+- Sentry: use the upstream environ snapshot. The cmux pre-spawn cache
+  directory code is removed.
+- `Surface.occlusionCallback`: dedupe only the mode 2033 report. The cmux
+  renderer publish stays unconditional.
+- Formatter: the cmux cursor restore runs after the screen formatter, and
+  only in origin mode without pending wrap.
+- `src/config/url.zig`: keep the cmux trailing spaces at end of line.
+- Clipboard: the embedder API is MIME-aware. `Sources/GhosttyApp.swift`
+  serves `text/plain` only and approves read confirmations without a dialog.
+
+Known gap: term-mesh opens `GHOSTTY_ACTION_OPEN_URL_KIND_OSC8` links with its
+own opener. Upstream blocks the generic opener for OSC 8 links. This gap
+existed before stage 1.
+
+Test reference for stage 1: `zig build test -Demit-macos-app=false` gives
+4122 passed, 23 skipped, 1 failed. The failed test
+(`OpenGL acknowledges only after successful present and GPU completion`)
+also fails on the fork before the merge.
 
 ## Merge conflict notes
 
