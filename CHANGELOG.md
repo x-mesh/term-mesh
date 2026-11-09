@@ -4,6 +4,25 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.286.0] - 2026-11-09
+
+### Security
+
+- Cmd-clicking a link in terminal output no longer launches apps or executables. A program could print `file:///System/Applications/Calculator.app`, or hide it behind OSC 8 link text, and one click ran it. Links from terminal output now open web and mail addresses directly, ask before opening other schemes such as `vscode://`, and block app bundles, executable files and targets with hidden characters. Scripts such as `./build.sh` open in your source-code editor instead of their default app, which can be a terminal that runs them.
+
+### Changed
+
+- The terminal engine is updated to Ghostty as of 2026-11-08, with term-mesh's own changes kept.
+- Building GhosttyKit from source now needs Zig 0.17. `scripts/setup.sh` and `make doctor` look for it.
+
+### Fixed
+
+- Cmd-clicking a path or URL followed by Korean text no longer pulls the Korean particle into the link, so `README.md에서` opens `README.md`.
+- Selecting from the right half of a wide character (Korean, CJK, emoji) now highlights the whole character, so the highlight matches what is copied.
+- The display link now starts and stops on the main thread. Doing it on the render thread could freeze the app when a display went to sleep or woke.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.285.0] - 2026-11-08
 
 ### Changed
