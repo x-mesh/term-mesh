@@ -266,7 +266,7 @@ patches and merges `ghostty-org/main` in dated stages.
 | Stage | ghostty-org commit | Zig | Fork merge |
 |---|---|---|---|
 | 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` + fixes |
-| 2 | 2026-10-20, before #14519 | 0.16 | not started |
+| 2 | `b58ef1d678` (2026-10-20, before #14519) | 0.16 | `e29bd7968` |
 | 3 | latest | 0.17 | not started |
 
 Stage 1 resolution rules. Use the same rules in later stages.
@@ -308,6 +308,34 @@ Test reference for stage 1: `zig build test -Demit-macos-app=false` gives
 4122 passed, 23 skipped, 1 failed. The failed test
 (`OpenGL acknowledges only after successful present and GPU completion`)
 also fails on the fork before the merge.
+
+Stage 2 adds these rules:
+
+- Display link: the cmux renderer uses the upstream
+  `src/renderer/DisplayLink.zig` (#14691). Start, stop and display changes
+  run on the main thread, because a CVDisplayLink stop on the render thread
+  can deadlock against CoreVideo's own reconfiguration on display sleep and
+  wake. The link is created lazily and bound to the surface's initial
+  display. `Surface.deinit` closes it before the renderer thread is freed,
+  also when it skips the GPU teardown. This also fixes a stage 1 leak of the
+  eagerly created per-display link.
+- Renderer: stage 2 leaves out #14446 (shared render device), the OpenGL and
+  EGL rework, and the upstream RenderState overscan. cmux keeps its own
+  pixel-scroll overscan in `src/terminal/render.zig`, so the libghostty-vt
+  render API (`src/terminal/c/render.zig`, `vt/render.h`) stays at stage 1.
+  The wide-char selection fix #14651 depends on that overscan and is left
+  out.
+- OSC 7501 program status: use the upstream parser and stream wiring. The
+  cmux `GHOSTTY_ACTION_PROGRAM_STATUS` app action stays.
+- DECSCUSR defaults: use upstream `Terminal.setCursorStyle`. The cmux
+  handler keeps only its cursor activity counter.
+- Formatter: upstream steps over gaps with CUF and erases background-only
+  cells with ECH. The cmux blank-cell tests now check the replayed cells.
+- `src/os/open.zig`: keep the cmux `drainStderr`, which also reaps the child.
+
+Test reference for stage 2: `zig build test -Demit-macos-app=false` gives
+4312 passed, 30 skipped, 1 failed (the same OpenGL test).
+`zig build test-lib-vt` passes.
 
 ## Merge conflict notes
 

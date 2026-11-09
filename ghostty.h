@@ -1071,6 +1071,12 @@ typedef struct {
   uint32_t height;
 } ghostty_action_initial_size_s;
 
+// apprt.action.ResizeWindow
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+} ghostty_action_resize_window_s;
+
 // apprt.action.CellSize
 typedef struct {
   uint32_t width;
@@ -1316,6 +1322,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+  GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_SELECTION_CHANGED,
   GHOSTTY_ACTION_PROGRAM_STATUS,
 } ghostty_action_tag_e;
@@ -1330,6 +1337,7 @@ typedef union {
   ghostty_action_resize_split_s resize_split;
   ghostty_action_size_limit_s size_limit;
   ghostty_action_initial_size_s initial_size;
+  ghostty_action_resize_window_s resize_window;
   ghostty_action_cell_size_s cell_size;
   ghostty_action_scrollbar_s scrollbar;
   ghostty_action_inspector_e inspector;
@@ -1825,6 +1833,7 @@ GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t)
 // cmux fork: delete when upstream separates committed typed text from paste
 // delivery for libghostty embedders.
 GHOSTTY_API void ghostty_surface_text_input(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_paste_text(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 // cmux fork: upstream already has internal Termio.processOutput. Delete this
 // C bridge when upstream exports an equivalent surface output API.
