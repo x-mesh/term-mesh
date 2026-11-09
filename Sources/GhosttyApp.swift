@@ -704,7 +704,7 @@ class GhosttyApp {
         initLog("ghostty diagnostics (\(label)): count=\(count)")
         for i in 0..<count {
             let diag = ghostty_config_get_diagnostic(config, UInt32(i))
-            let msg = diag.message.flatMap { String(cString: $0) } ?? "(null)"
+            let msg = String(cString: diag.message)
             initLog("  [\(i)] \(msg)")
         }
     }
@@ -748,18 +748,15 @@ class GhosttyApp {
         updateDefaultBackground(from: primaryConfig, source: "initialize.primaryConfig")
 
         // Create runtime config with callbacks
-        var runtimeConfig = ghostty_runtime_config_s()
-        runtimeConfig.userdata = Unmanaged.passUnretained(self).toOpaque()
-        runtimeConfig.supports_selection_clipboard = true
-        runtimeConfig.wakeup_cb = { userdata in
+        let wakeupCallback: ghostty_runtime_wakeup_cb = { userdata in
             DispatchQueue.main.async {
                 GhosttyApp.shared.tick()
             }
         }
-        runtimeConfig.action_cb = { app, target, action in
+        let actionCallback: ghostty_runtime_action_cb = { app, target, action in
             return GhosttyApp.shared.handleAction(target: target, action: action)
         }
-        runtimeConfig.read_clipboard_cb = { userdata, location, state, mimes, mimeCount, listOnly in
+        let readClipboardCallback: ghostty_runtime_read_clipboard_cb = { userdata, location, state, mimes, mimeCount, listOnly in
             // STARTED means we will complete the request, so ghostty keeps the
             // request state alive; any other result makes ghostty free it.
             // Mismatching this leaks or double-frees the request — see ghostty
@@ -841,13 +838,9 @@ class GhosttyApp {
                 surface, mime: textMime, text: value, available: available, state: state)
             return GHOSTTY_CLIPBOARD_READ_STARTED
         }
-        runtimeConfig.confirm_read_clipboard_cb = { userdata, confirm, state, _ in
+        let confirmReadClipboardCallback: ghostty_runtime_confirm_read_clipboard_cb = { userdata, confirm, state, _ in
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata),
                   let surface = callbackContext.runtimeSurface else { return }
-            guard let confirm else {
-                ghostty_surface_deny_clipboard_request(surface, state)
-                return
-            }
 
             // term-mesh approves clipboard reads without a dialog, as before the
             // 2026-08 ghostty-org merge; complete with exactly what was offered.
@@ -860,26 +853,23 @@ class GhosttyApp {
                 remember: false)
             ghostty_surface_complete_clipboard_request(surface, &completion, state)
         }
-        runtimeConfig.write_clipboard_cb = { _, location, content, len, _ in
+        let writeClipboardCallback: ghostty_runtime_write_clipboard_cb = { _, location, content, len, _ in
             // Write clipboard
-            guard let content = content, len > 0 else { return }
+            guard len > 0 else { return }
             let buffer = UnsafeBufferPointer(start: content, count: Int(len))
 
             var fallback: String?
             for item in buffer {
-                guard let dataPtr = item.data else { continue }
+                let dataPtr = item.data
                 // Contents are length-delimited and not guaranteed to be
                 // null-terminated since the 2026-08 ghostty-org merge.
                 let value = String(
                     decoding: UnsafeRawBufferPointer(start: dataPtr, count: item.len),
                     as: UTF8.self)
 
-                if let mimePtr = item.mime {
-                    let mime = String(cString: mimePtr)
-                    if mime.hasPrefix("text/plain") {
-                        GhosttyPasteboardHelper.writeString(value, to: location)
-                        return
-                    }
+                if String(cString: item.mime).hasPrefix("text/plain") {
+                    GhosttyPasteboardHelper.writeString(value, to: location)
+                    return
                 }
 
                 if fallback == nil {
@@ -891,7 +881,7 @@ class GhosttyApp {
                 GhosttyPasteboardHelper.writeString(fallback, to: location)
             }
         }
-        runtimeConfig.close_surface_cb = { userdata, needsConfirmClose in
+        let closeSurfaceCallback: ghostty_runtime_close_surface_cb = { userdata, needsConfirmClose in
             guard let callbackContext = GhosttyApp.callbackContext(from: userdata) else { return }
             let callbackSurfaceId = callbackContext.surfaceId
             let callbackTabId = callbackContext.tabId
@@ -929,6 +919,16 @@ class GhosttyApp {
                 }
             }
         }
+        var runtimeConfig = ghostty_runtime_config_s(
+            userdata: Unmanaged.passUnretained(self).toOpaque(),
+            supports_selection_clipboard: true,
+            wakeup_cb: wakeupCallback,
+            action_cb: actionCallback,
+            read_clipboard_cb: readClipboardCallback,
+            confirm_read_clipboard_cb: confirmReadClipboardCallback,
+            write_clipboard_cb: writeClipboardCallback,
+            close_surface_cb: closeSurfaceCallback,
+            tmux_control_cb: nil)
 
         // Create app
         if let created = ghostty_app_new(&runtimeConfig, primaryConfig) {
@@ -1383,13 +1383,11 @@ class GhosttyApp {
     /// The first requested MIME type term-mesh can serve, or nil. term-mesh only
     /// reads text from the pasteboard, so only the `text/plain` family matches.
     private static func requestedTextMime(
-        _ mimes: UnsafePointer<UnsafePointer<CChar>?>?,
+        _ mimes: UnsafePointer<UnsafePointer<CChar>>,
         count: Int
     ) -> String? {
-        guard let mimes else { return nil }
         for index in 0..<count {
-            guard let ptr = mimes[index] else { continue }
-            let mime = String(cString: ptr)
+            let mime = String(cString: mimes[index])
             if mime.hasPrefix("text/plain") { return mime }
         }
         return nil
@@ -1402,7 +1400,7 @@ class GhosttyApp {
         mime: String?,
         text: String,
         available: [String],
-        state: UnsafeMutableRawPointer?
+        state: UnsafeMutableRawPointer
     ) {
         let mimeCString = mime.flatMap { strdup($0) }
         let availableCStrings = available.compactMap { strdup($0) }
@@ -1419,7 +1417,7 @@ class GhosttyApp {
                 contents.append(ghostty_clipboard_content_s(
                     mime: mimeCString, data: data, len: textBuf.count - 1))
             }
-            let availablePtrs: [UnsafePointer<CChar>?] = availableCStrings.map { UnsafePointer($0) }
+            let availablePtrs: [UnsafePointer<CChar>] = availableCStrings.map { UnsafePointer($0) }
             contents.withUnsafeBufferPointer { contentsBuf in
                 availablePtrs.withUnsafeBufferPointer { availableBuf in
                     var completion = ghostty_clipboard_complete_s(
@@ -1444,10 +1442,8 @@ class GhosttyApp {
             }
 
             if action.tag == GHOSTTY_ACTION_DESKTOP_NOTIFICATION {
-                let actionTitle = action.action.desktop_notification.title
-                    .flatMap { String(cString: $0) } ?? ""
-                let actionBody = action.action.desktop_notification.body
-                    .flatMap { String(cString: $0) } ?? ""
+                let actionTitle = String(cString: action.action.desktop_notification.title)
+                let actionBody = String(cString: action.action.desktop_notification.body)
                 // The app-wide arrival point, taken when the action carries no
                 // surface. Logged alongside the surface-scoped one so a missing
                 // notification can be told apart from one that arrived and was
@@ -1519,7 +1515,7 @@ class GhosttyApp {
 
             return false
         }
-        let callbackContext = Self.callbackContext(from: ghostty_surface_userdata(target.target.surface))
+        let callbackContext = Self.callbackContext(from: target.target.surface.flatMap { ghostty_surface_userdata($0) })
         let callbackTabId = callbackContext?.tabId
         let callbackSurfaceId = callbackContext?.surfaceId
 
@@ -1681,7 +1677,7 @@ class GhosttyApp {
             return true
         case GHOSTTY_ACTION_START_SEARCH:
             guard let terminalSurface = surfaceView.terminalSurface else { return true }
-            let needle = action.action.start_search.needle.flatMap { String(cString: $0) }
+            let needle: String? = String(cString: action.action.start_search.needle)
             DispatchQueue.main.async {
                 if let searchState = terminalSurface.searchState {
                     if let needle, !needle.isEmpty {
@@ -1716,8 +1712,7 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_SET_TITLE:
-            let title = action.action.set_title.title
-                .flatMap { String(cString: $0) } ?? ""
+            let title = String(cString: action.action.set_title.title)
             if let tabId = surfaceView.tabId,
                let surfaceId = surfaceView.terminalSurface?.id {
                 DispatchQueue.main.async {
@@ -1734,7 +1729,7 @@ class GhosttyApp {
             }
             return true
         case GHOSTTY_ACTION_PWD:
-            let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
+            let pwd = String(cString: action.action.pwd.pwd)
             // The only place a working directory is learned from the terminal
             // stream, and it fires for local panes only: Ghostty refuses an
             // OSC 7 whose hostname is not local, so a pane hosted on another
@@ -1757,10 +1752,8 @@ class GhosttyApp {
             return true
         case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
             let surfaceId = surfaceView.terminalSurface?.id
-            let actionTitle = action.action.desktop_notification.title
-                .flatMap { String(cString: $0) } ?? ""
-            let actionBody = action.action.desktop_notification.body
-                .flatMap { String(cString: $0) } ?? ""
+            let actionTitle = String(cString: action.action.desktop_notification.title)
+            let actionBody = String(cString: action.action.desktop_notification.body)
             // A pane on another machine reports through the same OSC as a
             // local one, so this is also the arrival point for a remote
             // agent asking for a decision. Logged because a notification
