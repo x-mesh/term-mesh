@@ -364,6 +364,10 @@ Stage 3 adds these rules:
 - `src/Surface.zig` exec path: use the upstream env ownership fix
   inside the cmux manual-IO branch.
 
+- Wide-char selection #14651: ported after stage 3 (fork `4a79b29f28`).
+  The cmux render state loops over every `row_data` entry, so the change
+  applies without the upstream overscan range.
+
 Test reference for stage 3: `zig build test -Demit-macos-app=false` gives
 4557 passed, 31 skipped, 1 failed (the same OpenGL test).
 `zig build test-lib-vt` passes. The macOS app test step
