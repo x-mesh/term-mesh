@@ -267,7 +267,7 @@ patches and merges `ghostty-org/main` in dated stages.
 |---|---|---|---|
 | 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` + fixes |
 | 2 | `b58ef1d678` (2026-10-20, before #14519) | 0.16 | `e29bd7968` |
-| 3 | latest | 0.17 | not started |
+| 3 | `cf5519b22f` (2026-11-08) | 0.17 | in progress |
 
 Stage 1 resolution rules. Use the same rules in later stages.
 
@@ -336,6 +336,33 @@ Stage 2 adds these rules:
 Test reference for stage 2: `zig build test -Demit-macos-app=false` gives
 4312 passed, 30 skipped, 1 failed (the same OpenGL test).
 `zig build test-lib-vt` passes.
+
+Stage 3 adds these rules:
+
+- Zig 0.17: `@hasDecl` only finds `pub` declarations. A check against a
+  private declaration is false without a compile error. cmux tests that
+  chose between a fix and the pre-fix path with `@hasDecl` now call the
+  fix directly, and test mocks that stand in for renderer types declare
+  their methods `pub`. Keep every declaration that a `@hasDecl` checks
+  `pub`.
+- Zig 0.17 also removes `**` array repetition (use `@splat`) and
+  `@cImport`. C headers come from build modules: `ghostty-h` for
+  `include/ghostty.h`, and `pty-c` for `sys/ioctl.h` and `sys/sysctl.h`
+  in `src/termio/Exec.zig`.
+- `include/ghostty.h` is `assume_nonnull` upstream. Every pointer in a
+  cmux declaration is non-null unless it is marked `GHOSTTY_NULLABLE`.
+- Action enum: upstream added `GHOSTTY_ACTION_SET_WINDOW_THEME`, so the
+  cmux actions move again. The ABI test now checks that the cmux actions
+  are last, not their numbers.
+- Render state: the upstream Kitty image placements read rows through
+  `RenderState.rowDataRange` and `viewportY`. cmux implements both for its
+  own overscan layout: the top band, the viewport, then the bottom rows.
+- libghostty-vt render API (`src/terminal/c/render.zig`, `vt/render.h`):
+  use the upstream files again. The stage 1 copy only added one cmux test,
+  which is kept. The C overscan option and data map to the cmux fields
+  through `RenderState.setOverscanRequest` and `overscanCaptured`.
+- `src/Surface.zig` exec path: use the upstream env ownership fix
+  inside the cmux manual-IO branch.
 
 ## Merge conflict notes
 
