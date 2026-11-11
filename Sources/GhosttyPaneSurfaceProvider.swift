@@ -1848,6 +1848,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     // via the PTY tap), so the viewer sees: clear → full
                     // repaint. Skipped on a no-op resize so plain shells don't
                     // lose their view.
+                    let columnsBeforeResize = curSz.columns
                     let sizeChanged = terminalSurface.applyRemoteViewerPixelSize(
                         width: w, height: h, claimsAttention: request.claimsAuthority,
                         viewerName: request.viewerName
@@ -1855,17 +1856,19 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     if sizeChanged {
                         // ESC[2J (erase screen) + ESC[H (cursor home).
                         hub.broadcast(Data([0x1B, 0x5B, 0x32, 0x4A, 0x1B, 0x5B, 0x48]))
-                        // Then re-send the host viewport snapshot at the new
-                        // size. The bare clear above (added in v0.139.0 to stop
-                        // garbled absolute-cursor TUI output) assumed a
-                        // SIGWINCH-driven repaint would refill the grid — but
-                        // plain shells (bash/zsh at a prompt) do NOT repaint on
-                        // SIGWINCH, so the viewer stayed blank after every real
-                        // resize (initial sizing from bounds=.zero, window
-                        // shrink, etc.). Re-sending the snapshot restores
-                        // content for plain shells; TUIs additionally repaint
-                        // via the PTY tap, overwriting the plain-text snapshot.
-                        if let snap = readPaneSnapshot(ptr) {
+                        // Then re-send the host screen at the new size. The bare
+                        // clear above (added in v0.139.0 to stop garbled
+                        // absolute-cursor TUI output) assumed a SIGWINCH-driven
+                        // repaint would refill the grid, but plain shells
+                        // (bash/zsh at a prompt) do NOT repaint on SIGWINCH,
+                        // so the viewer stayed blank after every real resize.
+                        // The snapshot restores content for plain shells and
+                        // keeps its colors; TUIs additionally repaint via the
+                        // PTY tap, overwriting it.
+                        // The viewer's real size arrives here after attach, so
+                        // this runs on every connection.
+                        let widthChanged = ghostty_surface_size(ptr).columns != columnsBeforeResize
+                        if let snap = readPaneResizeSnapshot(ptr, widthChanged: widthChanged) {
                             hub.broadcast(snap)
                         }
                     }
@@ -4014,6 +4017,42 @@ private func readPaneAttachSnapshot(_ surface: ghostty_surface_t) -> Data? {
     readPaneSnapshotWithRawOutputSequence(surface)?.bytes ?? readPaneSnapshot(surface)
 }
 
+private let peerTerminalClearHome = Data([0x1B, 0x5B, 0x32, 0x4A, 0x1B, 0x5B, 0x48])
+
+/// The post-resize screen with colors. Trailing blank rows are trimmed because
+/// shells and TUIs redraw on SIGWINCH relative to the cursor, which must stay
+/// on the last content row as it does in the plain-text snapshot. The row
+/// count comes from the terminal grid because grid resizes apply asynchronously
+/// on the IO thread, so the surface's target size does not say how many rows
+/// the grid has yet.
+/// The styled dump breaks soft-wrapped rows while the plain dump joins them.
+/// When the width changes and their line structure differs, the plain dump is
+/// used because the viewer can re-wrap it at its own width.
+@MainActor
+private func readPaneResizeSnapshot(_ surface: ghostty_surface_t, widthChanged: Bool) -> Data? {
+    var bar = ghostty_surface_scrollbar_s()
+    guard ghostty_surface_scrollbar(surface, &bar), bar.len > 0 else {
+        return readPaneSnapshot(surface)
+    }
+    var out = ghostty_text_s()
+    guard ghostty_surface_read_screen_tail_vt(surface, UInt(bar.len), 512 * 1_024, &out) else {
+        return readPaneSnapshot(surface)
+    }
+    defer { ghostty_surface_free_text(surface, &out) }
+    // An empty read is a real blank screen and still needs clear+home.
+    var styledBody = Data()
+    if let text = out.text, out.text_len > 0 {
+        styledBody = peerTerminalTrimTrailingBlankRows(Data(bytes: text, count: Int(out.text_len)))
+    }
+    if widthChanged, let plain = readPaneSnapshot(surface) {
+        let plainBody = plain.dropFirst(peerTerminalClearHome.count)
+        if !peerTerminalDumpsShareLineStructure(styled: styledBody, plain: Data(plainBody)) {
+            return plain
+        }
+    }
+    return peerTerminalClearHome + styledBody
+}
+
 @MainActor
 private func readPaneSnapshotWithRawOutputSequence(
     _ surface: ghostty_surface_t
@@ -4031,6 +4070,27 @@ private func readPaneSnapshotWithRawOutputSequence(
         snapshot.append(Data(bytes: text, count: Int(out.text_len)))
     }
     return (snapshot, rawEnd)
+}
+
+/// Drops only the CR LF pairs at the end of a VT dump. Ghostty can emit blank
+/// rows as CR LF; interior blank lines and trailing SGR sequences are content.
+func peerTerminalTrimTrailingBlankRows(_ vt: Data) -> Data {
+    var end = vt.endIndex
+    while end - vt.startIndex >= 2,
+          vt[end - 2] == 0x0D, vt[end - 1] == 0x0A {
+        end -= 2
+    }
+    return Data(vt[vt.startIndex..<end])
+}
+
+/// Whether two screen dumps have the same number of lines once trailing blank
+/// rows are ignored. Inputs are bodies without the clear+home prefix.
+func peerTerminalDumpsShareLineStructure(styled: Data, plain: Data) -> Bool {
+    func lineCount(_ dump: Data) -> Int {
+        let body = peerTerminalTrimTrailingBlankRows(dump)
+        return body.isEmpty ? 0 : body.reduce(1) { $0 + ($1 == 0x0A ? 1 : 0) }
+    }
+    return lineCount(styled) == lineCount(plain)
 }
 
 /// Recreates the source pane's default terminal colors before replaying its

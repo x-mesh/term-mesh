@@ -3828,6 +3828,34 @@ final class PeerPaneSessionTests: XCTestCase {
         )
     }
 
+    func testTrimTrailingBlankRowsRemovesOnlyTrailingCRLF() {
+        let crlf = "\r\n"
+        func trim(_ text: String) -> Data {
+            peerTerminalTrimTrailingBlankRows(Data(text.utf8))
+        }
+
+        XCTAssertEqual(trim("abc"), Data("abc".utf8))
+        XCTAssertEqual(trim("abc\(crlf)\(crlf)\(crlf)"), Data("abc".utf8))
+        XCTAssertEqual(trim("a\(crlf)\(crlf)b\(crlf)"), Data("a\(crlf)\(crlf)b".utf8))
+        XCTAssertEqual(trim("\u{1b}[31mred\u{1b}[0m\(crlf)\(crlf)"), Data("\u{1b}[31mred\u{1b}[0m".utf8))
+        XCTAssertEqual(trim("\(crlf)\(crlf)"), Data())
+        XCTAssertEqual(trim(""), Data())
+    }
+
+    func testDumpsShareLineStructureComparesLineCounts() {
+        func share(_ styled: String, _ plain: String) -> Bool {
+            peerTerminalDumpsShareLineStructure(styled: Data(styled.utf8), plain: Data(plain.utf8))
+        }
+
+        XCTAssertTrue(share("\u{1b}[31ma\u{1b}[0m\r\nb\r\nc", "a\nb\nc"))
+        XCTAssertFalse(share("abcd\r\nef\r\ngh", "abcdef\ngh"))
+        XCTAssertTrue(share("a\r\nb\r\n\r\n\r\n", "a\r\nb\r\n"))
+        XCTAssertTrue(share("", ""))
+        XCTAssertFalse(share("a", ""))
+        XCTAssertFalse(share("", "a"))
+        XCTAssertTrue(share("a\r\nb\r\nc", "a\r\nb\r\nc"))
+    }
+
     // MARK: - Reconnect surface match (terminal panes only)
 
     private func surface(
