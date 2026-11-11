@@ -4,8 +4,10 @@ host re-sends. Regression for the resize snapshot being plain text (no SGR), so
 every viewer connect/reconnect showed an uncolored screen.
 
 Flow: the DEBUG loopback open starts the app's in-app peer server; a raw
-PeerClient then attaches a host surface that printed colored markers, sends a
-smaller Resize, and checks the bytes the host broadcasts afterwards still carry
+PeerClient then attaches a host surface that printed colored markers and sends
+three Resizes, each checked on the bytes after the last ESC[2J: rows only
+(columns unchanged), columns and rows together, and rows again after the viewer
+detaches and reconnects on a new PeerClient. The re-sent screen must still carry
 the color SGR in effect at each marker.
 """
 import re
@@ -98,6 +100,73 @@ def _color_active_before(data: bytes, marker: bytes):
     return active, data[max(0, pos - 60):pos]
 
 
+RESIZE_CLEAR = b"\x1b[2J"
+
+
+def _after_last_clear(data: bytes):
+    """Bytes after the last ESC[2J, or None when the clear is absent. The resize
+    path broadcasts ESC[2J ESC[H before re-sending the screen."""
+    pos = data.rfind(RESIZE_CLEAR)
+    if pos < 0:
+        return None
+    return data[pos + len(RESIZE_CLEAR):]
+
+
+def _check_attach_colored(peer: PeerClient, surface_id: bytes, red: bytes, green: bytes):
+    attach_bytes = _drain_quiet(peer, surface_id)
+    for marker in (red, green):
+        active, ctx = _color_active_before(attach_bytes, marker)
+        if marker not in attach_bytes or not active:
+            raise termmeshError(
+                f"precondition failed: attach snapshot lacks colored {marker!r} "
+                f"(context={ctx!r})"
+            )
+
+
+def _resize_and_check_colors(peer: PeerClient, host_key, surface_id: bytes,
+                             red: bytes, green: bytes, step: str,
+                             cols: int, rows: int):
+    # A host pane with local focus ignores viewer sizes that do not claim
+    # authority, so claim it like a viewer whose pane just gained focus.
+    peer._send(resize=pb.Resize(
+        surface_id=surface_id, cols=cols, rows=rows, claim_authority=True,
+    ))
+
+    def _both_after_clear(collected: bytes) -> bool:
+        tail = _after_last_clear(collected)
+        return tail is not None and red in tail and green in tail
+
+    after = _collect_pty(peer, surface_id, 5.0, stop_when=_both_after_clear)
+
+    with PeerClient(host_key) as probe:
+        probe.connect()
+        probe.handshake()
+        now = [s for s in probe.list_surfaces() if s.surface_id == surface_id]
+    if not now or (now[0].cols, now[0].rows) != (cols, rows):
+        raise termmeshError(
+            f"test is vacuous at step {step!r}: host size is not the requested size "
+            f"(requested={cols}x{rows}, "
+            f"actual={(now[0].cols, now[0].rows) if now else None})"
+        )
+
+    tail = _after_last_clear(after)
+    if tail is None:
+        raise termmeshError(
+            f"step {step!r}: no ESC[2J resize snapshot within 5s; got {after[-200:]!r}"
+        )
+    for marker in (red, green):
+        if marker not in tail:
+            raise termmeshError(
+                f"step {step!r}: {marker!r} missing after the resize clear: {tail[-200:]!r}"
+            )
+        active, ctx = _color_active_before(tail, marker)
+        if not active:
+            raise termmeshError(
+                f"step {step!r}: expected a color SGR active before {marker!r} after "
+                f"resize, got no color; preceding 60 bytes={ctx!r}"
+            )
+
+
 def main() -> int:
     token = uuid.uuid4().hex[:8]
     red = f"RZC_RED_{token}".encode()
@@ -184,52 +253,35 @@ def main() -> int:
             attached = True
 
             # --- 4. attach snapshot is the precondition: markers arrive colored
-            attach_bytes = _drain_quiet(peer, surface_id)
-            for marker in (red, green):
-                active, ctx = _color_active_before(attach_bytes, marker)
-                if marker not in attach_bytes or not active:
-                    raise termmeshError(
-                        f"precondition failed: attach snapshot lacks colored {marker!r} "
-                        f"(context={ctx!r})"
-                    )
+            _check_attach_colored(peer, surface_id, red, green)
 
-            # --- 5. viewer resize to a smaller grid
-            new_cols, new_rows = max(1, before_cols - 8), max(1, before_rows - 4)
-            # A host pane with local focus ignores viewer sizes that do not claim
-            # authority, so claim it like a viewer whose pane just gained focus.
-            peer._send(resize=pb.Resize(
-                surface_id=surface_id, cols=new_cols, rows=new_rows,
-                claim_authority=True,
-            ))
+            # --- 5. resize steps; each requests a size different from the last
+            _resize_and_check_colors(
+                peer, host_key, surface_id, red, green, "rows-only",
+                before_cols, max(2, before_rows - 4),
+            )
+            _resize_and_check_colors(
+                peer, host_key, surface_id, red, green, "width",
+                max(2, before_cols - 8), max(2, before_rows - 4),
+            )
 
-            # --- 6. bytes after the resize must carry the marker
-            after = _collect_pty(peer, surface_id, 5.0, stop_when=lambda b: red in b and green in b)
-            if red not in after:
-                raise termmeshError(
-                    f"no {red!r} after resize within 5s; got {after[-200:]!r}"
-                )
-
-            with PeerClient(host_key) as probe:
-                probe.connect()
-                probe.handshake()
-                now = [s for s in probe.list_surfaces() if s.surface_id == surface_id]
-            if not now or (now[0].cols, now[0].rows) == (before_cols, before_rows):
-                raise termmeshError(
-                    "test is vacuous: host size did not change "
-                    f"(before={before_cols}x{before_rows}, "
-                    f"after={(now[0].cols, now[0].rows) if now else None})"
-                )
-
-            # --- 7. colors survive the resize snapshot
-            for marker in (red, green):
-                active, ctx = _color_active_before(after, marker)
-                if marker not in after:
-                    raise termmeshError(f"{marker!r} missing after resize: {after[-200:]!r}")
-                if not active:
-                    raise termmeshError(
-                        f"expected a color SGR active before {marker!r} after resize, "
-                        f"got no color; preceding 60 bytes={ctx!r}"
-                    )
+            # --- 6. same path on a fresh viewer connection
+            try:
+                peer.detach_surface(surface_id)
+            finally:
+                attached = False
+                peer.close()
+                peer = None
+            peer = PeerClient(host_key)
+            peer.connect()
+            peer.handshake()
+            peer.attach_surface(surface_id)
+            attached = True
+            _check_attach_colored(peer, surface_id, red, green)
+            _resize_and_check_colors(
+                peer, host_key, surface_id, red, green, "reconnect",
+                before_cols, max(2, before_rows - 6),
+            )
         finally:
             if peer is not None:
                 try:
