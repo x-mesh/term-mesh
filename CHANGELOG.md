@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.287.0] - 2026-11-11
+
+### Fixed
+
+- Remote panes from a Mac host no longer lose their colors when you connect, reconnect or resize. The host re-sent the screen as plain text whenever the viewer's size changed, which happens on every connection, so colored output stayed black and white until the program redrew it. The host now re-sends the screen with its colors. The Mac host must run this version. If the viewer's width differs and a wrapped line is on screen, the screen is still sent without colors.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.286.0] - 2026-11-09
 
 ### Security
