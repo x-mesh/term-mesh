@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.288.0] - 2026-11-13
+
+### Fixed
+
+- A pane you move to another workspace now closes when its shell exits. Before, the pane stayed open with nothing behind it: it took input and never answered. Close requests from the pane were also dropped after a move.
+- Program status reports (OSC 7501) from a moved pane now reach the workspace that holds the pane. Before, the status was dropped and the sidebar did not show it.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.287.0] - 2026-11-11
 
 ### Fixed
