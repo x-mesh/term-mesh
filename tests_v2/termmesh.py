@@ -1095,6 +1095,14 @@ class termmesh:
             lines.append(f"{k}={v}")
         return "\n".join(lines)
 
+    def program_statuses(self, workspace: Union[str, int, None] = None) -> List[dict]:
+        """Per-surface program status records (OSC 7501) held by a workspace."""
+        params: Dict[str, Any] = {}
+        if workspace is not None:
+            params["workspace_id"] = self._resolve_workspace_id(workspace)
+        res = self._call("workspace.sidebar_state", params) or {}
+        return list(res.get("program_statuses") or [])
+
     # ---------------------------------------------------------------------
     # Debug / test-only
     # ---------------------------------------------------------------------

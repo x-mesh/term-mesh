@@ -1584,6 +1584,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return nil
     }
 
+    /// The workspace that owns `surfaceId` right now, for Ghostty runtime callbacks.
+    ///
+    /// A callback context keeps the workspace id from when the surface was created, and
+    /// that id goes stale once the surface moves to another workspace or window. The
+    /// surface id is the only key that stays true, so it wins; the cached id remains a
+    /// fallback for a manager that is not registered as a main window context.
+    func ghosttyCallbackOwner(
+        surfaceId: UUID,
+        cachedTabId: UUID?
+    ) -> (tabManager: TabManager, workspace: Workspace)? {
+        for ctx in mainWindowContexts.values {
+            for workspace in ctx.tabManager.tabs where workspace.panels[surfaceId] != nil {
+                return (ctx.tabManager, workspace)
+            }
+        }
+        guard let cachedTabId,
+              let manager = tabManagerFor(tabId: cachedTabId) ?? tabManager,
+              let workspace = manager.tabs.first(where: { $0.id == cachedTabId }),
+              workspace.panels[surfaceId] != nil else { return nil }
+        return (manager, workspace)
+    }
+
     /// Resolve a Bonsplit drag payload back to its owning workspace.
     ///
     /// Cross-workspace drags carry the Bonsplit tab id, not term-mesh's panel

@@ -898,24 +898,22 @@ class GhosttyApp {
 #endif
 
             DispatchQueue.main.async {
-                guard let app = AppDelegate.shared else { return }
-                // Close requests must be resolved by the callback's workspace/surface IDs only.
-                // If the mapping is already gone (duplicate/stale callback), ignore it.
-                if let callbackTabId,
-                   let manager = app.tabManagerFor(tabId: callbackTabId) ?? app.tabManager,
-                   let workspace = manager.tabs.first(where: { $0.id == callbackTabId }),
-                   workspace.panels[callbackSurfaceId] != nil {
-                    if needsConfirmClose {
-                        manager.closeRuntimeSurfaceWithConfirmation(
-                            tabId: callbackTabId,
-                            surfaceId: callbackSurfaceId
-                        )
-                    } else {
-                        manager.closeRuntimeSurface(
-                            tabId: callbackTabId,
-                            surfaceId: callbackSurfaceId
-                        )
-                    }
+                // A surface no workspace owns any more is a duplicate or stale callback.
+                guard let app = AppDelegate.shared,
+                      let owner = app.ghosttyCallbackOwner(
+                          surfaceId: callbackSurfaceId,
+                          cachedTabId: callbackTabId
+                      ) else { return }
+                if needsConfirmClose {
+                    owner.tabManager.closeRuntimeSurfaceWithConfirmation(
+                        tabId: owner.workspace.id,
+                        surfaceId: callbackSurfaceId
+                    )
+                } else {
+                    owner.tabManager.closeRuntimeSurface(
+                        tabId: owner.workspace.id,
+                        surfaceId: callbackSurfaceId
+                    )
                 }
             }
         }
@@ -1542,14 +1540,16 @@ class GhosttyApp {
             // Keep host-close async to avoid re-entrant close/deinit while Ghostty is still
             // dispatching this action callback.
             DispatchQueue.main.async {
-                guard let app = AppDelegate.shared else { return }
-                if let callbackTabId,
-                   let callbackSurfaceId,
-                   let manager = app.tabManagerFor(tabId: callbackTabId) ?? app.tabManager,
-                   let workspace = manager.tabs.first(where: { $0.id == callbackTabId }),
-                   workspace.panels[callbackSurfaceId] != nil {
-                    manager.closePanelAfterChildExited(tabId: callbackTabId, surfaceId: callbackSurfaceId)
-                }
+                guard let app = AppDelegate.shared,
+                      let callbackSurfaceId,
+                      let owner = app.ghosttyCallbackOwner(
+                          surfaceId: callbackSurfaceId,
+                          cachedTabId: callbackTabId
+                      ) else { return }
+                owner.tabManager.closePanelAfterChildExited(
+                    tabId: owner.workspace.id,
+                    surfaceId: callbackSurfaceId
+                )
             }
             // Always report handled so Ghostty doesn't print the fallback prompt.
             return true
@@ -1579,7 +1579,7 @@ class GhosttyApp {
             logAction(
                 action,
                 target: target,
-                tabId: callbackTabId ?? surfaceView.tabId,
+                tabId: surfaceView.tabId ?? callbackTabId,
                 surfaceId: callbackSurfaceId ?? surfaceView.terminalSurface?.id
             )
         }
@@ -1817,20 +1817,19 @@ class GhosttyApp {
                 app: status.app.map { String(cString: $0) }
             ) else { return true }
             #if DEBUG
-            dlog("program_status.action report=\(report) tab=\((callbackTabId ?? surfaceView.tabId)?.uuidString.prefix(8) ?? "<nil>") surface=\((callbackSurfaceId ?? surfaceView.terminalSurface?.id)?.uuidString.prefix(8) ?? "<nil>")")
+            dlog("program_status.action report=\(report) tab=\((surfaceView.tabId ?? callbackTabId)?.uuidString.prefix(8) ?? "<nil>") surface=\((callbackSurfaceId ?? surfaceView.terminalSurface?.id)?.uuidString.prefix(8) ?? "<nil>")")
             #endif
-            guard let tabId = callbackTabId ?? surfaceView.tabId,
-                  let surfaceId = callbackSurfaceId ?? surfaceView.terminalSurface?.id else { return true }
+            guard let surfaceId = callbackSurfaceId ?? surfaceView.terminalSurface?.id else { return true }
+            let cachedTabId = surfaceView.tabId ?? callbackTabId
             DispatchQueue.main.async {
                 guard let app = AppDelegate.shared,
-                      let manager = app.tabManagerFor(tabId: tabId) ?? app.tabManager,
-                      let workspace = manager.tabs.first(where: { $0.id == tabId }) else {
+                      let owner = app.ghosttyCallbackOwner(surfaceId: surfaceId, cachedTabId: cachedTabId) else {
                     #if DEBUG
-                    dlog("program_status.dropped no workspace tab=\(tabId.uuidString.prefix(8))")
+                    dlog("program_status.dropped no workspace surface=\(surfaceId.uuidString.prefix(8))")
                     #endif
                     return
                 }
-                workspace.applyProgramStatus(report, panelId: surfaceId)
+                owner.workspace.applyProgramStatus(report, panelId: surfaceId)
             }
             return true
         case GHOSTTY_ACTION_COLOR_CHANGE:
