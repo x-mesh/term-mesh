@@ -1925,6 +1925,14 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         if let status {
             let normalizedStatus = Self.normalizedTaskStatus(status)
             tasks[idx].status = normalizedStatus
+            if TaskUncommittedCheck.reportedStatuses.contains(normalizedStatus) {
+                let check = TaskUncommittedCheck.pending(
+                    checkout: tasks[idx].worktreePath, at: now)
+                tasks[idx].uncommittedCheck = check
+                scheduleUncommittedCheck(teamName: teamName, taskId: taskId, check: check)
+            } else {
+                tasks[idx].uncommittedCheck = nil
+            }
             let lifecycleTask = tasks[idx]
             LeaderTurnLog.appendTaskLifecycle(
                 team: teamName,
@@ -1980,6 +1988,45 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return taskBoards[teamName]?.first(where: { $0.id == taskId })
+    }
+
+    /// `git status` runs off the caller's thread, after the status change: a
+    /// report must never wait on git, and the native turn-end path settles on
+    /// the main thread.
+    private func scheduleUncommittedCheck(
+        teamName: String, taskId: String, check: TaskUncommittedCheck
+    ) {
+        Task.detached(priority: .utility) { [weak self] in
+            let outcome = await TaskUncommittedChecker.run(checkout: check.checkout)
+            self?.recordUncommittedCheck(
+                teamName: teamName, taskId: taskId, token: check.token, outcome: outcome)
+        }
+    }
+
+    /// Stores a check result without touching the status, `updatedAt`, the
+    /// lifecycle log or leader wakes. Only the report that scheduled the check
+    /// may fill it in.
+    @discardableResult
+    func recordUncommittedCheck(
+        teamName: String, taskId: String, token: String,
+        outcome: TaskUncommittedChecker.Outcome
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var tasks = taskBoards[teamName],
+              let idx = tasks.firstIndex(where: { $0.id == taskId }),
+              var check = tasks[idx].uncommittedCheck,
+              check.token == token, check.state == .pending else { return false }
+        check.state = outcome.state
+        check.count = outcome.count
+        check.paths = outcome.paths
+        check.reason = outcome.reason
+        check.checkedAt = Date()
+        tasks[idx].uncommittedCheck = check
+        commitTaskBoardLocked(tasks, teamName: teamName)
+        noteTasksChanged()
+        notifyChanged()
+        return true
     }
 
     @discardableResult
@@ -2623,6 +2670,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "active_task_wave_id": activeTask.map { $0.waveId ?? $0.id } as Any? ?? NSNull(),
             "active_task_wave_id_stated": activeTask?.waveId != nil,
             "active_task_is_stale": isTaskStale,
+            "active_task_uncommitted_check": activeTask?.uncommittedCheck?.dictionary() as Any? ?? NSNull(),
             "heartbeat_age_seconds": heartbeatAge as Any? ?? NSNull(),
             "last_heartbeat_summary": heartbeat?.summary as Any? ?? NSNull(),
             "heartbeat_is_stale": heartbeatStale,
@@ -2830,6 +2878,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 var enriched = result
                 enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
                 enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
+                enriched["uncommitted_check"] = task.uncommittedCheck?.dictionary() as Any? ?? NSNull()
                 results.append(enriched)
                 continue
             }
@@ -2837,6 +2886,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             var enriched = result
             enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
             enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
+            enriched["uncommitted_check"] = task.uncommittedCheck?.dictionary() as Any? ?? NSNull()
             results.append(enriched)
         }
         return results.sorted { ($0["task_id"] as? String ?? "") < ($1["task_id"] as? String ?? "") }
@@ -2883,6 +2933,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "worktree_init": task.worktreeInit as Any? ?? NSNull(),
             "worktree_finish_mode": task.worktreeFinishMode as Any? ?? NSNull(),
             "worktree_removed": task.worktreeRemoved as Any? ?? NSNull(),
+            "uncommitted_check": task.uncommittedCheck?.dictionary() as Any? ?? NSNull(),
             "created_at": ISO8601DateFormatter().string(from: task.createdAt),
             "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
             "needs_attention": Self.taskNeedsAttention(task, threshold: staleTaskThreshold),
