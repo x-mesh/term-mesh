@@ -35,6 +35,7 @@ for raw in sys.stdin:
   if 'CASE_REVIEW' in text: status='NEEDS_REVIEW'
   elif 'CASE_BLOCK' in text: status='BLOCKED'
   answer='STATUS: '+status+'\nFILES: left-behind.txt\nVERIFY: n/a\nNEXT: n/a\nFULL_REPORT: n/a\nexecution wrapper rejected the commit'
+  if 'CASE_' not in text: answer='STATUS: DONE\nFILES: none\nVERIFY: pong\nNEXT: none\nFULL_REPORT: n/a\npong'
   print(json.dumps({'method':'item/completed','params':{'item':{'type':'agentMessage','text':answer}}}),flush=True)
   print(json.dumps({'method':'turn/completed','params':{'threadId':'t818','turn':{'status':'completed'}}}),flush=True)
 '''
