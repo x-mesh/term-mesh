@@ -48,29 +48,34 @@ func decodeGhosttyOpenURL(
 
 /// Claude Code turns a bare URL into an OSC 8 link with a pattern that runs to
 /// the next space, so the Korean prose `(https://x/a)의` targets
-/// `https://x/a)의`. A trailing run of raw Hangul after an ASCII letter, digit
-/// or closing bracket is that attached particle, the same boundary the fork's
-/// `url.zig` uses for detected links. It must be cut from the raw text:
-/// `URL(string:)` would percent-encode the Hangul into a valid-looking path.
+/// `https://x/a)의`. A run of raw Hangul after an ASCII letter, digit, closing
+/// bracket or quote is that attached particle, the same boundary the fork's
+/// `url.zig` uses for detected links; punctuation may follow it (`a”에서`,
+/// `a의」`). It must be cut from the raw text: `URL(string:)` would
+/// percent-encode the Hangul into a valid-looking path.
 func trimmingHangulProseTail(fromTerminalWebLink value: String) -> String {
     let lowercased = value.lowercased()
     guard lowercased.hasPrefix("http://") || lowercased.hasPrefix("https://") else { return value }
 
     var scalars = Array(value.unicodeScalars)
-    var tailStart = scalars.count
+    var tailEnd = scalars.count
+    while tailEnd > 0, isProseClosingScalar(scalars[tailEnd - 1]) {
+        tailEnd -= 1
+    }
+    var tailStart = tailEnd
     while tailStart > 0, isHangulScalar(scalars[tailStart - 1]) {
         tailStart -= 1
     }
-    guard tailStart < scalars.count, tailStart > 0 else { return value }
+    guard tailStart < tailEnd, tailStart > 0 else { return value }
     let boundary = scalars[tailStart - 1]
-    guard boundary.isASCII,
-          boundary.properties.isAlphabetic || ("0"..."9").contains(boundary) || ")]}".unicodeScalars.contains(boundary)
-    else { return value }
+    let asciiBoundary = boundary.isASCII
+        && (boundary.properties.isAlphabetic || ("0"..."9").contains(boundary) || ")]}".unicodeScalars.contains(boundary))
+    guard asciiBoundary || isNonASCIIClosingPunctuation(boundary) else { return value }
     scalars.removeSubrange(tailStart...)
 
     let openers: [Unicode.Scalar: Unicode.Scalar] = [")": "(", "]": "[", "}": "{"]
     while let last = scalars.last {
-        if ".,;:!?".unicodeScalars.contains(last) {
+        if ".,;:!?".unicodeScalars.contains(last) || isNonASCIIClosingPunctuation(last) {
             scalars.removeLast()
             continue
         }
@@ -81,6 +86,22 @@ func trimmingHangulProseTail(fromTerminalWebLink value: String) -> String {
         scalars.removeLast()
     }
     return String(String.UnicodeScalarView(scalars))
+}
+
+private func isProseClosingScalar(_ scalar: Unicode.Scalar) -> Bool {
+    ".,;:!?)]}".unicodeScalars.contains(scalar) || isNonASCIIClosingPunctuation(scalar)
+}
+
+/// `”`, `’`, `」` and `。`, but not an opening mark such as `「` or `(`: Hangul
+/// after an opening mark (`wiki/(한글)`) is part of the address.
+private func isNonASCIIClosingPunctuation(_ scalar: Unicode.Scalar) -> Bool {
+    guard !scalar.isASCII else { return false }
+    switch scalar.properties.generalCategory {
+    case .closePunctuation, .finalPunctuation, .otherPunctuation:
+        return true
+    default:
+        return false
+    }
 }
 
 private func isHangulScalar(_ scalar: Unicode.Scalar) -> Bool {

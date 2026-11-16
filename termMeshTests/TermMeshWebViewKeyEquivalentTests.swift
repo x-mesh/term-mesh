@@ -7383,6 +7383,11 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
             ("https://example.com/a?id=42를", "https://example.com/a?id=42"),
             ("HTTP://example.com/a]에", "HTTP://example.com/a"),
             ("https://en.wikipedia.org/wiki/Rust_(video_game)의", "https://en.wikipedia.org/wiki/Rust_(video_game)"),
+            ("https://example.com/a)의.", "https://example.com/a"),
+            ("https://example.com/a의)", "https://example.com/a"),
+            ("https://example.com/a의」", "https://example.com/a"),
+            ("https://example.com/a”에서", "https://example.com/a"),
+            ("https://example.com/a’를,", "https://example.com/a"),
         ]
         for (raw, expected) in cases {
             XCTAssertEqual(trimmingHangulProseTail(fromTerminalWebLink: raw), expected, raw)
@@ -7399,6 +7404,9 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
             "file:///tmp/notes.md를",
             "/tmp/notes.md를",
             "https://example.com/a)",
+            "https://example.com/a.",
+            "https://ko.wikipedia.org/wiki/서울_(도시)",
+            "https://example.com/wiki/(한글)",
         ] {
             XCTAssertEqual(trimmingHangulProseTail(fromTerminalWebLink: raw), raw, raw)
         }
