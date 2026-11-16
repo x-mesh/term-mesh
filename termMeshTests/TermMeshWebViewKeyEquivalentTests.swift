@@ -7375,6 +7375,62 @@ final class BrowserLinkOpenSettingsTests: XCTestCase {
 }
 
 final class TerminalOpenURLTargetResolutionTests: XCTestCase {
+    func testOSC8WebLinkDropsHangulParticleAttachedByProse() {
+        let cases: [(String, String)] = [
+            ("https://claude.ai/artifact/VFyjttD4zXNx6kdxKfQLo8)의", "https://claude.ai/artifact/VFyjttD4zXNx6kdxKfQLo8"),
+            ("https://example.com/docs에서", "https://example.com/docs"),
+            ("https://example.com/a)입니다", "https://example.com/a"),
+            ("https://example.com/a?id=42를", "https://example.com/a?id=42"),
+            ("HTTP://example.com/a]에", "HTTP://example.com/a"),
+            ("https://en.wikipedia.org/wiki/Rust_(video_game)의", "https://en.wikipedia.org/wiki/Rust_(video_game)"),
+            ("https://example.com/a)의.", "https://example.com/a"),
+            ("https://example.com/a의)", "https://example.com/a"),
+            ("https://example.com/a의」", "https://example.com/a"),
+            ("https://example.com/a”에서", "https://example.com/a"),
+            ("https://example.com/a’를,", "https://example.com/a"),
+            ("https://example.com/a의!", "https://example.com/a"),
+            ("https://example.com/a에서?", "https://example.com/a"),
+            ("https://example.com/a!)의", "https://example.com/a"),
+            ("https://example.com/a}의", "https://example.com/a"),
+            ("https://example.com/{id}의", "https://example.com/{id}"),
+            ("https://example.com/a。에서", "https://example.com/a"),
+        ]
+        for (raw, expected) in cases {
+            XCTAssertEqual(trimmingHangulProseTail(fromTerminalWebLink: raw), expected, raw)
+        }
+    }
+
+    func testOSC8WebLinkDropsParticleFromEveryHangulBlock() {
+        for particle in [
+            "ㅋㅋ",
+            "\u{110B}\u{1174}",
+            "\u{A960}\u{1161}",
+            "\u{110B}\u{D7B0}",
+            "힣",
+        ] {
+            let raw = "https://example.com/a" + particle
+            XCTAssertEqual(trimmingHangulProseTail(fromTerminalWebLink: raw), "https://example.com/a", raw)
+        }
+    }
+
+    func testOSC8WebLinkKeepsHangulThatBelongsToTheURL() {
+        for raw in [
+            "https://ko.wikipedia.org/wiki/한글",
+            "https://example.com/search?q=한글",
+            "https://example.com/report_최종",
+            "https://example.com/%ED%95%9C%EA%B8%80",
+            "https://example.com/café",
+            "file:///tmp/notes.md를",
+            "/tmp/notes.md를",
+            "https://example.com/a)",
+            "https://example.com/a.",
+            "https://ko.wikipedia.org/wiki/서울_(도시)",
+            "https://example.com/wiki/(한글)",
+        ] {
+            XCTAssertEqual(trimmingHangulProseTail(fromTerminalWebLink: raw), raw, raw)
+        }
+    }
+
     func testResolvesHTTPSAsEmbeddedBrowser() throws {
         let target = try XCTUnwrap(resolveTerminalOpenURLTarget("https://example.com/path?q=1"))
         switch target {
