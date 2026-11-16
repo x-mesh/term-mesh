@@ -7388,9 +7388,28 @@ final class TerminalOpenURLTargetResolutionTests: XCTestCase {
             ("https://example.com/a의」", "https://example.com/a"),
             ("https://example.com/a”에서", "https://example.com/a"),
             ("https://example.com/a’를,", "https://example.com/a"),
+            ("https://example.com/a의!", "https://example.com/a"),
+            ("https://example.com/a에서?", "https://example.com/a"),
+            ("https://example.com/a!)의", "https://example.com/a"),
+            ("https://example.com/a}의", "https://example.com/a"),
+            ("https://example.com/{id}의", "https://example.com/{id}"),
+            ("https://example.com/a。에서", "https://example.com/a"),
         ]
         for (raw, expected) in cases {
             XCTAssertEqual(trimmingHangulProseTail(fromTerminalWebLink: raw), expected, raw)
+        }
+    }
+
+    func testOSC8WebLinkDropsParticleFromEveryHangulBlock() {
+        for particle in [
+            "ㅋㅋ",
+            "\u{110B}\u{1174}",
+            "\u{A960}\u{1161}",
+            "\u{110B}\u{D7B0}",
+            "힣",
+        ] {
+            let raw = "https://example.com/a" + particle
+            XCTAssertEqual(trimmingHangulProseTail(fromTerminalWebLink: raw), "https://example.com/a", raw)
         }
     }
 
