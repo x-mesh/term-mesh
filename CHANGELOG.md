@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.289.0] - 2026-11-17
+
+### Changed
+
+- The terminal engine is updated to Ghostty as of 2026-11-16, with term-mesh's own changes kept.
+- Building GhosttyKit from source now needs Zig 0.17.1.
+- Selecting text now also copies it to the selection clipboard that Paste Selection reads. The system clipboard does not change when you select text.
+
+### Fixed
+
+- Cmd-clicking a link that a program such as Claude Code prints as an OSC 8 hyperlink no longer opens the Korean particle after it, so `페이지(https://example.com/a)의` opens `https://example.com/a`. The program still sets the link color and underline, so they can cover the particle.
+- A prompt that the shell redraws after you resize the pane no longer leaves copies of the old prompt above it.
+- A character whose fallback font cannot be loaded now shows as a replacement character. Before, every row with that character went blank.
+- A Kitty image that a program sends again in chunks keeps the old image on screen until the new one is complete.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.288.0] - 2026-11-13
 
 ### Fixed
