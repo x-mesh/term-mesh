@@ -268,6 +268,7 @@ patches and merges `ghostty-org/main` in dated stages.
 | 1 | `d4d8f62262` (2026-08-31) | 0.16 | `69d58eec8` + fixes |
 | 2 | `b58ef1d678` (2026-10-20, before #14519) | 0.16 | `e29bd7968` |
 | 3 | `cf5519b22f` (2026-11-08) | 0.17 | `2b65b2e243` |
+| 4 | `d4cf6ec225` (2026-11-16) | 0.17.1 | `f274207bd` |
 
 Stage 1 resolution rules. Use the same rules in later stages.
 
@@ -374,6 +375,24 @@ Test reference for stage 3: `zig build test -Demit-macos-app=false` gives
 (`xcodebuild test -scheme Ghostty`) also fails
 `KeyboardLayoutTests.characterAppliesModifiers` when the active input
 source is Korean 2-Set, because Shift does not change that layout's key A.
+
+Stage 4 adds these rules:
+
+- `build.zig`: upstream adds the test dependencies inside the loop that
+  builds the normal and the valgrind test executables. The cmux Metal
+  link for Darwin test executables is in that loop too.
+- `src/termio/stream_handler.zig`: upstream logs VT action errors in
+  `vtFailed`. The cmux `vt()` calls `failKittyReplayIfTracking` before it.
+- `src/quirks_memset.zig`: upstream does not export `memset` on Darwin.
+  Before stage 4, `ghostty-internal.a` exported a strong `_memset`, and
+  the term-mesh app used it in place of the libSystem `memset`.
+- `copy-on-select` defaults to `primary` on macOS. term-mesh writes
+  `GHOSTTY_CLIPBOARD_SELECTION` to its private selection pasteboard, so
+  the general pasteboard does not change when you select text.
+
+Test reference for stage 4: `zig build test -Demit-macos-app=false` gives
+4569 passed, 32 skipped, 1 failed (the same OpenGL test).
+`zig build test-lib-vt` passes.
 
 ## Merge conflict notes
 
