@@ -46,6 +46,73 @@ func decodeGhosttyOpenURL(
     return String(data: Data(bytes: pointer, count: count), encoding: .utf8)
 }
 
+/// Claude Code turns a bare URL into an OSC 8 link with a pattern that runs to
+/// the next space, so the Korean prose `(https://x/a)의` targets
+/// `https://x/a)의`. A run of raw Hangul after an ASCII letter, digit, closing
+/// bracket or quote is that attached particle, the same boundary the fork's
+/// `url.zig` uses for detected links; punctuation may follow it (`a”에서`,
+/// `a의」`). It must be cut from the raw text: `URL(string:)` would
+/// percent-encode the Hangul into a valid-looking path.
+func trimmingHangulProseTail(fromTerminalWebLink value: String) -> String {
+    let lowercased = value.lowercased()
+    guard lowercased.hasPrefix("http://") || lowercased.hasPrefix("https://") else { return value }
+
+    var scalars = Array(value.unicodeScalars)
+    var tailEnd = scalars.count
+    while tailEnd > 0, isProseClosingScalar(scalars[tailEnd - 1]) {
+        tailEnd -= 1
+    }
+    var tailStart = tailEnd
+    while tailStart > 0, isHangulScalar(scalars[tailStart - 1]) {
+        tailStart -= 1
+    }
+    guard tailStart < tailEnd, tailStart > 0 else { return value }
+    let boundary = scalars[tailStart - 1]
+    let asciiBoundary = boundary.isASCII
+        && (boundary.properties.isAlphabetic || ("0"..."9").contains(boundary) || ")]}".unicodeScalars.contains(boundary))
+    guard asciiBoundary || isNonASCIIClosingPunctuation(boundary) else { return value }
+    scalars.removeSubrange(tailStart...)
+
+    let openers: [Unicode.Scalar: Unicode.Scalar] = [")": "(", "]": "[", "}": "{"]
+    while let last = scalars.last {
+        if ".,;:!?".unicodeScalars.contains(last) || isNonASCIIClosingPunctuation(last) {
+            scalars.removeLast()
+            continue
+        }
+        guard let opener = openers[last] else { break }
+        let opened = scalars.filter { $0 == opener }.count
+        let closed = scalars.filter { $0 == last }.count
+        guard closed > opened else { break }
+        scalars.removeLast()
+    }
+    return String(String.UnicodeScalarView(scalars))
+}
+
+private func isProseClosingScalar(_ scalar: Unicode.Scalar) -> Bool {
+    ".,;:!?)]}".unicodeScalars.contains(scalar) || isNonASCIIClosingPunctuation(scalar)
+}
+
+/// `”`, `’`, `」` and `。`, but not an opening mark such as `「` or `(`: Hangul
+/// after an opening mark (`wiki/(한글)`) is part of the address.
+private func isNonASCIIClosingPunctuation(_ scalar: Unicode.Scalar) -> Bool {
+    guard !scalar.isASCII else { return false }
+    switch scalar.properties.generalCategory {
+    case .closePunctuation, .finalPunctuation, .otherPunctuation:
+        return true
+    default:
+        return false
+    }
+}
+
+private func isHangulScalar(_ scalar: Unicode.Scalar) -> Bool {
+    switch scalar.value {
+    case 0x1100...0x11FF, 0x3130...0x318F, 0xA960...0xA97F, 0xAC00...0xD7AF, 0xD7B0...0xD7FF:
+        return true
+    default:
+        return false
+    }
+}
+
 enum GhosttyDefaultBackgroundUpdateScope: Int {
     case unscoped = 0
     case app = 1
@@ -1889,7 +1956,7 @@ class GhosttyApp {
             let openUrl = action.action.open_url
             // ghostty_action_open_url_s is pointer + length, not a C string.
             // Copy it while the synchronous Ghostty callback still owns the bytes.
-            guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len) else {
+            guard let decodedURL = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len) else {
                 return false
             }
             // OSC 8 targets and links detected in output are written by
@@ -1897,6 +1964,7 @@ class GhosttyApp {
             // Ghostty itself.
             let untrusted = openUrl.kind == GHOSTTY_ACTION_OPEN_URL_KIND_OSC8
                 || openUrl.kind == GHOSTTY_ACTION_OPEN_URL_KIND_UNKNOWN
+            let urlString = untrusted ? trimmingHangulProseTail(fromTerminalWebLink: decodedURL) : decodedURL
             if untrusted, UntrustedURL.containsUnsafeCharacters(urlString) {
                 // Check the raw text: resolving it to a URL percent-encodes
                 // the invisible characters the block alert has to show.
