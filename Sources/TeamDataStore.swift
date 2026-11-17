@@ -124,6 +124,10 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                check.current(forTaskStatus: tasks[index].status) == nil {
                 tasks[index].uncommittedCheck = nil
             }
+            if let failures = tasks[index].toolFailures,
+               failures.current(forTaskStatus: tasks[index].status) == nil {
+                tasks[index].toolFailures = nil
+            }
         }
         taskBoards[teamName] = tasks
         guard tasks.contains(where: { task in previous[task.id].map { $0 != task.status } ?? false })
@@ -1863,6 +1867,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         worktreeFinishedAt: Date? = nil,
         worktreeFinishMode: String? = nil,
         worktreeRemoved: Bool? = nil,
+        toolFailures: TaskToolFailures? = nil,
         expectedStatus: String? = nil,
         expectedAssignee: String? = nil,
         // `.some(nil)` expects the task to be unpinned; omitted skips the check.
@@ -1949,6 +1954,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 }
             } else {
                 tasks[idx].uncommittedCheck = nil
+            }
+            // Only a native turn knows its tool failures. A repeat of the
+            // same report from another path keeps them; any other status
+            // drops them, so a later verdict never shows an earlier turn's.
+            if !TaskUncommittedCheck.reportedStatuses.contains(normalizedStatus) {
+                tasks[idx].toolFailures = nil
+            } else if var failures = toolFailures {
+                failures.forStatus = normalizedStatus
+                tasks[idx].toolFailures = failures
+            } else if tasks[idx].toolFailures?.forStatus != normalizedStatus {
+                tasks[idx].toolFailures = nil
             }
             let lifecycleTask = tasks[idx]
             LeaderTurnLog.appendTaskLifecycle(
@@ -2897,6 +2913,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
                 enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
                 enriched["uncommitted_check"] = task.uncommittedCheck?.current(forTaskStatus: task.status)?.dictionary() as Any? ?? NSNull()
+                enriched["tool_failures"] = task.toolFailures?.current(forTaskStatus: task.status)?.dictionary as Any? ?? NSNull()
                 results.append(enriched)
                 continue
             }
@@ -2905,6 +2922,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             enriched["parallel_telemetry"] = Self.parallelTelemetry(for: task)
             enriched["content_bytes"] = (result["content"] as? String)?.lengthOfBytes(using: .utf8) ?? 0
             enriched["uncommitted_check"] = task.uncommittedCheck?.current(forTaskStatus: task.status)?.dictionary() as Any? ?? NSNull()
+            enriched["tool_failures"] = task.toolFailures?.current(forTaskStatus: task.status)?.dictionary as Any? ?? NSNull()
             results.append(enriched)
         }
         return results.sorted { ($0["task_id"] as? String ?? "") < ($1["task_id"] as? String ?? "") }
@@ -2952,6 +2970,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "worktree_finish_mode": task.worktreeFinishMode as Any? ?? NSNull(),
             "worktree_removed": task.worktreeRemoved as Any? ?? NSNull(),
             "uncommitted_check": task.uncommittedCheck?.current(forTaskStatus: task.status)?.dictionary() as Any? ?? NSNull(),
+            "tool_failures": task.toolFailures?.current(forTaskStatus: task.status)?.dictionary as Any? ?? NSNull(),
             "created_at": ISO8601DateFormatter().string(from: task.createdAt),
             "updated_at": ISO8601DateFormatter().string(from: task.updatedAt),
             "needs_attention": Self.taskNeedsAttention(task, threshold: staleTaskThreshold),
@@ -3054,6 +3073,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 "review_summary": task.reviewSummary as Any? ?? NSNull(),
                 "status": task.status,
                 "uncommitted_check": task.uncommittedCheck?.current(forTaskStatus: task.status)?.dictionary() as Any? ?? NSNull(),
+                "tool_failures": task.toolFailures?.current(forTaskStatus: task.status)?.dictionary as Any? ?? NSNull(),
                 "is_stale": staleSeconds != nil,
                 "stale_seconds": staleSeconds as Any? ?? NSNull()
             ])

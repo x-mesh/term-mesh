@@ -78,6 +78,44 @@ struct TaskUncommittedCheck: Codable, Equatable {
     }
 }
 
+/// The tool failures of the native turn that reported a task (#818).
+///
+/// A worker whose tool calls keep failing can still end its turn with a
+/// verdict. The live counters are on `team.status`, but a leader reads the
+/// outcome through `wait` and `collect`, so the turn's counts travel with the
+/// task the turn settled.
+struct TaskToolFailures: Codable, Equatable {
+    var turnFailures: Int
+    var consecutive: Int
+    var lastTool: String?
+    var lastError: String?
+    /// The status the report set; dropped when the status moves on.
+    var forStatus: String?
+
+    /// `lastError` arrives redacted and bounded by
+    /// `AgentSession.projectedToolHeadline`; the task persists it as given.
+    init(turnFailures: Int, consecutive: Int, lastTool: String?, lastError: String?) {
+        self.turnFailures = turnFailures
+        self.consecutive = consecutive
+        self.lastTool = lastTool
+        self.lastError = lastError
+        self.forStatus = nil
+    }
+
+    func current(forTaskStatus status: String) -> TaskToolFailures? {
+        forStatus == status ? self : nil
+    }
+
+    var dictionary: [String: Any] {
+        [
+            "turn_failures": turnFailures,
+            "consecutive": consecutive,
+            "last_tool": lastTool as Any? ?? NSNull(),
+            "last_error": lastError as Any? ?? NSNull(),
+        ]
+    }
+}
+
 enum TaskUncommittedChecker {
     struct Outcome: Equatable {
         var state: TaskUncommittedCheck.State

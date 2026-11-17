@@ -71,6 +71,12 @@ worker에는 `tool_failures`가 있으며 세션 전체 `total`, 현재 또는 �
 같은 턴에서 도구가 3번 연속 실패하면 `health: degraded`와 복구 제안이 표시된다.
 성공한 도구 또는 새 턴은 연속 실패 수를 초기화한다.
 
+Native 턴이 STATUS를 보고해 작업 상태를 정하면, 그 턴의 `turn_failures`,
+`consecutive`, `last_tool`, `last_error`가 작업의 `tool_failures`로 남는다.
+리더는 `tm-agent wait`, `collect --headers`, inbox 항목, `task get`에서 이 값을
+`status` 없이 볼 수 있다. 실패가 없던 턴은 0과 `null`을 남긴다. 작업 상태가 다른
+값으로 바뀌면 이 기록은 사라지고, STATUS 없이 끝난 턴은 기록을 남기지 않는다.
+
 건강 신호는 작업의 STATUS와 별개다. `NEEDS_REVIEW`는 계속 `review_ready`로
 기록하며, 미커밋 변경만으로 실패를 판정하지 않는다. 자동으로 세션을 재시작하지
 않으므로 오류를 확인하고 변경을 보존한 뒤 필요하면 `tm-agent restart --hard`를
