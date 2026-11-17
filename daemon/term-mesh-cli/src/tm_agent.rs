@@ -3262,7 +3262,7 @@ enum RunbookCommands {
         /// Print planned changes without writing files
         #[arg(long)]
         dry_run: bool,
-        /// Overwrite existing managed files
+        /// Replace existing source runbooks with the defaults, edits included
         #[arg(long)]
         force: bool,
     },
@@ -3277,7 +3277,7 @@ enum RunbookCommands {
         /// Print planned changes without writing files
         #[arg(long)]
         dry_run: bool,
-        /// Overwrite existing non-managed files
+        /// Also replace existing source runbooks and non-managed projections
         #[arg(long)]
         force: bool,
     },
