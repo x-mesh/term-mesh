@@ -1884,6 +1884,11 @@ final class TeamOrchestrator: ObservableObject {
         var worktreeFinishedAt: Date? = nil
         var worktreeFinishMode: String? = nil
         var worktreeRemoved: Bool? = nil
+        /// What the task's checkout held at the worker's last DONE, BLOCKED or
+        /// NEEDS_REVIEW report. Optional so boards written before it decode.
+        var uncommittedCheck: TaskUncommittedCheck? = nil
+        /// Tool failures of the native turn that set the current status.
+        var toolFailures: TaskToolFailures? = nil
         let createdAt: Date
         var updatedAt: Date
         var startedAt: Date?
@@ -7303,7 +7308,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentInstanceId: agentInstanceId, taskId: taskId
             )?.worktreePath
         }
-        session.onTurnEnd = { final, _, taskId in
+        session.onTurnEnd = { [weak session] final, _, taskId in
             let reportTaskId = taskId.flatMap {
                 nativeWorkerTask(
                     teamName: teamName, agentName: agentName,
@@ -7320,7 +7325,8 @@ final class TeamOrchestrator: ObservableObject {
             AutoReplyEmit.settleNativeTurn(
                 teamName: teamName, agentName: agentName,
                 agentInstanceId: agentInstanceId,
-                final: final, taskId: reportTaskId
+                final: final, taskId: reportTaskId,
+                toolFailures: session?.turnToolFailures
             )
         }
         session.onTaskCorrelationLost = { taskId, loss in
@@ -8849,6 +8855,7 @@ final class TeamOrchestrator: ObservableObject {
                         "active_task_title": activeTask?.title as Any? ?? NSNull(),
                         "active_task_status": activeTask?.status as Any? ?? NSNull(),
                         "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
+                        "active_task_uncommitted_check": activeTask.flatMap { $0.uncommittedCheck?.current(forTaskStatus: $0.status) }?.dictionary() as Any? ?? NSNull(),
                         "agent_state": agentRuntimeState(
                             teamName: team.id,
                             agentName: agent.name,
@@ -9303,6 +9310,7 @@ final class TeamOrchestrator: ObservableObject {
                     "active_task_title": enrichment["active_task_title"] ?? NSNull(),
                     "active_task_status": enrichment["active_task_status"] ?? NSNull(),
                     "active_task_is_stale": enrichment["active_task_is_stale"] ?? false,
+                    "active_task_uncommitted_check": enrichment["active_task_uncommitted_check"] ?? NSNull(),
                     "agent_state": enrichment["agent_state"] ?? agentRuntimeState(teamName: team.id, agentName: agent.name),
                     "waiting_input": agentIsWaitingInput(agent),
                     "heartbeat_age_seconds": heartbeatAgeSeconds(teamName: team.id, agentName: agent.name) as Any? ?? NSNull(),
@@ -11453,6 +11461,8 @@ final class TeamOrchestrator: ObservableObject {
                 "result": task.result as Any? ?? NSNull(),
                 "review_summary": task.reviewSummary as Any? ?? NSNull(),
                 "status": task.status,
+                "uncommitted_check": task.uncommittedCheck?.current(forTaskStatus: task.status)?.dictionary() as Any? ?? NSNull(),
+                "tool_failures": task.toolFailures?.current(forTaskStatus: task.status)?.dictionary as Any? ?? NSNull(),
                 "is_stale": staleSeconds != nil,
                 "stale_seconds": staleSeconds as Any? ?? NSNull()
             ])
@@ -11553,6 +11563,8 @@ final class TeamOrchestrator: ObservableObject {
             "worktree_init": task.worktreeInit as Any? ?? NSNull(),
             "worktree_finish_mode": task.worktreeFinishMode as Any? ?? NSNull(),
             "worktree_removed": task.worktreeRemoved as Any? ?? NSNull(),
+            "uncommitted_check": task.uncommittedCheck?.current(forTaskStatus: task.status)?.dictionary() as Any? ?? NSNull(),
+            "tool_failures": task.toolFailures?.current(forTaskStatus: task.status)?.dictionary as Any? ?? NSNull(),
             "created_at": sharedISO8601.string(from: task.createdAt),
             "updated_at": sharedISO8601.string(from: task.updatedAt),
             "needs_attention": taskNeedsAttention(task),

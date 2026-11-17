@@ -46,6 +46,7 @@
 		A17B0000000000000000000B /* AutoPilotUndo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17B0000000000000000000C /* AutoPilotUndo.swift */; };
 		A1750000000000000000000B /* ReviewBoardMergeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1750000000000000000000C /* ReviewBoardMergeRunner.swift */; };
 		A1740000000000000000000B /* ProcessRun.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1740000000000000000000C /* ProcessRun.swift */; };
+		A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8180000000000000000000C /* TaskUncommittedCheck.swift */; };
 		A17000000000000000000002 /* ReviewBoardViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000006 /* ReviewBoardViewModel.swift */; };
 		A17000000000000000000003 /* ReviewBoardPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000007 /* ReviewBoardPanelView.swift */; };
 		A17000000000000000000004 /* ReviewBoardViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000008 /* ReviewBoardViewModelTests.swift */; };
@@ -453,6 +454,7 @@
 			A17B0000000000000000000C /* AutoPilotUndo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoPilotUndo.swift; sourceTree = "<group>"; };
 			A1750000000000000000000C /* ReviewBoardMergeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardMergeRunner.swift; sourceTree = "<group>"; };
 			A1740000000000000000000C /* ProcessRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRun.swift; sourceTree = "<group>"; };
+			A8180000000000000000000C /* TaskUncommittedCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TaskUncommittedCheck.swift; sourceTree = "<group>"; };
 			A17000000000000000000006 /* ReviewBoardViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardViewModel.swift; sourceTree = "<group>"; };
 			A17000000000000000000007 /* ReviewBoardPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardPanelView.swift; sourceTree = "<group>"; };
 			A17000000000000000000008 /* ReviewBoardViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardViewModelTests.swift; sourceTree = "<group>"; };
@@ -908,6 +910,7 @@ A1790000000000000000000C /* AutoPilotDispatch.swift */,
 A17B0000000000000000000C /* AutoPilotUndo.swift */,
 A1750000000000000000000C /* ReviewBoardMergeRunner.swift */,
 A1740000000000000000000C /* ProcessRun.swift */,
+A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 					A17000000000000000000006 /* ReviewBoardViewModel.swift */,
 					A17000000000000000000007 /* ReviewBoardPanelView.swift */,
 					A17100000000000000000003 /* ReviewBoardCoordinatorService.swift */,
@@ -1425,6 +1428,7 @@ A1790000000000000000000B /* AutoPilotDispatch.swift in Sources */,
 A17B0000000000000000000B /* AutoPilotUndo.swift in Sources */,
 A1750000000000000000000B /* ReviewBoardMergeRunner.swift in Sources */,
 A1740000000000000000000B /* ProcessRun.swift in Sources */,
+A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 					A17000000000000000000002 /* ReviewBoardViewModel.swift in Sources */,
 					A17000000000000000000003 /* ReviewBoardPanelView.swift in Sources */,
 					A17100000000000000000001 /* ReviewBoardCoordinatorService.swift in Sources */,

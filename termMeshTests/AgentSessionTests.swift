@@ -4545,6 +4545,67 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(summary["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
     }
 
+    /// #818: the task a native turn settles carries that turn's tool
+    /// failures, so `wait` and `collect` show them without `team.status`.
+    func testASettledTaskCarriesTheToolFailuresOfTheTurnThatReportedIt() async throws {
+        let team = "tool-failures-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        let task = try boardTask(team: team, instance: "inst-1")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let sink = RemoteSinkRecorder()
+        let s = AgentSession()
+        TeamOrchestrator.wireNativeWorkerCompletion(
+            s, teamName: team, agentName: "executor", agentInstanceId: "inst-1", report: { _, _ in })
+        s.startRemote(cli: "codex") { sink.record($0) }
+        defer { s.stop() }
+        try s.send(capsule(task: task.id, worktree: nil), from: .leader)
+        let sent = await waitUntil { sink.all.count == 1 }
+        XCTAssertTrue(sent)
+
+        failTool(s, "x1", name: "exec")
+        passTool(s, "x2")
+        failTool(s, "x3", name: "exec")
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn",
+                                  "result": "STATUS: NEEDS_REVIEW\nFILES: a\nVERIFY: n/a\nNEXT: n/a\nFULL_REPORT: n/a"]))
+
+        let settled = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(settled.status, "review_ready")
+        let field = try XCTUnwrap(store.taskDictionary(settled)["tool_failures"] as? [String: Any])
+        XCTAssertEqual(field["turn_failures"] as? Int, 2)
+        XCTAssertEqual(field["consecutive"] as? Int, 1)
+        XCTAssertEqual(field["last_tool"] as? String, "exec")
+        XCTAssertEqual(field["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
+
+        _ = store.updateTask(teamName: team, taskId: task.id, status: "review_ready", result: "again")
+        let repeated = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual((store.taskDictionary(repeated)["tool_failures"] as? [String: Any])?["turn_failures"] as? Int, 2)
+
+        _ = store.updateTask(teamName: team, taskId: task.id, status: "completed", result: "done")
+        XCTAssertTrue(store.taskDictionary(try XCTUnwrap(
+            store.getTask(teamName: team, taskId: task.id)))["tool_failures"] is NSNull)
+
+        _ = store.updateTask(teamName: team, taskId: task.id, status: "in_progress")
+        XCTAssertTrue(store.taskDictionary(try XCTUnwrap(
+            store.getTask(teamName: team, taskId: task.id)))["tool_failures"] is NSNull)
+    }
+
+    /// A clean turn reports no last tool or error, even though the session
+    /// still remembers an earlier turn's.
+    func testACleanTurnCarriesNoEarlierTurnsFailure() throws {
+        let s = AgentSession()
+        s.startRemote { _ in }
+        try s.send("first turn", from: .person)
+        failTool(s, "old1", name: "exec")
+        XCTAssertEqual(s.turnToolFailures.lastTool, "exec")
+        s.ingestForTesting(event(["type": "result", "stop_reason": "end_turn", "is_error": false]))
+        try s.send("second turn", from: .person)
+        passTool(s, "new1")
+        let clean = s.turnToolFailures
+        XCTAssertEqual(clean.turnFailures, 0)
+        XCTAssertNil(clean.lastTool)
+        XCTAssertNil(clean.lastError)
+    }
+
     func testASelfStartedTurnKeepsItsFailuresAfterCompletion() {
         let s = AgentSession()
         s.startRemote { _ in }

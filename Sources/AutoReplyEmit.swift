@@ -75,6 +75,7 @@ enum AutoReplyEmit {
         // the difference between closing a task and closing *this* task.
         preferredTaskId: String? = nil,
         agentInstanceId: String? = nil,
+        toolFailures: TaskToolFailures? = nil,
         store: TeamDataStore = .shared
     ) -> Bool {
         // Fail closed before formatting, task lookup, result persistence, or
@@ -136,7 +137,8 @@ enum AutoReplyEmit {
             assignee: nil,
             blockedReason: blockedReason,
             reviewSummary: reviewSummary,
-            progressNote: nil
+            progressNote: nil,
+            toolFailures: toolFailures
         ) else {
             return true
         }
@@ -187,6 +189,7 @@ enum AutoReplyEmit {
         agentInstanceId: String?,
         final: String,
         taskId: String?,
+        toolFailures: TaskToolFailures? = nil,
         store: TeamDataStore = .shared
     ) {
         guard let taskId else { return }
@@ -195,6 +198,7 @@ enum AutoReplyEmit {
                 teamName: teamName, agentName: agentName,
                 event: AgentPipeCompletion.headerEvent(from: final),
                 preferredTaskId: taskId, agentInstanceId: agentInstanceId,
+                toolFailures: toolFailures,
                 store: store
             )
         } else {

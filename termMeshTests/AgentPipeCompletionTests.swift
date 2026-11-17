@@ -1022,3 +1022,228 @@ final class ScrollbackReplyIdentityTests: XCTestCase {
         XCTAssertEqual(closed?.status, "completed")
     }
 }
+
+/// A worker that stops with uncommitted edits and reports NEEDS_REVIEW must
+/// not read like ordinary review-ready work (#818).
+final class TaskUncommittedCheckTests: XCTestCase {
+
+    private var scratch: URL!
+
+    override func setUpWithError() throws {
+        scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("uncommitted-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: scratch)
+    }
+
+    private func git(_ args: [String], in dir: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["git", "-C", dir.path] + args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "git \(args.joined(separator: " "))")
+    }
+
+    /// A repository with one commit, so a later file is the only change.
+    private func repository(named name: String) throws -> URL {
+        let repo = scratch.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        try git(["init", "-q"], in: repo)
+        try "base\n".write(to: repo.appendingPathComponent("base.txt"), atomically: true, encoding: .utf8)
+        try git(["add", "base.txt"], in: repo)
+        try git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"], in: repo)
+        return repo
+    }
+
+    // MARK: - Reading git status
+
+    func testPorcelainPathsSkipTheSourceOfARename() {
+        let raw = "?? new.swift\0 M edited.swift\0R  moved.swift\0old.swift\0A  added.swift\0"
+        XCTAssertEqual(
+            TaskUncommittedChecker.parsePorcelainZ(Data(raw.utf8)),
+            ["new.swift", "edited.swift", "moved.swift", "added.swift"])
+        XCTAssertEqual(TaskUncommittedChecker.parsePorcelainZ(Data()), [])
+    }
+
+    func testAnUntrackedAndAModifiedFileAreBothCounted() async throws {
+        let repo = try repository(named: "dirty")
+        try "edited\n".write(to: repo.appendingPathComponent("base.txt"), atomically: true, encoding: .utf8)
+        try "new\n".write(to: repo.appendingPathComponent("new.txt"), atomically: true, encoding: .utf8)
+
+        let outcome = await TaskUncommittedChecker.run(checkout: repo.path)
+
+        XCTAssertEqual(outcome.state, .checked)
+        XCTAssertEqual(outcome.count, 2)
+        XCTAssertEqual(Set(outcome.paths ?? []), ["base.txt", "new.txt"])
+    }
+
+    func testACleanCheckoutIsCheckedWithNoChanges() async throws {
+        let repo = try repository(named: "clean")
+        let outcome = await TaskUncommittedChecker.run(checkout: repo.path)
+        XCTAssertEqual(outcome, .init(state: .checked, count: 0, paths: []))
+    }
+
+    func testCheckoutsThatCannotBeCheckedAreSkippedWithAReasonNotReportedClean() async throws {
+        let repo = try repository(named: "outer")
+        let inside = repo.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+        let plain = scratch.appendingPathComponent("plain", isDirectory: true)
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+
+        let cases: [(String?, String)] = [
+            (nil, "no_task_worktree"),
+            ("", "no_task_worktree"),
+            (scratch.appendingPathComponent("gone").path, "checkout_missing"),
+            (plain.path, "not_git_worktree"),
+            (inside.path, "not_worktree_root"),
+        ]
+        for (checkout, reason) in cases {
+            let outcome = await TaskUncommittedChecker.run(checkout: checkout)
+            XCTAssertEqual(outcome, .init(state: .skipped, reason: reason), checkout ?? "nil")
+        }
+    }
+
+    // MARK: - Recording it on the task
+
+    private func team(_ label: String) -> String {
+        let team = "\(label)-\(UUID().uuidString)"
+        TeamDataStore.shared.registerTeam(team, agents: [.init(name: "executor", instanceId: nil)])
+        return team
+    }
+
+    private func settledCheck(
+        _ team: String, _ taskId: String, timeout: TimeInterval = 10
+    ) -> TaskUncommittedCheck? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let check = TeamDataStore.shared.getTask(teamName: team, taskId: taskId)?.uncommittedCheck,
+               check.state != .pending {
+                return check
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return TeamDataStore.shared.getTask(teamName: team, taskId: taskId)?.uncommittedCheck
+    }
+
+    /// The incident's path: a native worker settled from its turn text, not
+    /// through `tm-agent reply`.
+    @MainActor
+    func testANativeNeedsReviewTurnRecordsTheEditsItLeftBehind() throws {
+        let store = TeamDataStore.shared
+        let team = team("uncommitted-native")
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let repo = try repository(named: "worker")
+        try "half done\n".write(to: repo.appendingPathComponent("menu.swift"), atomically: true, encoding: .utf8)
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "history menu", assignee: "executor"))
+        _ = try XCTUnwrap(store.updateTask(
+            teamName: team, taskId: task.id, status: "in_progress", worktreePath: repo.path))
+
+        AutoReplyEmit.settleNativeTurn(
+            teamName: team, agentName: "executor", agentInstanceId: nil,
+            final: "STATUS: NEEDS_REVIEW\nFILES: menu.swift\nVERIFY: n/a\nNEXT: review\nFULL_REPORT: n/a\n\nExecution wrapper rejected the commit.",
+            taskId: task.id, store: store)
+
+        let reported = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(reported.status, "review_ready")
+        XCTAssertNotNil(reported.uncommittedCheck)
+        let check = try XCTUnwrap(settledCheck(team, task.id))
+        XCTAssertEqual(check.state, .checked)
+        XCTAssertEqual(check.count, 1)
+        XCTAssertEqual(check.paths, ["menu.swift"])
+        XCTAssertEqual(check.checkout, repo.path)
+        let after = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(after.status, "review_ready")
+        XCTAssertEqual(after.updatedAt, reported.updatedAt, "a check result is not a task update")
+
+        let dict = store.taskDictionary(after)
+        let field = try XCTUnwrap(dict["uncommitted_check"] as? [String: Any])
+        XCTAssertEqual(field["state"] as? String, "checked")
+        XCTAssertEqual(field["count"] as? Int, 1)
+    }
+
+    func testLeavingAReportedStatusDropsTheCheckAndALateResultIsIgnored() throws {
+        let store = TeamDataStore.shared
+        let team = team("uncommitted-reopen")
+        defer { store.unregisterTeam(team) }
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "work", assignee: "executor"))
+        let blocked = try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "blocked"))
+        let firstToken = try XCTUnwrap(blocked.uncommittedCheck?.token)
+
+        let reopened = try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "in_progress"))
+        XCTAssertNil(reopened.uncommittedCheck)
+        XCTAssertFalse(store.recordUncommittedCheck(
+            teamName: team, taskId: task.id, token: firstToken,
+            outcome: .init(state: .checked, count: 3, paths: ["a"])))
+        XCTAssertNil(store.getTask(teamName: team, taskId: task.id)?.uncommittedCheck)
+
+        let again = try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "completed"))
+        XCTAssertNotEqual(again.uncommittedCheck?.token, firstToken)
+        XCTAssertEqual(settledCheck(team, task.id)?.reason, "no_task_worktree")
+    }
+
+    /// A status changed by a route other than a report (here an unblock)
+    /// must not keep showing the earlier report's check.
+    func testAStatusChangedOutsideAReportDropsTheCheck() throws {
+        let store = TeamDataStore.shared
+        let team = team("uncommitted-unblock")
+        defer { store.unregisterTeam(team) }
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "work", assignee: "executor"))
+        _ = try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "in_progress"))
+        let blocked = try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "blocked"))
+        let token = try XCTUnwrap(blocked.uncommittedCheck?.token)
+
+        let unblocked = try XCTUnwrap(store.unblockTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(unblocked.status, "in_progress")
+        XCTAssertNil(store.getTask(teamName: team, taskId: task.id)?.uncommittedCheck)
+        XCTAssertTrue(store.taskDictionary(unblocked)["uncommitted_check"] is NSNull)
+        XCTAssertFalse(store.recordUncommittedCheck(
+            teamName: team, taskId: task.id, token: token,
+            outcome: .init(state: .checked, count: 1, paths: ["a"])))
+    }
+
+    /// A worker that repeats the same report reuses the check in flight
+    /// instead of starting another git process pair per retry.
+    func testARepeatedReportReusesOnlyAMatchingCheckStillInFlight() {
+        let start = Date()
+        let check = TaskUncommittedCheck.pending(checkout: "/wt", forStatus: "completed", at: start)
+        let soon = start.addingTimeInterval(1)
+        XCTAssertTrue(check.answersRepeatedReport(ofStatus: "completed", checkout: "/wt", at: soon))
+        XCTAssertFalse(check.answersRepeatedReport(ofStatus: "blocked", checkout: "/wt", at: soon))
+        XCTAssertFalse(check.answersRepeatedReport(ofStatus: "completed", checkout: "/other", at: soon))
+        XCTAssertFalse(check.answersRepeatedReport(
+            ofStatus: "completed", checkout: "/wt",
+            at: start.addingTimeInterval(TaskUncommittedCheck.staleAfter + 1)))
+        var finished = check
+        finished.state = .checked
+        XCTAssertFalse(finished.answersRepeatedReport(ofStatus: "completed", checkout: "/wt", at: soon))
+    }
+
+    func testAPendingCheckThatNeverFinishesReadsAsUnknown() {
+        let start = Date()
+        let check = TaskUncommittedCheck.pending(checkout: "/x", forStatus: "blocked", at: start)
+        XCTAssertEqual(check.dictionary(now: start)["state"] as? String, "pending")
+        let late = check.dictionary(now: start.addingTimeInterval(TaskUncommittedCheck.staleAfter + 1))
+        XCTAssertEqual(late["state"] as? String, "unknown")
+        XCTAssertEqual(late["reason"] as? String, "check_did_not_finish")
+    }
+
+    func testABoardWrittenBeforeTheFieldStillDecodes() throws {
+        let store = TeamDataStore.shared
+        let team = team("uncommitted-decode")
+        defer { store.unregisterTeam(team) }
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "old", assignee: "executor"))
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(task)) as? [String: Any])
+        object.removeValue(forKey: "uncommittedCheck")
+        let decoded = try JSONDecoder().decode(
+            TeamOrchestrator.TeamTask.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertNil(decoded.uncommittedCheck)
+        XCTAssertEqual(decoded.id, task.id)
+    }
+}
