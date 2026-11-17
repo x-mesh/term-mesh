@@ -505,7 +505,9 @@ pub(crate) fn backup_peer_state_file_at(
         };
         let copied = std::fs::File::open(path).and_then(|mut source| {
             std::io::copy(&mut source, &mut backup)?;
-            std::fs::set_permissions(&candidate, source.metadata()?.permissions())
+            // Through the open handle (fchmod), not the path: the name could
+            // be swapped for a link after `create_new` made it.
+            backup.set_permissions(source.metadata()?.permissions())
         });
         if let Err(e) = copied {
             let _ = std::fs::remove_file(&candidate);
@@ -1948,6 +1950,25 @@ mod backup_create_new_tests {
             "the backup was written through the planted link"
         );
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "state");
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_no_partial_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("peer-workspaces.json");
+        std::fs::write(&state, "state").unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&state).is_ok() {
+            return; // running as root: mode 000 does not stop the read
+        }
+
+        assert!(backup_peer_state_file_at(&state, 42).is_err());
+
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("peer-workspaces.json")]);
     }
 
     #[test]
