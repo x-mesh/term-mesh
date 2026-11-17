@@ -1583,3 +1583,1591 @@ mod auto_watch_tests {
         }
     }
 }
+
+// ── Session picker ──────────────────────────────────────────────────
+
+/// A Claude Code session entry parsed from the project session directory.
+pub(crate) struct SessionEntry {
+    id: String,
+    modified: std::time::SystemTime,
+    first_message: String,
+    last_message: String,
+}
+
+/// Discover the Claude Code sessions directory for the current working directory.
+pub(crate) fn claude_sessions_dir() -> Option<PathBuf> {
+    let home = env::var("HOME").ok()?;
+    let cwd = env::current_dir().ok()?;
+    // Claude Code encodes the project path as dash-separated: /Users/foo/bar → -Users-foo-bar
+    let encoded = cwd.to_string_lossy().replace('/', "-");
+    let dir = PathBuf::from(format!("{home}/.claude/projects/{encoded}"));
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// List recent sessions from the Claude Code sessions directory.
+pub(crate) fn list_recent_sessions(limit: usize) -> Vec<SessionEntry> {
+    let dir = match claude_sessions_dir() {
+        Some(d) => d,
+        None => return vec![],
+    };
+
+    let mut entries: Vec<SessionEntry> = vec![];
+    if let Ok(read_dir) = std::fs::read_dir(&dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            // Only .jsonl session files with UUID names
+            if !name.ends_with(".jsonl") {
+                continue;
+            }
+            let id = name.trim_end_matches(".jsonl");
+            // Quick UUID format check (8-4-4-4-12)
+            if id.len() != 36 || id.chars().filter(|c| *c == '-').count() != 4 {
+                continue;
+            }
+
+            let modified = match entry.metadata().and_then(|m| m.modified()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            // Extract first user message and last assistant message
+            let (first_message, last_message) = extract_messages(&path);
+
+            entries.push(SessionEntry {
+                id: id.to_string(),
+                modified,
+                first_message,
+                last_message,
+            });
+        }
+    }
+
+    // Sort by modification time, newest first
+    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    entries.truncate(limit);
+    entries
+}
+
+/// Extract text content from a session JSONL entry.
+/// User messages: `message.content` is a string.
+/// Assistant messages: `message.content` is `[{"type":"text","text":"..."}]`.
+pub(crate) fn extract_text_from_entry(val: &Value) -> String {
+    // Try message.content first (current format)
+    let msg = &val["message"]["content"];
+    if let Some(s) = msg.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = msg.as_array() {
+        let texts: Vec<&str> = arr
+            .iter()
+            .filter(|b| b["type"].as_str() == Some("text"))
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        if !texts.is_empty() {
+            return texts.join(" ");
+        }
+    }
+    // Fallback: top-level content (older format)
+    val["content"].as_str().unwrap_or("").to_string()
+}
+
+/// Extract the first user message and last assistant message from a session JSONL file.
+pub(crate) fn extract_messages(path: &PathBuf) -> (String, String) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (String::new(), String::new()),
+    };
+
+    // First message: read first ~16KB
+    let mut head_buf = vec![0u8; 16384];
+    let head_n = file.read(&mut head_buf).unwrap_or(0);
+    head_buf.truncate(head_n);
+    let head_text = String::from_utf8_lossy(&head_buf);
+
+    let mut first_message = String::new();
+    for line in head_text.lines().take(50) {
+        if let Ok(val) = serde_json::from_str::<Value>(line) {
+            if val["type"].as_str() != Some("user") {
+                continue;
+            }
+            let text = extract_text_from_entry(&val);
+            if text.contains("<system-reminder>")
+                || text.contains("<command-name>")
+                || text.contains("<local-command")
+            {
+                continue;
+            }
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Label commit generator sessions clearly
+            if trimmed.starts_with("You are a commit message generator") {
+                first_message = "[commit message]".to_string();
+                break;
+            }
+            let display: String = trimmed.chars().take(80).collect();
+            first_message = if trimmed.chars().count() > 80 {
+                format!("{display}...")
+            } else {
+                display
+            };
+            break;
+        }
+    }
+
+    // Last message: read last ~32KB
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let tail_offset = if file_len > 32768 {
+        file_len - 32768
+    } else {
+        0
+    };
+    let _ = file.seek(SeekFrom::Start(tail_offset));
+    let mut tail_buf = Vec::new();
+    let _ = file.read_to_end(&mut tail_buf);
+    let tail_text = String::from_utf8_lossy(&tail_buf);
+
+    let mut last_message = String::new();
+    for line in tail_text.lines().rev() {
+        if let Ok(val) = serde_json::from_str::<Value>(line) {
+            if val["type"].as_str() != Some("assistant") {
+                continue;
+            }
+            let text = extract_text_from_entry(&val);
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let display: String = trimmed.chars().take(80).collect();
+                last_message = if trimmed.chars().count() > 80 {
+                    format!("{display}...")
+                } else {
+                    display
+                };
+                break;
+            }
+        }
+    }
+
+    (first_message, last_message)
+}
+
+/// Format a SystemTime as a relative time string (e.g. "2h ago", "3d ago").
+pub(crate) fn format_relative_time(time: std::time::SystemTime) -> String {
+    let elapsed = time.elapsed().unwrap_or_default();
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    if secs < 86400 {
+        return format!("{}h ago", secs / 3600);
+    }
+    format!("{}d ago", secs / 86400)
+}
+
+/// Interactive session picker. Returns a session ID or exits.
+pub(crate) fn pick_session() -> String {
+    let sessions = list_recent_sessions(15);
+    if sessions.is_empty() {
+        eprintln!("No recent sessions found for this project.");
+        eprintln!("Hint: enter a session ID directly with --resume-session=<uuid>");
+        process::exit(1);
+    }
+
+    eprintln!("\n  Recent sessions:\n");
+    for (i, s) in sessions.iter().enumerate() {
+        let time_str = format_relative_time(s.modified);
+        let preview = if s.first_message.is_empty() {
+            s.id[..8].to_string()
+        } else {
+            s.first_message.clone()
+        };
+        eprintln!("  {:>2}) {:<10} Q: {}", i + 1, time_str, preview);
+        if !s.last_message.is_empty() {
+            eprintln!("      {:<10} A: {}", "", s.last_message);
+        }
+    }
+    eprintln!();
+    eprint!("  Select [1-{}] or paste session ID: ", sessions.len());
+    std::io::stderr().flush().ok();
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {
+        eprintln!("No selection made.");
+        process::exit(1);
+    }
+    let input = input.trim();
+
+    // Try as number first
+    if let Ok(num) = input.parse::<usize>() {
+        if num >= 1 && num <= sessions.len() {
+            return sessions[num - 1].id.clone();
+        }
+        eprintln!("Invalid selection: {num}");
+        process::exit(1);
+    }
+
+    // Otherwise treat as session ID
+    input.to_string()
+}
+
+/// Resolve --resume-session: None means not requested, Some(None) means interactive picker,
+/// Some(Some(id)) means specific session ID.
+pub(crate) fn resolve_resume_session(flag: Option<Option<String>>) -> Option<String> {
+    match flag {
+        None => None,
+        Some(None) => Some(pick_session()),
+        Some(Some(id)) if id.is_empty() => Some(pick_session()),
+        Some(Some(id)) => Some(id),
+    }
+}
+
+/// Resolve --spec: literal text, or @path to read the spec from a file.
+/// Returns Ok(None) when no spec was supplied. A leading `@` reads the file
+/// at the remaining path (error if it cannot be read). Empty input is treated
+/// as absent.
+pub(crate) fn resolve_watcher_spec(spec: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = spec else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Some(path) = raw.strip_prefix('@') {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("--spec @<path> requires a file path after '@'".to_string());
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("--spec: cannot read file '{path}': {e}"))?;
+        if content.trim().is_empty() {
+            return Err(format!("--spec: file '{path}' is empty"));
+        }
+        Ok(Some(content))
+    } else {
+        Ok(Some(raw.to_string()))
+    }
+}
+
+/// Attach `watcher_spec` as `custom_instructions` to watcher agents only (R7:
+/// watcher-only invariant). Warns when a spec is supplied but no watcher role
+/// is present in the team. Mutates the agents JSON array in place.
+pub(crate) fn apply_watcher_spec(agents: &mut [serde_json::Value], watcher_spec: Option<&str>) {
+    let Some(spec) = watcher_spec else {
+        return;
+    };
+    let mut attached = 0usize;
+    for agent in agents.iter_mut() {
+        let role = agent
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| agent.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        if role == "watcher" {
+            if let Some(obj) = agent.as_object_mut() {
+                obj.insert(
+                    "custom_instructions".to_string(),
+                    serde_json::Value::String(spec.to_string()),
+                );
+                attached += 1;
+            }
+        }
+    }
+    if attached == 0 {
+        eprintln!(
+            "Warning: --spec was provided but no 'watcher' agent is in this team; spec ignored."
+        );
+    }
+}
+
+// ── Orchestration implementations ────────────────────────────────────
+
+pub(crate) fn run_create(
+    sock: &PathBuf,
+    team: &str,
+    count: u32,
+    claude_leader: bool,
+    model: &str,
+    leader_model: Option<&str>,
+    effort: Option<&str>,
+    leader_effort: Option<&str>,
+    kiro: &Option<String>,
+    codex: &Option<String>,
+    gemini: &Option<String>,
+    adopt: bool,
+    preset: Option<&str>,
+    roles: Option<&str>,
+    resume_session: Option<Option<String>>,
+    watcher_spec: Option<&str>,
+    no_auto_watch: bool,
+    auto_recycle: Option<u32>,
+    auto_recycle_per_agent: Option<&str>,
+) {
+    // Guard: --adopt and --claude-leader are mutually exclusive
+    if adopt && claude_leader {
+        eprintln!("Error: --adopt and --claude-leader cannot be used together. In --adopt mode the current terminal is already the leader.");
+        process::exit(1);
+    }
+    // Guard: --roles and count together — roles wins, count is ignored
+    if roles.is_some() && count != 2 {
+        eprintln!("Warning: --roles is specified; --count ({count}) will be ignored.");
+    }
+    // Resolve resume session before team creation (may show interactive picker)
+    let resume_session_id = resolve_resume_session(resume_session);
+    if resume_session_id.is_some() && adopt {
+        eprintln!("Error: --resume-session and --adopt cannot be used together.");
+        process::exit(1);
+    }
+
+    cleanup_old_results(team);
+    // --resume-session implies claude leader mode (need Claude CLI to pass --resume)
+    let mut leader_mode = if adopt {
+        "adopted".to_string()
+    } else if claude_leader || resume_session_id.is_some() {
+        "claude".to_string()
+    } else {
+        "repl".to_string()
+    };
+    let leader_model = leader_model.unwrap_or(model);
+    let kiro_agents = parse_cli_flag(kiro);
+    let codex_agents = parse_cli_flag(codex);
+    let gemini_agents = parse_cli_flag(gemini);
+    let mut preset_name: Option<String> = None;
+    let mut workflow_task_templates: Vec<String> = Vec::new();
+    let mut workflow_review_checkpoints: Vec<String> = Vec::new();
+
+    // Resolve agents from preset or roles via RPC, or build from defaults
+    let mut agents: Vec<serde_json::Value> = if let Some(preset_id) = preset {
+        eprintln!("Resolving preset '{preset_id}'...");
+        match rpc_call_timeout(
+            sock,
+            "team.preset.resolve",
+            json!({
+                "preset_id": preset_id,
+                "model": model,
+            }),
+            3,
+        ) {
+            Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
+                let result = &resp["result"];
+                preset_name = result["preset_name"].as_str().map(str::to_string);
+                if !adopt && !claude_leader && resume_session_id.is_none() {
+                    if let Some(resolved_leader) = result["leader_mode"].as_str() {
+                        leader_mode = resolved_leader.to_string();
+                    }
+                }
+                workflow_task_templates = result["task_templates"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                workflow_review_checkpoints = result["review_checkpoints"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                result["agents"].as_array().cloned().unwrap_or_default()
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "Error: preset resolve failed: {}",
+                    resp["error"]["message"].as_str().unwrap_or("unknown")
+                );
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Error: team.preset.resolve RPC failed (app may not support presets yet): {e}"
+                );
+                process::exit(1);
+            }
+        }
+    } else if let Some(roles_str) = roles {
+        eprintln!("Resolving roles '{roles_str}'...");
+        // Split comma-separated roles into a JSON array (Swift expects [String], not String)
+        let roles_vec: Vec<&str> = roles_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        match rpc_call_timeout(
+            sock,
+            "team.preset.resolve",
+            json!({
+                "roles": roles_vec,
+                "model": model,
+            }),
+            3,
+        ) {
+            Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => resp["result"]["agents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            Ok(resp) => {
+                eprintln!(
+                    "Error: roles resolve failed: {}",
+                    resp["error"]["message"].as_str().unwrap_or("unknown")
+                );
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Error: team.preset.resolve RPC failed (app may not support roles yet): {e}"
+                );
+                process::exit(1);
+            }
+        }
+    } else {
+        // Default: build from DEFAULT_AGENT_NAMES up to count
+        let mut default_agents = Vec::new();
+        for i in 0..count as usize {
+            let name = if i < DEFAULT_AGENT_NAMES.len() {
+                DEFAULT_AGENT_NAMES[i].to_string()
+            } else {
+                format!("agent-{i}")
+            };
+            let color = DEFAULT_AGENT_COLORS[i % DEFAULT_AGENT_COLORS.len()];
+            let cli = if codex_agents.contains(&name) || codex_agents.contains("all") {
+                "codex"
+            } else if gemini_agents.contains(&name) || gemini_agents.contains("all") {
+                "gemini"
+            } else if kiro_agents.contains(&name) || kiro_agents.contains("all") {
+                "kiro"
+            } else {
+                "claude"
+            };
+            default_agents.push(json!({
+                "name": name, "cli": cli, "model": model,
+                "agent_type": name, "color": color,
+            }));
+        }
+        default_agents
+    };
+
+    // Attach watcher spec (if any) to watcher agents only (R7: watcher-only).
+    apply_watcher_spec(&mut agents, watcher_spec);
+    if let Some(effort) = effort {
+        for agent in &mut agents {
+            agent["effort"] = json!(effort);
+        }
+    }
+
+    // Destroy existing team first, then poll until gone (max 10 × 50ms = 500ms)
+    let _ = rpc_call_timeout(sock, "team.destroy", json!({ "team_name": team }), 2);
+    for i in 0..10 {
+        if rpc_call_timeout(sock, "team.status", json!({ "team_name": team }), 1).is_err() {
+            break;
+        }
+        // team.status returns ok even if team exists but is being torn down;
+        // check if the response indicates the team no longer exists
+        if let Ok(r) = rpc_call_timeout(sock, "team.status", json!({ "team_name": team }), 1) {
+            if !r["ok"].as_bool().unwrap_or(false) {
+                break;
+            }
+        }
+        if i == 9 {
+            eprintln!("Warning: previous team may still be tearing down");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let workdir = env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let agent_count = agents.len();
+    if let Some(ref sid) = resume_session_id {
+        eprintln!("Creating team '{team}' with {agent_count} agent(s) [leader: {leader_mode}, resume: {}]...", &sid[..8.min(sid.len())]);
+    } else {
+        eprintln!("Creating team '{team}' with {agent_count} agent(s) [leader: {leader_mode}]...");
+    }
+    eprintln!("Socket: {}", sock.display());
+
+    // Pass caller's panel ID so the app can route team creation to the correct window
+    let mut create_params = json!({
+        "team_name": team,
+        "working_directory": workdir,
+        "leader_session_id": format!("leader-{}", process::id()),
+        "leader_mode": leader_mode,
+        "leader_model": leader_model,
+        "agents": agents,
+        "runbook_init_prompt": true,
+    });
+    if let Some(ref sid) = resume_session_id {
+        create_params["resume_session_id"] = json!(sid);
+    }
+    if let Ok(panel_id) = env::var("TERMMESH_PANEL_ID") {
+        create_params["surface_id"] = json!(panel_id);
+    }
+    if let Ok(window_id) = env::var("TERMMESH_WINDOW_ID") {
+        create_params["window_id"] = json!(window_id);
+    }
+    if let Ok(workspace_id) = env::var("TERMMESH_WORKSPACE_ID") {
+        create_params["workspace_id"] = json!(workspace_id);
+    }
+    // In --adopt mode, pass the adopted leader's CLI for stable detection
+    if adopt {
+        if let Ok(cli) = env::var("TERMMESH_CLI") {
+            create_params["leader_cli"] = json!(cli);
+        }
+    }
+    if let Some(n) = auto_recycle {
+        create_params["default_auto_recycle_every"] = json!(n);
+    }
+    if let Some(effort) = leader_effort {
+        create_params["leader_effort"] = json!(effort);
+    }
+    if let Some(per_agent_str) = auto_recycle_per_agent {
+        let map: serde_json::Map<String, serde_json::Value> = per_agent_str
+            .split(',')
+            .filter_map(|s| {
+                let mut parts = s.trim().splitn(2, ':');
+                let name = parts.next()?.trim().to_string();
+                let count: u32 = parts.next()?.trim().parse().ok()?;
+                Some((name, json!(count)))
+            })
+            .collect();
+        if !map.is_empty() {
+            create_params["per_agent_auto_recycle"] = serde_json::Value::Object(map);
+        }
+    }
+    let r = match rpc_call_timeout(sock, "team.create", create_params, 5) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    println!("{}", pretty(&r));
+    println!();
+    println!("Commands:");
+    println!("  tm-agent send <agent> 'your message'");
+    println!("  tm-agent broadcast 'message to all'");
+    println!("  tm-agent status");
+    println!("  tm-agent destroy");
+
+    if r["ok"].as_bool().unwrap_or(false) {
+        if !workflow_task_templates.is_empty() {
+            let workflow_label = preset_name.as_deref().or(preset).unwrap_or("workflow");
+            let checkpoint_note = if workflow_review_checkpoints.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\nReview checkpoints: {}",
+                    workflow_review_checkpoints.join(", ")
+                )
+            };
+            eprintln!("\nCreating workflow task templates for '{workflow_label}'...");
+            for (i, title) in workflow_task_templates.iter().enumerate() {
+                let assignee = agents
+                    .get(i % agents.len())
+                    .and_then(|a| a["name"].as_str())
+                    .unwrap_or("");
+                let mut params = json!({
+                    "team_name": team,
+                    "title": title,
+                    "description": format!(
+                        "Created from workflow preset: {}{}",
+                        workflow_label,
+                        checkpoint_note
+                    ),
+                    "priority": 2,
+                    "created_by": format!("workflow:{workflow_label}"),
+                });
+                if !assignee.is_empty() {
+                    params["assignee"] = json!(assignee);
+                }
+                match rpc_call_timeout(sock, "team.task.create", params, 2) {
+                    Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
+                        let suffix = if assignee.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" -> {assignee}")
+                        };
+                        eprintln!("  \u{2713} {title}{suffix}");
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "  \u{2717} {title}: {}",
+                            resp["error"]["message"]
+                                .as_str()
+                                .unwrap_or("task create failed")
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("  \u{2717} {title}: {e}");
+                    }
+                }
+            }
+        }
+
+        let created_agents = r["result"]["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let non_kiro: Vec<(usize, &Value)> = agents
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a["cli"].as_str().unwrap_or("claude") != "kiro")
+            .collect();
+        if !non_kiro.is_empty() {
+            // Poll until all agent panels are spawned (max 60 × 100ms = 6s)
+            eprintln!("\nWaiting for agent panels to spawn...");
+            let expected = non_kiro.len();
+            for i in 0..60 {
+                if let Ok(st) =
+                    rpc_call_timeout(sock, "team.status", json!({ "team_name": team }), 2)
+                {
+                    if let Some(agents_arr) = st["result"]["agents"].as_array() {
+                        let with_panels = agents_arr
+                            .iter()
+                            .filter(|a| {
+                                a["panel_id"]
+                                    .as_str()
+                                    .map(|s| !s.is_empty())
+                                    .unwrap_or(false)
+                            })
+                            .count();
+                        if with_panels >= expected {
+                            eprintln!("  All {expected} agent panels ready ({} ms)", (i + 1) * 100);
+                            break;
+                        }
+                        if i % 10 == 9 {
+                            eprintln!("  ... {with_panels}/{expected} panels ready");
+                        }
+                    }
+                }
+                if i == 59 {
+                    eprintln!("  Warning: timed out waiting for all panels (proceeding anyway)");
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            eprintln!("Sending init prompts to non-kiro agents...");
+            // Cold-start protection moved to Swift: the TerminalSurface gates
+            // the first paste on each surface until ghostty's pty_data_callback
+            // confirms the child has started outputting. No fixed warmup here.
+            for (agent_index, a) in &non_kiro {
+                let name = a["name"].as_str().unwrap_or("");
+                let role = a["agent_type"].as_str().unwrap_or(name);
+                let (agent_instance_id, panel_id) =
+                    created_agent_selector(&created_agents, *agent_index);
+                let init_text =
+                    agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
+                let mut pace_for_terminal = true;
+                match rpc_call_timeout(
+                    sock,
+                    "team.send",
+                    json!({
+                        "team_name": team, "agent_name": name,
+                        "agent_instance_id": agent_instance_id,
+                        "panel_id": panel_id,
+                        "text": format!("{init_text}\n"),
+                        "send_sequence_aware": true,
+                        // The role briefing must arrive as the user's own turn; a
+                        // Claude inbox frames it as another session's message, and
+                        // an agent can reject its own role as an injection.
+                        "claude_inbox": false,
+                    }),
+                    3,
+                ) {
+                    Ok(ref r) => {
+                        // team.send pastes text with withReturn=false; the trailing "\n"
+                        // is stripped by sendTextToPanel, so the Enter must be delivered
+                        // separately via team.send_key — same follow-up as `tm-agent send`
+                        // and `tm-agent delegate`. Without this the init prompt sits
+                        // unsubmitted in the freshly spawned agent pane (enter-swallow).
+                        let text_delivered =
+                            r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                        let return_required = send_response_return_required(r);
+                        let _ = send_return_key_with_retry(
+                            sock,
+                            team,
+                            name,
+                            text_delivered,
+                            "team.create.init",
+                            panel_id,
+                            agent_instance_id,
+                            r["result"]["send_sequence_id"].as_str(),
+                            return_required,
+                        );
+                        pace_for_terminal = return_required != Some(false);
+                        eprintln!("  \u{2713} {name}: init prompt sent");
+                    }
+                    Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
+                }
+                // Keep 1s delay between sends: this is NOT state synchronization but
+                // main-thread congestion relief. The Swift app processes sendTextToPanel
+                // on DispatchQueue.main — sending too fast causes Enter key events to be
+                // dropped because the TUI (Claude Code) hasn't processed the previous
+                // text input before the next arrives. DO NOT remove this delay.
+                // A native acknowledgement (return_required=false) is exempt: its
+                // turn went to stdin, with no main-thread paste or TUI to congest.
+                if pace_for_terminal {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+        let kiro_count = agents.len() - non_kiro.len();
+        if kiro_count > 0 {
+            eprintln!("\n  \u{2713} {kiro_count} kiro agent(s): prompt loaded via agent profile (no delay)");
+        }
+
+        // Auto-watch hook: trigger after successful team creation (best-effort)
+        let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        maybe_auto_watch_after_team_change(sock, team, no_auto_watch, &wd);
+    }
+}
+
+pub(crate) fn is_auto_watch_disabled_by_env() -> bool {
+    match env::var("TERMMESH_AUTO_WATCH") {
+        Ok(val) => matches!(
+            val.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Normalized agent descriptor used by the pure decision function.
+#[derive(Debug, Clone)]
+pub(crate) struct AutoWatchAgent {
+    name: String,
+    agent_type: String,
+    cli: String,
+    model: String,
+}
+
+/// Decision returned by `auto_watch_decision`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AutoWatchDecision {
+    SkipNoWatcher,
+    SkipNoWorker,
+    SkipMultiWorker(usize),
+    SkipMissingSpec,
+    Enable {
+        target: String,
+        watcher_cli: String,
+        watcher_model: String,
+    },
+}
+
+/// Pure decision function — no I/O, fully unit-testable.
+pub(crate) fn auto_watch_decision(
+    agents: &[AutoWatchAgent],
+    spec_exists: bool,
+) -> AutoWatchDecision {
+    let watchers: Vec<&AutoWatchAgent> = agents
+        .iter()
+        .filter(|a| a.agent_type == "watcher")
+        .collect();
+    let workers: Vec<&AutoWatchAgent> = agents
+        .iter()
+        .filter(|a| a.agent_type != "watcher")
+        .collect();
+
+    if watchers.is_empty() {
+        return AutoWatchDecision::SkipNoWatcher;
+    }
+    if workers.is_empty() {
+        return AutoWatchDecision::SkipNoWorker;
+    }
+    if workers.len() > 1 {
+        return AutoWatchDecision::SkipMultiWorker(workers.len());
+    }
+    if !spec_exists {
+        return AutoWatchDecision::SkipMissingSpec;
+    }
+    let w = &watchers[0];
+    AutoWatchDecision::Enable {
+        target: workers[0].name.clone(),
+        watcher_cli: w.cli.clone(),
+        watcher_model: w.model.clone(),
+    }
+}
+
+/// Outcome of parsing a watch.on JSON-RPC response envelope.
+#[derive(Debug)]
+pub(crate) enum WatchOnOutcome {
+    Enabled,
+    Failed(String),
+    Unexpected(String),
+}
+
+/// Classify a watch.on JSON-RPC response for unit testing without RPC mocking.
+pub(crate) fn parse_watch_on_response(r: &serde_json::Value) -> WatchOnOutcome {
+    if r.get("error").map_or(true, serde_json::Value::is_null)
+        && r["result"]["enabled"].as_bool().unwrap_or(false)
+    {
+        WatchOnOutcome::Enabled
+    } else if r.get("error").map_or(false, |e| !e.is_null()) {
+        let msg = r["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        WatchOnOutcome::Failed(msg)
+    } else {
+        WatchOnOutcome::Unexpected(r.to_string())
+    }
+}
+
+/// Emit the user-facing message and call watch.on RPC (best-effort).
+pub(crate) fn apply_auto_watch(
+    team_name: &str,
+    working_dir: &std::path::Path,
+    decision: AutoWatchDecision,
+) {
+    match decision {
+        AutoWatchDecision::SkipNoWatcher | AutoWatchDecision::SkipNoWorker => {}
+        AutoWatchDecision::SkipMultiWorker(n) => {
+            eprintln!(
+                "ℹ️  auto-watch skipped: {n} non-watcher workers found; run \
+                 `tm-agent watch on <team> --target <name>` manually"
+            );
+        }
+        AutoWatchDecision::SkipMissingSpec => {
+            eprintln!(
+                "ℹ️  auto-watch skipped: .xm/watch/default-spec.md not present; \
+                 create the file to enable auto drift watch"
+            );
+        }
+        AutoWatchDecision::Enable {
+            target,
+            watcher_cli,
+            watcher_model,
+        } => {
+            let wd_str = working_dir.to_string_lossy();
+            let mut params = json!({
+                "team_id": team_name,
+                "target": &target,
+                "interval_secs": 300u64,
+                "stance": "critic",
+                "cli": &watcher_cli,
+                "model": &watcher_model,
+                "spec": "@.xm/watch/default-spec.md",
+                "working_directory": wd_str,
+            });
+            if let Some(app_sock) = resolve_app_socket(None) {
+                params["app_socket_path"] = json!(app_sock);
+            }
+            let watch_sock = match detect_watch_socket() {
+                Some(s) => s,
+                None => {
+                    eprintln!("⚠️  auto-watch failed: daemon socket not found; skipping");
+                    return;
+                }
+            };
+            match rpc_call(&watch_sock, "watch.on", params) {
+                Ok(r) => match parse_watch_on_response(&r) {
+                    WatchOnOutcome::Enabled => {
+                        eprintln!(
+                            "✓ auto-watch enabled: target={target} \
+                             spec=@.xm/watch/default-spec.md every=300s"
+                        );
+                    }
+                    WatchOnOutcome::Failed(msg) => {
+                        eprintln!("⚠️  auto-watch failed: {msg}; skipping");
+                    }
+                    WatchOnOutcome::Unexpected(r) => {
+                        eprintln!("⚠️  auto-watch failed: unexpected response {r}; skipping");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("⚠️  auto-watch failed: {e}; skipping");
+                }
+            }
+        }
+    }
+}
+
+/// Build AutoWatchAgent roster from a JSON agents array (GUI team.status format).
+pub(crate) fn roster_from_gui_status(agents: &[Value]) -> Vec<AutoWatchAgent> {
+    agents
+        .iter()
+        .map(|a| {
+            let name = a["name"].as_str().unwrap_or("").to_string();
+            let agent_type = a["agent_type"].as_str().unwrap_or(&name).to_string();
+            AutoWatchAgent {
+                name: name.clone(),
+                agent_type,
+                cli: a["cli"].as_str().unwrap_or("claude").to_string(),
+                model: a["model"].as_str().unwrap_or("sonnet").to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Build AutoWatchAgent roster from headless agent specs (Value array from create).
+pub(crate) fn roster_from_headless_specs(specs: &[Value]) -> Vec<AutoWatchAgent> {
+    specs
+        .iter()
+        .map(|a| {
+            let name = a["name"].as_str().unwrap_or("").to_string();
+            // headless specs use "name" as agent_type; watcher is detected by name
+            let agent_type = a["agent_type"].as_str().unwrap_or(&name).to_string();
+            AutoWatchAgent {
+                name: name.clone(),
+                agent_type,
+                cli: a["cli"].as_str().unwrap_or("claude").to_string(),
+                model: a["model"].as_str().unwrap_or("sonnet").to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Build AutoWatchAgent roster via headless.list on daemon socket (for add path).
+pub(crate) fn roster_from_headless_daemon(
+    daemon_sock: &PathBuf,
+    team_name: &str,
+) -> Vec<AutoWatchAgent> {
+    let resp = match rpc_call_timeout(
+        daemon_sock,
+        "headless.list",
+        json!({ "team_name": team_name }),
+        3,
+    ) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    // headless.list returns an array directly (not wrapped in result)
+    let arr = if let Some(a) = resp.as_array() {
+        a.as_slice().to_vec()
+    } else if let Some(a) = resp["result"].as_array() {
+        a.clone()
+    } else {
+        return vec![];
+    };
+    arr.iter()
+        .map(|a| {
+            let name = a["name"].as_str().unwrap_or("").to_string();
+            // headless.list AgentInfo has no agent_type field; infer from name
+            AutoWatchAgent {
+                agent_type: name.clone(),
+                name,
+                cli: a["cli"].as_str().unwrap_or("claude").to_string(),
+                model: a["model"].as_str().unwrap_or("sonnet").to_string(),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn run_auto_watch_if_enabled(
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+    roster: Vec<AutoWatchAgent>,
+) {
+    if no_auto_watch || is_auto_watch_disabled_by_env() {
+        return;
+    }
+    let spec_exists = working_dir.join(".xm/watch/default-spec.md").exists();
+    let decision = auto_watch_decision(&roster, spec_exists);
+    apply_auto_watch(team_name, working_dir, decision);
+}
+
+/// Auto-watch hook for GUI team create/add — fetches roster via app socket.
+pub(crate) fn maybe_auto_watch_after_team_change(
+    app_sock: &PathBuf,
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+) {
+    // The watcher would run on this host for a team the owning host manages.
+    if no_auto_watch || is_auto_watch_disabled_by_env() || remote_leader_route().is_some() {
+        return;
+    }
+    let status = match rpc_call_timeout(
+        app_sock,
+        "team.status",
+        json!({ "team_name": team_name }),
+        3,
+    ) {
+        Ok(v) if v["ok"].as_bool().unwrap_or(false) => v,
+        _ => return,
+    };
+    let agents = match status["result"]["agents"].as_array() {
+        Some(a) => a.clone(),
+        None => return,
+    };
+    let roster = roster_from_gui_status(&agents);
+    let spec_exists = working_dir.join(".xm/watch/default-spec.md").exists();
+    let decision = auto_watch_decision(&roster, spec_exists);
+    apply_auto_watch(team_name, working_dir, decision);
+}
+
+/// Auto-watch hook for headless create — uses existing agent_specs (no RPC needed).
+pub(crate) fn maybe_auto_watch_after_headless_create(
+    agent_specs: &[Value],
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+) {
+    let roster = roster_from_headless_specs(agent_specs);
+    run_auto_watch_if_enabled(team_name, no_auto_watch, working_dir, roster);
+}
+
+/// Auto-watch hook for headless add — fetches roster via daemon socket.
+/// `added_agent_name` / `added_agent_type` are patched in because headless.list
+/// AgentInfo has no agent_type field; fallback infers type=name so "drift" becomes worker.
+pub(crate) fn maybe_auto_watch_after_headless_add(
+    daemon_sock: &PathBuf,
+    team_name: &str,
+    no_auto_watch: bool,
+    working_dir: &std::path::Path,
+    added_agent_name: &str,
+    added_agent_type: &str,
+    added_cli: &str,
+    added_model: &str,
+) {
+    let mut roster = roster_from_headless_daemon(daemon_sock, team_name);
+    // Patch the just-added agent with the explicit type the caller knows.
+    if let Some(existing) = roster.iter_mut().find(|a| a.name == added_agent_name) {
+        existing.agent_type = added_agent_type.to_string();
+    } else {
+        roster.push(AutoWatchAgent {
+            name: added_agent_name.to_string(),
+            agent_type: added_agent_type.to_string(),
+            cli: added_cli.to_string(),
+            model: added_model.to_string(),
+        });
+    }
+    run_auto_watch_if_enabled(team_name, no_auto_watch, working_dir, roster);
+}
+
+/// Validate agent name against the whitelist regex `^[a-zA-Z0-9_-]{1,32}$`.
+///
+/// Used by `attach` and `detach` subcommands to prevent env var injection and
+/// filename escape via agent_name. Returns `Err(message)` if invalid.
+/// Implemented as a manual char scan (no `regex` crate dep).
+pub(crate) fn validate_agent_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("agent name must not be empty".to_string());
+    }
+    if name.len() > 32 {
+        return Err(format!(
+            "agent name '{}' is too long ({}>32 chars)",
+            name,
+            name.len()
+        ));
+    }
+    for ch in name.chars() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+        if !ok {
+            return Err(format!(
+                "agent name '{}' contains invalid character '{}'; only [a-zA-Z0-9_-] allowed",
+                name, ch
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the team name for workspace-local attach/detach operations.
+///
+/// Priority:
+/// 1. `TERMMESH_TEAM` env var (explicit override)
+/// 2. `ws-<first8hex>` derived from `TERMMESH_WORKSPACE_ID`
+///
+/// Returns `Err` if neither is available.
+#[allow(dead_code)] // used by run_attach/run_detach (t8/t9)
+/// Resolve the team name for agent-side RPCs (report/send/delegate/read/collect/
+/// inbox/task.*). Every agent-side command shares this so a missing TERMMESH_TEAM
+/// can no longer silently leak the whole command set to `live-team`. Priority:
+/// 1. explicit `--team` flag — works from any context, including an adopted leader
+///    pane that never had TERMMESH_TEAM injected,
+/// 2. `$TERMMESH_TEAM` — set on GUI-spawned agent panes,
+/// 3. `$TERMMESH_WORKSPACE_ID` → `ws-<hex>` — same derivation attach/detach use
+///    via [`resolve_workspace_team_name`], so workspace-local teams resolve
+///    symmetrically across all commands,
+/// 4. `live-team` — create-based / legacy default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TeamNameSource {
+    Explicit,
+    Environment,
+    Workspace,
+    LiveTeamFallback,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TeamNameResolution {
+    pub(crate) name: String,
+    pub(crate) source: TeamNameSource,
+}
+
+pub(crate) const LIVE_TEAM_FALLBACK_WARNING: &str = "Warning: no --team, TERMMESH_TEAM, or usable TERMMESH_WORKSPACE_ID; falling back to live-team. Pass --team <name> to select a team explicitly.";
+
+pub(crate) fn resolve_team_name_inputs(
+    explicit: Option<&str>,
+    environment: Option<&str>,
+    workspace: Option<&str>,
+) -> TeamNameResolution {
+    if let Some(t) = explicit {
+        if !t.is_empty() {
+            return TeamNameResolution {
+                name: t.to_string(),
+                source: TeamNameSource::Explicit,
+            };
+        }
+    }
+    if let Some(t) = environment {
+        if !t.is_empty() {
+            return TeamNameResolution {
+                name: t.to_string(),
+                source: TeamNameSource::Environment,
+            };
+        }
+    }
+    match workspace {
+        Some(name) if !name.is_empty() => TeamNameResolution {
+            name: name.to_string(),
+            source: TeamNameSource::Workspace,
+        },
+        _ => TeamNameResolution {
+            name: "live-team".to_string(),
+            source: TeamNameSource::LiveTeamFallback,
+        },
+    }
+}
+
+pub(crate) fn resolve_team_name_with_source(explicit: Option<&str>) -> TeamNameResolution {
+    let environment = env::var("TERMMESH_TEAM").ok();
+    // resolve_workspace_team_name re-checks TERMMESH_TEAM (already handled by
+    // `resolve_team_name_inputs`) and otherwise derives ws-<hex>; errors are
+    // intentionally reduced to absence so diagnostics never expose env values.
+    let workspace = resolve_workspace_team_name().ok();
+    resolve_team_name_inputs(explicit, environment.as_deref(), workspace.as_deref())
+}
+
+pub(crate) fn resolve_team_name(explicit: Option<&str>) -> String {
+    let resolution = resolve_team_name_with_source(explicit);
+    if resolution.source == TeamNameSource::LiveTeamFallback {
+        eprintln!("{LIVE_TEAM_FALLBACK_WARNING}");
+    }
+    resolution.name
+}
+
+pub(crate) fn resolve_workspace_team_name() -> Result<String, String> {
+    if let Ok(explicit) = env::var("TERMMESH_TEAM") {
+        if !explicit.is_empty() {
+            return Ok(explicit);
+        }
+    }
+    let ws = env::var("TERMMESH_WORKSPACE_ID").map_err(|_| {
+        "TERMMESH_WORKSPACE_ID env var not set. Not running inside a term-mesh workspace?"
+            .to_string()
+    })?;
+    if ws.is_empty() {
+        return Err("TERMMESH_WORKSPACE_ID is empty".to_string());
+    }
+    // Strip dashes, take first 8 hex chars, lowercase
+    let hex: String = ws
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
+        .collect::<String>()
+        .to_lowercase();
+    if hex.len() < 8 {
+        return Err(format!(
+            "TERMMESH_WORKSPACE_ID '{}' does not contain 8 hex chars",
+            ws
+        ));
+    }
+    Ok(format!("ws-{}", hex))
+}
+
+/// Validate that the caller is running inside a term-mesh pane.
+/// Returns the tuple of env vars needed for workspace-local attach/detach.
+pub(crate) fn require_termmesh_context() -> Result<(String, String, Option<String>), String> {
+    let workspace_id = env::var("TERMMESH_WORKSPACE_ID").map_err(|_| {
+        "Not running inside a term-mesh workspace. Use tm-agent create instead.".to_string()
+    })?;
+    if workspace_id.is_empty() {
+        return Err(
+            "Not running inside a term-mesh workspace. Use tm-agent create instead.".to_string(),
+        );
+    }
+    let panel_id = env::var("TERMMESH_PANEL_ID").map_err(|_| {
+        "TERMMESH_PANEL_ID not set. Caller pane cannot be identified for attach.".to_string()
+    })?;
+    if panel_id.is_empty() {
+        return Err(
+            "TERMMESH_PANEL_ID is empty. Caller pane cannot be identified for attach.".to_string(),
+        );
+    }
+    let window_id = env::var("TERMMESH_WINDOW_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    Ok((workspace_id, panel_id, window_id))
+}
+
+/// Attach a single agent pane to the caller's current workspace via `team.attach` RPC.
+pub(crate) fn run_attach(
+    sock: &PathBuf,
+    agent_type: &str,
+    agent_name: &str,
+    model: &str,
+    cli: &str,
+) {
+    let (workspace_id, panel_id, window_id) = match require_termmesh_context() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+    let team_name = match resolve_workspace_team_name() {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "Attaching agent '{}' (type={}, cli={}, model={}) to team '{}' in current workspace...",
+        agent_name, agent_type, cli, model, team_name
+    );
+
+    let mut params = json!({
+        "agent_type": agent_type,
+        "agent_name": agent_name,
+        "agent_cli": cli,
+        "agent_model": model,
+        "workspace_id": workspace_id,
+        "surface_id": panel_id,
+    });
+    if let Some(wid) = window_id {
+        params["window_id"] = json!(wid);
+    }
+
+    let resp = match rpc_call_timeout(sock, "team.attach", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            eprintln!();
+            eprintln!(
+                "  \u{2713} agent '{}' attached ({} total in team '{}')",
+                result
+                    .get("agent_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(agent_name),
+                result
+                    .get("agent_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                result
+                    .get("team_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&team_name),
+            );
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"].as_str().unwrap_or("attach failed");
+        eprintln!("Error [{}]: {}", code, msg);
+        process::exit(1);
+    }
+}
+
+/// Detach a single agent from the caller's workspace-local team via `team.detach` RPC.
+pub(crate) fn run_detach(
+    sock: &PathBuf,
+    agent_name: &str,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) {
+    let (workspace_id, _panel_id, window_id) = match require_termmesh_context() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+    let team_name = match resolve_workspace_team_name() {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+    let agent_instance_id = match command_agent_instance_id(
+        sock,
+        &team_name,
+        agent_name,
+        panel_id,
+        explicit_instance_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "Detaching agent '{}' from team '{}'...",
+        agent_name, team_name
+    );
+
+    let mut params = json!({
+        "agent_name": agent_name,
+        "team_name": team_name,
+        "workspace_id": workspace_id,
+        "panel_id": panel_id,
+        "agent_instance_id": agent_instance_id,
+    });
+    if let Some(wid) = window_id {
+        params["window_id"] = json!(wid);
+    }
+
+    let resp = match rpc_call_timeout(sock, "team.detach", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            let remaining = result
+                .get("remaining_agents")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let team_destroyed = result
+                .get("team_destroyed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            eprintln!();
+            if team_destroyed {
+                eprintln!(
+                    "  \u{2713} agent '{}' detached. Team '{}' destroyed (leader pane preserved).",
+                    agent_name, team_name
+                );
+            } else {
+                eprintln!(
+                    "  \u{2713} agent '{}' detached ({} remaining)",
+                    agent_name, remaining
+                );
+            }
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"].as_str().unwrap_or("detach failed");
+        eprintln!("Error [{}]: {}", code, msg);
+        process::exit(1);
+    }
+}
+
+/// Add a single agent pane to a named GUI team via `team.add_agent` RPC.
+///
+/// Team-name–scoped: does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
+pub(crate) fn run_add_gui(
+    sock: &PathBuf,
+    team_name: &str,
+    agent_type: &str,
+    agent_name: &str,
+    model: &str,
+    cli: &str,
+    effort: Option<&str>,
+    no_auto_watch: bool,
+    auto_recycle: Option<u32>,
+    host: Option<&str>,
+    dir: Option<&str>,
+) {
+    match host {
+        Some(h) => eprintln!(
+            "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}' on host '{}'...",
+            agent_name, agent_type, cli, model, team_name, h
+        ),
+        None => eprintln!(
+            "Adding agent '{}' (type={}, cli={}, model={}) to GUI team '{}'...",
+            agent_name, agent_type, cli, model, team_name
+        ),
+    }
+
+    let mut params = json!({
+        "team_name": team_name,
+        "agent_type": agent_type,
+        "name": agent_name,
+        "model": model,
+        "cli": cli,
+    });
+    if let Some(n) = auto_recycle {
+        params["auto_recycle_every"] = json!(n);
+    }
+    if let Some(effort) = effort {
+        params["effort"] = json!(effort);
+    }
+    if let Some(h) = host {
+        params["host"] = json!(h);
+    }
+    if let Some(d) = dir {
+        params["directory"] = json!(d);
+    }
+
+    let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            eprintln!();
+            eprintln!(
+                "  \u{2713} agent '{}' added ({} total in team '{}')",
+                result
+                    .get("agent_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(agent_name),
+                result
+                    .get("agent_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                result
+                    .get("team_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(team_name),
+            );
+        }
+        // Fire unconditionally — helper checks (watcher==1 + worker>=1) internally.
+        let wd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        maybe_auto_watch_after_team_change(sock, team_name, no_auto_watch, &wd);
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"]
+            .as_str()
+            .unwrap_or("add_agent failed");
+        let hint = match code {
+            "duplicate_name" => format!(
+                "\nHint: An agent named '{}' already exists in team '{}'. Use --name to pick a unique name.",
+                agent_name, team_name
+            ),
+            "team_not_found" => format!(
+                "\nHint: Team '{}' not found. Run 'tm-agent status' to see active teams.",
+                team_name
+            ),
+            "workspace_gone" => "\nHint: The team's workspace is no longer open. Recreate the team with 'tm-agent create'.".to_string(),
+            "cli_not_found" => "\nHint: CLI executable not found — check Settings → CLI Paths or the cliPath.<cli> UserDefaults key.".to_string(),
+            "pane_creation_failed" => "\nHint: Pane creation failed — check term-mesh logs at /tmp/term-mesh-debug.log.".to_string(),
+            _ => String::new(),
+        };
+        eprintln!("Error [{}]: {}{}", code, msg, hint);
+        process::exit(1);
+    }
+}
+
+/// Remove an agent from a named GUI team via `team.detach` RPC (team-name–scoped).
+///
+/// Unlike `run_detach` (workspace-local), this variant looks up the team by name
+/// and does not require TERMMESH_WORKSPACE_ID or PANEL_ID.
+pub(crate) fn run_remove_gui(
+    sock: &PathBuf,
+    team_name: &str,
+    agent_name: &str,
+    force: bool,
+    panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
+) {
+    eprintln!(
+        "Removing agent '{}' from GUI team '{}'...",
+        agent_name, team_name
+    );
+
+    let agent_instance_id = match command_agent_instance_id(
+        sock,
+        team_name,
+        agent_name,
+        panel_id,
+        explicit_instance_id,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+    let params = json!({
+        "team_name": team_name,
+        "agent_name": agent_name,
+        "force": force,
+        "panel_id": panel_id,
+        "agent_instance_id": agent_instance_id,
+    });
+
+    let resp = match rpc_call_timeout(sock, "team.detach", params, 10) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if resp["ok"].as_bool().unwrap_or(false) {
+        println!("{}", pretty(&resp));
+        if let Some(result) = resp["result"].as_object() {
+            let remaining = result
+                .get("remaining_agents")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let team_destroyed = result
+                .get("team_destroyed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            eprintln!();
+            if team_destroyed {
+                eprintln!(
+                    "  \u{2713} agent '{}' removed. Team '{}' destroyed (leader pane preserved).",
+                    agent_name, team_name
+                );
+            } else {
+                eprintln!(
+                    "  \u{2713} agent '{}' removed ({} remaining in team '{}')",
+                    agent_name, remaining, team_name
+                );
+            }
+        }
+    } else {
+        let code = resp["error"]["code"].as_str().unwrap_or("unknown");
+        let msg = resp["error"]["message"].as_str().unwrap_or("remove failed");
+        let hint = match code {
+            "agent_busy" => "\nHint: Agent has an active task — pass --force to close anyway, or finish/block the task first.".to_string(),
+            "ambiguous_agent" => "\nHint: Pass --panel <PANEL_ID> or --agent-instance-id <ID> to select the instance.".to_string(),
+            _ => String::new(),
+        };
+        eprintln!("Error [{}]: {}{}", code, msg, hint);
+        process::exit(1);
+    }
+}
