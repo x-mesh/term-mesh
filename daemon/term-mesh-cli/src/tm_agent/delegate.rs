@@ -1651,6 +1651,37 @@ pub(crate) fn run_delegate(
 /// directly from the CLI (no daemon required). The subprocess runs without
 /// team flags (--agent-id etc.), so no leader approval is needed for edits.
 /// It uses `claude -p` (print mode) for single-shot execution.
+/// A `claude -p` run that exits nonzero, or whose exit could not be read
+/// (-1), did not finish the task, so the board must not say it did.
+pub(crate) fn autonomous_outcome(task_id: &str, exit_code: i32) -> (&'static str, String) {
+    if exit_code == 0 {
+        (
+            "completed",
+            format!("autonomous task {task_id} completed (exit=0)"),
+        )
+    } else {
+        (
+            "failed",
+            format!("autonomous task {task_id} failed (exit={exit_code})"),
+        )
+    }
+}
+
+/// The task already exists when the run cannot start; leave it `failed`
+/// rather than assigned to a run that never began.
+pub(crate) fn fail_autonomous_task(sock: &PathBuf, team: &str, task_id: &str, reason: &str) {
+    let _ = rpc_call(
+        sock,
+        "team.task.update",
+        json!({
+            "team_name": team,
+            "task_id": task_id,
+            "status": "failed",
+            "result": format!("autonomous task {task_id} did not start: {reason}"),
+        }),
+    );
+}
+
 pub(crate) fn run_delegate_autonomous(
     sock: &PathBuf,
     team: &str,
@@ -1751,6 +1782,7 @@ pub(crate) fn run_delegate_autonomous(
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error creating stdout file: {e}");
+            fail_autonomous_task(sock, team, &task_id, &format!("stdout file: {e}"));
             process::exit(1);
         }
     };
@@ -1778,6 +1810,7 @@ pub(crate) fn run_delegate_autonomous(
             eprintln!("Error: failed to spawn claude: {e}");
             eprintln!("  Tried path: {claude_path}");
             let _ = std::fs::remove_file(&stdout_file_path);
+            fail_autonomous_task(sock, team, &task_id, &format!("spawn {claude_path}: {e}"));
             process::exit(1);
         }
     };
@@ -1830,10 +1863,7 @@ pub(crate) fn run_delegate_autonomous(
         let _ = std::fs::remove_file(&stdout_path_clone);
 
         // Auto-complete the task via RPC
-        let completion_msg = format!(
-            "autonomous task {} completed (exit={})",
-            task_id_clone, exit_code
-        );
+        let (final_status, completion_msg) = autonomous_outcome(&task_id_clone, exit_code);
         let _ = rpc_call(
             &sock_path,
             "team.report",
@@ -1849,13 +1879,13 @@ pub(crate) fn run_delegate_autonomous(
             json!({
                 "team_name": team_str,
                 "task_id": task_id_clone,
-                "status": "completed",
+                "status": final_status,
                 "result": &completion_msg,
             }),
         );
 
         eprintln!(
-            "  Autonomous task {} completed (exit={})",
+            "  Autonomous task {} {final_status} (exit={})",
             &task_id_clone[..8.min(task_id_clone.len())],
             exit_code
         );
@@ -2102,5 +2132,19 @@ mod worktree_availability_tests {
             WorktreePolicyArg::Auto,
             &wrapped
         ));
+    }
+}
+
+#[cfg(test)]
+mod autonomous_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_clean_exit_completes_an_autonomous_task() {
+        assert_eq!(autonomous_outcome("t1", 0).0, "completed");
+        let (status, message) = autonomous_outcome("t1", 2);
+        assert_eq!(status, "failed");
+        assert!(message.contains("exit=2"));
+        assert_eq!(autonomous_outcome("t1", -1).0, "failed");
     }
 }
