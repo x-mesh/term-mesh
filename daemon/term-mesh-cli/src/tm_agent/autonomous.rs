@@ -677,6 +677,52 @@ pub(crate) fn run_brief(sock: &PathBuf, team: &str, target: &str, lines: u32) {
 /// Missing fields are tolerated — raw JSON is used as fallback.
 /// Poll task IDs until all are completed/failed/abandoned, or timeout.
 /// Returns the set of task IDs that completed successfully.
+pub(crate) struct TaskPoll {
+    pub(crate) all_done: bool,
+    pub(crate) done_count: usize,
+    /// `None` when this poll could not read the board, so the previous
+    /// poll's list stands.
+    pub(crate) completed_ids: Option<Vec<String>>,
+}
+
+/// One `team.task.list` poll. A failed call or a response without
+/// `result.tasks` says nothing about the tasks, so it never counts as done.
+pub(crate) fn task_poll(listed: Option<&Value>, task_ids: &[String]) -> TaskPoll {
+    let Some(tasks) = listed.and_then(|r| r["result"]["tasks"].as_array()) else {
+        return TaskPoll {
+            all_done: false,
+            done_count: 0,
+            completed_ids: None,
+        };
+    };
+    let mut all_done = true;
+    let mut done_count = 0usize;
+    let mut completed_ids = Vec::new();
+    for tid in task_ids {
+        let task_status = tasks
+            .iter()
+            .find(|t| t["id"].as_str() == Some(tid.as_str()))
+            .and_then(|t| t["status"].as_str());
+        match task_status {
+            Some("completed") => {
+                done_count += 1;
+                completed_ids.push(tid.clone());
+            }
+            Some("failed") | Some("abandoned") => {
+                done_count += 1;
+            }
+            _ => {
+                all_done = false;
+            }
+        }
+    }
+    TaskPoll {
+        all_done,
+        done_count,
+        completed_ids: Some(completed_ids),
+    }
+}
+
 pub(crate) fn wait_for_tasks(
     sock: &PathBuf,
     team: &str,
@@ -708,30 +754,12 @@ pub(crate) fn wait_for_tasks(
             break;
         }
         thread::sleep(poll_interval);
-        let mut all_done = true;
-        let mut done_count = 0usize;
-        if let Ok(r) = rpc_call(sock, "team.task.list", json!({ "team_name": team })) {
-            if let Some(tasks) = r["result"]["tasks"].as_array() {
-                completed_ids.clear();
-                for tid in task_ids {
-                    let task_status = tasks
-                        .iter()
-                        .find(|t| t["id"].as_str() == Some(tid.as_str()))
-                        .and_then(|t| t["status"].as_str());
-                    match task_status {
-                        Some("completed") => {
-                            done_count += 1;
-                            completed_ids.push(tid.clone());
-                        }
-                        Some("failed") | Some("abandoned") => {
-                            done_count += 1;
-                        }
-                        _ => {
-                            all_done = false;
-                        }
-                    }
-                }
-            }
+        let listed = rpc_call(sock, "team.task.list", json!({ "team_name": team })).ok();
+        let poll = task_poll(listed.as_ref(), task_ids);
+        let all_done = poll.all_done;
+        let done_count = poll.done_count;
+        if let Some(ids) = poll.completed_ids {
+            completed_ids = ids;
         }
         let elapsed = start.elapsed().as_secs();
         eprintln!(
@@ -1022,41 +1050,7 @@ pub(crate) fn run_autonomous(
 
     // For swarm mode: seed initial tasks to board
     if mode == "swarm" {
-        let seed_tasks: Vec<&str> = extra
-            .map(|s| s.split(',').map(|t| t.trim()).collect::<Vec<_>>())
-            .unwrap_or_default();
-        if seed_tasks.is_empty() {
-            // Auto-generate 3 generic seed tasks
-            let seeds = vec![
-                format!(
-                    r#"{{"type":"task","id":1,"desc":"Analyze scope and requirements for: {}","status":"open","added_by":"leader"}}"#,
-                    topic
-                ),
-                format!(
-                    r#"{{"type":"task","id":2,"desc":"Identify key components and dependencies","status":"open","added_by":"leader"}}"#
-                ),
-                format!(
-                    r#"{{"type":"task","id":3,"desc":"Create implementation plan with priorities","status":"open","added_by":"leader"}}"#
-                ),
-            ];
-            let mut content = String::new();
-            for s in &seeds {
-                content.push_str(s);
-                content.push('\n');
-            }
-            let _ = std::fs::write(&board_path, &content);
-        } else {
-            let mut content = String::new();
-            for (i, task) in seed_tasks.iter().enumerate() {
-                content.push_str(&format!(
-                    r#"{{"type":"task","id":{},"desc":"{}","status":"open","added_by":"leader"}}"#,
-                    i + 1,
-                    task
-                ));
-                content.push('\n');
-            }
-            let _ = std::fs::write(&board_path, &content);
-        }
+        let _ = std::fs::write(&board_path, swarm_seed_board(topic, extra));
     }
 
     // Build per-agent instructions
@@ -1278,5 +1272,93 @@ pub(crate) fn run_autonomous(
 
     if succeeded.is_empty() {
         process::exit(1);
+    }
+}
+
+/// The swarm board's opening task lines. The descriptions come from the
+/// command line, so each one is written as an escaped JSON string.
+pub(crate) fn swarm_seed_board(topic: &str, extra: Option<&str>) -> String {
+    let seed_tasks: Vec<String> = extra
+        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+        .unwrap_or_default();
+    let descs = if seed_tasks.is_empty() {
+        vec![
+            format!("Analyze scope and requirements for: {topic}"),
+            "Identify key components and dependencies".to_string(),
+            "Create implementation plan with priorities".to_string(),
+        ]
+    } else {
+        seed_tasks
+    };
+    let mut content = String::new();
+    for (i, desc) in descs.iter().enumerate() {
+        content.push_str(&format!(
+            r#"{{"type":"task","id":{},"desc":{},"status":"open","added_by":"leader"}}"#,
+            i + 1,
+            Value::String(desc.clone())
+        ));
+        content.push('\n');
+    }
+    content
+}
+
+#[cfg(test)]
+mod autonomous_failure_tests {
+    use super::*;
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_unreadable_task_list_never_ends_the_wait() {
+        let tasks = ids(&["t1"]);
+        assert!(!task_poll(None, &tasks).all_done);
+        let no_tasks = json!({ "ok": false, "error": { "message": "socket" } });
+        let poll = task_poll(Some(&no_tasks), &tasks);
+        assert!(!poll.all_done);
+        assert!(poll.completed_ids.is_none());
+    }
+
+    #[test]
+    fn a_task_poll_counts_terminal_tasks() {
+        let tasks = ids(&["t1", "t2", "t3"]);
+        let listed = json!({ "result": { "tasks": [
+            { "id": "t1", "status": "completed" },
+            { "id": "t2", "status": "failed" },
+            { "id": "t3", "status": "in_progress" },
+        ] } });
+        let poll = task_poll(Some(&listed), &tasks);
+        assert!(!poll.all_done);
+        assert_eq!(poll.done_count, 2);
+        assert_eq!(poll.completed_ids, Some(ids(&["t1"])));
+
+        let finished = json!({ "result": { "tasks": [
+            { "id": "t1", "status": "completed" },
+            { "id": "t2", "status": "abandoned" },
+            { "id": "t3", "status": "completed" },
+        ] } });
+        assert!(task_poll(Some(&finished), &tasks).all_done);
+    }
+
+    #[test]
+    fn swarm_seed_descriptions_stay_valid_json() {
+        let hostile = "review \"auth\" flow \\ path\nnext";
+        for board in [
+            swarm_seed_board("t", Some(hostile)),
+            swarm_seed_board(hostile, None),
+        ] {
+            for line in board.lines() {
+                let task: Value = serde_json::from_str(line).unwrap();
+                assert_eq!(task["type"], "task");
+            }
+        }
+        let seeded = swarm_seed_board("t", Some(hostile));
+        let first: Value = serde_json::from_str(seeded.lines().next().unwrap()).unwrap();
+        assert_eq!(first["desc"], hostile);
+        assert_eq!(
+            swarm_seed_board("topic", Some("a, b")),
+            "{\"type\":\"task\",\"id\":1,\"desc\":\"a\",\"status\":\"open\",\"added_by\":\"leader\"}\n{\"type\":\"task\",\"id\":2,\"desc\":\"b\",\"status\":\"open\",\"added_by\":\"leader\"}\n"
+        );
     }
 }
