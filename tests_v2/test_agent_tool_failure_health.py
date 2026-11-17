@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expose repeated tool failures through real app read/status without changing task verdicts."""
+"""Expose repeated tool failures through real app read/status and the reported task without changing verdicts."""
 import json
 import os
 from pathlib import Path
@@ -134,6 +134,23 @@ def main():
                             ["tool_failures"]["total"] == 3, "CLI status lost failure counts")
                     require(member()["agent_instance_id"] == instance, "unexpected automatic restart")
 
+                    # The leader reads the verdict through wait and collect,
+                    # so the reporting turn's failures travel with the task.
+                    waited = json.loads(command("wait", "--task", task_id, "--mode", "any",
+                                                "--timeout", "30"))
+                    on_task = waited["result"]["task"]["tool_failures"]
+                    require(on_task["turn_failures"] == 3 and on_task["consecutive"] == 3,
+                            f"wait lost the turn's failures: {on_task}")
+                    require("SyntaxError" in (on_task.get("last_error") or ""),
+                            f"wait lost the root error: {on_task}")
+                    collected = json.loads(command("collect", "--headers"))
+                    entry = next(r for r in collected["result"]["results"]
+                                 if r.get("task_id") == task_id)
+                    require(entry.get("tool_failures", {}).get("turn_failures") == 3,
+                            f"collect lost the turn's failures: {entry}")
+                    require(SECRET not in json.dumps(waited) + json.dumps(collected),
+                            "credential leaked into wait/collect")
+
                     command("send", agent, "RECOVER818", "--task", task_id)
                     wait_for(lambda: task_status() == "completed", "recovered task completion")
                     recovered = member()
@@ -142,6 +159,10 @@ def main():
                             and counters["consecutive"] == 0, f"bad recovery counters: {counters}")
                     require(counters["needs_attention"] is False and recovered["health"] == "ok",
                             f"health did not recover: {recovered}")
+                    clean = json.loads(command("wait", "--task", task_id, "--mode", "any",
+                                               "--timeout", "30"))["result"]["task"]["tool_failures"]
+                    require(clean["turn_failures"] == 0 and clean["last_error"] is None,
+                            f"a clean turn kept an earlier turn's failure: {clean}")
                     require((client.current_workspace(), [s[1] for s in client.list_surfaces() if s[2]])
                             == focus, "non-focus commands changed focus")
                     print(json.dumps({"failed": health, "recovered": counters}, indent=2))

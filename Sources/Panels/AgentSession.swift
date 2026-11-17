@@ -3222,6 +3222,17 @@ final class AgentSession {
 
     @ObservationIgnored private var toolFailures = ToolFailureHealth()
 
+    /// `lastTool` and `lastError` outlive the turn that set them, so a clean
+    /// turn reports neither instead of an earlier turn's failure.
+    var turnToolFailures: TaskToolFailures {
+        let failed = toolFailures.turnFailures > 0
+        return TaskToolFailures(
+            turnFailures: toolFailures.turnFailures,
+            consecutive: toolFailures.consecutive,
+            lastTool: failed ? toolFailures.lastTool : nil,
+            lastError: failed ? toolFailures.lastError : nil)
+    }
+
     var toolFailureSummary: [String: Any] {
         var summary: [String: Any] = [
             "total": toolFailures.total,
