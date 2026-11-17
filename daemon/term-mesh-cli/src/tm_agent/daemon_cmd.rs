@@ -466,6 +466,17 @@ pub(crate) fn try_lock_peer_state_dir(dir: &std::path::Path) -> std::io::Result<
 /// Copy `path` next to itself before removing it, matching the daemon's
 /// `persist::backup_state_file` naming so both paths leave the same trail.
 pub(crate) fn backup_peer_state_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    backup_peer_state_file_at(path, stamp)
+}
+
+pub(crate) fn backup_peer_state_file_at(
+    path: &std::path::Path,
+    stamp: u64,
+) -> Result<Option<String>, String> {
     if !path.exists() {
         return Ok(None);
     }
@@ -473,21 +484,36 @@ pub(crate) fn backup_peer_state_file(path: &std::path::Path) -> Result<Option<St
         .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| format!("cannot derive a backup name for {}", path.display()))?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let mut candidate = path.with_file_name(format!("{stem}.{stamp}.bak.json"));
-    let mut suffix = 1;
-    while candidate.exists() {
-        if suffix > 1000 {
-            return Err(format!("too many backups beside {}", path.display()));
+    for suffix in 0..=1000 {
+        let name = if suffix == 0 {
+            format!("{stem}.{stamp}.bak.json")
+        } else {
+            format!("{stem}.{stamp}-{suffix}.bak.json")
+        };
+        let candidate = path.with_file_name(name);
+        // `create_new` refuses any existing name, a symlink included, so the
+        // copy never writes through a link planted in a shared state directory
+        // between choosing the name and writing it.
+        let mut backup = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("backup failed: {e}")),
+        };
+        let copied = std::fs::File::open(path).and_then(|mut source| {
+            std::io::copy(&mut source, &mut backup)?;
+            std::fs::set_permissions(&candidate, source.metadata()?.permissions())
+        });
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(format!("backup failed: {e}"));
         }
-        candidate = path.with_file_name(format!("{stem}.{stamp}-{suffix}.bak.json"));
-        suffix += 1;
+        return Ok(Some(candidate.display().to_string()));
     }
-    std::fs::copy(path, &candidate).map_err(|e| format!("backup failed: {e}"))?;
-    Ok(Some(candidate.display().to_string()))
+    Err(format!("too many backups beside {}", path.display()))
 }
 
 /// Reset with no daemon to ask.
@@ -1857,6 +1883,78 @@ mod version_skew_tests {
     fn an_unknown_app_build_is_not_a_mismatch() {
         assert_eq!(
             version_skew_note("abc123456", "", "0.170.1", "unknown"),
+            None
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod backup_create_new_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_backup_never_writes_through_a_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("peer-workspaces.json");
+        std::fs::write(&state, "state").unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let planted = dir.path().join("peer-workspaces.42.bak.json");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let backup = backup_peer_state_file_at(&state, 42).unwrap().unwrap();
+
+        assert_eq!(
+            backup,
+            dir.path()
+                .join("peer-workspaces.42-1.bak.json")
+                .display()
+                .to_string()
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "state");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// A link to a path that does not exist yet passes an `exists()` check,
+    /// the same window a link planted after the check opens.
+    #[test]
+    fn a_backup_never_creates_the_target_of_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("peer-workspaces.json");
+        std::fs::write(&state, "state").unwrap();
+        let victim = dir.path().join("victim");
+        let planted = dir.path().join("peer-workspaces.42.bak.json");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let backup = backup_peer_state_file_at(&state, 42).unwrap().unwrap();
+
+        assert_eq!(
+            backup,
+            dir.path()
+                .join("peer-workspaces.42-1.bak.json")
+                .display()
+                .to_string()
+        );
+        assert!(
+            !victim.exists(),
+            "the backup was written through the planted link"
+        );
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "state");
+    }
+
+    #[test]
+    fn a_missing_state_file_has_nothing_to_back_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            backup_peer_state_file_at(&dir.path().join("peer-workspaces.json"), 42).unwrap(),
             None
         );
     }
