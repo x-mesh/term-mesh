@@ -4695,7 +4695,7 @@ mod team_call_allow_list_tests {
     #[test]
     fn scoped_leader_methods_match_the_cli_allow_list() {
         let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../term-mesh-cli/src/tm_agent.rs");
+            .join("../term-mesh-cli/src/tm_agent/remote_leader.rs");
         let source =
             std::fs::read_to_string(&cli).unwrap_or_else(|e| panic!("read {}: {e}", cli.display()));
         let body = source
