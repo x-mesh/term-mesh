@@ -1670,7 +1670,7 @@ pub(crate) fn autonomous_outcome(task_id: &str, exit_code: i32) -> (&'static str
 /// The task already exists when the run cannot start; leave it `failed`
 /// rather than assigned to a run that never began.
 pub(crate) fn fail_autonomous_task(sock: &PathBuf, team: &str, task_id: &str, reason: &str) {
-    let _ = rpc_call(
+    let updated = rpc_call(
         sock,
         "team.task.update",
         json!({
@@ -1680,6 +1680,22 @@ pub(crate) fn fail_autonomous_task(sock: &PathBuf, team: &str, task_id: &str, re
             "result": format!("autonomous task {task_id} did not start: {reason}"),
         }),
     );
+    warn_unrecorded_task_status(task_id, "failed", &updated);
+}
+
+/// Nothing else can fix the board when the app refuses or cannot take the
+/// update, so the caller at least sees which task it left behind.
+pub(crate) fn warn_unrecorded_task_status(
+    task_id: &str,
+    status: &str,
+    updated: &Result<Value, String>,
+) {
+    let failure = match updated {
+        Ok(v) if v["ok"].as_bool().unwrap_or(false) => return,
+        Ok(v) => pretty(v),
+        Err(e) => e.clone(),
+    };
+    eprintln!("Warning: task {task_id} was not marked {status}: {failure}");
 }
 
 pub(crate) fn run_delegate_autonomous(
@@ -1873,7 +1889,7 @@ pub(crate) fn run_delegate_autonomous(
                 "content": &completion_msg,
             }),
         );
-        let _ = rpc_call(
+        let updated = rpc_call(
             &sock_path,
             "team.task.update",
             json!({
@@ -1883,6 +1899,7 @@ pub(crate) fn run_delegate_autonomous(
                 "result": &completion_msg,
             }),
         );
+        warn_unrecorded_task_status(&task_id_clone, final_status, &updated);
 
         eprintln!(
             "  Autonomous task {} {final_status} (exit={})",
