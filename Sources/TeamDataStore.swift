@@ -1955,12 +1955,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             } else {
                 tasks[idx].uncommittedCheck = nil
             }
-            // Only a native turn knows its tool failures; another report
-            // path leaves nothing rather than the previous turn's counts.
-            var failures = toolFailures
-            failures?.forStatus = normalizedStatus
-            tasks[idx].toolFailures = TaskUncommittedCheck.reportedStatuses.contains(normalizedStatus)
-                ? failures : nil
+            // Only a native turn knows its tool failures. A repeat of the
+            // same report from another path keeps them; any other status
+            // drops them, so a later verdict never shows an earlier turn's.
+            if !TaskUncommittedCheck.reportedStatuses.contains(normalizedStatus) {
+                tasks[idx].toolFailures = nil
+            } else if var failures = toolFailures {
+                failures.forStatus = normalizedStatus
+                tasks[idx].toolFailures = failures
+            } else if tasks[idx].toolFailures?.forStatus != normalizedStatus {
+                tasks[idx].toolFailures = nil
+            }
             let lifecycleTask = tasks[idx]
             LeaderTurnLog.appendTaskLifecycle(
                 team: teamName,

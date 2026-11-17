@@ -143,13 +143,17 @@ def main():
                             f"wait lost the turn's failures: {on_task}")
                     require("SyntaxError" in (on_task.get("last_error") or ""),
                             f"wait lost the root error: {on_task}")
+                    inbox = json.loads(command("wait", "--mode", "review_ready", "--timeout", "30"))
+                    item = next(i for i in inbox["result"]["items"] if i.get("task_id") == task_id)
+                    require(item.get("tool_failures", {}).get("turn_failures") == 3,
+                            f"inbox lost the turn's failures: {item}")
                     collected = json.loads(command("collect", "--headers"))
                     entry = next(r for r in collected["result"]["results"]
                                  if r.get("task_id") == task_id)
                     require(entry.get("tool_failures", {}).get("turn_failures") == 3,
                             f"collect lost the turn's failures: {entry}")
-                    require(SECRET not in json.dumps(waited) + json.dumps(collected),
-                            "credential leaked into wait/collect")
+                    require(SECRET not in json.dumps(waited) + json.dumps(inbox) + json.dumps(collected),
+                            "credential leaked into wait/inbox/collect")
 
                     command("send", agent, "RECOVER818", "--task", task_id)
                     wait_for(lambda: task_status() == "completed", "recovered task completion")

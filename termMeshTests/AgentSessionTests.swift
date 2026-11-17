@@ -4576,6 +4576,14 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(field["last_tool"] as? String, "exec")
         XCTAssertEqual(field["last_error"] as? String, "SyntaxError: Invalid or unexpected token")
 
+        _ = store.updateTask(teamName: team, taskId: task.id, status: "review_ready", result: "again")
+        let repeated = try XCTUnwrap(store.getTask(teamName: team, taskId: task.id))
+        XCTAssertEqual((store.taskDictionary(repeated)["tool_failures"] as? [String: Any])?["turn_failures"] as? Int, 2)
+
+        _ = store.updateTask(teamName: team, taskId: task.id, status: "completed", result: "done")
+        XCTAssertTrue(store.taskDictionary(try XCTUnwrap(
+            store.getTask(teamName: team, taskId: task.id)))["tool_failures"] is NSNull)
+
         _ = store.updateTask(teamName: team, taskId: task.id, status: "in_progress")
         XCTAssertTrue(store.taskDictionary(try XCTUnwrap(
             store.getTask(teamName: team, taskId: task.id)))["tool_failures"] is NSNull)
