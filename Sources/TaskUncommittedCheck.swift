@@ -54,6 +54,14 @@ struct TaskUncommittedCheck: Codable, Equatable {
         forStatus == status ? self : nil
     }
 
+    /// True while this check is still running for the same status and
+    /// checkout, so a repeated report can reuse it. A pending check past
+    /// `staleAfter` never finished and does not count.
+    func answersRepeatedReport(ofStatus status: String, checkout: String?, at date: Date) -> Bool {
+        state == .pending && forStatus == status && self.checkout == checkout
+            && date.timeIntervalSince(requestedAt) <= Self.staleAfter
+    }
+
     func dictionary(now: Date = Date()) -> [String: Any] {
         let formatter = ISO8601DateFormatter()
         let neverFinished = state == .pending

@@ -1936,10 +1936,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             let normalizedStatus = Self.normalizedTaskStatus(status)
             tasks[idx].status = normalizedStatus
             if TaskUncommittedCheck.reportedStatuses.contains(normalizedStatus) {
-                let check = TaskUncommittedCheck.pending(
-                    checkout: tasks[idx].worktreePath, forStatus: normalizedStatus, at: now)
-                tasks[idx].uncommittedCheck = check
-                scheduleUncommittedCheck(teamName: teamName, taskId: taskId, check: check)
+                // A worker that retries the same report must not stack a git
+                // process pair per retry; the check already in flight answers
+                // for it.
+                let inFlight = tasks[idx].uncommittedCheck?.answersRepeatedReport(
+                    ofStatus: normalizedStatus, checkout: tasks[idx].worktreePath, at: now) ?? false
+                if !inFlight {
+                    let check = TaskUncommittedCheck.pending(
+                        checkout: tasks[idx].worktreePath, forStatus: normalizedStatus, at: now)
+                    tasks[idx].uncommittedCheck = check
+                    scheduleUncommittedCheck(teamName: teamName, taskId: taskId, check: check)
+                }
             } else {
                 tasks[idx].uncommittedCheck = nil
             }

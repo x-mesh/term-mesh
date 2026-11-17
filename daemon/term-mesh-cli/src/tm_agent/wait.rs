@@ -252,6 +252,15 @@ pub(crate) fn wait_task_settled(status: &str) -> bool {
 const UNCOMMITTED_CHECK_SETTLE: Duration = Duration::from_secs(8);
 const UNCOMMITTED_CHECK_POLL: Duration = Duration::from_millis(250);
 
+/// The re-read never runs past the caller's own `--timeout`: a short timeout
+/// is how automation decides to give up, so the settle budget is whatever is
+/// left of it, capped at `UNCOMMITTED_CHECK_SETTLE`.
+fn uncommitted_check_budget(started: Instant, timeout_secs: u32) -> Duration {
+    Duration::from_secs(u64::from(timeout_secs))
+        .saturating_sub(started.elapsed())
+        .min(UNCOMMITTED_CHECK_SETTLE)
+}
+
 fn uncommitted_check_pending(value: &Value) -> bool {
     value
         .get("uncommitted_check")
@@ -281,9 +290,25 @@ fn inbox_task_items(response: &Value, status: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// A successful inbox re-read replaces the items even when none are left in
+/// `status`: the task moved on, and the stale item must not be reported. Only
+/// a failed call keeps the previous items.
+fn inbox_reread(response: Result<Value, String>, status: &str) -> Option<Value> {
+    response
+        .ok()
+        .map(|response| Value::Array(inbox_task_items(&response, status)))
+}
+
 /// Inbox task items for a `blocked` or `review_ready` wait that ended, re-read
-/// while one of them still has a pending uncommitted-changes check.
-fn settled_inbox_items(sock: &PathBuf, team: &str, status: &str, items: Vec<Value>) -> Vec<Value> {
+/// while one of them still has a pending uncommitted-changes check. Empty when
+/// every item left `status` during the re-read.
+fn settled_inbox_items(
+    sock: &PathBuf,
+    team: &str,
+    status: &str,
+    items: Vec<Value>,
+    budget: Duration,
+) -> Vec<Value> {
     let settled = settle_uncommitted_check(
         Value::Array(items),
         |value| {
@@ -292,13 +317,12 @@ fn settled_inbox_items(sock: &PathBuf, team: &str, status: &str, items: Vec<Valu
                 .is_some_and(|items| items.iter().any(uncommitted_check_pending))
         },
         || {
-            rpc_call(sock, "team.inbox", json!({ "team_name": team }))
-                .ok()
-                .map(|response| inbox_task_items(&response, status))
-                .filter(|items| !items.is_empty())
-                .map(Value::Array)
+            inbox_reread(
+                rpc_call(sock, "team.inbox", json!({ "team_name": team })),
+                status,
+            )
         },
-        UNCOMMITTED_CHECK_SETTLE,
+        budget,
         UNCOMMITTED_CHECK_POLL,
     );
     settled.as_array().cloned().unwrap_or_default()
@@ -310,6 +334,7 @@ fn collect_settled_results(
     sock: &PathBuf,
     team: &str,
     tracked_task_ids: Option<&std::collections::HashSet<String>>,
+    budget: Duration,
 ) -> Option<Value> {
     let fetch = || {
         rpc_call(sock, "team.result.collect", json!({ "team_name": team }))
@@ -321,7 +346,7 @@ fn collect_settled_results(
         first,
         collect_has_pending_uncommitted_check,
         fetch,
-        UNCOMMITTED_CHECK_SETTLE,
+        budget,
         UNCOMMITTED_CHECK_POLL,
     ))
 }
@@ -1400,7 +1425,7 @@ pub(crate) fn run_wait(
                         .filter(|r| r["ok"].as_bool().unwrap_or(false))
                         .map(|r| r["result"].clone())
                     },
-                    UNCOMMITTED_CHECK_SETTLE,
+                    uncommitted_check_budget(wait_started, timeout),
                     UNCOMMITTED_CHECK_POLL,
                 );
                 println!(
@@ -1460,6 +1485,7 @@ pub(crate) fn run_wait(
                         sock,
                         team,
                         explicit_task_scope.then_some(&tracked_task_ids),
+                        uncommitted_check_budget(wait_started, timeout),
                     ) {
                         println!("{}", pretty(&filtered));
                     }
@@ -1498,6 +1524,7 @@ pub(crate) fn run_wait(
                         sock,
                         team,
                         explicit_task_scope.then_some(&tracked_task_ids),
+                        uncommitted_check_budget(wait_started, timeout),
                     ) {
                         if result["result"].is_null() {
                             result["result"] = json!({});
@@ -1520,8 +1547,18 @@ pub(crate) fn run_wait(
             }
             "blocked" => {
                 eprintln!("  [{elapsed}/{timeout}s] blocked={}", inbox_blocked.len());
-                if !inbox_blocked.is_empty() {
-                    let items = settled_inbox_items(sock, team, "blocked", inbox_blocked.clone());
+                let items = if inbox_blocked.is_empty() {
+                    Vec::new()
+                } else {
+                    settled_inbox_items(
+                        sock,
+                        team,
+                        "blocked",
+                        inbox_blocked.clone(),
+                        uncommitted_check_budget(wait_started, timeout),
+                    )
+                };
+                if !items.is_empty() {
                     eprintln!("A task is blocked.");
                     println!(
                         "{}",
@@ -1537,9 +1574,18 @@ pub(crate) fn run_wait(
                     "  [{elapsed}/{timeout}s] review_ready={}",
                     inbox_review.len()
                 );
-                if !inbox_review.is_empty() {
-                    let items =
-                        settled_inbox_items(sock, team, "review_ready", inbox_review.clone());
+                let items = if inbox_review.is_empty() {
+                    Vec::new()
+                } else {
+                    settled_inbox_items(
+                        sock,
+                        team,
+                        "review_ready",
+                        inbox_review.clone(),
+                        uncommitted_check_budget(wait_started, timeout),
+                    )
+                };
+                if !items.is_empty() {
                     eprintln!("A task is ready for review.");
                     println!(
                         "{}",
@@ -1867,6 +1913,28 @@ mod wait_any_scope_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["task_id"], "a");
         assert!(inbox_task_items(&json!({ "result": null }), "blocked").is_empty());
+    }
+
+    #[test]
+    fn the_uncommitted_check_reread_never_outlasts_the_wait_timeout() {
+        let started = Instant::now();
+        assert_eq!(uncommitted_check_budget(started, 0), Duration::ZERO);
+        assert!(uncommitted_check_budget(started, 1) <= Duration::from_secs(1));
+        assert_eq!(
+            uncommitted_check_budget(started, 3600),
+            UNCOMMITTED_CHECK_SETTLE
+        );
+        let long_ago = Instant::now() - Duration::from_secs(10);
+        assert_eq!(uncommitted_check_budget(long_ago, 5), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_successful_inbox_reread_drops_a_task_that_left_the_status() {
+        let moved_on = Ok(json!({ "result": { "items": [
+            { "kind": "task", "status": "in_progress", "task_id": "a" },
+        ] } }));
+        assert_eq!(inbox_reread(moved_on, "review_ready"), Some(json!([])));
+        assert_eq!(inbox_reread(Err("socket".into()), "review_ready"), None);
     }
 
     #[test]

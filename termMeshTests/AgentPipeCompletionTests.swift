@@ -1207,6 +1207,23 @@ final class TaskUncommittedCheckTests: XCTestCase {
             outcome: .init(state: .checked, count: 1, paths: ["a"])))
     }
 
+    /// A worker that repeats the same report reuses the check in flight
+    /// instead of starting another git process pair per retry.
+    func testARepeatedReportReusesOnlyAMatchingCheckStillInFlight() {
+        let start = Date()
+        let check = TaskUncommittedCheck.pending(checkout: "/wt", forStatus: "completed", at: start)
+        let soon = start.addingTimeInterval(1)
+        XCTAssertTrue(check.answersRepeatedReport(ofStatus: "completed", checkout: "/wt", at: soon))
+        XCTAssertFalse(check.answersRepeatedReport(ofStatus: "blocked", checkout: "/wt", at: soon))
+        XCTAssertFalse(check.answersRepeatedReport(ofStatus: "completed", checkout: "/other", at: soon))
+        XCTAssertFalse(check.answersRepeatedReport(
+            ofStatus: "completed", checkout: "/wt",
+            at: start.addingTimeInterval(TaskUncommittedCheck.staleAfter + 1)))
+        var finished = check
+        finished.state = .checked
+        XCTAssertFalse(finished.answersRepeatedReport(ofStatus: "completed", checkout: "/wt", at: soon))
+    }
+
     func testAPendingCheckThatNeverFinishesReadsAsUnknown() {
         let start = Date()
         let check = TaskUncommittedCheck.pending(checkout: "/x", forStatus: "blocked", at: start)

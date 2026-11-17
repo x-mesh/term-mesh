@@ -129,6 +129,11 @@ def main():
                     review_repo = repository(root, 'review')
                     t_review = task('left edits, NEEDS_REVIEW', review_repo)
                     command('send', agent, 'CASE_DIRTY CASE_REVIEW R818', '--task', t_review)
+                    # Called before the check is known to have finished: wait
+                    # itself must re-read a pending check, not print it.
+                    immediate = output_json('wait', '--task', t_review, '--mode', 'any', '--timeout', '30')
+                    first = immediate['result']['task']['uncommitted_check']
+                    assert first['state'] == 'checked' and first['count'] == 1, first
                     review = settled(t_review, 'review_ready')
                     check = review['uncommitted_check']
                     assert check['state'] == 'checked', check
