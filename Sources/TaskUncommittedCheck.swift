@@ -17,6 +17,9 @@ struct TaskUncommittedCheck: Codable, Equatable {
     /// Ties a result to the report that asked for it. A later report replaces
     /// the token, so a slow check of an earlier report is dropped.
     var token: String
+    /// The status the report set. The check describes that report only, so
+    /// it is dropped as soon as the task's status moves on by any route.
+    var forStatus: String
     var checkout: String?
     var count: Int?
     var paths: [String]?
@@ -31,12 +34,24 @@ struct TaskUncommittedCheck: Codable, Equatable {
     /// never ends.
     static let staleAfter: TimeInterval = 30
     static let maxPaths = 10
+    /// Task dictionaries go out in every daemon team sync, which has a payload
+    /// limit (#740), so a recorded path is bounded too.
+    static let maxPathLength = 200
 
-    static func pending(checkout: String?, at date: Date) -> TaskUncommittedCheck {
+    static func pending(
+        checkout: String?, forStatus: String, at date: Date
+    ) -> TaskUncommittedCheck {
         TaskUncommittedCheck(
-            state: .pending, token: UUID().uuidString, checkout: checkout,
-            count: nil, paths: nil, reason: nil, requestedAt: date, checkedAt: nil
+            state: .pending, token: UUID().uuidString, forStatus: forStatus,
+            checkout: checkout, count: nil, paths: nil, reason: nil,
+            requestedAt: date, checkedAt: nil
         )
+    }
+
+    /// The check for a task in `status`, or nil when it was taken for an
+    /// earlier status and no longer describes the task.
+    func current(forTaskStatus status: String) -> TaskUncommittedCheck? {
+        forStatus == status ? self : nil
     }
 
     func dictionary(now: Date = Date()) -> [String: Any] {
@@ -119,7 +134,7 @@ enum TaskUncommittedChecker {
         let paths = parsePorcelainZ(status.stdout)
         return Outcome(
             state: .checked, count: paths.count,
-            paths: Array(paths.prefix(TaskUncommittedCheck.maxPaths)))
+            paths: paths.prefix(TaskUncommittedCheck.maxPaths).map(bounded))
     }
 
     /// Paths from `git status --porcelain=v1 -z`. A rename or copy entry is
@@ -139,6 +154,11 @@ enum TaskUncommittedChecker {
             }
         }
         return paths
+    }
+
+    private static func bounded(_ path: String) -> String {
+        guard path.count > TaskUncommittedCheck.maxPathLength else { return path }
+        return String(path.prefix(TaskUncommittedCheck.maxPathLength - 1)) + "…"
     }
 
     private static func resolved(_ path: String) -> String {

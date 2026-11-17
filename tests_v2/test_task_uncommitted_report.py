@@ -138,6 +138,10 @@ def main():
                     waited = output_json('wait', '--task', t_review, '--mode', 'any', '--timeout', '30')
                     assert waited['result']['task']['uncommitted_check']['count'] == 1, waited
 
+                    inbox_wait = output_json('wait', '--mode', 'review_ready', '--timeout', '30')
+                    item = next(i for i in inbox_wait['result']['items'] if i.get('task_id') == t_review)
+                    assert item['uncommitted_check']['count'] == 1, item
+
                     now = c.team_status(team)
                     row = next(a for a in now.get('agents', now.get('members', [])) if a.get('name') == agent)
                     assert row.get('active_task_id') == t_review, row

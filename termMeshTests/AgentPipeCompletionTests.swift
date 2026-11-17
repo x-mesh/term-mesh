@@ -1187,9 +1187,29 @@ final class TaskUncommittedCheckTests: XCTestCase {
         XCTAssertEqual(settledCheck(team, task.id)?.reason, "no_task_worktree")
     }
 
+    /// A status changed by a route other than a report (here an unblock)
+    /// must not keep showing the earlier report's check.
+    func testAStatusChangedOutsideAReportDropsTheCheck() throws {
+        let store = TeamDataStore.shared
+        let team = team("uncommitted-unblock")
+        defer { store.unregisterTeam(team) }
+        let task = try XCTUnwrap(store.createTask(teamName: team, title: "work", assignee: "executor"))
+        _ = try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "in_progress"))
+        let blocked = try XCTUnwrap(store.updateTask(teamName: team, taskId: task.id, status: "blocked"))
+        let token = try XCTUnwrap(blocked.uncommittedCheck?.token)
+
+        let unblocked = try XCTUnwrap(store.unblockTask(teamName: team, taskId: task.id))
+        XCTAssertEqual(unblocked.status, "in_progress")
+        XCTAssertNil(store.getTask(teamName: team, taskId: task.id)?.uncommittedCheck)
+        XCTAssertTrue(store.taskDictionary(unblocked)["uncommitted_check"] is NSNull)
+        XCTAssertFalse(store.recordUncommittedCheck(
+            teamName: team, taskId: task.id, token: token,
+            outcome: .init(state: .checked, count: 1, paths: ["a"])))
+    }
+
     func testAPendingCheckThatNeverFinishesReadsAsUnknown() {
         let start = Date()
-        let check = TaskUncommittedCheck.pending(checkout: "/x", at: start)
+        let check = TaskUncommittedCheck.pending(checkout: "/x", forStatus: "blocked", at: start)
         XCTAssertEqual(check.dictionary(now: start)["state"] as? String, "pending")
         let late = check.dictionary(now: start.addingTimeInterval(TaskUncommittedCheck.staleAfter + 1))
         XCTAssertEqual(late["state"] as? String, "unknown")
