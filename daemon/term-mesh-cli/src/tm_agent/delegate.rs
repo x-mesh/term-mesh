@@ -1690,12 +1690,24 @@ pub(crate) fn warn_unrecorded_task_status(
     status: &str,
     updated: &Result<Value, String>,
 ) {
+    if let Some(warning) = unrecorded_task_status_warning(task_id, status, updated) {
+        eprintln!("{warning}");
+    }
+}
+
+pub(crate) fn unrecorded_task_status_warning(
+    task_id: &str,
+    status: &str,
+    updated: &Result<Value, String>,
+) -> Option<String> {
     let failure = match updated {
-        Ok(v) if v["ok"].as_bool().unwrap_or(false) => return,
+        Ok(v) if v["ok"].as_bool().unwrap_or(false) => return None,
         Ok(v) => pretty(v),
         Err(e) => e.clone(),
     };
-    eprintln!("Warning: task {task_id} was not marked {status}: {failure}");
+    Some(format!(
+        "Warning: task {task_id} was not marked {status}: {failure}"
+    ))
 }
 
 pub(crate) fn run_delegate_autonomous(
@@ -2163,5 +2175,104 @@ mod autonomous_outcome_tests {
         assert_eq!(status, "failed");
         assert!(message.contains("exit=2"));
         assert_eq!(autonomous_outcome("t1", -1).0, "failed");
+    }
+
+    #[test]
+    fn only_an_accepted_update_skips_the_unrecorded_status_warning() {
+        let accepted = Ok(json!({"id": 1, "ok": true, "result": {}}));
+        assert_eq!(
+            unrecorded_task_status_warning("t1", "failed", &accepted),
+            None
+        );
+
+        for refused in [
+            Ok(json!({"id": 1, "ok": false, "error": "unknown task"})),
+            Ok(json!({"id": 1})),
+        ] {
+            let warning = unrecorded_task_status_warning("t1", "failed", &refused)
+                .expect("a refused or unconfirmed update warns");
+            assert!(
+                warning.starts_with("Warning: task t1 was not marked failed: "),
+                "{warning}"
+            );
+        }
+
+        let unreachable: Result<Value, String> = Err("connect: refused".to_string());
+        let warning = unrecorded_task_status_warning("t1", "completed", &unreachable)
+            .expect("an unreachable app warns");
+        assert_eq!(
+            warning,
+            "Warning: task t1 was not marked completed: connect: refused"
+        );
+    }
+
+    #[test]
+    fn a_run_that_cannot_start_marks_its_task_failed() {
+        let _env = ProcessEnvGuard::acquire();
+        let _route = RouteDerivationEnv::isolated();
+        let leader_keys = [
+            "TERMMESH_LEADER_GRANT_ID",
+            "TERMMESH_LEADER_PROJECT_ID",
+            "TERMMESH_LEADER_TEAM_UUID",
+            "TERMMESH_LEADER_EXPIRES_AT",
+            "TERMMESH_LEADER_PEER_ID",
+            REMOTE_LEADER_ROUTE_FILE_ENV,
+        ];
+        let saved: Vec<_> = leader_keys
+            .iter()
+            .map(|key| (*key, env::var_os(key)))
+            .collect();
+        for key in leader_keys {
+            env::remove_var(key);
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            while !server_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).expect("blocking stream");
+                let mut line = String::new();
+                BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .expect("read request");
+                requests.push(serde_json::from_str::<Value>(&line).expect("request json"));
+                (&stream)
+                    .write_all(
+                        format!("{}\n", json!({"id": 1, "ok": true, "result": {}})).as_bytes(),
+                    )
+                    .expect("write response");
+            }
+            requests
+        });
+
+        fail_autonomous_task(&sock, "team-a", "t1", "spawn claude: not found");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let requests = server.join().expect("server thread");
+        for (key, value) in saved {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["method"], "team.task.update");
+        let params = &requests[0]["params"];
+        assert_eq!(params["team_name"], "team-a");
+        assert_eq!(params["task_id"], "t1");
+        assert_eq!(params["status"], "failed");
+        assert_eq!(
+            params["result"],
+            "autonomous task t1 did not start: spawn claude: not found"
+        );
     }
 }
