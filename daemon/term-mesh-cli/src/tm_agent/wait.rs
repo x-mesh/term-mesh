@@ -252,6 +252,13 @@ pub(crate) fn wait_task_settled(status: &str) -> bool {
 const UNCOMMITTED_CHECK_SETTLE: Duration = Duration::from_secs(8);
 const UNCOMMITTED_CHECK_POLL: Duration = Duration::from_millis(250);
 
+/// The pause between polls, cut short so the last one ends at `--timeout`
+/// instead of a full interval past it.
+fn wait_pause(interval_secs: u64, started: Instant, timeout_secs: u32) -> Duration {
+    Duration::from_secs(interval_secs)
+        .min(Duration::from_secs(u64::from(timeout_secs)).saturating_sub(started.elapsed()))
+}
+
 /// The re-read never runs past the caller's own `--timeout`: a short timeout
 /// is how automation decides to give up, so the settle budget is whatever is
 /// left of it, capped at `UNCOMMITTED_CHECK_SETTLE`.
@@ -1170,17 +1177,16 @@ pub(crate) fn run_wait(
         std::collections::HashMap::new();
     while elapsed < timeout {
         if current_interval > 0 {
+            let pause = wait_pause(current_interval, wait_started, timeout);
             // B1: a push event ends the sleep early; a quiet stream keeps the
             // configured cadence.
             if let Some(ref rx) = event_rx {
-                if recv_push_or_interval(rx, Duration::from_secs(current_interval))
-                    == PushWait::Closed
-                {
+                if recv_push_or_interval(rx, pause) == PushWait::Closed {
                     eprintln!("wait: subscribe stream closed; falling back to polling");
                     event_rx = None;
                 }
             } else {
-                thread::sleep(Duration::from_secs(current_interval));
+                thread::sleep(pause);
             }
             elapsed = wait_started.elapsed().as_secs() as u32;
         }
@@ -1913,6 +1919,14 @@ mod wait_any_scope_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["task_id"], "a");
         assert!(inbox_task_items(&json!({ "result": null }), "blocked").is_empty());
+    }
+
+    #[test]
+    fn a_poll_pause_ends_at_the_wait_timeout() {
+        let started = Instant::now() - Duration::from_millis(1500);
+        assert!(wait_pause(10, started, 2) <= Duration::from_millis(500));
+        assert_eq!(wait_pause(10, started, 1), Duration::ZERO);
+        assert_eq!(wait_pause(3, Instant::now(), 3600), Duration::from_secs(3));
     }
 
     #[test]
