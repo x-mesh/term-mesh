@@ -1971,6 +1971,26 @@ mod backup_create_new_tests {
         assert_eq!(left, vec![std::ffi::OsString::from("peer-workspaces.json")]);
     }
 
+    /// Only a taken name moves on to the next suffix; any other open error is
+    /// the real cause and must not turn into "too many backups".
+    #[test]
+    fn an_unwritable_directory_reports_the_open_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("peer-workspaces.json");
+        std::fs::write(&state, "state").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::File::create(dir.path().join("probe")).is_ok();
+
+        let result = backup_peer_state_file_at(&state, 42);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            return; // running as root: mode 555 does not stop the create
+        }
+
+        let error = result.expect_err("no backup can be created");
+        assert!(error.starts_with("backup failed: "), "{error}");
+    }
+
     #[test]
     fn a_missing_state_file_has_nothing_to_back_up() {
         let dir = tempfile::tempdir().unwrap();
