@@ -179,7 +179,7 @@ If `tm-agent` is not in PATH:
 | `runbook digest --agent executor` | `/team runbook digest --agent executor` | Show compact prompt-efficient role digest |
 | `runbook install --tool all` | `/team runbook install --tool all` | Install managed projections for supported agent tools |
 
-Runbook precedence: base term-mesh protocol → role preset → `.agent-runbooks/<role>.md` → per-team custom instructions. Tool-specific files under `.claude/skills`, `.codex/skills`, and `.opencode/runbooks` are projections, not the source of truth.
+Runbook precedence: base term-mesh protocol → role preset → `.agent-runbooks/<role>.md` → per-team custom instructions. Tool-specific files under `.claude/skills`, `.codex/skills`, and `.opencode/runbooks` are projections, not the source of truth. `runbook init` and `runbook install` create a missing `.agent-runbooks/<role>.md` but keep an existing one, edits included; `--force` replaces it with the default.
 Agent init uses compact runbook digests by default; set `TERMMESH_RUNBOOK_MODE=full` only for debugging or deep role-behavior audits.
 
 ### Agent context lifecycle

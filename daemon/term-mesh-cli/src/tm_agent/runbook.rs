@@ -1067,6 +1067,31 @@ pub(crate) fn write_managed_runbook(
     }))
 }
 
+/// `.agent-runbooks/<role>.md` is the project's source of truth, and people
+/// edit it below the managed marker. An existing one is therefore kept unless
+/// `force`; only a missing one is written. Projections are regenerated from it.
+pub(crate) fn write_source_runbook(
+    path: &Path,
+    content: &str,
+    dry_run: bool,
+    force: bool,
+) -> Result<Value, String> {
+    if !force {
+        if let Ok(existing) = fs::read_to_string(path) {
+            let action = if existing == content {
+                "unchanged"
+            } else {
+                "kept_existing"
+            };
+            return Ok(json!({
+                "path": path.to_string_lossy(),
+                "action": action,
+            }));
+        }
+    }
+    write_managed_runbook(path, content, dry_run, force)
+}
+
 pub(crate) fn runbook_init(dry_run: bool, force: bool) -> Result<Value, String> {
     let root = find_runbook_project_root()?;
     let roles = builtin_runbook_roles();
@@ -1078,7 +1103,7 @@ pub(crate) fn runbook_init(dry_run: bool, force: bool) -> Result<Value, String> 
         force,
     )?);
     for role in &roles {
-        files.push(write_managed_runbook(
+        files.push(write_source_runbook(
             &runbook_source_path(&root, role),
             &source_runbook_content(role),
             dry_run,
@@ -1114,7 +1139,7 @@ pub(crate) fn runbook_install(
         force,
     )?);
     for role in &roles {
-        files.push(write_managed_runbook(
+        files.push(write_source_runbook(
             &runbook_source_path(&root, role),
             &source_runbook_content(role),
             dry_run,
@@ -1317,6 +1342,66 @@ mod runbook_tests {
         let skill = tool_runbook_content(RunbookTool::Codex, &role, &source);
         assert!(skill.starts_with("---\nname: term-mesh-reviewer"));
         assert!(skill.contains(RUNBOOK_MARKER));
+    }
+
+    /// #903 L1: an edit below the managed marker survived neither `init` nor
+    /// `install`, which rewrote the source before projecting it.
+    #[test]
+    fn an_edited_managed_source_runbook_is_kept_and_projected() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-source-{unique}"));
+        let role = selected_runbook_roles(Some("reviewer")).unwrap().remove(0);
+        let path = runbook_source_path(&dir, &role);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let edited = format!(
+            "{}\n## Project rule\nALWAYS-CHECK-MIGRATIONS\n",
+            source_runbook_content(&role)
+        );
+        fs::write(&path, &edited).unwrap();
+
+        let kept =
+            write_source_runbook(&path, &source_runbook_content(&role), false, false).unwrap();
+        assert_eq!(kept["action"].as_str(), Some("kept_existing"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        let projected = tool_runbook_content(
+            RunbookTool::OpenCode,
+            &role,
+            &effective_source_runbook_content(&dir, &role),
+        );
+        assert!(projected.contains("ALWAYS-CHECK-MIGRATIONS"));
+
+        let forced =
+            write_source_runbook(&path, &source_runbook_content(&role), false, true).unwrap();
+        assert_eq!(forced["action"].as_str(), Some("updated"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            source_runbook_content(&role)
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_missing_source_runbook_is_still_created() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-missing-{unique}"));
+        let path = dir.join("reviewer.md");
+
+        let planned = write_source_runbook(&path, "content\n", true, false).unwrap();
+        assert_eq!(planned["action"].as_str(), Some("would_create"));
+        assert!(!path.exists());
+        let created = write_source_runbook(&path, "content\n", false, false).unwrap();
+        assert_eq!(created["action"].as_str(), Some("created"));
+        let again = write_source_runbook(&path, "content\n", false, false).unwrap();
+        assert_eq!(again["action"].as_str(), Some("unchanged"));
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
