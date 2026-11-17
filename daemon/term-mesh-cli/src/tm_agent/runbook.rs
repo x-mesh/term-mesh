@@ -1077,16 +1077,21 @@ pub(crate) fn write_source_runbook(
     force: bool,
 ) -> Result<Value, String> {
     if !force {
-        if let Ok(existing) = fs::read_to_string(path) {
-            let action = if existing == content {
-                "unchanged"
-            } else {
-                "kept_existing"
-            };
-            return Ok(json!({
-                "path": path.to_string_lossy(),
-                "action": action,
-            }));
+        match fs::read_to_string(path) {
+            Ok(existing) => {
+                let action = if existing == content {
+                    "unchanged"
+                } else {
+                    "kept_existing"
+                };
+                return Ok(json!({
+                    "path": path.to_string_lossy(),
+                    "action": action,
+                }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // An unreadable source is still the user's file, not a missing one.
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
         }
     }
     write_managed_runbook(path, content, dry_run, force)
@@ -1380,6 +1385,23 @@ mod runbook_tests {
             fs::read_to_string(&path).unwrap(),
             source_runbook_content(&role)
         );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_source_runbook_is_an_error_not_a_missing_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("tm-agent-runbook-unreadable-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reviewer.md");
+        fs::write(&path, [0xff_u8, 0xfe, b'\n']).unwrap();
+
+        assert!(write_source_runbook(&path, "content\n", false, false).is_err());
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff_u8, 0xfe, b'\n']);
 
         fs::remove_dir_all(dir).ok();
     }
