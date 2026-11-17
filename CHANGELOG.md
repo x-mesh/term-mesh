@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.290.0] - 2026-11-18
+
+### Changed
+
+- When a worker reports DONE, BLOCKED or NEEDS_REVIEW, its task now records the uncommitted files left in the task's checkout. `task get`, `wait`, `collect --headers`, the inbox and `status` show this as `uncommitted_check`. Before, a worker that stopped with unsaved edits looked like ordinary review-ready work. A checkout that cannot be checked is shown with a reason, never as clean.
+- A task that a native agent turn settles now records the tool failures of that turn as `tool_failures`, with the count, the last tool and its error line. Leaders see it in `wait`, `collect --headers`, the inbox and `task get`. Before, these failures appeared only in `tm-agent status`.
+
+### Fixed
+
+- `tm-agent wait` now returns at `--timeout`. Before, it could wait one more poll interval past the timeout, and that interval grows with each poll: `--timeout 7` returned after about 10 seconds.
+- `tm-agent runbook install` and `runbook init` no longer replace an edited `.agent-runbooks/<role>.md` with the built-in default. The Settings button "Update projections" ran the same code. An existing source runbook is now kept, and the projections are built from it. Use `--force`, or "Force repair" in the app, to reset sources to the defaults. An unedited source no longer picks up a newer default without `--force`.
+- `tm-agent delegate --autonomous` now marks the task `failed` when `claude -p` exits with an error, when it cannot start, or when its output file cannot be created. Before, a failed run was marked `completed`, and a run that never started left its task assigned. `tm-agent` now prints a warning when the app does not record a task status update.
+- `tm-agent wait` for autonomous tasks no longer treats a task list that it cannot read as "all done".
+- `swarm` seed descriptions with quotes, backslashes or line breaks no longer break the task board file.
+
+### Security
+
+- Peer state backups in `term-meshd` and in `tm-agent daemon` reset no longer follow a symlink at the backup name. Another local user could plant a link there, mostly when the state directory falls back to `/tmp/term-meshd`, and the backup would overwrite the link's target with your permissions. Backups are now created only as new files.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.289.0] - 2026-11-17
 
 ### Changed
