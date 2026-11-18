@@ -442,6 +442,8 @@ fi
 # dispatched earlier in the same session. Work merely remaining in flight does
 # not justify unrelated direct work while a worker runs.
 DELEGATION_FLOOR=""
+FLOOR_DISPATCHED=""
+FLOOR_WAVE=""
 if [ "$MODE" = --end ] \
     && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
     && [ -r "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
@@ -489,6 +491,22 @@ except (TypeError, ValueError):
     workers = 0
 if level != "delegated" or workers <= 0:
     sys.exit(0)
+
+try:
+    cap = int(control.get("max_parallel_workers") or 3)
+except (TypeError, ValueError):
+    cap = 3
+# Same bound the floor states at --start, so breadth is judged against the
+# wave the leader was told it could run.
+wave = min(max(1, min(10, cap)), workers)
+
+
+def verdict(name, workers_used):
+    # Breadth is reported only when it can be scoped to this leader's session.
+    if leader_session:
+        print("{} {} {}".format(name, workers_used, wave), end="")
+    else:
+        print(name, end="")
 
 # Read the bytes this turn appended, rather than walking the log back to this
 # turn's own turn_start.
@@ -557,19 +575,28 @@ for index, raw in enumerate(chunks):
     if isinstance(record, dict) and record.get("team") == team:
         records.append((line_offset, record))
 
-dispatched = sum(
-    1
+# Another leader of the same team appends to the same log. With a known
+# session, only this leader's dispatches count, for the floor and for breadth.
+turn_dispatches = [
+    record
     for line_offset, record in records
-    if line_offset >= baseline and record.get("event") == "task_dispatch"
-)
-if dispatched > 0:
-    print("met", end="")
+    if line_offset >= baseline
+    and record.get("event") == "task_dispatch"
+    and (not leader_session or record.get("leader_session_id") == leader_session)
+]
+if turn_dispatches:
+    # A wave is parallel workers, so three tasks queued on one worker are one.
+    workers_used = len({
+        record.get("worker") or record.get("task_id") or str(index)
+        for index, record in enumerate(turn_dispatches)
+    })
+    verdict("met", workers_used)
     sys.exit(0)
 
 # Outstanding work is attributed by leader session. Without one, a task of
 # another leader in the same team would exempt this leader, so no exemption.
 if not leader_session:
-    print("unmet", end="")
+    verdict("unmet", 0)
     sys.exit(0)
 
 # Only explicit collection in this turn can exempt a no-dispatch turn. Both
@@ -622,12 +649,20 @@ for line_offset, record in records:
     if isinstance(task_ids, list):
         collected_ids.update(task_id for task_id in task_ids if isinstance(task_id, str))
 
-print("met_by_collection" if prior_dispatches.intersection(collected_ids) else "unmet", end="")
+verdict("met_by_collection" if prior_dispatches.intersection(collected_ids) else "unmet", 0)
 TURN_HOOK_MET
 )"
+    # shellcheck disable=SC2086 # deliberate word split of "<verdict> <dispatched> <wave>"
+    set -- $DELEGATION_FLOOR
+    DELEGATION_FLOOR="${1:-}"
+    FLOOR_DISPATCHED="${2:-}"
+    FLOOR_WAVE="${3:-}"
     case "$DELEGATION_FLOOR" in
         met|unmet|met_by_collection) ;;
         *) DELEGATION_FLOOR="" ;;
+    esac
+    case "$FLOOR_DISPATCHED:$FLOOR_WAVE" in
+        *[!0-9:]*|:*|*:) FLOOR_DISPATCHED=""; FLOOR_WAVE="" ;;
     esac
 fi
 
@@ -736,8 +771,25 @@ else
     FLOOR_FIELD=""
     if [ -n "$DELEGATION_FLOOR" ]; then
         FLOOR_FIELD=",\"delegation_floor\":$(json_string "$DELEGATION_FLOOR")"
+        if [ -n "$FLOOR_DISPATCHED" ]; then
+            FLOOR_FIELD="$FLOOR_FIELD,\"dispatched_workers\":$FLOOR_DISPATCHED,\"wave_capacity\":$FLOOR_WAVE"
+        fi
     fi
     LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")$FLOOR_FIELD$STOP_BLOCKED_FIELD$IDENTITY_FIELDS}"
+fi
+
+# A floor that passes on one dispatch says nothing about breadth: a leader can
+# keep five workers idle while it lists open items or runs long checks itself.
+# Leave a note for the next --start to restate, instead of blocking this Stop:
+# narrow can be right when the work is serial, so this informs and never gates.
+NARROW_FILE="$LOG_DIR/.turn-narrow-$STATE_KEY"
+if [ "$MODE" = --end ] && [ -n "$FLOOR_DISPATCHED" ] && [ "$STOP_BLOCK" -eq 0 ]; then
+    if [ "$FLOOR_WAVE" -ge 2 ] && [ "$FLOOR_DISPATCHED" -lt "$FLOOR_WAVE" ] \
+        && [ "$DELEGATION_FLOOR" != unmet ]; then
+        { printf '%s %s\n' "$FLOOR_DISPATCHED" "$FLOOR_WAVE" > "$NARROW_FILE"; } 2>/dev/null || true
+    else
+        rm -f "$NARROW_FILE" 2>/dev/null || true
+    fi
 fi
 
 # Open the append once per invocation and emit one complete line. Do not retain
@@ -799,7 +851,7 @@ if [ "$MODE" = --start ] \
     && command -v python3 >/dev/null 2>&1; then
     # TERMMESH_LEADER_PROJECT_ID is a display ID (e.g. "team:<uuid>"), not the team
     # name control payloads use as project_id, so only TERMMESH_TEAM can match it.
-    python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$TEAM" <<'TURN_HOOK_FLOOR' 2>/dev/null || true
+    python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$TEAM" "$NARROW_FILE" <<'TURN_HOOK_FLOOR' 2>/dev/null || true
 import json
 import os
 import sys
@@ -884,7 +936,12 @@ FLOORS = {
         "Delegated guidance is mandatory. Assign every useful dependency-ready unit up to "
         "the available roster, configured maximum, or ten workers, whichever is lower, and "
         "keep coordination, integration, and review in the leader lane. If the work is serial, "
-        "use one worker. Fill every useful independent unit, but never invent units only to fill capacity. A leader mutation lane "
+        "use one worker. Fill every useful independent unit, but never invent units only to fill capacity. "
+        "Open items you already reported in this session that need no user decision (unverified checks, "
+        "flaky-test investigations, agreed follow-up fixes) are dependency-ready units: dispatch them to "
+        "idle workers instead of only listing them. When dependent units wait on a base you integrate, "
+        "keep only the conflict resolution and commit in the leader lane, dispatch the dependent units, "
+        "then run or delegate long verification while they work. A leader mutation lane "
         "requires isolated checkout, explicit disjoint ownership, zero write overlap, and "
         "serial integration. Implementing it yourself requires "
         "`tm-agent leader turn route --route direct --no-dispatch-reason <reason>`. "
@@ -911,7 +968,22 @@ if route_file:
         "prefix it with TERMMESH_LEADER_ROUTE_FILE={}.".format(route_file)
     )
 print(floor)
+
+narrow_path = sys.argv[3] if len(sys.argv) > 3 else ""
+try:
+    with open(narrow_path, "r", encoding="utf-8") as handle:
+        last_dispatched, last_wave = (int(v) for v in handle.read().split()[:2])
+except Exception:
+    last_dispatched = last_wave = None
+if last_wave is not None and 0 <= last_dispatched < last_wave:
+    print(
+        "Your previous turn dispatched to {} worker(s) against a wave of {}. Before this turn ends, "
+        "check the open items you reported earlier: dispatch each one that needs no user "
+        "decision to an idle worker.".format(last_dispatched, last_wave)
+    )
 TURN_HOOK_FLOOR
 fi
+# Consumed whether or not the floor printed, so a stale note never resurfaces.
+[ "$MODE" != --start ] || rm -f "$NARROW_FILE" 2>/dev/null || true
 
 exit 0

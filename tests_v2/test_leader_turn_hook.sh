@@ -476,6 +476,82 @@ if actual != expected:
     raise SystemExit(f"FAIL: delegation floors were {actual}, expected {expected}")
 PY
 
+# Breadth: a floor met by one dispatch still records how narrow the turn was,
+# and the next prompt restates it so idle workers are not left idle silently.
+case "$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"wording","session_id":"floor-w"}')" in
+    *"Open items you already reported"*"dispatch them to idle workers"*) ;;
+    *) fail "delegated floor lacks the open-item rule" ;;
+esac
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-w","stop_hook_active":true}' >/dev/null
+NARROW_NOTE="$FLOOR_HOME/.term-mesh/logs/.turn-narrow-99999999-8888-7777-6666-555555555555"
+rm -f "$NARROW_NOTE"
+
+# A subshell, because POSIX sh keeps an assignment that prefixes a function call.
+breadth_hook() {
+    (
+        TERMMESH_LEADER_SESSION_ID=breadth-leader
+        export TERMMESH_LEADER_SESSION_ID
+        floor_hook "$FLOOR_CTL/delegated.json" "$@"
+    )
+}
+# breadth_dispatch <task_id> <worker> <leader_session>
+breadth_dispatch() {
+    printf '{"event":"task_dispatch","turn_id":"req-%s","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"%s","worker":"%s","leader_session_id":"%s","delivery":"created"}\n' \
+        "$1" "$1" "$2" "$3" >> "$FLOOR_LOG" || exit 1
+}
+last_breadth() {
+    python3 - "$FLOOR_LOG" <<'BREADTHPY'
+import json
+import pathlib
+import sys
+
+ends = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+        if l.strip() and json.loads(l)["event"] == "turn_end"]
+last = ends[-1]
+print(last.get("delegation_floor"), last.get("dispatched_workers"), last.get("wave_capacity"))
+BREADTHPY
+}
+
+# Three tasks on one worker, plus another leader's dispatch, are a wave of one.
+breadth_hook --start '{"prompt":"narrow turn","session_id":"floor-n1"}' >/dev/null \
+    || fail "narrow start returned nonzero"
+breadth_dispatch tn1 executor breadth-leader
+breadth_dispatch tn2 executor breadth-leader
+breadth_dispatch tn3 executor breadth-leader
+breadth_dispatch to1 architect other-leader
+breadth_dispatch to2 reviewer other-leader
+breadth_hook --end '{"session_id":"floor-n1"}' >/dev/null || fail "narrow end returned nonzero"
+[ "$(last_breadth)" = "met 1 3" ] || fail "narrow turn_end was $(last_breadth)"
+[ -f "$NARROW_NOTE" ] || fail "narrow turn left no note for the next prompt"
+FLOOR_OUT=$(breadth_hook --start '{"prompt":"after narrow","session_id":"floor-n2"}') \
+    || fail "after-narrow start returned nonzero"
+case "$FLOOR_OUT" in
+    *"previous turn dispatched to 1 worker(s) against a wave of 3"*) ;;
+    *) fail "next prompt did not restate the narrow turn: $FLOOR_OUT" ;;
+esac
+[ ! -e "$NARROW_NOTE" ] || fail "narrow note was not consumed"
+breadth_dispatch tw1 executor breadth-leader
+breadth_dispatch tw2 architect breadth-leader
+breadth_dispatch tw3 reviewer breadth-leader
+breadth_hook --end '{"session_id":"floor-n2"}' >/dev/null || fail "full-wave end returned nonzero"
+[ "$(last_breadth)" = "met 3 3" ] || fail "full-wave turn_end was $(last_breadth)"
+[ ! -e "$NARROW_NOTE" ] || fail "a full wave left a narrow note"
+FLOOR_OUT=$(breadth_hook --start '{"prompt":"after full","session_id":"floor-n3"}') \
+    || fail "after-full start returned nonzero"
+case "$FLOOR_OUT" in
+    *"previous turn dispatched"*) fail "full wave was restated as narrow: $FLOOR_OUT" ;;
+esac
+# Only another leader dispatched: this turn delegated nothing and must not pass.
+breadth_dispatch tx1 architect other-leader
+FLOOR_OUT=$(breadth_hook --end '{"session_id":"floor-n3","stop_hook_active":false}') \
+    || fail "other-leader end returned nonzero"
+case "$FLOOR_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "another leader's dispatch met this turn's floor: $FLOOR_OUT" ;;
+esac
+breadth_hook --end '{"session_id":"floor-n3","stop_hook_active":true}' >/dev/null
+[ "$(last_breadth)" = "unmet 0 3" ] || fail "other-leader turn_end was $(last_breadth)"
+
 # Legacy mode does not stop the mandatory floor record.
 floor_hook "$FLOOR_CTL/mode-off.json" --start '{"prompt":"off turn","session_id":"floor-off"}' >/dev/null \
     || fail "mode-off start returned nonzero"
@@ -1374,4 +1450,5 @@ printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tai
 printf '%s\n' 'PASS: delegation floor lets an async leader collect work it already dispatched'
 printf '%s\n' 'PASS: delegation floor finds the previous turn_end beyond its lookback'
 printf '%s\n' 'PASS: delegation floor gives a session-less leader no exemption'
+printf '%s\n' 'PASS: delegation floor records breadth and restates a narrow turn'
 printf '%s\n' 'PASS: leader turn hook records scoped Project identity'
