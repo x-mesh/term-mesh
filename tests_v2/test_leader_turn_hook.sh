@@ -476,6 +476,54 @@ if actual != expected:
     raise SystemExit(f"FAIL: delegation floors were {actual}, expected {expected}")
 PY
 
+# Breadth: a floor met by one dispatch still records how narrow the turn was,
+# and the next prompt restates it so idle workers are not left idle silently.
+case "$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"wording","session_id":"floor-w"}')" in
+    *"Open items you already reported"*"dispatch them to idle workers"*) ;;
+    *) fail "delegated floor lacks the open-item rule" ;;
+esac
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-w","stop_hook_active":true}' >/dev/null
+NARROW_NOTE="$FLOOR_HOME/.term-mesh/logs/.turn-narrow-99999999-8888-7777-6666-555555555555"
+rm -f "$NARROW_NOTE"
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"narrow turn","session_id":"floor-n1"}' >/dev/null \
+    || fail "narrow start returned nonzero"
+printf '%s\n' '{"event":"task_dispatch","turn_id":"req-n1","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"tn1","worker":"executor","delivery":"created"}' \
+    >> "$FLOOR_LOG" || exit 1
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-n1"}' >/dev/null \
+    || fail "narrow end returned nonzero"
+python3 - "$FLOOR_LOG" <<'NARROWPY' || exit 1
+import json
+import pathlib
+import sys
+
+ends = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+        if l.strip() and json.loads(l)["event"] == "turn_end"]
+last = ends[-1]
+if (last.get("delegation_floor"), last.get("dispatched"), last.get("wave_capacity")) != ("met", 1, 3):
+    raise SystemExit("FAIL: narrow turn_end was %r" % last)
+NARROWPY
+[ -f "$NARROW_NOTE" ] || fail "narrow turn left no note for the next prompt"
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"after narrow","session_id":"floor-n2"}') \
+    || fail "after-narrow start returned nonzero"
+case "$FLOOR_OUT" in
+    *"previous turn dispatched 1 task(s) against a wave of 3"*) ;;
+    *) fail "next prompt did not restate the narrow turn: $FLOOR_OUT" ;;
+esac
+[ ! -e "$NARROW_NOTE" ] || fail "narrow note was not consumed"
+for n in 1 2 3; do
+    printf '{"event":"task_dispatch","turn_id":"req-n2","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"tw%s","worker":"executor","delivery":"created"}\n' "$n" \
+        >> "$FLOOR_LOG" || exit 1
+done
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-n2"}' >/dev/null \
+    || fail "full-wave end returned nonzero"
+[ ! -e "$NARROW_NOTE" ] || fail "a full wave left a narrow note"
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"after full","session_id":"floor-n3"}') \
+    || fail "after-full start returned nonzero"
+case "$FLOOR_OUT" in
+    *"previous turn dispatched"*) fail "full wave was restated as narrow: $FLOOR_OUT" ;;
+esac
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-n3","stop_hook_active":true}' >/dev/null
+
 # Legacy mode does not stop the mandatory floor record.
 floor_hook "$FLOOR_CTL/mode-off.json" --start '{"prompt":"off turn","session_id":"floor-off"}' >/dev/null \
     || fail "mode-off start returned nonzero"
@@ -1374,4 +1422,5 @@ printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tai
 printf '%s\n' 'PASS: delegation floor lets an async leader collect work it already dispatched'
 printf '%s\n' 'PASS: delegation floor finds the previous turn_end beyond its lookback'
 printf '%s\n' 'PASS: delegation floor gives a session-less leader no exemption'
+printf '%s\n' 'PASS: delegation floor records breadth and restates a narrow turn'
 printf '%s\n' 'PASS: leader turn hook records scoped Project identity'
