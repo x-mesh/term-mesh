@@ -485,13 +485,22 @@ esac
 floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-w","stop_hook_active":true}' >/dev/null
 NARROW_NOTE="$FLOOR_HOME/.term-mesh/logs/.turn-narrow-99999999-8888-7777-6666-555555555555"
 rm -f "$NARROW_NOTE"
-floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"narrow turn","session_id":"floor-n1"}' >/dev/null \
-    || fail "narrow start returned nonzero"
-printf '%s\n' '{"event":"task_dispatch","turn_id":"req-n1","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"tn1","worker":"executor","delivery":"created"}' \
-    >> "$FLOOR_LOG" || exit 1
-floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-n1"}' >/dev/null \
-    || fail "narrow end returned nonzero"
-python3 - "$FLOOR_LOG" <<'NARROWPY' || exit 1
+
+# A subshell, because POSIX sh keeps an assignment that prefixes a function call.
+breadth_hook() {
+    (
+        TERMMESH_LEADER_SESSION_ID=breadth-leader
+        export TERMMESH_LEADER_SESSION_ID
+        floor_hook "$FLOOR_CTL/delegated.json" "$@"
+    )
+}
+# breadth_dispatch <task_id> <worker> <leader_session>
+breadth_dispatch() {
+    printf '{"event":"task_dispatch","turn_id":"req-%s","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"%s","worker":"%s","leader_session_id":"%s","delivery":"created"}\n' \
+        "$1" "$1" "$2" "$3" >> "$FLOOR_LOG" || exit 1
+}
+last_breadth() {
+    python3 - "$FLOOR_LOG" <<'BREADTHPY'
 import json
 import pathlib
 import sys
@@ -499,30 +508,49 @@ import sys
 ends = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
         if l.strip() and json.loads(l)["event"] == "turn_end"]
 last = ends[-1]
-if (last.get("delegation_floor"), last.get("dispatched"), last.get("wave_capacity")) != ("met", 1, 3):
-    raise SystemExit("FAIL: narrow turn_end was %r" % last)
-NARROWPY
+print(last.get("delegation_floor"), last.get("dispatched_workers"), last.get("wave_capacity"))
+BREADTHPY
+}
+
+# Three tasks on one worker, plus another leader's dispatch, are a wave of one.
+breadth_hook --start '{"prompt":"narrow turn","session_id":"floor-n1"}' >/dev/null \
+    || fail "narrow start returned nonzero"
+breadth_dispatch tn1 executor breadth-leader
+breadth_dispatch tn2 executor breadth-leader
+breadth_dispatch tn3 executor breadth-leader
+breadth_dispatch to1 architect other-leader
+breadth_dispatch to2 reviewer other-leader
+breadth_hook --end '{"session_id":"floor-n1"}' >/dev/null || fail "narrow end returned nonzero"
+[ "$(last_breadth)" = "met 1 3" ] || fail "narrow turn_end was $(last_breadth)"
 [ -f "$NARROW_NOTE" ] || fail "narrow turn left no note for the next prompt"
-FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"after narrow","session_id":"floor-n2"}') \
+FLOOR_OUT=$(breadth_hook --start '{"prompt":"after narrow","session_id":"floor-n2"}') \
     || fail "after-narrow start returned nonzero"
 case "$FLOOR_OUT" in
-    *"previous turn dispatched 1 task(s) against a wave of 3"*) ;;
+    *"previous turn dispatched to 1 worker(s) against a wave of 3"*) ;;
     *) fail "next prompt did not restate the narrow turn: $FLOOR_OUT" ;;
 esac
 [ ! -e "$NARROW_NOTE" ] || fail "narrow note was not consumed"
-for n in 1 2 3; do
-    printf '{"event":"task_dispatch","turn_id":"req-n2","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"tw%s","worker":"executor","delivery":"created"}\n' "$n" \
-        >> "$FLOOR_LOG" || exit 1
-done
-floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-n2"}' >/dev/null \
-    || fail "full-wave end returned nonzero"
+breadth_dispatch tw1 executor breadth-leader
+breadth_dispatch tw2 architect breadth-leader
+breadth_dispatch tw3 reviewer breadth-leader
+breadth_hook --end '{"session_id":"floor-n2"}' >/dev/null || fail "full-wave end returned nonzero"
+[ "$(last_breadth)" = "met 3 3" ] || fail "full-wave turn_end was $(last_breadth)"
 [ ! -e "$NARROW_NOTE" ] || fail "a full wave left a narrow note"
-FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"after full","session_id":"floor-n3"}') \
+FLOOR_OUT=$(breadth_hook --start '{"prompt":"after full","session_id":"floor-n3"}') \
     || fail "after-full start returned nonzero"
 case "$FLOOR_OUT" in
     *"previous turn dispatched"*) fail "full wave was restated as narrow: $FLOOR_OUT" ;;
 esac
-floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-n3","stop_hook_active":true}' >/dev/null
+# Only another leader dispatched: this turn delegated nothing and must not pass.
+breadth_dispatch tx1 architect other-leader
+FLOOR_OUT=$(breadth_hook --end '{"session_id":"floor-n3","stop_hook_active":false}') \
+    || fail "other-leader end returned nonzero"
+case "$FLOOR_OUT" in
+    *'"decision":"block"'*) ;;
+    *) fail "another leader's dispatch met this turn's floor: $FLOOR_OUT" ;;
+esac
+breadth_hook --end '{"session_id":"floor-n3","stop_hook_active":true}' >/dev/null
+[ "$(last_breadth)" = "unmet 0 3" ] || fail "other-leader turn_end was $(last_breadth)"
 
 # Legacy mode does not stop the mandatory floor record.
 floor_hook "$FLOOR_CTL/mode-off.json" --start '{"prompt":"off turn","session_id":"floor-off"}' >/dev/null \

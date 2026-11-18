@@ -501,8 +501,12 @@ except (TypeError, ValueError):
 wave = min(max(1, min(10, cap)), workers)
 
 
-def verdict(name, count):
-    print("{} {} {}".format(name, count, wave), end="")
+def verdict(name, workers_used):
+    # Breadth is reported only when it can be scoped to this leader's session.
+    if leader_session:
+        print("{} {} {}".format(name, workers_used, wave), end="")
+    else:
+        print(name, end="")
 
 # Read the bytes this turn appended, rather than walking the log back to this
 # turn's own turn_start.
@@ -571,13 +575,22 @@ for index, raw in enumerate(chunks):
     if isinstance(record, dict) and record.get("team") == team:
         records.append((line_offset, record))
 
-dispatched = sum(
-    1
+# Another leader of the same team appends to the same log. With a known
+# session, only this leader's dispatches count, for the floor and for breadth.
+turn_dispatches = [
+    record
     for line_offset, record in records
-    if line_offset >= baseline and record.get("event") == "task_dispatch"
-)
-if dispatched > 0:
-    verdict("met", dispatched)
+    if line_offset >= baseline
+    and record.get("event") == "task_dispatch"
+    and (not leader_session or record.get("leader_session_id") == leader_session)
+]
+if turn_dispatches:
+    # A wave is parallel workers, so three tasks queued on one worker are one.
+    workers_used = len({
+        record.get("worker") or record.get("task_id") or str(index)
+        for index, record in enumerate(turn_dispatches)
+    })
+    verdict("met", workers_used)
     sys.exit(0)
 
 # Outstanding work is attributed by leader session. Without one, a task of
@@ -759,7 +772,7 @@ else
     if [ -n "$DELEGATION_FLOOR" ]; then
         FLOOR_FIELD=",\"delegation_floor\":$(json_string "$DELEGATION_FLOOR")"
         if [ -n "$FLOOR_DISPATCHED" ]; then
-            FLOOR_FIELD="$FLOOR_FIELD,\"dispatched\":$FLOOR_DISPATCHED,\"wave_capacity\":$FLOOR_WAVE"
+            FLOOR_FIELD="$FLOOR_FIELD,\"dispatched_workers\":$FLOOR_DISPATCHED,\"wave_capacity\":$FLOOR_WAVE"
         fi
     fi
     LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")$FLOOR_FIELD$STOP_BLOCKED_FIELD$IDENTITY_FIELDS}"
@@ -964,7 +977,7 @@ except Exception:
     last_dispatched = last_wave = None
 if last_wave is not None and 0 <= last_dispatched < last_wave:
     print(
-        "Your previous turn dispatched {} task(s) against a wave of {}. Before this turn ends, "
+        "Your previous turn dispatched to {} worker(s) against a wave of {}. Before this turn ends, "
         "check the open items you reported earlier: dispatch each one that needs no user "
         "decision to an idle worker.".format(last_dispatched, last_wave)
     )
