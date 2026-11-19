@@ -273,6 +273,92 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertFalse(PeerWorkspaceMirrorController.layoutsEquivalent(a, b))
     }
 
+    // MARK: - Host tabs
+
+    private func tabbedLeaf(active: UInt8, tabs: [UInt8]) -> Termmesh_Peer_V1_WorkspaceLayout {
+        var node = leaf(active, title: "active")
+        node.pane.tabs = tabs.map { id in
+            var tab = Termmesh_Peer_V1_PaneTab()
+            tab.surfaceID = Data([id])
+            tab.title = "tab \(id)"
+            return tab
+        }
+        return node
+    }
+
+    func test_mirroredTabs_keepsHostOrderAndTitles() {
+        let tabs = PeerWorkspaceMirrorController.mirroredTabs(of: tabbedLeaf(active: 2, tabs: [1, 2, 3]).pane)
+        XCTAssertEqual(tabs.map(\.surfaceID), [Data([1]), Data([2]), Data([3])])
+        XCTAssertEqual(tabs.map(\.title), ["tab 1", "active", "tab 3"])
+        XCTAssertEqual(tabs.map(\.cols), [80, 80, 80])
+    }
+
+    func test_mirroredTabs_hostWithoutTabsListMirrorsItsActiveTab() {
+        let tabs = PeerWorkspaceMirrorController.mirroredTabs(of: leaf(7).pane)
+        XCTAssertEqual(tabs.map(\.surfaceID), [Data([7])])
+    }
+
+    func test_mirroredTabs_keepsAnActiveTabMissingFromTabs() {
+        let tabs = PeerWorkspaceMirrorController.mirroredTabs(of: tabbedLeaf(active: 9, tabs: [1, 1]).pane)
+        XCTAssertEqual(tabs.map(\.surfaceID), [Data([1]), Data([9])])
+    }
+
+    func test_mirroredSurfaceIDs_includesInactiveTabs() {
+        let layout = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1, 4]), leaf(2))
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.mirroredSurfaceIDs(layout),
+            [Data([1]), Data([4]), Data([2])]
+        )
+    }
+
+    func test_allTargetLeavesMapped_requiresInactiveTabs() {
+        let leaves = PeerWorkspaceMirrorController.preorderLeaves(tabbedLeaf(active: 1, tabs: [1, 4]))
+        XCTAssertFalse(
+            PeerWorkspaceMirrorController.allTargetLeavesMapped(leaves, panelBySurfaceID: [Data([1]): UUID()])
+        )
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.allTargetLeavesMapped(
+                leaves, panelBySurfaceID: [Data([1]): UUID(), Data([4]): UUID()]
+            )
+        )
+    }
+
+    func test_layoutsEquivalent_addedBackgroundTabDiffers() {
+        // The active tab is unchanged, so comparing only `surface_id` would
+        // swallow the new tab without a reconcile.
+        let a = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1]), leaf(2))
+        let b = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1, 5]), leaf(2))
+        XCTAssertFalse(PeerWorkspaceMirrorController.layoutsEquivalent(a, b))
+        XCTAssertFalse(PeerWorkspaceMirrorController.isDividerOnlyDelta(a, b))
+        XCTAssertFalse(PeerWorkspaceMirrorController.isSelectionOnlyDelta(a, b))
+    }
+
+    func test_selectionOnlyDelta_switchToAnExistingTab() {
+        let a = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1, 5]), leaf(2))
+        let b = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 5, tabs: [1, 5]), leaf(2))
+        XCTAssertTrue(PeerWorkspaceMirrorController.isSelectionOnlyDelta(a, b))
+        XCTAssertFalse(PeerWorkspaceMirrorController.isDividerOnlyDelta(a, b))
+    }
+
+    func test_selectionOnlyDelta_newActiveTabIsStructural() {
+        // A tab opened on the host becomes active at once (both host kinds),
+        // so the new active surface has no local panel yet.
+        let a = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1]), leaf(2))
+        let b = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 5, tabs: [1, 5]), leaf(2))
+        XCTAssertFalse(PeerWorkspaceMirrorController.isSelectionOnlyDelta(a, b))
+    }
+
+    func test_selectionOnlyDelta_identicalLayoutIsNot() {
+        let a = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1, 5]), leaf(2))
+        XCTAssertFalse(PeerWorkspaceMirrorController.isSelectionOnlyDelta(a, a))
+    }
+
+    func test_selectionOnlyDelta_dividerMoveIsNot() {
+        let a = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1, 5]), leaf(2))
+        let b = split("horizontal", 0.7, id: 9, tabbedLeaf(active: 5, tabs: [1, 5]), leaf(2))
+        XCTAssertFalse(PeerWorkspaceMirrorController.isSelectionOnlyDelta(a, b))
+    }
+
     // MARK: - isDividerOnlyDelta
 
     func test_dividerOnlyDelta_positive() {
@@ -288,8 +374,8 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
     }
 
     func test_dividerOnlyDelta_activeTabChangeIsNot() {
-        // Active-tab switch rewrites the leaf's surface_id — must take
-        // the structural path (old panel out, new panel in).
+        // The leaf's surface_id changed to a surface the pane never listed,
+        // so there is no local panel to select — not divider-only.
         let a = split("horizontal", 0.5, id: 9, leaf(1), leaf(2))
         let b = split("horizontal", 0.5, id: 9, leaf(1), leaf(4))
         XCTAssertFalse(PeerWorkspaceMirrorController.isDividerOnlyDelta(a, b))

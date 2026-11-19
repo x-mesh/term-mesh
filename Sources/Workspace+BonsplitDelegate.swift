@@ -450,6 +450,9 @@ extension Workspace: BonsplitDelegate {
 
     func splitTabBar(_ controller: BonsplitController, didSelectTab tab: Bonsplit.Tab, inPane pane: PaneID) {
         applyTabSelection(tabId: tab.id, inPane: pane)
+        if mirrorForwardsLocalActions, let panelId = panelIdFromSurfaceId(tab.id) {
+            peerMirror?.forwardActivateTab(panelId: panelId)
+        }
         // The proto's WorkspacePane only carries the selected tab's
         // surface_id, so a tab selection change effectively rewrites
         // the pane's surface in the relay client's view.

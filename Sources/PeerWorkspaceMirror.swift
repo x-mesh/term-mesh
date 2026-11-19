@@ -485,7 +485,7 @@ final class PeerWorkspaceMirrorController {
             expectedGeneration: generation, currentGeneration: layoutRecoveryGeneration,
             isCancelled: Task.isCancelled, isTornDown: isTornDown
         ) else { return }
-        let required = Set(Self.preorderLeaves(target).map(\.surfaceID))
+        let required = Self.mirroredSurfaceIDs(target)
         let missing = PeerMirrorLayoutRecoveryPolicy.missingSurfaceIDs(
             required: required, spawned: Set(panelBySurfaceID.keys)
         )
@@ -582,6 +582,26 @@ final class PeerWorkspaceMirrorController {
         guard let sid = wireSurfaceID(forPanelId: panelId),
               let session = subscriptionSession else { return }
         Task { try? await session.requestNewTab(paneID: sid) }
+    }
+
+    /// A local tab selection in a mirrored pane asks the host to make that
+    /// tab active; the host's next layout push confirms it. A selection that
+    /// already matches the host's active tab sends nothing, so the
+    /// confirmation cannot echo back as another request.
+    func forwardActivateTab(panelId: UUID) {
+        guard let sid = wireSurfaceID(forPanelId: panelId),
+              let session = subscriptionSession,
+              let last = lastAppliedLayout,
+              let pane = Self.preorderLeaves(last).first(where: { leaf in
+                  Self.mirroredTabs(of: leaf).contains { $0.surfaceID == sid }
+              }),
+              pane.surfaceID != sid
+        else { return }
+        #if DEBUG
+        dlog("peer.mirror.forward activate panel=\(panelId.uuidString.prefix(5))")
+        #endif
+        // Both host kinds locate the pane by any surface it holds.
+        Task { try? await session.requestActivateTab(paneID: sid, surfaceID: sid) }
     }
 
     /// Debounced (150ms per host split) so a whole drag coalesces into

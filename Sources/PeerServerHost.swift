@@ -667,13 +667,18 @@ final class PeerHostCoordinator: NSObject {
         layoutBroadcastDebounce[workspaceID] = task
     }
 
-    /// Surface id → title for every leaf of a layout tree.
+    /// Surface id → title for every tab of every leaf of a layout tree.
+    /// A viewer mirrors inactive tabs too, so switching tabs drops nothing.
     nonisolated static func leafTitles(
         _ node: Termmesh_Peer_V1_WorkspaceLayout
     ) -> [Data: String] {
         switch node.node {
         case .pane(let pane):
-            return [pane.surfaceID: pane.title]
+            var titles = [pane.surfaceID: pane.title]
+            for tab in pane.tabs where titles[tab.surfaceID] == nil {
+                titles[tab.surfaceID] = tab.title
+            }
+            return titles
         case .split(let split):
             return leafTitles(split.first)
                 .merging(leafTitles(split.second)) { first, _ in first }
@@ -720,9 +725,9 @@ final class PeerHostCoordinator: NSObject {
         lastDroppedLeafNames = names
         droppingBroadcastCount += 1
         RemoteWorkLog.info(
-            "Broadcasting a layout that drops \(removed.count) pane(s) to attached peers: "
+            "Broadcasting a layout that drops \(removed.count) tab(s) to attached peers: "
                 + names.joined(separator: ", ")
-                + " (\(previous.count) → \(leaves.count) pane(s))"
+                + " (\(previous.count) → \(leaves.count) tab(s))"
         )
     }
 
