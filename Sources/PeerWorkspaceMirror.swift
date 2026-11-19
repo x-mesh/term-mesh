@@ -121,6 +121,9 @@ final class PeerWorkspaceMirrorController {
     /// naming the panes a host push removed needs a baseline, and the
     /// reconnect is the very path that has to clear the real one.
     var dropDiagnosticsBaseline: Termmesh_Peer_V1_WorkspaceLayout?
+    /// Host pane's confirmed active surface → the tab this mirror last asked
+    /// it to activate, until a push moves that pane's active tab.
+    private var pendingActivations: [Data: Data] = [:]
     /// Wire surfaceID → local TerminalPanel.id for every mirrored leaf.
     var panelBySurfaceID: [Data: UUID] = [:] {
         didSet { everMappedPanelIDs.formUnion(panelBySurfaceID.values) }
@@ -485,7 +488,7 @@ final class PeerWorkspaceMirrorController {
             expectedGeneration: generation, currentGeneration: layoutRecoveryGeneration,
             isCancelled: Task.isCancelled, isTornDown: isTornDown
         ) else { return }
-        let required = Set(Self.preorderLeaves(target).map(\.surfaceID))
+        let required = Self.mirroredSurfaceIDs(target)
         let missing = PeerMirrorLayoutRecoveryPolicy.missingSurfaceIDs(
             required: required, spawned: Set(panelBySurfaceID.keys)
         )
@@ -582,6 +585,32 @@ final class PeerWorkspaceMirrorController {
         guard let sid = wireSurfaceID(forPanelId: panelId),
               let session = subscriptionSession else { return }
         Task { try? await session.requestNewTab(paneID: sid) }
+    }
+
+    /// A local tab selection in a mirrored pane asks the host to make that
+    /// tab active; the host's next layout push confirms it. Only a selection
+    /// of the host's confirmed active tab with no request outstanding sends
+    /// nothing (see `activationNeedsRequest`): skipping on the confirmed tab
+    /// alone would drop a switch back made before the first confirmation.
+    func forwardActivateTab(panelId: UUID) {
+        guard let sid = wireSurfaceID(forPanelId: panelId),
+              let session = subscriptionSession,
+              let last = lastAppliedLayout,
+              let pane = Self.preorderLeaves(last).first(where: { leaf in
+                  Self.mirroredTabs(of: leaf).contains { $0.surfaceID == sid }
+              }),
+              Self.activationNeedsRequest(
+                  selected: sid,
+                  hostActive: pane.surfaceID,
+                  pending: pendingActivations[pane.surfaceID]
+              )
+        else { return }
+        pendingActivations[pane.surfaceID] = sid
+        #if DEBUG
+        dlog("peer.mirror.forward activate panel=\(panelId.uuidString.prefix(5))")
+        #endif
+        // Both host kinds locate the pane by any surface it holds.
+        Task { try? await session.requestActivateTab(paneID: sid, surfaceID: sid) }
     }
 
     /// Debounced (150ms per host split) so a whole drag coalesces into
@@ -1646,6 +1675,10 @@ final class PeerWorkspaceMirrorController {
 
     func recordApplied(_ layout: Termmesh_Peer_V1_WorkspaceLayout) {
         lastAppliedLayout = layout
+        pendingActivations = Self.unsettledActivations(
+            pendingActivations,
+            hostActives: Set(Self.preorderLeaves(layout).map(\.surfaceID))
+        )
         // Consumed: the real baseline is back, and leaving the reconnect's
         // copy behind would let a later push diff against a layout two
         // reconciles old and name panes that were replaced, not dropped.
