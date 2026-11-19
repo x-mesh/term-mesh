@@ -83,6 +83,21 @@ final class PeerServerHostLayoutTests: XCTestCase {
         XCTAssertEqual(titles[Data([1])], "")
     }
 
+    func test_leafTitles_includesInactiveTabs() {
+        var node = leaf(1, title: "active")
+        var inactive = Termmesh_Peer_V1_PaneTab()
+        inactive.surfaceID = Data([2])
+        inactive.title = "background"
+        var active = Termmesh_Peer_V1_PaneTab()
+        active.surfaceID = Data([1])
+        active.title = "stale"
+        node.pane.tabs = [active, inactive]
+        XCTAssertEqual(
+            PeerHostCoordinator.leafTitles(node),
+            [Data([1]): "active", Data([2]): "background"]
+        )
+    }
+
     // MARK: - droppedLeaves
 
     func test_droppedLeaves_namesTheSurfacesThatLeft() {

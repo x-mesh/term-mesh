@@ -4,28 +4,37 @@
 //  local bonsplit tree to match while preserving TerminalPanel /
 //  TerminalSurface identity (PTY continuity) for every surviving leaf.
 //
-//  Strategy: two fast paths, then collapse+rebuild.
+//  Every tab the host stacks in a pane is mirrored as a local tab of the
+//  matching local pane (`WorkspacePane.tabs`), and the local selection
+//  follows the host's active tab. A pane is LOCATED by its seed tab: the
+//  active tab when it is mirrored, else its first mirrored tab.
+//
+//  Strategy: three fast paths, then collapse+rebuild.
 //   fast 0  no-op        — layout equivalent to last applied (covers our
 //                          own forwarded-op echoes once converged)
 //   fast 1  divider-only — same shape/leaves, only ratios changed →
 //                          setDividerPosition(fromExternal:) via the
 //                          hostSplitToLocal map
+//   fast 2  selection    — same shape and tabs, only active tabs moved →
+//                          select them locally, nothing respawns
 //   full    structural   — Phase A (async, NO tree mutation): attach
-//                          sessions for missing leaves. Phase B (sync,
+//                          sessions for missing tabs. Phase B (sync,
 //                          MainActor, remote-application flag set):
 //                          B1 move every surviving tab into one anchor
 //                             pane (emptied panes auto-collapse —
 //                             bonsplit closes them without delegate
 //                             round-trips)
-//                          B2 spawn missing leaves as fresh remote-pane
+//                          B2 spawn missing tabs as fresh remote-pane
 //                             tabs in the anchor
 //                          B3 close stale panels (spawn-before-close
 //                             keeps the workspace non-empty throughout)
 //                          B4 pre-order rebuild: each split pulls the
-//                             second subtree's first-leaf tab out with
-//                             splitPane(movingTab:) — the anchor holds
-//                             N tabs and suffers N−1 pulls, so it can
-//                             never empty mid-rebuild
+//                             second subtree's first-pane seed tab out
+//                             with splitPane(movingTab:) — the anchor
+//                             keeps its own seed, so it can never empty
+//                             mid-rebuild
+//                          B4b move every other tab into its pane in host
+//                             order, then select the host's active tabs
 //                          B5 divider ratios (fromExternal) + rebuild
 //                             the hostSplitID → local split UUID map
 //
@@ -126,11 +135,21 @@ extension PeerWorkspaceMirrorController {
                 recordApplied(target)
                 return
             }
+            if Self.isSelectionOnlyDelta(last, target) {
+                let focusedBefore = workspace.focusedPanelId
+                withRemoteApplication {
+                    selectHostActiveTabs(targetLeaves, workspace: workspace)
+                    restoreFocus(focusedBefore, targetLeaves: targetLeaves, workspace: workspace)
+                }
+                recordApplied(target)
+                return
+            }
         }
 
-        // ── Phase A (async, no tree mutation): sessions for new leaves.
+        // ── Phase A (async, no tree mutation): sessions for new tabs.
         guard !targetLeaves.isEmpty else { return }
-        let activeIDs = Set(targetLeaves.map(\.surfaceID))
+        let targetTabs = targetLeaves.flatMap(Self.mirroredTabs(of:))
+        let activeIDs = Set(targetTabs.map(\.surfaceID))
         // A push that DROPS a leaf is the only layout change that destroys
         // local state — the pane and its scrollback go with it — and it used
         // to be indistinguishable in the log from the user closing that same
@@ -145,35 +164,36 @@ extension PeerWorkspaceMirrorController {
         // reconnect is the incident this line was written for.
         if let last = lastAppliedLayout ?? dropDiagnosticsBaseline {
             let previousLeaves = Self.preorderLeaves(last)
-            let dropped = previousLeaves.filter { !activeIDs.contains($0.surfaceID) }
+            let dropped = previousLeaves.flatMap(Self.mirroredTabs(of:))
+                .filter { !activeIDs.contains($0.surfaceID) }
             if !dropped.isEmpty {
-                let names = dropped.map { leaf in
-                    leaf.title.isEmpty
-                        ? "surface \(Self.surfaceMarker(leaf.surfaceID))"
-                        : leaf.title
+                let names = dropped.map { tab in
+                    tab.title.isEmpty
+                        ? "surface \(Self.surfaceMarker(tab.surfaceID))"
+                        : tab.title
                 }
                 lastDroppedPaneNames = names
                 droppedPaneReportCount += 1
                 if lastAppliedLayout == nil { droppedPaneReportsFromReconnectBaseline += 1 }
                 RemoteWorkLog.infoOffMain(
-                    "Host dropped \(dropped.count) pane(s) from the mirrored layout"
+                    "Host dropped \(dropped.count) tab(s) from the mirrored layout"
                         + " — closing locally: \(names.joined(separator: ", "))"
                         + " (\(previousLeaves.count) → \(targetLeaves.count) pane(s))"
                 )
             }
         }
-        let missing = targetLeaves.filter { panelBySurfaceID[$0.surfaceID] == nil }
+        let missing = targetTabs.filter { panelBySurfaceID[$0.surfaceID] == nil }
         var newSessions: [Data: PeerPaneSession] = [:]
         var spawnedCount = 0
-        for leaf in missing {
+        for tab in missing {
             do {
                 let session = try await PeerPaneSession.attach(
                     lease: lease,
-                    surface: Self.surfaceInfo(fromLeaf: leaf),
-                    title: leaf.title,
+                    surface: Self.surfaceInfo(fromTab: tab),
+                    title: tab.title,
                     spec: spec
                 )
-                newSessions[leaf.surfaceID] = session
+                newSessions[tab.surfaceID] = session
             } catch {
                 NSLog("[peer-mirror] leaf attach failed (bounded autonomous retry armed): %@",
                       String(describing: error))
@@ -199,7 +219,7 @@ extension PeerWorkspaceMirrorController {
 
             let controller = workspace2.bonsplitController
 
-            // Anchor: pane holding the first target leaf's tab, else first pane.
+            // Anchor: pane holding the first target pane's seed tab, else first pane.
             let anchor = anchorPane(for: targetLeaves, in: workspace2) ?? controller.allPaneIds.first
             guard let anchor else { return }
 
@@ -210,14 +230,14 @@ extension PeerWorkspaceMirrorController {
                 }
             }
 
-            // B2 — spawn missing leaves as remote-pane tabs in the anchor.
-            for leaf in missing {
-                guard let session = newSessions[leaf.surfaceID] else { continue }
+            // B2 — spawn missing tabs as remote-pane tabs in the anchor.
+            for tab in missing {
+                guard let session = newSessions[tab.surfaceID] else { continue }
                 // `start()`, `forceResync` and `reconnectLoop` call reconcile
                 // directly, outside `scheduleApply`'s chain, so another pass
-                // can map this leaf while ours awaited its attach. Overwriting
+                // can map this tab while ours awaited its attach. Overwriting
                 // that mapping would leave its panel owned by nothing.
-                guard panelBySurfaceID[leaf.surfaceID] == nil else {
+                guard panelBySurfaceID[tab.surfaceID] == nil else {
                     session.teardown()
                     continue
                 }
@@ -230,7 +250,7 @@ extension PeerWorkspaceMirrorController {
                     continue
                 }
                 workspace2.bindRemotePane(session: session, to: panel)
-                panelBySurfaceID[leaf.surfaceID] = panel.id
+                panelBySurfaceID[tab.surfaceID] = panel.id
                 spawnedCount += 1
             }
 
@@ -278,6 +298,11 @@ extension PeerWorkspaceMirrorController {
             // B4 — pre-order rebuild.
             buildSplits(node: target, currentPane: anchor, workspace: workspace2)
 
+            // B4b — every non-seed tab is still in the anchor: move each into
+            // its pane in host order, then select the host's active tabs.
+            arrangeTabs(targetLeaves, workspace: workspace2)
+            selectHostActiveTabs(targetLeaves, workspace: workspace2)
+
             // B5 — divider ratios + host→local split map.
             hostSplitToLocal.removeAll()
             Self.walkParallel(host: target, local: controller.treeSnapshot()) { hostSplit, localSplitId in
@@ -296,12 +321,9 @@ extension PeerWorkspaceMirrorController {
         for (_, panelId) in panelBySurfaceID {
             workspace2.terminalPanel(for: panelId)?.requestViewReattach()
         }
-        if let focusedBefore, workspace2.panels[focusedBefore] != nil {
-            workspace2.focusPanel(focusedBefore)
-        } else if let first = targetLeaves.first,
-                  let panelId = panelBySurfaceID[first.surfaceID]
-        {
-            workspace2.focusPanel(panelId)
+        // Focusing selects a tab; under the flag that selection stays local.
+        withRemoteApplication {
+            restoreFocus(focusedBefore, targetLeaves: targetLeaves, workspace: workspace2)
         }
 
         recordApplied(target)
@@ -345,8 +367,7 @@ extension PeerWorkspaceMirrorController {
     ) {
         guard case .split(let split) = node.node else { return }
         guard let secondLeaf = Self.firstLeaf(split.second),
-              let panelId = panelBySurfaceID[secondLeaf.surfaceID],
-              let tabId = workspace.surfaceIdFromPanelId(panelId)
+              let tabId = seedTabID(of: secondLeaf, in: workspace)
         else {
             // Second subtree's seed leaf failed to attach — flatten:
             // keep first subtree in the current pane, skip the split.
@@ -372,15 +393,98 @@ extension PeerWorkspaceMirrorController {
         in workspace: Workspace
     ) -> PaneID? {
         guard let first = leaves.first,
-              let panelId = panelBySurfaceID[first.surfaceID],
-              let tabId = workspace.surfaceIdFromPanelId(panelId)
+              let tabId = seedTabID(of: first, in: workspace)
         else { return nil }
-        for pane in workspace.bonsplitController.allPaneIds {
-            if workspace.bonsplitController.tabs(inPane: pane).contains(where: { $0.id == tabId }) {
-                return pane
-            }
+        return localPane(holding: tabId, in: workspace)
+    }
+
+    // MARK: - Tabs
+
+    private func tabID(forSurface surfaceID: Data, in workspace: Workspace) -> TabID? {
+        panelBySurfaceID[surfaceID].flatMap { workspace.surfaceIdFromPanelId($0) }
+    }
+
+    /// The tab that locates a host pane locally: its active tab when that is
+    /// mirrored, else its first mirrored tab. Falling back keeps the split
+    /// when only the active tab's attach failed.
+    private func seedTabID(
+        of pane: Termmesh_Peer_V1_WorkspacePane,
+        in workspace: Workspace
+    ) -> TabID? {
+        if let active = tabID(forSurface: pane.surfaceID, in: workspace) { return active }
+        for tab in Self.mirroredTabs(of: pane) {
+            if let id = tabID(forSurface: tab.surfaceID, in: workspace) { return id }
         }
         return nil
+    }
+
+    private func localPane(holding tabId: TabID, in workspace: Workspace) -> PaneID? {
+        workspace.bonsplitController.allPaneIds.first { pane in
+            workspace.bonsplitController.tabs(inPane: pane).contains { $0.id == tabId }
+        }
+    }
+
+    /// Put each host pane's mirrored tabs into the local pane holding its seed,
+    /// in host order.
+    private func arrangeTabs(
+        _ leaves: [Termmesh_Peer_V1_WorkspacePane],
+        workspace: Workspace
+    ) {
+        let controller = workspace.bonsplitController
+        for leaf in leaves {
+            guard let seed = seedTabID(of: leaf, in: workspace),
+                  let pane = localPane(holding: seed, in: workspace)
+            else { continue }
+            var index = 0
+            for tab in Self.mirroredTabs(of: leaf) {
+                guard let tabId = tabID(forSurface: tab.surfaceID, in: workspace) else { continue }
+                let current = controller.tabs(inPane: pane)
+                if index >= current.count || current[index].id != tabId {
+                    _ = controller.moveTab(tabId, toPane: pane, atIndex: index)
+                }
+                index += 1
+            }
+        }
+    }
+
+    private func selectHostActiveTabs(
+        _ leaves: [Termmesh_Peer_V1_WorkspacePane],
+        workspace: Workspace
+    ) {
+        let controller = workspace.bonsplitController
+        for leaf in leaves {
+            guard let active = tabID(forSurface: leaf.surfaceID, in: workspace),
+                  let pane = localPane(holding: active, in: workspace),
+                  controller.selectedTab(inPane: pane)?.id != active
+            else { continue }
+            controller.selectTab(active)
+        }
+    }
+
+    /// Selecting a tab also focuses its pane, so put focus back where the user
+    /// had it. When the host switched the focused pane's tab, focus follows the
+    /// new active tab instead of re-selecting the old one.
+    private func restoreFocus(
+        _ focusedBefore: UUID?,
+        targetLeaves: [Termmesh_Peer_V1_WorkspacePane],
+        workspace: Workspace
+    ) {
+        let controller = workspace.bonsplitController
+        if let focusedBefore, workspace.panels[focusedBefore] != nil {
+            if let tabId = workspace.surfaceIdFromPanelId(focusedBefore),
+               let pane = localPane(holding: tabId, in: workspace),
+               let selected = controller.selectedTab(inPane: pane),
+               selected.id != tabId,
+               let selectedPanel = workspace.panelIdFromSurfaceId(selected.id) {
+                workspace.focusPanel(selectedPanel)
+            } else {
+                workspace.focusPanel(focusedBefore)
+            }
+        } else if let first = targetLeaves.first,
+                  let tabId = seedTabID(of: first, in: workspace),
+                  let panelId = workspace.panelIdFromSurfaceId(tabId) {
+            workspace.focusPanel(panelId)
+        }
     }
 
     // MARK: - Pure helpers (unit-tested)
@@ -402,6 +506,69 @@ extension PeerWorkspaceMirrorController {
         preorderLeaves(node).first
     }
 
+    /// One host tab to mirror, with the pane geometry its attach needs.
+    struct MirroredTab: Equatable {
+        let surfaceID: Data
+        let title: String
+        let cols: UInt32
+        let rows: UInt32
+    }
+
+    /// Every tab of a host pane, in host order. A host that predates
+    /// `tabs` sends only the active `surface_id`, which is then the pane's
+    /// one tab; the active tab is kept even if a push omits it from `tabs`.
+    nonisolated static func mirroredTabs(
+        of pane: Termmesh_Peer_V1_WorkspacePane
+    ) -> [MirroredTab] {
+        var seen = Set<Data>()
+        var out: [MirroredTab] = []
+        func add(_ surfaceID: Data, _ title: String) {
+            guard !surfaceID.isEmpty, seen.insert(surfaceID).inserted else { return }
+            out.append(MirroredTab(surfaceID: surfaceID, title: title, cols: pane.cols, rows: pane.rows))
+        }
+        for tab in pane.tabs {
+            add(tab.surfaceID, tab.surfaceID == pane.surfaceID ? pane.title : tab.title)
+        }
+        add(pane.surfaceID, pane.title)
+        return out
+    }
+
+    /// Every surface the mirror must map for `layout`.
+    nonisolated static func mirroredSurfaceIDs(
+        _ layout: Termmesh_Peer_V1_WorkspaceLayout
+    ) -> Set<Data> {
+        Set(preorderLeaves(layout).flatMap(mirroredTabs(of:)).map(\.surfaceID))
+    }
+
+    /// Whether a local selection must be sent. Only a selection of the host's
+    /// confirmed active tab with nothing unconfirmed is skipped. While a
+    /// request is unconfirmed every selection is sent, the same tab included:
+    /// that request may have failed or its confirming push may be lost, and
+    /// re-selecting is how the user retries.
+    nonisolated static func activationNeedsRequest(
+        selected: Data,
+        hostActive: Data,
+        pending: Data?
+    ) -> Bool {
+        pending != nil || hostActive != selected
+    }
+
+    /// Requests keyed by a pane's old active tab are settled once a push
+    /// moves that pane's active tab; requests for unchanged panes remain.
+    nonisolated static func unsettledActivations(
+        _ pending: [Data: Data],
+        hostActives: Set<Data>
+    ) -> [Data: Data] {
+        pending.filter { hostActives.contains($0.key) }
+    }
+
+    nonisolated static func sameTabs(
+        _ a: Termmesh_Peer_V1_WorkspacePane,
+        _ b: Termmesh_Peer_V1_WorkspacePane
+    ) -> Bool {
+        mirroredTabs(of: a).map(\.surfaceID) == mirroredTabs(of: b).map(\.surfaceID)
+    }
+
     /// True when every target leaf already has a mirrored local panel.
     /// The no-op/divider-only fast paths in `reconcile` must only fire
     /// when this holds — otherwise a leaf whose attach failed on a
@@ -412,7 +579,9 @@ extension PeerWorkspaceMirrorController {
         _ leaves: [Termmesh_Peer_V1_WorkspacePane],
         panelBySurfaceID: [Data: UUID]
     ) -> Bool {
-        leaves.allSatisfy { panelBySurfaceID[$0.surfaceID] != nil }
+        leaves.allSatisfy { leaf in
+            mirroredTabs(of: leaf).allSatisfy { panelBySurfaceID[$0.surfaceID] != nil }
+        }
     }
 
     nonisolated static func ghostPanelIDs(
@@ -469,9 +638,10 @@ extension PeerWorkspaceMirrorController {
         panelBySurfaceID.compactMap { livePanelIDs.contains($0.value) ? nil : $0.key }
     }
 
-    /// Structure + leaf surfaceIDs + divider ratios (ε) all match —
-    /// nothing to do. Title-only changes are equivalent (pane titles
-    /// flow through the relay byte stream, not the layout).
+    /// Structure + each pane's active tab and ordered tab list + divider
+    /// ratios (ε) all match — nothing to do. Title-only changes are
+    /// equivalent (pane titles flow through the relay byte stream, not the
+    /// layout).
     nonisolated static func layoutsEquivalent(
         _ a: Termmesh_Peer_V1_WorkspaceLayout,
         _ b: Termmesh_Peer_V1_WorkspaceLayout,
@@ -479,7 +649,7 @@ extension PeerWorkspaceMirrorController {
     ) -> Bool {
         switch (a.node, b.node) {
         case (.pane(let pa), .pane(let pb)):
-            return pa.surfaceID == pb.surfaceID
+            return pa.surfaceID == pb.surfaceID && sameTabs(pa, pb)
         case (.split(let sa), .split(let sb)):
             return sa.orientation == sb.orientation
                 && abs(sa.dividerPosition - sb.dividerPosition) <= epsilon
@@ -490,17 +660,17 @@ extension PeerWorkspaceMirrorController {
         }
     }
 
-    /// Same shape + same leaves (+ stable split ids); only divider
+    /// Same shape + same leaves and tabs (+ stable split ids); only divider
     /// ratios may differ. Ported from the relay window's
-    /// isDividerOnlyDelta, minus tab/title comparisons (v1 mirrors the
-    /// active tab only, and titles ride the byte stream).
+    /// isDividerOnlyDelta, minus title comparisons (titles ride the byte
+    /// stream).
     nonisolated static func isDividerOnlyDelta(
         _ a: Termmesh_Peer_V1_WorkspaceLayout,
         _ b: Termmesh_Peer_V1_WorkspaceLayout
     ) -> Bool {
         switch (a.node, b.node) {
         case (.pane(let pa), .pane(let pb)):
-            return pa.surfaceID == pb.surfaceID
+            return pa.surfaceID == pb.surfaceID && sameTabs(pa, pb)
         case (.split(let sa), .split(let sb)):
             return sa.orientation == sb.orientation
                 && !sa.splitID.isEmpty
@@ -510,6 +680,37 @@ extension PeerWorkspaceMirrorController {
         default:
             return false
         }
+    }
+
+    /// Same shape, split ids, dividers and tabs; only which tab is active
+    /// changed, and only to a tab the pane already had. Selecting locally is
+    /// then the whole update: no pane respawns and no split is rebuilt. A
+    /// changed split id needs the full path, which rebuilds `hostSplitToLocal`.
+    nonisolated static func isSelectionOnlyDelta(
+        _ a: Termmesh_Peer_V1_WorkspaceLayout,
+        _ b: Termmesh_Peer_V1_WorkspaceLayout,
+        epsilon: Double = 0.005
+    ) -> Bool {
+        func walk(_ a: Termmesh_Peer_V1_WorkspaceLayout, _ b: Termmesh_Peer_V1_WorkspaceLayout) -> Bool? {
+            switch (a.node, b.node) {
+            case (.pane(let pa), .pane(let pb)):
+                guard sameTabs(pa, pb),
+                      mirroredTabs(of: pa).contains(where: { $0.surfaceID == pb.surfaceID })
+                else { return nil }
+                return pa.surfaceID != pb.surfaceID
+            case (.split(let sa), .split(let sb)):
+                guard sa.orientation == sb.orientation,
+                      sa.splitID == sb.splitID,
+                      abs(sa.dividerPosition - sb.dividerPosition) <= epsilon,
+                      let first = walk(sa.first, sb.first),
+                      let second = walk(sa.second, sb.second)
+                else { return nil }
+                return first || second
+            default:
+                return nil
+            }
+        }
+        return walk(a, b) == true
     }
 
     /// Lockstep walk of the host layout and the freshly-rebuilt local
@@ -582,14 +783,12 @@ extension PeerWorkspaceMirrorController {
         }
     }
 
-    nonisolated static func surfaceInfo(
-        fromLeaf leaf: Termmesh_Peer_V1_WorkspacePane
-    ) -> Termmesh_Peer_V1_SurfaceInfo {
+    nonisolated static func surfaceInfo(fromTab tab: MirroredTab) -> Termmesh_Peer_V1_SurfaceInfo {
         var info = Termmesh_Peer_V1_SurfaceInfo()
-        info.surfaceID = leaf.surfaceID
-        info.title = leaf.title
-        info.cols = leaf.cols
-        info.rows = leaf.rows
+        info.surfaceID = tab.surfaceID
+        info.title = tab.title
+        info.cols = tab.cols
+        info.rows = tab.rows
         info.attachable = true
         return info
     }
