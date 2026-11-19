@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.291.0] - 2026-11-19
+
+### Changed
+
+- A team leader that dispatches work to only a few of its workers in a turn now gets a note in its next prompt that names the idle capacity. Before, one dispatch was enough to pass the delegation check, so a leader could leave most workers idle while it listed open items or ran long checks itself. Each leader turn now records how many workers it dispatched to and how many it could have used. Only the leader's own dispatches count, and several tasks to one worker count once.
+
+### Fixed
+
+- A mirrored remote pane now shows every tab of the host pane. Before, the mirror showed only the host's active tab, so a tab opened on the host or from the mirror could be hidden or missing. Selecting a tab in the mirror now selects it on the host, and closing a tab closes only that tab.
+Thanks to @JINWOO-J for these changes.
+
 ## [0.290.0] - 2026-11-18
 
 ### Changed
