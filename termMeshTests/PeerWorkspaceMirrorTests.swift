@@ -353,6 +353,33 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertFalse(PeerWorkspaceMirrorController.isSelectionOnlyDelta(a, a))
     }
 
+    func test_selectionOnlyDelta_changedSplitIdIsNot() {
+        // The fast path skips B5, so a new split id would leave
+        // hostSplitToLocal keyed by the old one.
+        let a = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1, 5]), leaf(2))
+        let b = split("horizontal", 0.5, id: 7, tabbedLeaf(active: 5, tabs: [1, 5]), leaf(2))
+        XCTAssertFalse(PeerWorkspaceMirrorController.isSelectionOnlyDelta(a, b))
+    }
+
+    func test_activationNeedsRequest_switchBackBeforeConfirmationIsSent() {
+        let x = Data([1]), a = Data([2])
+        // Host on X; the user picked A, whose request is unconfirmed.
+        XCTAssertTrue(PeerWorkspaceMirrorController.activationNeedsRequest(selected: a, hostActive: x, pending: nil))
+        // Switching back to X must be sent, or the host ends on A.
+        XCTAssertTrue(PeerWorkspaceMirrorController.activationNeedsRequest(selected: x, hostActive: x, pending: a))
+        // Re-selecting what the host will already end on sends nothing.
+        XCTAssertFalse(PeerWorkspaceMirrorController.activationNeedsRequest(selected: x, hostActive: x, pending: nil))
+        XCTAssertFalse(PeerWorkspaceMirrorController.activationNeedsRequest(selected: a, hostActive: x, pending: a))
+    }
+
+    func test_unsettledActivations_dropOnlyPanesWhoseActiveMoved() {
+        let pending: [Data: Data] = [Data([1]): Data([2]), Data([3]): Data([4])]
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.unsettledActivations(pending, hostActives: [Data([2]), Data([3])]),
+            [Data([3]): Data([4])]
+        )
+    }
+
     func test_selectionOnlyDelta_dividerMoveIsNot() {
         let a = split("horizontal", 0.5, id: 9, tabbedLeaf(active: 1, tabs: [1, 5]), leaf(2))
         let b = split("horizontal", 0.7, id: 9, tabbedLeaf(active: 5, tabs: [1, 5]), leaf(2))

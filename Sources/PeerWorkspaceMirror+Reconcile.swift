@@ -540,6 +540,25 @@ extension PeerWorkspaceMirrorController {
         Set(preorderLeaves(layout).flatMap(mirroredTabs(of:)).map(\.surfaceID))
     }
 
+    /// Whether a local selection must be sent: the host ends on the last
+    /// unconfirmed request when there is one, else on its active tab.
+    nonisolated static func activationNeedsRequest(
+        selected: Data,
+        hostActive: Data,
+        pending: Data?
+    ) -> Bool {
+        (pending ?? hostActive) != selected
+    }
+
+    /// Requests keyed by a pane's old active tab are settled once a push
+    /// moves that pane's active tab; requests for unchanged panes remain.
+    nonisolated static func unsettledActivations(
+        _ pending: [Data: Data],
+        hostActives: Set<Data>
+    ) -> [Data: Data] {
+        pending.filter { hostActives.contains($0.key) }
+    }
+
     nonisolated static func sameTabs(
         _ a: Termmesh_Peer_V1_WorkspacePane,
         _ b: Termmesh_Peer_V1_WorkspacePane
@@ -660,9 +679,10 @@ extension PeerWorkspaceMirrorController {
         }
     }
 
-    /// Same shape, dividers and tabs; only which tab is active changed, and
-    /// only to a tab the pane already had. Selecting locally is then the
-    /// whole update: no pane respawns and no split is rebuilt.
+    /// Same shape, split ids, dividers and tabs; only which tab is active
+    /// changed, and only to a tab the pane already had. Selecting locally is
+    /// then the whole update: no pane respawns and no split is rebuilt. A
+    /// changed split id needs the full path, which rebuilds `hostSplitToLocal`.
     nonisolated static func isSelectionOnlyDelta(
         _ a: Termmesh_Peer_V1_WorkspaceLayout,
         _ b: Termmesh_Peer_V1_WorkspaceLayout,
@@ -677,6 +697,7 @@ extension PeerWorkspaceMirrorController {
                 return pa.surfaceID != pb.surfaceID
             case (.split(let sa), .split(let sb)):
                 guard sa.orientation == sb.orientation,
+                      sa.splitID == sb.splitID,
                       abs(sa.dividerPosition - sb.dividerPosition) <= epsilon,
                       let first = walk(sa.first, sb.first),
                       let second = walk(sa.second, sb.second)

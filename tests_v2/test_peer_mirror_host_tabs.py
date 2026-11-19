@@ -12,6 +12,8 @@ Asserted:
 - a tab opened from the mirror keeps every existing tab's local panel;
 - selecting another tab in the mirror makes it active on the host, and the
   confirming push only selects it (no panel is respawned);
+- picking a tab and switching straight back leaves the host on the tab the
+  user returned to;
 - closing one tab from the mirror closes that tab only.
 In every step each mirror pane holds the same tabs as its host pane, in the
 same order, with the same tab selected.
@@ -180,6 +182,19 @@ def main() -> int:
             )
         if _mirror_rows(c) != after:
             raise termmeshError(f"selecting a tab respawned panels: {after} → {_mirror_rows(c)}")
+
+        # ── pick another tab and switch straight back, without waiting for the
+        #    host to confirm the first pick: the host must end on the tab the
+        #    user returned to.
+        other_surface = host[0][1][0]
+        c.focus_surface(after[other_surface])
+        c.focus_surface(after[target_surface])
+        time.sleep(2.0)
+        if not _wait(_host_selected, timeout_s=20):
+            host_now, mirror_now = _shape(c, host_ws, mirror_ws)
+            raise termmeshError(
+                f"host did not end on the tab the user switched back to:\n host={host_now}\nmirror={mirror_now}"
+            )
 
         # ── close one inactive tab from the mirror: only that tab goes, on
         #    the host and in the mirror.
