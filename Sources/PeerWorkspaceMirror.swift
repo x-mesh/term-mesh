@@ -588,10 +588,10 @@ final class PeerWorkspaceMirrorController {
     }
 
     /// A local tab selection in a mirrored pane asks the host to make that
-    /// tab active; the host's next layout push confirms it. A selection equal
-    /// to what the host will end on — the last request still unconfirmed, else
-    /// the host's active tab — sends nothing. Comparing with the host's active
-    /// tab alone would drop a switch back made before the first confirmation.
+    /// tab active; the host's next layout push confirms it. Only a selection
+    /// of the host's confirmed active tab with no request outstanding sends
+    /// nothing (see `activationNeedsRequest`): skipping on the confirmed tab
+    /// alone would drop a switch back made before the first confirmation.
     func forwardActivateTab(panelId: UUID) {
         guard let sid = wireSurfaceID(forPanelId: panelId),
               let session = subscriptionSession,

@@ -540,14 +540,17 @@ extension PeerWorkspaceMirrorController {
         Set(preorderLeaves(layout).flatMap(mirroredTabs(of:)).map(\.surfaceID))
     }
 
-    /// Whether a local selection must be sent: the host ends on the last
-    /// unconfirmed request when there is one, else on its active tab.
+    /// Whether a local selection must be sent. Only a selection of the host's
+    /// confirmed active tab with nothing unconfirmed is skipped. While a
+    /// request is unconfirmed every selection is sent, the same tab included:
+    /// that request may have failed or its confirming push may be lost, and
+    /// re-selecting is how the user retries.
     nonisolated static func activationNeedsRequest(
         selected: Data,
         hostActive: Data,
         pending: Data?
     ) -> Bool {
-        (pending ?? hostActive) != selected
+        pending != nil || hostActive != selected
     }
 
     /// Requests keyed by a pane's old active tab are settled once a push

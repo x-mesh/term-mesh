@@ -367,9 +367,11 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         XCTAssertTrue(PeerWorkspaceMirrorController.activationNeedsRequest(selected: a, hostActive: x, pending: nil))
         // Switching back to X must be sent, or the host ends on A.
         XCTAssertTrue(PeerWorkspaceMirrorController.activationNeedsRequest(selected: x, hostActive: x, pending: a))
-        // Re-selecting what the host will already end on sends nothing.
+        // Re-selecting the confirmed active tab with nothing outstanding sends nothing.
         XCTAssertFalse(PeerWorkspaceMirrorController.activationNeedsRequest(selected: x, hostActive: x, pending: nil))
-        XCTAssertFalse(PeerWorkspaceMirrorController.activationNeedsRequest(selected: a, hostActive: x, pending: a))
+        // Re-selecting an unconfirmed pick resends it: the first request may
+        // have failed, or its confirming push may be lost.
+        XCTAssertTrue(PeerWorkspaceMirrorController.activationNeedsRequest(selected: a, hostActive: x, pending: a))
     }
 
     func test_unsettledActivations_dropOnlyPanesWhoseActiveMoved() {
