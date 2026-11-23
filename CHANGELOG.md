@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.292.0] - 2026-11-23
+
+### Added
+
+- Settings › Worktrees has a Disk Usage card. It shows the free space on the volumes agent builds fill: the home volume, and the worktree base directory's volume when that is a different one. It also lists what `tm-agent gc` can reclaim in each category. Measure sizes the build caches, and Reclaim… shows the folders it would remove and asks before it removes them. Only build caches are reclaimed from here; worktrees keep their own delete.
+- The sidebar shows a low-disk line when a volume agent builds fill has less than 5 GiB or 10% free. Its Reclaim button opens the Disk Usage card.
+- Agent Worker Builds in Settings › Worktrees can make agent workers build with `CARGO_INCREMENTAL=0` and line-table-only debug info, so each worker worktree's Cargo `target/` stays smaller. It is off by default, applies to workers started after the change, on this Mac and on remote hosts, and never overrides a value a CLI profile or a host's stored environment sets. In a measured fresh build of `term-meshd` the target went from 1.41 GiB to 1.11 GiB.
+- A delegation is refused when the disk the chosen worker builds on has less free space than a minimum, 5 GB by default. The leader gets a `disk_low` error that names the free space and how to reclaim it, and no task is created. Set the minimum, or 0 to turn this off, in Settings › Worktrees.
+
+### Changed
+
+- `tm-agent gc sweep --category build_caches --deep` also reclaims the Cargo `target/` at the root of an inactive Rust worktree, not only `daemon/target`. A `target/` counts only when the worktree has a `Cargo.toml` and the directory carries cargo's `CACHEDIR.TAG` signature. Worktrees that a term-mesh session or task points at keep theirs.
+
+### Fixed
+
+- Open Settings in the command palette, the info button on the sidebar's resumable-teams line, and the menu bar's Preferences now open Settings. Before, they did nothing.
+- Settings › Worktrees now shows and saves the worktree base directory and the Auto-Cleanup on Quit setting, and Clear History in Settings › Browser now clears history. Before, the Settings window always showed the default directory, and these edits and actions had no effect.
+- Opening Settings at a section, for example from the sidebar, now lands on that section the first time the window opens. Before, the first open after launch could show the App section instead.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.291.0] - 2026-11-19
 
 ### Changed
