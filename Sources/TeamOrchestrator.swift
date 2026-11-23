@@ -6581,12 +6581,18 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Free bytes on the disk a member builds on, and the host it is on.
     ///
-    /// A local worker builds on this Mac's home volume. A remote one builds
-    /// on its host, whose free space arrives in that host's stats; with no
-    /// recent reading the space is unknown, which the gate never refuses.
-    func workerDiskAvailability(_ member: AgentMember) -> (availableBytes: UInt64?, hostName: String?) {
+    /// A local worker builds on the volume that holds its working directory
+    /// (its worktree, else its launch directory, else the team's). A remote
+    /// one builds on its host, whose free space arrives in that host's stats;
+    /// with no recent reading the space is unknown, which the gate never
+    /// refuses.
+    func workerDiskAvailability(
+        _ member: AgentMember,
+        in team: Team
+    ) -> (availableBytes: UInt64?, hostName: String?) {
         guard let hostKey = member.hostKey, !hostKey.isEmpty else {
-            return (DiskSpace.homeVolume()?.available, nil)
+            let workDir = member.worktreePath ?? member.originalAgentWorkDir ?? team.workingDirectory
+            return (DiskSpace.volume(containing: workDir)?.available, nil)
         }
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
             return (nil, hostKey)
@@ -6784,7 +6790,7 @@ final class TeamOrchestrator: ObservableObject {
         // A replay finishes a task that was already accepted; only new work
         // is held back by a full disk.
         if replayed == nil {
-            let disk = workerDiskAvailability(target)
+            let disk = workerDiskAvailability(target, in: team)
             if let refusal = DelegateDiskGate.refusal(
                 availableBytes: disk.availableBytes,
                 minimumGB: DelegateDiskGate.minimumFreeGB()
