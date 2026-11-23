@@ -211,6 +211,16 @@
         }
       }
     },
+    "A delegation is refused when the disk the worker builds on has less free space. The leader is told why and how to reclaim space. 0 turns this off.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "워커가 빌드하는 디스크의 여유 공간이 이보다 적으면 위임을 거절합니다. 리더에게는 거절한 이유와 공간을 확보하는 방법을 알려 줍니다. 0이면 이 검사를 끕니다."
+          }
+        }
+      }
+    },
     "A recovery export can restore project access. Store it offline. Revoking a device cannot be undone from that device.": {
       "localizations": {
         "ko": {
@@ -1597,6 +1607,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "측정됨"
+          }
+        }
+      }
+    },
+    "Minimum Free Disk to Delegate": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "위임에 필요한 최소 여유 공간"
           }
         }
       }
