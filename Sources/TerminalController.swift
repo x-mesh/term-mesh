@@ -5144,6 +5144,13 @@ class TerminalController {
                 id: id, code: "internal_error",
                 message: "Task creation failed for agent '\(agentName)'"
             )
+        case .diskLow(let refusal, let hostName):
+            return v2Error(
+                id: id, code: "disk_low",
+                message: DelegateDiskGate.message(
+                    agentName: agentName, hostName: hostName, refusal: refusal
+                )
+            )
         case .presentationUnavailable(let presentation):
             return v2Error(
                 id: id,

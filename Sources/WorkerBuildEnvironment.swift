@@ -55,6 +55,8 @@ enum WorkerBuildEnvironment {
 /// The settings card for `WorkerBuildEnvironment`.
 struct WorkerBuildSettingsSection: View {
     @AppStorage(WorkerBuildEnvironment.enabledKey) private var enabled = false
+    @AppStorage(DelegateDiskGate.minimumFreeGBKey)
+    private var minimumFreeGB = DelegateDiskGate.defaultMinimumFreeGB
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -72,6 +74,20 @@ struct WorkerBuildSettingsSection: View {
                     Toggle("", isOn: $enabled)
                         .labelsHidden()
                         .toggleStyle(.switch)
+                }
+
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Minimum Free Disk to Delegate",
+                    subtitle: "A delegation is refused when the disk the worker builds on has less free space. The leader is told why and how to reclaim space. 0 turns this off."
+                ) {
+                    Stepper(value: $minimumFreeGB, in: 0...500) {
+                        Text(verbatim: minimumFreeGB == 0
+                            ? LanguageSettings.localized("Off")
+                            : "\(minimumFreeGB) GB")
+                            .monospacedDigit()
+                    }
                 }
             }
 

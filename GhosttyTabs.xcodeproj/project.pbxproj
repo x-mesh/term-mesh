@@ -91,6 +91,7 @@
 			CVB00105 /* PeerHostStatsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00105 /* PeerHostStatsStore.swift */; };
 		DRC00002 /* DiskReclamation.swift in Sources */ = {isa = PBXBuildFile; fileRef = DRC00001 /* DiskReclamation.swift */; };
 		WBE00002 /* WorkerBuildEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = WBE00001 /* WorkerBuildEnvironment.swift */; };
+		DDG00002 /* DelegateDiskGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDG00001 /* DelegateDiskGate.swift */; };
 			CVB00931 /* PeerTerminalQueryStripper.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00931 /* PeerTerminalQueryStripper.swift */; };
 			CVB00085 /* PeerRelayWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00085 /* PeerRelayWindowController.swift */; };
 			CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00086 /* PeerRelayWorkspaceWindowController.swift */; };
@@ -330,6 +331,7 @@
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
 		DRC00004 /* DiskReclamationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DRC00003 /* DiskReclamationTests.swift */; };
 		WBE00004 /* WorkerBuildEnvironmentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = WBE00003 /* WorkerBuildEnvironmentTests.swift */; };
+		DDG00004 /* DelegateDiskGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDG00003 /* DelegateDiskGateTests.swift */; };
 				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */; };
 				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */; };
 				F9000096A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */; };
@@ -500,6 +502,7 @@
 			CVS00105 /* PeerHostStatsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsStore.swift; sourceTree = "<group>"; };
 		DRC00001 /* DiskReclamation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskReclamation.swift; sourceTree = "<group>"; };
 		WBE00001 /* WorkerBuildEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerBuildEnvironment.swift; sourceTree = "<group>"; };
+		DDG00001 /* DelegateDiskGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiskGate.swift; sourceTree = "<group>"; };
 			CVS00931 /* PeerTerminalQueryStripper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTerminalQueryStripper.swift; sourceTree = "<group>"; };
 			CVS00085 /* PeerRelayWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWindowController.swift; sourceTree = "<group>"; };
 			CVS00086 /* PeerRelayWorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceWindowController.swift; sourceTree = "<group>"; };
@@ -740,6 +743,7 @@
 			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
 		DRC00003 /* DiskReclamationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskReclamationTests.swift; sourceTree = "<group>"; };
 		WBE00003 /* WorkerBuildEnvironmentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerBuildEnvironmentTests.swift; sourceTree = "<group>"; };
+		DDG00003 /* DelegateDiskGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiskGateTests.swift; sourceTree = "<group>"; };
 			F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LargeTextSelectionSourceTests.swift; sourceTree = "<group>"; };
 			F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostResyncTests.swift; sourceTree = "<group>"; };
 			F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayoutCensusTallyTests.swift; sourceTree = "<group>"; };
@@ -946,6 +950,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				CVS00105 /* PeerHostStatsStore.swift */,
 				DRC00001 /* DiskReclamation.swift */,
 				WBE00001 /* WorkerBuildEnvironment.swift */,
+				DDG00001 /* DelegateDiskGate.swift */,
 				CVS00931 /* PeerTerminalQueryStripper.swift */,
 				CVS00085 /* PeerRelayWindowController.swift */,
 				CVS00086 /* PeerRelayWorkspaceWindowController.swift */,
@@ -1216,6 +1221,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
 				DRC00003 /* DiskReclamationTests.swift */,
 				WBE00003 /* WorkerBuildEnvironmentTests.swift */,
+				DDG00003 /* DelegateDiskGateTests.swift */,
 				F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */,
 				F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */,
 				F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */,
@@ -1468,6 +1474,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				CVB00105 /* PeerHostStatsStore.swift in Sources */,
 				DRC00002 /* DiskReclamation.swift in Sources */,
 				WBE00002 /* WorkerBuildEnvironment.swift in Sources */,
+				DDG00002 /* DelegateDiskGate.swift in Sources */,
 				CVB00931 /* PeerTerminalQueryStripper.swift in Sources */,
 				CVB00085 /* PeerRelayWindowController.swift in Sources */,
 				CVB00086 /* PeerRelayWorkspaceWindowController.swift in Sources */,
@@ -1710,6 +1717,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,
 				DRC00004 /* DiskReclamationTests.swift in Sources */,
 				WBE00004 /* WorkerBuildEnvironmentTests.swift in Sources */,
+				DDG00004 /* DelegateDiskGateTests.swift in Sources */,
 				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */,
 				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */,
 				F9000096A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift in Sources */,
