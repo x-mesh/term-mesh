@@ -1802,6 +1802,8 @@ struct SettingsView: View {
 
         DiskUsageSection()
 
+        WorkerBuildSettingsSection()
+
         WorktreeManagerSection(baseDir: daemonService?.worktreeBaseDir ?? TermMeshDaemon.defaultWorktreeBaseDir)
 
         WorktreeLogSection()
