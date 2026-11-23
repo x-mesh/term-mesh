@@ -332,6 +332,7 @@
 		DRC00004 /* DiskReclamationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DRC00003 /* DiskReclamationTests.swift */; };
 		WBE00004 /* WorkerBuildEnvironmentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = WBE00003 /* WorkerBuildEnvironmentTests.swift */; };
 		DDG00004 /* DelegateDiskGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDG00003 /* DelegateDiskGateTests.swift */; };
+		SNR00004 /* SettingsNavigationRequestsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = SNR00003 /* SettingsNavigationRequestsTests.swift */; };
 				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */; };
 				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */; };
 				F9000096A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */; };
@@ -744,6 +745,7 @@
 		DRC00003 /* DiskReclamationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskReclamationTests.swift; sourceTree = "<group>"; };
 		WBE00003 /* WorkerBuildEnvironmentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerBuildEnvironmentTests.swift; sourceTree = "<group>"; };
 		DDG00003 /* DelegateDiskGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiskGateTests.swift; sourceTree = "<group>"; };
+		SNR00003 /* SettingsNavigationRequestsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsNavigationRequestsTests.swift; sourceTree = "<group>"; };
 			F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LargeTextSelectionSourceTests.swift; sourceTree = "<group>"; };
 			F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostResyncTests.swift; sourceTree = "<group>"; };
 			F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayoutCensusTallyTests.swift; sourceTree = "<group>"; };
@@ -1222,6 +1224,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				DRC00003 /* DiskReclamationTests.swift */,
 				WBE00003 /* WorkerBuildEnvironmentTests.swift */,
 				DDG00003 /* DelegateDiskGateTests.swift */,
+				SNR00003 /* SettingsNavigationRequestsTests.swift */,
 				F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */,
 				F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */,
 				F9000097A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift */,
@@ -1718,6 +1721,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				DRC00004 /* DiskReclamationTests.swift in Sources */,
 				WBE00004 /* WorkerBuildEnvironmentTests.swift in Sources */,
 				DDG00004 /* DelegateDiskGateTests.swift in Sources */,
+				SNR00004 /* SettingsNavigationRequestsTests.swift in Sources */,
 				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */,
 				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */,
 				F9000096A1B2C3D4E5F60718 /* LayoutCensusTallyTests.swift in Sources */,

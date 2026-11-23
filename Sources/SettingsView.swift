@@ -463,11 +463,14 @@ struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             reloadWorkspaceTabColorSettings()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .settingsNavigateToSection)) { output in
-            guard let raw = output.userInfo?[SettingsNavigationUserInfoKey.section] as? String,
-                  let section = SettingsSection(rawValue: raw) else { return }
+        .onReceive(SettingsNavigationRequests.shared.$pendingSection.compactMap { $0 }) { section in
             settingsSearchQuery = ""
             selectedSection = section
+            // Taken once; cleared after this update so a later open does not
+            // jump back to it.
+            DispatchQueue.main.async {
+                SettingsNavigationRequests.shared.pendingSection = nil
+            }
         }
         .confirmationDialog(
             "Clear browser history?",
@@ -4726,9 +4729,42 @@ extension Notification.Name {
     static let settingsNavigateToSection = Notification.Name("TermMeshSettingsNavigateToSection")
 }
 
+/// Holds the section the last `.settingsNavigateToSection` asked for, until
+/// the settings view takes it.
+///
+/// The view subscribes only once SwiftUI installs it, which can be after a
+/// request posted right after `SettingsWindowController.show()` created the
+/// window; that request was lost and the first open landed on the default
+/// section. A `@Published` value is delivered to a late subscriber, so the
+/// request survives the gap.
+@MainActor
+final class SettingsNavigationRequests: ObservableObject {
+    static let shared = SettingsNavigationRequests()
+
+    @Published var pendingSection: SettingsSection?
+    private var observer: NSObjectProtocol?
+
+    func startListening(center: NotificationCenter = .default) {
+        guard observer == nil else { return }
+        observer = center.addObserver(
+            forName: .settingsNavigateToSection, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let raw = note.userInfo?[SettingsNavigationUserInfoKey.section] as? String,
+                  let section = SettingsSection(rawValue: raw) else { return }
+            MainActor.assumeIsolated { self?.pendingSection = section }
+        }
+    }
+}
+
 struct SettingsRootView: View {
     var body: some View {
         SettingsView()
+            // The main window gets these at its root; this window has its own
+            // root, and without them `daemonService` and `browserHistory`
+            // were nil here: the worktree directory always showed the
+            // default, and its edits, the auto-cleanup toggle and
+            // Clear History did nothing.
+            .withServices()
             .termMeshLanguage()
             .background(WindowAccessor { window in
                 configureSettingsWindow(window)

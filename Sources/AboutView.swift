@@ -25,6 +25,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = SettingsWindowController()
 
     private init() {
+        // Listen before the settings view exists: a request posted right
+        // after `show()` creates this window can arrive before the view does.
+        SettingsNavigationRequests.shared.startListening()
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 820, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
