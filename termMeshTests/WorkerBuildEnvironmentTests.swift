@@ -42,8 +42,21 @@ final class WorkerBuildEnvironmentTests: XCTestCase {
         XCTAssertEqual(WorkerBuildEnvironment.current(defaults: defaults, inherited: [:]), [:])
         defaults.set(true, forKey: WorkerBuildEnvironment.enabledKey)
         XCTAssertEqual(
-            WorkerBuildEnvironment.current(defaults: defaults, inherited: [:]).count,
-            3
+            WorkerBuildEnvironment.current(defaults: defaults, inherited: [:]),
+            [
+                "CARGO_INCREMENTAL": "0",
+                "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+                "CARGO_PROFILE_TEST_DEBUG": "line-tables-only",
+            ]
+        )
+        XCTAssertEqual(
+            WorkerBuildEnvironment.current(
+                defaults: defaults, inherited: ["CARGO_INCREMENTAL": "1"]
+            ),
+            [
+                "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+                "CARGO_PROFILE_TEST_DEBUG": "line-tables-only",
+            ]
         )
     }
 
