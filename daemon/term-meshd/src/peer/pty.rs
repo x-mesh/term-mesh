@@ -690,6 +690,7 @@ pub fn teardown(master_fd: RawFd, pid: libc::pid_t) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
@@ -884,6 +885,36 @@ mod tests {
         );
     }
 
+    /// The device and inode an open fd refers to.
+    fn open_file_identity(fd: libc::c_int) -> (libc::dev_t, libc::ino_t) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(fd, &mut stat) },
+            0,
+            "fd {fd} is not open"
+        );
+        (stat.st_dev, stat.st_ino)
+    }
+
+    /// `fd` no longer refers to the file it did when `identity` was taken.
+    ///
+    /// Tests run as threads of one process, so a number this test closed can
+    /// be handed to another test's `open` before it is checked. A bare
+    /// `F_GETFD == -1` read that reuse as a leaked fd; here a reused number
+    /// passes as long as it names a different file.
+    fn assert_fd_closed(fd: libc::c_int, identity: (libc::dev_t, libc::ino_t)) {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } == 0 {
+            assert_ne!(
+                (stat.st_dev, stat.st_ino),
+                identity,
+                "fd {fd} still refers to the file it was expected to close"
+            );
+        } else {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
     #[test]
     fn foreign_write_holder_causes_bounded_timeout_and_child_cleanup() {
         let (read_fd, write_fd) = exec_handshake_pipe().unwrap();
@@ -899,6 +930,7 @@ mod tests {
             }
         }
         close_fd(write_fd);
+        let read_identity = open_file_identity(read_fd);
 
         let started = Instant::now();
         let failure = await_startup(
@@ -914,15 +946,13 @@ mod tests {
         assert_eq!(failure.error.to_string(), "EXEC_HANDSHAKE_TIMEOUT");
         assert!(!failure.child_reaped);
         assert!(elapsed < Duration::from_millis(500));
-        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_fd_closed(read_fd, read_identity);
 
-        let dev_null = CString::new("/dev/null").unwrap();
-        let cleanup_fd = unsafe { libc::open(dev_null.as_ptr(), libc::O_RDONLY) };
-        assert!(cleanup_fd >= 0);
+        // A file of its own, so no other test can open the same inode.
+        let cleanup_fd = tempfile::tempfile().unwrap().into_raw_fd();
+        let cleanup_identity = open_file_identity(cleanup_fd);
         cleanup_failed_spawn(cleanup_fd, original_pid, failure.child_reaped);
-        assert_eq!(unsafe { libc::fcntl(cleanup_fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_fd_closed(cleanup_fd, cleanup_identity);
         let mut status = 0;
         assert_eq!(
             unsafe { libc::waitpid(original_pid, &mut status, libc::WNOHANG) },
