@@ -236,6 +236,9 @@ struct VerticalTabsSidebar: View {
             SidebarResumableFooter()
                 .frame(maxWidth: .infinity, alignment: .leading)
 
+            SidebarLowDiskFooter()
+                .frame(maxWidth: .infinity, alignment: .leading)
+
 #if DEBUG
             SidebarDevFooter(updateViewModel: updateViewModel)
                 .frame(maxWidth: .infinity, alignment: .leading)

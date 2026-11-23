@@ -729,7 +729,7 @@ fn scan_build_caches(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs) -> GcCate
         ],
     );
     report.note = Some(
-        "tag/shared caches are reported; inactive worktree daemon/target directories are reclaimable"
+        "tag/shared caches are reported; Cargo target directories of inactive worktrees are reclaimable"
             .into(),
     );
     if !opts.deep {
@@ -829,30 +829,71 @@ fn scan_build_caches(paths: &GcPaths, opts: &GcOptions, refs: &GcRefs) -> GcCate
 
     for worktree in worktrees {
         let worktree = PathBuf::from(worktree);
-        let target = worktree.join("daemon").join("target");
-        let Ok(metadata) = fs::symlink_metadata(&target) else {
-            continue;
-        };
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            continue;
+        let mut targets = vec![worktree.join("daemon").join("target")];
+        if is_cargo_root_target(&worktree) {
+            targets.push(worktree.join("target"));
         }
-        let blockers = refs
-            .is_pinned(&worktree)
-            .map(|pin| vec![pin.to_string()])
-            .unwrap_or_default();
-        report.push(GcCandidate {
-            path: display(&target),
-            bytes: dir_size(&target),
-            modified_ms: modified_ms(&metadata),
-            kind: "directory".into(),
-            branch: None,
-            reasons: vec!["worktree_cargo_target".into(), "regenerable".into()],
-            blockers,
-            identity: Some(file_identity(&metadata)),
-        });
+        for target in targets {
+            let Ok(metadata) = fs::symlink_metadata(&target) else {
+                continue;
+            };
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let blockers = refs
+                .is_pinned(&worktree)
+                .map(|pin| vec![pin.to_string()])
+                .unwrap_or_default();
+            report.push(GcCandidate {
+                path: display(&target),
+                bytes: dir_size(&target),
+                modified_ms: modified_ms(&metadata),
+                kind: "directory".into(),
+                branch: None,
+                reasons: vec!["worktree_cargo_target".into(), "regenerable".into()],
+                blockers,
+                identity: Some(file_identity(&metadata)),
+            });
+        }
     }
 
     report
+}
+
+/// Signature line cargo writes into every target directory it creates.
+const CARGO_CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether `<worktree>/target` is Cargo's build output for that worktree.
+///
+/// Other Rust repositories keep their output at the root rather than under
+/// `daemon/`, and agent worktrees of those repositories are what fill a disk.
+/// `target` is too common a name to delete on sight, so the directory counts
+/// only when the worktree has a `Cargo.toml` and cargo's own `CACHEDIR.TAG`
+/// marks the directory as a regenerable cache.
+fn is_cargo_root_target(worktree: &Path) -> bool {
+    if !worktree.join("Cargo.toml").is_file() {
+        return false;
+    }
+    let tag = worktree.join("target").join("CACHEDIR.TAG");
+    // Only a regular file, and only the signature's bytes: a FIFO would block
+    // the scan on open, and a large file would be read whole into memory.
+    match fs::symlink_metadata(&tag) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        _ => return false,
+    }
+    let Ok(file) = fs::File::open(&tag) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(CARGO_CACHEDIR_TAG_SIGNATURE.len());
+    use std::io::Read;
+    if file
+        .take(CARGO_CACHEDIR_TAG_SIGNATURE.len() as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    head == CARGO_CACHEDIR_TAG_SIGNATURE.as_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -1781,6 +1822,148 @@ mod tests {
             .expect("worktree target candidate");
         assert_eq!(candidate.blockers, ["active_session"]);
 
+        let summary = execute_sweep(&paths, &plan, true, false, &refs).unwrap();
+        assert_eq!(summary.removed, 0);
+        assert!(target.exists());
+    }
+
+    fn gitkit_rust_worktree(temp: &Path, paths: &GcPaths, name: &str) -> PathBuf {
+        let repo = init_repo(temp);
+        let wt = paths.gitkit_worktrees.join("rust-repo").join(name);
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        add_worktree(&repo, &wt, name);
+        wt
+    }
+
+    fn root_target_candidate<'a>(plan: &'a GcPlan, target: &Path) -> Option<&'a GcCandidate> {
+        category(plan, CATEGORY_BUILD_CACHES)
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == display(target))
+    }
+
+    #[test]
+    fn a_cargo_root_target_in_an_idle_worktree_is_reclaimed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = gitkit_rust_worktree(temp.path(), &paths, "narrow-list");
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(wt.join("uncommitted.rs"), "keep me").unwrap();
+        let target = wt.join("target");
+        fs::create_dir_all(target.join("debug/incremental")).unwrap();
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            format!("{CARGO_CACHEDIR_TAG_SIGNATURE}\n# cargo\n"),
+        )
+        .unwrap();
+        fs::write(target.join("debug/incremental/blob"), vec![0u8; 64]).unwrap();
+
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &target)
+            .expect("root cargo target is planned")
+            .reclaimable());
+
+        let summary = execute_sweep(&paths, &plan, true, false, &GcRefs::default()).unwrap();
+        assert_eq!(summary.removed, 1);
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read_to_string(wt.join("uncommitted.rs")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[test]
+    fn a_root_target_without_cargo_markers_is_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = gitkit_rust_worktree(temp.path(), &paths, "not-cargo");
+        // Cargo.toml present, but the directory carries no cargo tag.
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let untagged = wt.join("target");
+        fs::create_dir_all(&untagged).unwrap();
+        fs::write(untagged.join("CACHEDIR.TAG"), "Signature: something-else\n").unwrap();
+
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &untagged).is_none());
+
+        // A cargo tag alone is not enough without the worktree's Cargo.toml.
+        fs::remove_file(wt.join("Cargo.toml")).unwrap();
+        fs::write(
+            untagged.join("CACHEDIR.TAG"),
+            format!("{CARGO_CACHEDIR_TAG_SIGNATURE}\n"),
+        )
+        .unwrap();
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &untagged).is_none());
+        assert!(untagged.exists());
+    }
+
+    /// Opening a FIFO for reading blocks until a writer appears, which would
+    /// hang the whole scan; the tag has to be a regular file to be read.
+    #[test]
+    fn a_fifo_cachedir_tag_does_not_block_the_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = gitkit_rust_worktree(temp.path(), &paths, "fifo-tag");
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = wt.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let status = Command::new("mkfifo")
+            .arg(target.join("CACHEDIR.TAG"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &target).is_none());
+    }
+
+    #[test]
+    fn a_cachedir_tag_is_matched_on_its_signature_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = gitkit_rust_worktree(temp.path(), &paths, "long-tag");
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = wt.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let mut tag = format!("{CARGO_CACHEDIR_TAG_SIGNATURE}\n").into_bytes();
+        tag.extend(std::iter::repeat(b'#').take(1 << 20));
+        fs::write(target.join("CACHEDIR.TAG"), tag).unwrap();
+
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &target).is_some());
+
+        // A file shorter than the signature is not a tag.
+        fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a47").unwrap();
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &target).is_none());
+    }
+
+    #[test]
+    fn an_active_worktree_blocks_its_root_cargo_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = gitkit_rust_worktree(temp.path(), &paths, "busy");
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = wt.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            format!("{CARGO_CACHEDIR_TAG_SIGNATURE}\n"),
+        )
+        .unwrap();
+
+        let refs = GcRefs {
+            active_session_worktrees: HashSet::from([wt.clone()]),
+            ..Default::default()
+        };
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &refs);
+        assert_eq!(
+            root_target_candidate(&plan, &target)
+                .expect("root cargo target is planned")
+                .blockers,
+            ["active_session"]
+        );
         let summary = execute_sweep(&paths, &plan, true, false, &refs).unwrap();
         assert_eq!(summary.removed, 0);
         assert!(target.exists());

@@ -65,7 +65,9 @@ tm-agent gc sweep --apply                   # actually reclaim
   `./scripts/reload.sh --tag <tag> --cleanup` stops that app and immediately
   reclaims its managed DerivedData, sockets, log, manifest, and Cargo target.
 - `tm-agent gc sweep --category build_caches --deep` previews regenerable
-  `daemon/target` directories inside inactive worktrees. Add `--apply` to
+  Cargo target directories inside inactive worktrees: `daemon/target`, and
+  `target` at the worktree root when the worktree has a `Cargo.toml` and the
+  directory has the cargo `CACHEDIR.TAG` signature. Add `--apply` to
   remove only those targets while preserving dirty source. Active session/task
   worktrees remain blocked. Shared Cargo/SwiftPM and GhosttyKit caches are
   reported but remain owned by their build scripts; `setup.sh` keeps the 3 most
