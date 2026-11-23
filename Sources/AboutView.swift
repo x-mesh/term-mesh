@@ -63,6 +63,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         window.makeKeyAndOrderFront(nil)
     }
+
+    /// Opens Settings and brings the app forward, at `section` when given.
+    ///
+    /// The app has no SwiftUI `Settings` scene, so `showSettingsWindow:` reaches
+    /// no responder and does nothing; every entry point opens the window here.
+    func show(navigateTo section: SettingsSection?) {
+        show()
+        NSApp.activate(ignoringOtherApps: true)
+        guard let section else { return }
+        // Posted after the window exists, or a settings view that `show()`
+        // has just created misses the navigation.
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .settingsNavigateToSection,
+                object: nil,
+                userInfo: [SettingsNavigationUserInfoKey.section: section.rawValue]
+            )
+        }
+    }
 }
 
 final class SidebarDebugWindowController: NSWindowController, NSWindowDelegate {

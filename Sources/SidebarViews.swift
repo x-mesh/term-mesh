@@ -412,12 +412,7 @@ struct SidebarResumableFooter: View {
                         .foregroundColor(.secondary)
 
                     Button {
-                        NotificationCenter.default.post(
-                            name: .settingsNavigateToSection,
-                            object: nil,
-                            userInfo: [SettingsNavigationUserInfoKey.section: SettingsSection.agentTeams.rawValue]
-                        )
-                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                        SettingsWindowController.shared.show(navigateTo: .agentTeams)
                     } label: {
                         Image(systemName: "info.circle")
                             .font(.system(size: 10))
