@@ -2671,16 +2671,6 @@
         }
       }
     },
-    "Volume that holds worktrees and build caches": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "워크트리와 빌드 캐시가 있는 볼륨"
-          }
-        }
-      }
-    },
     "Waiting for an answer": {
       "localizations": {
         "ko": {

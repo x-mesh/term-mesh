@@ -28,24 +28,60 @@ enum DiskSpace {
     struct Reading: Equatable {
         let available: UInt64
         let total: UInt64
+        /// The volume's display name, such as "Macintosh HD".
+        var name: String = ""
+        /// Identifies the volume, so two paths on one volume count once.
+        var volumePath: String = ""
         var isLow: Bool { DiskSpace.isLow(available: available, total: total) }
     }
 
-    /// The volume that holds the home directory, where worktrees and build
-    /// caches live. `volumeAvailableCapacityKey` excludes purgeable space, the
-    /// same figure `df` and `reload.sh`'s free-space check see.
-    static func homeVolume() -> Reading? {
-        let url = URL(fileURLWithPath: NSHomeDirectory())
+    /// The volume that holds `path`. A path that does not exist yet, such as a
+    /// worktree base directory created on first use, is measured at its
+    /// nearest existing ancestor, which is the volume it will be created on.
+    /// `volumeAvailableCapacityKey` excludes purgeable space, the same figure
+    /// `df` and `reload.sh`'s free-space check see.
+    static func volume(containing path: String) -> Reading? {
+        var url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            .standardizedFileURL
+        while !FileManager.default.fileExists(atPath: url.path) {
+            let parent = url.deletingLastPathComponent()
+            guard parent.path != url.path else { return nil }
+            url = parent
+        }
         guard let values = try? url.resourceValues(forKeys: [
             .volumeAvailableCapacityKey,
             .volumeTotalCapacityKey,
+            .volumeNameKey,
+            .volumeURLKey,
         ]),
               let available = values.volumeAvailableCapacity,
               let total = values.volumeTotalCapacity,
               available >= 0, total > 0 else {
             return nil
         }
-        return Reading(available: UInt64(available), total: UInt64(total))
+        return Reading(
+            available: UInt64(available),
+            total: UInt64(total),
+            name: values.volumeName ?? "",
+            volumePath: values.volume?.path ?? ""
+        )
+    }
+
+    /// The home volume, where git-kit worktrees, agent state and build caches
+    /// live.
+    static func homeVolume() -> Reading? {
+        volume(containing: NSHomeDirectory())
+    }
+
+    /// Every volume agent builds fill: the home volume, plus the worktree base
+    /// directory's volume when it is a different one. Lowest free space first.
+    static func buildVolumes(worktreeBaseDir: String) -> [Reading] {
+        var readings: [Reading] = []
+        for reading in [homeVolume(), volume(containing: worktreeBaseDir)].compactMap({ $0 })
+            where !readings.contains(where: { $0.volumePath == reading.volumePath }) {
+            readings.append(reading)
+        }
+        return readings.sorted { $0.available < $1.available }
     }
 }
 
@@ -196,7 +232,9 @@ struct DiskUsageSection: View {
         case reclaiming
     }
 
-    @State private var disk: DiskSpace.Reading?
+    let worktreeBaseDir: String
+
+    @State private var volumes: [DiskSpace.Reading] = []
     @State private var status: GcStatusSummary?
     @State private var buildCaches: GcStatusSummary.Category?
     @State private var phase: Phase = .idle
@@ -222,14 +260,18 @@ struct DiskUsageSection: View {
             .padding(.horizontal, 2)
 
             SettingsCard {
-                SettingsCardRow("Free Space", subtitle: "Volume that holds worktrees and build caches") {
-                    if let disk {
+                if volumes.isEmpty {
+                    SettingsCardRow("Free Space") {
+                        Text("Unknown")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                ForEach(Array(volumes.enumerated()), id: \.element.volumePath) { index, disk in
+                    if index > 0 { SettingsCardDivider() }
+                    SettingsCardRow("Free Space", verbatimSubtitle: disk.name.isEmpty ? nil : disk.name) {
                         Text(verbatim: freeSpaceText(disk))
                             .font(.system(size: 12, weight: disk.isLow ? .semibold : .regular))
                             .foregroundColor(disk.isLow ? .orange : .secondary)
-                    } else {
-                        Text("Unknown")
-                            .foregroundColor(.secondary)
                     }
                 }
 
@@ -397,15 +439,17 @@ struct DiskUsageSection: View {
         }.value
     }
 
-    private static func readDisk() async -> DiskSpace.Reading? {
-        await Task.detached(priority: .userInitiated) { DiskSpace.homeVolume() }.value
+    private static func readVolumes(worktreeBaseDir: String) async -> [DiskSpace.Reading] {
+        await Task.detached(priority: .userInitiated) {
+            DiskSpace.buildVolumes(worktreeBaseDir: worktreeBaseDir)
+        }.value
     }
 
     @MainActor
     private func refresh() async {
         phase = .loading
         errorMessage = nil
-        disk = await Self.readDisk()
+        volumes = await Self.readVolumes(worktreeBaseDir: worktreeBaseDir)
         let raw = await Self.call("gc.status", [:], timeout: 30)
         if let parsed = GcStatusSummary.parse(raw) {
             status = parsed
@@ -515,7 +559,8 @@ private struct GcCategoryRow: View {
 
 // MARK: - Sidebar warning
 
-/// Appears only while this Mac's home volume is low, and opens the disk card.
+/// Appears only while a volume agent builds fill is low (the home volume, or
+/// the worktree base directory's), and opens the disk card.
 /// Reads the volume locally on a timer; `gc.status` walks every worktree and
 /// is too expensive to poll.
 struct SidebarLowDiskFooter: View {
@@ -569,7 +614,10 @@ struct SidebarLowDiskFooter: View {
         }
         .task {
             while !Task.isCancelled {
-                let next = await Task.detached(priority: .utility) { DiskSpace.homeVolume() }.value
+                let worktreeBaseDir = TermMeshDaemon.shared.worktreeBaseDir
+                let next = await Task.detached(priority: .utility) {
+                    DiskSpace.buildVolumes(worktreeBaseDir: worktreeBaseDir).first
+                }.value
                 if next != reading { reading = next }
                 try? await Task.sleep(for: Self.interval)
             }

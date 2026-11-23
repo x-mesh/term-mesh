@@ -107,4 +107,26 @@ final class DiskReclamationTests: XCTestCase {
         XCTAssertEqual(DiskSpace.capacity(13_584_153_464), "13.6GB")
         XCTAssertEqual(DiskSpace.capacity(2_500_000_000_000), "2.5TB")
     }
+    /// A worktree base directory that does not exist yet is measured where it
+    /// will be created: at its nearest existing ancestor.
+    func testAMissingPathIsMeasuredAtItsNearestExistingAncestor() throws {
+        let existing = FileManager.default.temporaryDirectory
+        let missing = existing.appendingPathComponent("no-such-\(UUID().uuidString)/a/b").path
+        let atAncestor = try XCTUnwrap(DiskSpace.volume(containing: existing.path))
+        let atMissing = try XCTUnwrap(DiskSpace.volume(containing: missing))
+        XCTAssertEqual(atMissing.volumePath, atAncestor.volumePath)
+        XCTAssertGreaterThan(atMissing.total, 0)
+        XCTAssertFalse(atMissing.volumePath.isEmpty)
+    }
+
+    /// Paths on one volume count once; the list is lowest free space first.
+    func testBuildVolumesListsEachVolumeOnce() throws {
+        let home = try XCTUnwrap(DiskSpace.homeVolume())
+        let sameVolume = DiskSpace.buildVolumes(worktreeBaseDir: NSHomeDirectory() + "/.term-mesh/worktrees")
+        XCTAssertEqual(sameVolume.map(\.volumePath), [home.volumePath])
+
+        let volumes = DiskSpace.buildVolumes(worktreeBaseDir: "/Volumes")
+        XCTAssertEqual(Set(volumes.map(\.volumePath)).count, volumes.count)
+        XCTAssertEqual(volumes.map(\.available), volumes.map(\.available).sorted())
+    }
 }

@@ -1800,7 +1800,10 @@ struct SettingsView: View {
                         }
         }
 
-        DiskUsageSection()
+        // Read from the daemon itself: the Settings window is not given a
+        // `daemonService` environment value, so that path always yields the
+        // default directory.
+        DiskUsageSection(worktreeBaseDir: TermMeshDaemon.shared.worktreeBaseDir)
 
         WorkerBuildSettingsSection()
 
