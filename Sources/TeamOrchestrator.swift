@@ -2490,7 +2490,10 @@ final class TeamOrchestrator: ObservableObject {
         )
         // Profiles may customize ordinary launch values, but cannot replace
         // app-owned routing identity or shadow the bundled tm-agent in PATH.
-        let paneEnv = Self.applyAgentProfileEnvironment(extraEnv, to: requiredPaneEnv)
+        let paneEnv = Self.applyAgentProfileEnvironment(
+            extraEnv,
+            to: WorkerBuildEnvironment.paneEnvironment(required: requiredPaneEnv)
+        )
 
         // No terminal at all: the agent is held in the pane, not run inside a
         // shell inside a PTY inside it. Everything below — the shell wrapper,
@@ -3482,7 +3485,9 @@ final class TeamOrchestrator: ObservableObject {
                 )
                 let headlessProfile = CLIPathSettings.activeProfile(for: cli)
                 let headlessExtraArgs = headlessProfile?.extraArgs ?? []
-                let headlessExtraEnv = headlessProfile?.env ?? [:]
+                let headlessExtraEnv = WorkerBuildEnvironment.headlessExtraEnv(
+                    profile: headlessProfile?.env ?? [:]
+                )
                 let headlessModel = headlessProfile?.modelOverride ?? a.model
                 var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": headlessModel]
                 if !a.effort.isEmpty {
