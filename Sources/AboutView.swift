@@ -75,8 +75,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         show()
         NSApp.activate(ignoringOtherApps: true)
         guard let section else { return }
-        // Posted after the window exists, or a settings view that `show()`
-        // has just created misses the navigation.
+        // The settings view may not be installed yet; `SettingsNavigationRequests`
+        // keeps the request until it is.
         DispatchQueue.main.async {
             NotificationCenter.default.post(
                 name: .settingsNavigateToSection,
