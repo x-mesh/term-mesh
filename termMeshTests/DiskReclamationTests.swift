@@ -93,6 +93,15 @@ final class DiskReclamationTests: XCTestCase {
         XCTAssertFalse(DiskSpace.isLow(available: 110 * gb, total: 926 * gb))
     }
 
+    /// Both limits are strict: exactly 5 GiB, or exactly 10% free, is not low.
+    func testLowDiskBoundariesAreExclusive() {
+        let gb: UInt64 = 1024 * 1024 * 1024
+        XCTAssertFalse(DiskSpace.isLow(available: 5 * gb, total: 40 * gb))
+        XCTAssertTrue(DiskSpace.isLow(available: 5 * gb - 1, total: 40 * gb))
+        XCTAssertFalse(DiskSpace.isLow(available: 10 * gb, total: 100 * gb))
+        XCTAssertTrue(DiskSpace.isLow(available: 10 * gb - 1, total: 100 * gb))
+    }
+
     func testCapacityUsesDecimalUnits() {
         XCTAssertEqual(DiskSpace.capacity(500_000_000), "500MB")
         XCTAssertEqual(DiskSpace.capacity(13_584_153_464), "13.6GB")
