@@ -83,6 +83,13 @@ enum DiskSpace {
         }
         return readings.sorted { $0.available < $1.available }
     }
+
+    /// The volume the sidebar warns about: the first low one, else the one
+    /// with the least free space. Low is partly a share of the volume's size,
+    /// so the volume with the fewest free bytes is not always the low one.
+    static func warningVolume(_ readings: [Reading]) -> Reading? {
+        readings.first(where: \.isLow) ?? readings.first
+    }
 }
 
 /// What `gc.status` reports, decoded for the settings card.
@@ -616,7 +623,7 @@ struct SidebarLowDiskFooter: View {
             while !Task.isCancelled {
                 let worktreeBaseDir = TermMeshDaemon.shared.worktreeBaseDir
                 let next = await Task.detached(priority: .utility) {
-                    DiskSpace.buildVolumes(worktreeBaseDir: worktreeBaseDir).first
+                    DiskSpace.warningVolume(DiskSpace.buildVolumes(worktreeBaseDir: worktreeBaseDir))
                 }.value
                 if next != reading { reading = next }
                 try? await Task.sleep(for: Self.interval)

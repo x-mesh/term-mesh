@@ -129,4 +129,19 @@ final class DiskReclamationTests: XCTestCase {
         XCTAssertEqual(Set(volumes.map(\.volumePath)).count, volumes.count)
         XCTAssertEqual(volumes.map(\.available), volumes.map(\.available).sorted())
     }
+
+    /// The sidebar warns about a volume that is low by share even when another
+    /// volume has fewer free bytes but is not low.
+    func testWarningVolumePrefersALowVolumeOverTheFewestFreeBytes() {
+        let gib: UInt64 = 1 << 30
+        let notLow = DiskSpace.Reading(available: 5 * gib, total: 40 * gib, volumePath: "/a")
+        let lowByShare = DiskSpace.Reading(available: 9 * gib, total: 100 * gib, volumePath: "/b")
+        XCTAssertFalse(notLow.isLow)
+        XCTAssertTrue(lowByShare.isLow)
+        XCTAssertEqual(DiskSpace.warningVolume([notLow, lowByShare]), lowByShare)
+
+        let roomy = DiskSpace.Reading(available: 50 * gib, total: 100 * gib, volumePath: "/c")
+        XCTAssertEqual(DiskSpace.warningVolume([notLow, roomy]), notLow)
+        XCTAssertNil(DiskSpace.warningVolume([]))
+    }
 }
