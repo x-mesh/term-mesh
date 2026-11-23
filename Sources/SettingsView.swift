@@ -91,7 +91,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
         case .agentCLIPaths: return ["cli", "path", "binary", "agent"] + AgentRolePreset.knownCLIs
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
-        case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
+        case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto", "disk", "space", "build cache", "cargo", "target", "reclaim", "gc"]
         case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
         case .mobileRemoteControl: return ["mobile", "remote control", "phone", "tailscale", "tailnet", "listener", "rc", "9877"]
         case .services: return ["services", "daemon", "doctor", "status", "restart", "subsystem", "log", "shell", "integration", "health"]
@@ -1799,6 +1799,8 @@ struct SettingsView: View {
                             .toggleStyle(.switch)
                         }
         }
+
+        DiskUsageSection()
 
         WorktreeManagerSection(baseDir: daemonService?.worktreeBaseDir ?? TermMeshDaemon.defaultWorktreeBaseDir)
 
