@@ -28,7 +28,10 @@ enum DelegateDiskGate {
     /// delegation on a missing reading would be worse than the risk it guards.
     static func refusal(availableBytes: UInt64?, minimumGB: Int) -> Refusal? {
         guard minimumGB > 0, let availableBytes else { return nil }
-        let minimum = UInt64(minimumGB) * bytesPerGB
+        // The minimum comes from user defaults, which accept any integer; an
+        // overflowing product would trap, so it saturates instead.
+        let product = UInt64(minimumGB).multipliedReportingOverflow(by: bytesPerGB)
+        let minimum = product.overflow ? UInt64.max : product.partialValue
         guard availableBytes < minimum else { return nil }
         return Refusal(availableBytes: availableBytes, minimumBytes: minimum)
     }
