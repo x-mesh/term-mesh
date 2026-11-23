@@ -595,20 +595,7 @@ struct SidebarLowDiskFooter: View {
                     .foregroundColor(.primary)
                     Spacer(minLength: 4)
                     Button("Reclaim") {
-                        // The app has no SwiftUI `Settings` scene, so nothing
-                        // answers `showSettingsWindow:`; open the window the
-                        // way the ⌘, menu item does.
-                        SettingsWindowController.shared.show()
-                        NSApp.activate(ignoringOtherApps: true)
-                        // Post after the window exists, or a settings view
-                        // created by `show()` misses the navigation.
-                        DispatchQueue.main.async {
-                            NotificationCenter.default.post(
-                                name: .settingsNavigateToSection,
-                                object: nil,
-                                userInfo: [SettingsNavigationUserInfoKey.section: SettingsSection.worktrees.rawValue]
-                            )
-                        }
+                        SettingsWindowController.shared.show(navigateTo: .worktrees)
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 10, weight: .medium))
