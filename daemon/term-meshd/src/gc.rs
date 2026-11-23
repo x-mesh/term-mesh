@@ -874,9 +874,26 @@ fn is_cargo_root_target(worktree: &Path) -> bool {
     if !worktree.join("Cargo.toml").is_file() {
         return false;
     }
-    fs::read_to_string(worktree.join("target").join("CACHEDIR.TAG"))
-        .map(|tag| tag.starts_with(CARGO_CACHEDIR_TAG_SIGNATURE))
-        .unwrap_or(false)
+    let tag = worktree.join("target").join("CACHEDIR.TAG");
+    // Only a regular file, and only the signature's bytes: a FIFO would block
+    // the scan on open, and a large file would be read whole into memory.
+    match fs::symlink_metadata(&tag) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        _ => return false,
+    }
+    let Ok(file) = fs::File::open(&tag) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(CARGO_CACHEDIR_TAG_SIGNATURE.len());
+    use std::io::Read;
+    if file
+        .take(CARGO_CACHEDIR_TAG_SIGNATURE.len() as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    head == CARGO_CACHEDIR_TAG_SIGNATURE.as_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,6 +1896,47 @@ mod tests {
         let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
         assert!(root_target_candidate(&plan, &untagged).is_none());
         assert!(untagged.exists());
+    }
+
+    /// Opening a FIFO for reading blocks until a writer appears, which would
+    /// hang the whole scan; the tag has to be a regular file to be read.
+    #[test]
+    fn a_fifo_cachedir_tag_does_not_block_the_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = gitkit_rust_worktree(temp.path(), &paths, "fifo-tag");
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = wt.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let status = Command::new("mkfifo")
+            .arg(target.join("CACHEDIR.TAG"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &target).is_none());
+    }
+
+    #[test]
+    fn a_cachedir_tag_is_matched_on_its_signature_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path());
+        let wt = gitkit_rust_worktree(temp.path(), &paths, "long-tag");
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = wt.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let mut tag = format!("{CARGO_CACHEDIR_TAG_SIGNATURE}\n").into_bytes();
+        tag.extend(std::iter::repeat(b'#').take(1 << 20));
+        fs::write(target.join("CACHEDIR.TAG"), tag).unwrap();
+
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &target).is_some());
+
+        // A file shorter than the signature is not a tag.
+        fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a47").unwrap();
+        let plan = build_plan(&paths, &deep(CATEGORY_BUILD_CACHES), &GcRefs::default());
+        assert!(root_target_candidate(&plan, &target).is_none());
     }
 
     #[test]
