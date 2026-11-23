@@ -38,21 +38,27 @@ final class SettingsNavigationRequestsTests: XCTestCase {
         XCTAssertEqual(received, .worktrees)
     }
 
+    /// Only the unknown request is posted, so nothing can overwrite a wrong
+    /// value: mapping it to any section, the default included, would show up
+    /// as an update here.
     func testAnUnknownSectionIsIgnored() async {
         let center = NotificationCenter()
         let requests = SettingsNavigationRequests()
         requests.startListening(center: center)
 
+        var updates: [SettingsSection?] = []
+        let subscription = requests.$pendingSection.dropFirst().sink { updates.append($0) }
         post("no-such-section", to: center)
-        post(SettingsSection.agentTeams.rawValue, to: center)
 
-        let delivered = expectation(description: "the valid request arrives")
-        let subscription = requests.$pendingSection.compactMap { $0 }.sink { _ in
-            delivered.fulfill()
-        }
-        await fulfillment(of: [delivered], timeout: 2)
+        // The observer runs on the main queue; let it and anything it
+        // schedules drain before reading.
+        let settled = expectation(description: "main queue drained")
+        DispatchQueue.main.async { DispatchQueue.main.async { settled.fulfill() } }
+        await fulfillment(of: [settled], timeout: 2)
         subscription.cancel()
-        XCTAssertEqual(requests.pendingSection, .agentTeams)
+
+        XCTAssertNil(requests.pendingSection)
+        XCTAssertTrue(updates.isEmpty, "an unknown section must not publish anything, got \(updates)")
     }
 
     func testListeningTwiceRegistersOnce() async {
