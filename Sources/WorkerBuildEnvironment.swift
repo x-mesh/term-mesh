@@ -32,6 +32,13 @@ enum WorkerBuildEnvironment {
         environment(enabled: defaults.bool(forKey: enabledKey), inherited: inherited)
     }
 
+    /// Remote workers. This Mac cannot see the remote shell's environment, so
+    /// nothing is filtered here; the CLI profile and the host's stored
+    /// environment are layered on top and win instead.
+    static func remote(defaults: UserDefaults = .standard) -> [String: String] {
+        environment(enabled: defaults.bool(forKey: enabledKey), inherited: [:])
+    }
+
     /// Headless workers: these defaults sit under the CLI profile's env, so a
     /// profile that sets the same variable keeps its value.
     static func headlessExtraEnv(
@@ -69,7 +76,7 @@ struct WorkerBuildSettingsSection: View {
             SettingsCard {
                 SettingsCardRow(
                     "Smaller Cargo Builds",
-                    subtitle: "Workers on this Mac build without the incremental cache and keep only line tables for debug info. Rebuilds take longer. A CLI profile that sets the same variable keeps its value."
+                    subtitle: "Agent workers build without the incremental cache and keep only line tables for debug info. Rebuilds take longer. A CLI profile that sets the same variable keeps its value."
                 ) {
                     Toggle("", isOn: $enabled)
                         .labelsHidden()
@@ -91,7 +98,7 @@ struct WorkerBuildSettingsSection: View {
                 }
             }
 
-            Text("Sets `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and `CARGO_PROFILE_TEST_DEBUG=line-tables-only` for agent workers started after the change. Leaders, your own terminals and remote workers are not affected.")
+            Text("Sets `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and `CARGO_PROFILE_TEST_DEBUG=line-tables-only` for agent workers started after the change. Remote workers get them too, unless that host's stored environment sets them. Leaders and your own terminals are not affected.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

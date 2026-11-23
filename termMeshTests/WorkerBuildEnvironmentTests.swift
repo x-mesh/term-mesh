@@ -100,4 +100,51 @@ final class WorkerBuildEnvironmentTests: XCTestCase {
         XCTAssertEqual(env["CARGO_INCREMENTAL"], "0")
         XCTAssertEqual(env["TERMMESH_TEAM_NAME"], "team-a")
     }
+    /// Remote workers: this Mac cannot see the remote shell, so the setting
+    /// alone decides; nothing is filtered by this process's environment.
+    func testRemoteReadsOnlyTheSetting() throws {
+        let suite = "WorkerBuildEnvironmentTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertEqual(WorkerBuildEnvironment.remote(defaults: defaults), [:])
+        defaults.set(true, forKey: WorkerBuildEnvironment.enabledKey)
+        XCTAssertEqual(WorkerBuildEnvironment.remote(defaults: defaults), WorkerBuildEnvironment.values)
+    }
+
+    @MainActor
+    func testSSHOwnedWorkerLayersBuildDefaultsUnderHostAndIdentity() {
+        let env = TeamOrchestrator.sshOwnedAgentEnvironment(
+            storedHost: ["CARGO_INCREMENTAL": "1", "AI_MESH_API_KEY": "host-key"],
+            internalIdentity: ["TERMMESH_TEAM": "real"],
+            buildDefaults: WorkerBuildEnvironment.values
+        )
+        XCTAssertEqual(env["CARGO_INCREMENTAL"], "1", "the host's stored value wins")
+        XCTAssertEqual(env["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only")
+        XCTAssertEqual(env["AI_MESH_API_KEY"], "host-key")
+        XCTAssertEqual(env["TERMMESH_TEAM"], "real")
+
+        let off = TeamOrchestrator.sshOwnedAgentEnvironment(
+            storedHost: ["AI_MESH_API_KEY": "host-key"],
+            internalIdentity: ["TERMMESH_TEAM": "real"],
+            buildDefaults: [:]
+        )
+        XCTAssertEqual(off, ["AI_MESH_API_KEY": "host-key", "TERMMESH_TEAM": "real"])
+    }
+
+    @MainActor
+    func testPeerOwnedWorkerLayersBuildDefaultsUnderProfileAndHost() throws {
+        let env = try TeamOrchestrator.remoteNativeAgentLaunchEnvironment(
+            cli: "claude",
+            hostKey: "host-1",
+            internalIdentity: ["TERMMESH_TEAM": "real"],
+            profileLookup: { _ in ["CARGO_PROFILE_DEV_DEBUG": "full"] },
+            hostLookup: { _ in ["CARGO_PROFILE_TEST_DEBUG": "full"] },
+            buildDefaults: WorkerBuildEnvironment.values
+        )
+        XCTAssertEqual(env["CARGO_INCREMENTAL"], "0")
+        XCTAssertEqual(env["CARGO_PROFILE_DEV_DEBUG"], "full", "the profile wins")
+        XCTAssertEqual(env["CARGO_PROFILE_TEST_DEBUG"], "full", "the host wins")
+        XCTAssertEqual(env["TERMMESH_TEAM"], "real")
+    }
 }
