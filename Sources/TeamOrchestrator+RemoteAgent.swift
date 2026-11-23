@@ -7776,8 +7776,9 @@ extension TeamOrchestrator {
                 agentName: agentName,
                 teamName: teamName,
                 workingDirectory: workingDirectory,
-                environment: PeerHostEnvironment.stored(forHostKey: hostKey)
-                    .merging(Self.remoteNativeAgentEnvironment(
+                environment: Self.sshOwnedAgentEnvironment(
+                    storedHost: PeerHostEnvironment.stored(forHostKey: hostKey),
+                    internalIdentity: Self.remoteNativeAgentEnvironment(
                         teamName: teamName,
                         agentName: agentName,
                         agentType: agentType,
@@ -7789,9 +7790,8 @@ extension TeamOrchestrator {
                         socketPath: nil,
                         routeGrant: routeGrant,
                         routeFilePath: routeFilePath
-                    )) {
-                        _, internalValue in internalValue
-                    },
+                    )
+                ),
                 hostBinDirs: hostCLIBinDirs,
                 needsSocketAccess: true
             )
@@ -9043,6 +9043,19 @@ extension TeamOrchestrator {
         profile.merging(explicitHost) { _, hostValue in hostValue }
     }
 
+    /// The environment an SSH-owned remote worker launches with: worker build
+    /// defaults at the bottom, the host's stored values above them, and
+    /// term-mesh's identity last.
+    static func sshOwnedAgentEnvironment(
+        storedHost: [String: String],
+        internalIdentity: [String: String],
+        buildDefaults: [String: String] = WorkerBuildEnvironment.remote()
+    ) -> [String: String] {
+        buildDefaults
+            .merging(storedHost) { _, hostValue in hostValue }
+            .merging(internalIdentity) { _, internalValue in internalValue }
+    }
+
     @MainActor
     static func peerOwnedAgentEnvironment(
         profile: [String: String],
@@ -9085,11 +9098,16 @@ extension TeamOrchestrator {
         hostKey: String,
         internalIdentity: [String: String],
         profileLookup: ((String) -> [String: String])? = nil,
-        hostLookup: ((String) -> [String: String])? = nil
+        hostLookup: ((String) -> [String: String])? = nil,
+        buildDefaults: [String: String]? = nil
     ) throws -> [String: String] {
-        let profile = profileLookup?(cli)
-            ?? CLIPathSettings.activeProfile(for: cli)?.env
-            ?? [:]
+        // Worker build defaults sit under the profile, so a profile or the
+        // host's stored environment that sets the same variable wins.
+        let profile = (buildDefaults ?? WorkerBuildEnvironment.remote()).merging(
+            profileLookup?(cli)
+                ?? CLIPathSettings.activeProfile(for: cli)?.env
+                ?? [:]
+        ) { _, profileValue in profileValue }
         let explicitHost = hostLookup?(hostKey)
             ?? PeerHostEnvironment.stored(forHostKey: hostKey)
         return try peerOwnedAgentEnvironment(
