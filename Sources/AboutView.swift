@@ -25,6 +25,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = SettingsWindowController()
 
     private init() {
+        // Listen before the settings view exists: a request posted right
+        // after `show()` creates this window can arrive before the view does.
+        SettingsNavigationRequests.shared.startListening()
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 820, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -62,6 +65,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             window.center()
         }
         window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Opens Settings and brings the app forward, at `section` when given.
+    ///
+    /// The app has no SwiftUI `Settings` scene, so `showSettingsWindow:` reaches
+    /// no responder and does nothing; every entry point opens the window here.
+    func show(navigateTo section: SettingsSection?) {
+        show()
+        NSApp.activate(ignoringOtherApps: true)
+        guard let section else { return }
+        // The settings view may not be installed yet; `SettingsNavigationRequests`
+        // keeps the request until it is.
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .settingsNavigateToSection,
+                object: nil,
+                userInfo: [SettingsNavigationUserInfoKey.section: section.rawValue]
+            )
+        }
     }
 }
 

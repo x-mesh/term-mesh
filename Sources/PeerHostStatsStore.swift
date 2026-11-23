@@ -49,15 +49,13 @@ struct PeerHostStats: Equatable, Sendable {
     /// build, or one that cannot measure it) is never "low" — showing a
     /// warning for a machine we know nothing about is worse than silence.
     var isDiskLow: Bool {
-        guard diskTotalBytes > 0 else { return false }
-        if diskAvailableBytes < 5 * 1024 * 1024 * 1024 { return true }
-        return Double(diskAvailableBytes) / Double(diskTotalBytes) < 0.10
+        DiskSpace.isLow(available: diskAvailableBytes, total: diskTotalBytes)
     }
 
     /// Free space rendered for a badge, or nil when the host did not report.
     var diskFreeText: String? {
         guard diskTotalBytes > 0 else { return nil }
-        return "\(Self.capacity(diskAvailableBytes)) free"
+        return "\(DiskSpace.capacity(diskAvailableBytes)) free"
     }
 
     /// Sidebar badge content, precomputed before constructing a host row so
@@ -124,16 +122,6 @@ struct PeerHostStats: Equatable, Sendable {
 
     private static func oneDecimal(_ value: Double) -> String {
         String(format: "%.1f", value)
-    }
-
-    /// Absolute capacity, in the units people use for disks (GB, not GiB).
-    private static func capacity(_ bytes: UInt64) -> String {
-        let value = Double(bytes)
-        switch value {
-        case 0..<1_000_000_000: return String(format: "%.0fMB", value / 1_000_000)
-        case 1_000_000_000..<1_000_000_000_000: return String(format: "%.1fGB", value / 1_000_000_000)
-        default: return String(format: "%.1fTB", value / 1_000_000_000_000)
-        }
     }
 
     /// Bytes/sec at titlebar width: two significant figures at most, and

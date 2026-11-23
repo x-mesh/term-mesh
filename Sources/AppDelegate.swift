@@ -2121,8 +2121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @objc func openPreferencesWindow() {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        NSApp.activate(ignoringOtherApps: true)
+        SettingsWindowController.shared.show(navigateTo: nil)
     }
 
     func refreshMenuBarExtraForDebug() {

@@ -8304,7 +8304,10 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             hostKey: "host-1",
             internalIdentity: identity,
             profileLookup: { _ in profile },
-            hostLookup: { _ in host }
+            hostLookup: { _ in host },
+            // The comparison is about layering; the worker build defaults
+            // follow a user setting and are covered separately.
+            buildDefaults: [:]
         )
         let viaPeerHelper = try TeamOrchestrator.peerOwnedAgentEnvironment(
             profile: profile,

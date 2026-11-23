@@ -6692,18 +6692,21 @@ mod tests {
             )
             .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !child_pid_path.exists() {
+        // `echo $! > file` creates the file before it writes the pid, so a
+        // file that exists can still be empty; wait for a pid that parses.
+        let child_pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&child_pid_path)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    break pid;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        let child_pid: libc::pid_t = std::fs::read_to_string(&child_pid_path)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
         let before = std::fs::read(&manifest_path).unwrap();
         let preview = host.force_prune_project_presentations(&[], false).unwrap();
         assert!(preview.forced && !preview.applied);
