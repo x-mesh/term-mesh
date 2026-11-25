@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.293.0] - 2026-11-26
+
+### Added
+
+- Panes, the sidebar, the Review Board and the Remote Work panel are now rounded cards on one window background. Pane tabs are pills, the pane header shares the card surface, and pane tools show only on the focused or hovered pane (they fold into a menu on narrow panes). The titlebar groups the branch and status into chips.
+- A pane with unread notifications gets a faint ring around its card, and a soft light sweeps around it once per notification.
+- Settings has pane spacing and pane padding (sides, top and bottom). Padding changes apply live, and the terminal snaps to whole rows so the bottom padding stays fixed.
+- Settings has Font Smoothing and Smoothing Strength controls for the terminal. Font Smoothing is off by default, and Smoothing Strength (0–255) applies only while it is on.
+
+### Fixed
+
+- A theme change now repaints the padding of every pane, not only the focused one.
+- The pane spacing can no longer go negative, and the notification glow no longer spills onto the neighbouring cards.
+
 ## [0.292.0] - 2026-11-23
 
 ### Added
