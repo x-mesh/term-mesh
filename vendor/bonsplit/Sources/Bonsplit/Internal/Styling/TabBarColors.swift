@@ -197,6 +197,74 @@ enum TabBarColors {
         return notificationBadge
     }
 
+    // MARK: - Card Chrome
+
+    private enum CardTone {
+        static let windowDarkenOnDark: CGFloat = 0.05
+        static let windowDarkenOnLight: CGFloat = 0.06
+        static let unfocusedBorderOnDark: CGFloat = 0.045
+        static let focusedBorderOnDark: CGFloat = 0.12
+        static let unfocusedBorderOnLight: CGFloat = 0.08
+        static let focusedBorderOnLight: CGFloat = 0.26
+        static let unfocusedExplicitBorderAlpha: CGFloat = 0.55
+        static let focusedShadowAlphaOnDark: CGFloat = 0.6
+        static let focusedShadowAlphaOnLight: CGFloat = 0.18
+        static let opaqueAlphaThreshold: CGFloat = 0.999
+    }
+
+    /// Panes are separate cards, so the gap between them shows the window
+    /// background instead of a drawn divider line.
+    static let splitGapColor: NSColor = .clear
+
+    /// A translucent theme leaves the window background clear: painting it under
+    /// the cards would composite the configured alpha twice inside every card.
+    static func nsColorCardWindowBackground(for appearance: BonsplitConfiguration.Appearance) -> NSColor {
+        let card = nsColorPaneBackground(for: appearance)
+        guard card.alphaComponent >= CardTone.opaqueAlphaThreshold else { return .clear }
+        return card.isBonsplitLightColor
+            ? card.bonsplitDarken(by: CardTone.windowDarkenOnLight)
+            : card.bonsplitDarken(by: CardTone.windowDarkenOnDark)
+    }
+
+    static func cardWindowBackground(for appearance: BonsplitConfiguration.Appearance) -> Color {
+        Color(nsColor: nsColorCardWindowBackground(for: appearance))
+    }
+
+    static func nsColorCardBorder(
+        for appearance: BonsplitConfiguration.Appearance,
+        isFocused: Bool
+    ) -> NSColor {
+        if let explicit = chromeBorderColor(for: appearance) {
+            return isFocused ? explicit : explicit.withAlphaComponent(
+                explicit.alphaComponent * CardTone.unfocusedExplicitBorderAlpha
+            )
+        }
+        let card = nsColorPaneBackground(for: appearance)
+        if card.isBonsplitLightColor {
+            return card.bonsplitDarken(
+                by: isFocused ? CardTone.focusedBorderOnLight : CardTone.unfocusedBorderOnLight
+            ).withAlphaComponent(1)
+        }
+        return card.bonsplitLighten(
+            by: isFocused ? CardTone.focusedBorderOnDark : CardTone.unfocusedBorderOnDark
+        ).withAlphaComponent(1)
+    }
+
+    static func cardBorder(for appearance: BonsplitConfiguration.Appearance, isFocused: Bool) -> Color {
+        Color(nsColor: nsColorCardBorder(for: appearance, isFocused: isFocused))
+    }
+
+    static func nsColorCardFocusedShadow(for appearance: BonsplitConfiguration.Appearance) -> NSColor {
+        let alpha = nsColorPaneBackground(for: appearance).isBonsplitLightColor
+            ? CardTone.focusedShadowAlphaOnLight
+            : CardTone.focusedShadowAlphaOnDark
+        return NSColor.black.withAlphaComponent(alpha)
+    }
+
+    static func cardFocusedShadow(for appearance: BonsplitConfiguration.Appearance) -> Color {
+        Color(nsColor: nsColorCardFocusedShadow(for: appearance))
+    }
+
     // MARK: - Shadows
 
     static var tabShadow: Color {

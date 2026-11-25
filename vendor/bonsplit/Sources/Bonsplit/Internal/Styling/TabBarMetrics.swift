@@ -4,18 +4,18 @@ import Foundation
 enum TabBarMetrics {
     // MARK: - Tab Bar
 
-    static let barHeight: CGFloat = 30
+    static let barHeight: CGFloat = BonsplitCardMetrics.tabBarHeight
     static let barPadding: CGFloat = 0
+    static let barLeadingInset: CGFloat = 6
 
     // MARK: - Individual Tabs
 
-    static let tabHeight: CGFloat = 30
+    static let tabHeight: CGFloat = BonsplitCardMetrics.tabBarHeight
     static let tabMinWidth: CGFloat = 48
     static let tabMaxWidth: CGFloat = 220
     static let tabCornerRadius: CGFloat = 0
     static let tabHorizontalPadding: CGFloat = 6
-    static let tabSpacing: CGFloat = 0
-    static let activeIndicatorHeight: CGFloat = 2
+    static let tabSpacing: CGFloat = 2
 
     // MARK: - Tab Content
 
@@ -36,7 +36,6 @@ enum TabBarMetrics {
 
     static let minimumPaneWidth: CGFloat = 100
     static let minimumPaneHeight: CGFloat = 100
-    static let dividerThickness: CGFloat = 1
 
     // MARK: - Animations
 

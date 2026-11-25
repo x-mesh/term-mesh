@@ -185,6 +185,9 @@ extension BonsplitConfiguration {
         /// Optional color overrides for tab/pane chrome.
         public var chromeColors: ChromeColors
 
+        /// Space between pane cards, and between the cards and the window edges.
+        public var cardGap: CGFloat
+
         // MARK: - Presets
 
         public static let `default` = Appearance()
@@ -215,7 +218,8 @@ extension BonsplitConfiguration {
             splitButtonTooltips: SplitButtonTooltips = .default,
             animationDuration: Double = 0.15,
             enableAnimations: Bool = true,
-            chromeColors: ChromeColors = .init()
+            chromeColors: ChromeColors = .init(),
+            cardGap: CGFloat = BonsplitCardMetrics.gap
         ) {
             self.tabBarHeight = tabBarHeight
             self.tabMinWidth = tabMinWidth
@@ -228,6 +232,7 @@ extension BonsplitConfiguration {
             self.animationDuration = animationDuration
             self.enableAnimations = enableAnimations
             self.chromeColors = chromeColors
+            self.cardGap = cardGap
         }
     }
 }
