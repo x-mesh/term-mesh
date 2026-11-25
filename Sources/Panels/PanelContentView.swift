@@ -11,6 +11,7 @@ struct PanelContentView: View {
     let isSplit: Bool
     let appearance: PanelAppearance
     let hasUnreadNotification: Bool
+    let unreadNotificationID: UUID?
     let onFocus: () -> Void
     let onRequestPanelFocus: () -> Void
     let onTriggerFlash: () -> Void
@@ -27,6 +28,7 @@ struct PanelContentView: View {
                     isSplit: isSplit,
                     appearance: appearance,
                     hasUnreadNotification: hasUnreadNotification,
+                    unreadNotificationID: unreadNotificationID,
                     onFocus: onFocus,
                     onTriggerFlash: onTriggerFlash
                 )

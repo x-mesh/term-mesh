@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Bonsplit
 
 private enum RetrievalDrawerTab: String, CaseIterable {
     case activity = "Live Activity"
@@ -195,13 +196,10 @@ struct WorkspaceRetrievalChrome<Content: View>: View {
                     }
                     .padding(.horizontal, 8)
                     .frame(height: 34)
-                    .background(RetrievalChromePalette.panel)
-                    .overlay(alignment: .top) {
-                        Rectangle().fill(RetrievalChromePalette.separator).frame(height: 1)
-                    }
                 }
             }
             .animation(.easeOut(duration: 0.18), value: store.visiblePresentations)
+            .cardWindowBackground()
             // Safety pin: if any chrome row ever refuses to compress again,
             // it must not inflate the VStack and re-center the terminal row
             // over the Review Board. Hold the chrome to its slot, top-leading,
@@ -361,8 +359,10 @@ private struct RetrievalActivityDrawer: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(height: 220)
-        .background(RetrievalChromePalette.panel)
-        .overlay(alignment: .top) { Rectangle().fill(RetrievalChromePalette.separator).frame(height: 1) }
+        .cardPanel()
+        // Below the pane cards, inset like them; the terminal area's bottom
+        // margin already separates the two.
+        .padding([.leading, .trailing, .bottom], PaneGapSettings.current)
         .accessibilityIdentifier("retrieval.drawer")
     }
 
@@ -372,13 +372,14 @@ private struct RetrievalActivityDrawer: View {
     /// without duplicating the controls.
     private var toolbar: some View {
         HStack(spacing: 10) {
-            Picker("Remote Work", selection: $selectedTab) {
-                ForEach(RetrievalDrawerTab.allCases, id: \.self) { tab in
-                    Text(tab == .incoming ? "Incoming \(store.incomingCount)" : tab.rawValue).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 440)
+            UnderlineTabPicker(
+                items: RetrievalDrawerTab.allCases.map { tab in
+                    UnderlineTabItem(value: tab, title: tab == .incoming ? "Incoming \(store.incomingCount)" : tab.rawValue)
+                },
+                selection: selectedTab,
+                onSelect: { selectedTab = $0 }
+            )
+            .accessibilityLabel("Remote Work")
 
             // Which pane the buttons act on. It was previously implicit —
             // the last pane to register, or the first in the list — so a
@@ -772,8 +773,11 @@ private struct RetrievalChangesInspector: View {
                 )
             }
         }
-        .background(RetrievalChromePalette.panel)
-        .overlay(alignment: .leading) { Rectangle().fill(RetrievalChromePalette.separator).frame(width: 1) }
+        .cardPanel()
+        // Beside or below the pane cards; the terminal area's own margin is the
+        // gap on the side that faces them.
+        .padding([.trailing, .bottom], PaneGapSettings.current)
+        .padding(.top, BonsplitCardMetrics.outerTopMargin)
         .accessibilityIdentifier("retrieval.inspector")
     }
 

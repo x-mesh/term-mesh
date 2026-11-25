@@ -294,7 +294,8 @@ final class Workspace: Identifiable {
         return BonsplitConfiguration.Appearance(
             splitButtonTooltips: Self.currentSplitButtonTooltips(),
             enableAnimations: false,
-            chromeColors: chromeColors
+            chromeColors: chromeColors,
+            cardGap: PaneGapSettings.current
         )
     }
 
@@ -320,8 +321,21 @@ final class Workspace: Identifiable {
         return BonsplitConfiguration.Appearance(
             splitButtonTooltips: Self.currentSplitButtonTooltips(),
             enableAnimations: false,
-            chromeColors: chromeColors
+            chromeColors: chromeColors,
+            cardGap: PaneGapSettings.current
         )
+    }
+
+    /// Re-lays out every terminal so a new pane padding shows at once.
+    func applyPanePadding() {
+        for panel in panels.values {
+            (panel as? TerminalPanel)?.hostedView.needsLayout = true
+        }
+    }
+
+    func applyCardGap(_ gap: CGFloat) {
+        guard bonsplitController.configuration.appearance.cardGap != gap else { return }
+        bonsplitController.configuration.appearance.cardGap = gap
     }
 
     func applyGhosttyChrome(from config: GhosttyConfig, reason: String = "unspecified") {

@@ -37,7 +37,7 @@ struct ReviewBoardPanelView: View {
         GeometryReader { proxy in
             panel(compact: ReviewBoardPanelLayout.isCompact(width: proxy.size.width))
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .cardPanel()
         .accessibilityIdentifier("reviewBoard.panel")
         .accessibilityElement(children: .contain)
         .onAppear {
@@ -166,13 +166,11 @@ struct ReviewBoardPanelView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 HStack(spacing: 8) {
-                    Picker("Task scope", selection: selection) {
-                        ForEach(ReviewBoardProjectScope.allCases, id: \.self) { scope in
-                            Text(scope.title).tag(scope)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
+                    UnderlineTabPicker(
+                        items: ReviewBoardProjectScope.allCases.map { UnderlineTabItem(value: $0, title: $0.title) },
+                        selection: selection.wrappedValue,
+                        onSelect: { selection.wrappedValue = $0 }
+                    )
                     Spacer(minLength: 0)
                 }
             }

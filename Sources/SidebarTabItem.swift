@@ -288,7 +288,7 @@ struct TabItemView: View, Equatable {
         case .leftRail:
             return .clear
         case .solidFill:
-            return Color.primary.opacity(0.5)
+            return resolvedCustomTabColor == nil ? .clear : Color.primary.opacity(0.5)
         }
     }
 
@@ -302,10 +302,6 @@ struct TabItemView: View, Equatable {
 
     private func activeSecondaryColor(_ opacity: Double = 0.75) -> Color {
         usesInvertedActiveForeground ? .white.opacity(opacity) : .secondary
-    }
-
-    private var activeUnreadBadgeFillColor: Color {
-        usesInvertedActiveForeground ? Color.white.opacity(0.25) : Color.accentColor
     }
 
     private var activeProgressTrackColor: Color {
@@ -383,18 +379,6 @@ struct TabItemView: View, Equatable {
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                let unreadCount = notificationSummary.unreadCount
-                if unreadCount > 0 {
-                    ZStack {
-                        Circle()
-                            .fill(activeUnreadBadgeFillColor)
-                        Text("\(unreadCount)")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundColor(.white)
-                    }
-                    .frame(width: 16, height: 16)
-                }
-
                 if tab.isPinned {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 9, weight: .semibold))
@@ -467,6 +451,8 @@ struct TabItemView: View, Equatable {
             // input for THIS workspace's panes so a relay workspace isn't
             // just an anonymous shell CWD in the list.
             hostChip
+
+            workspaceMetaChips
 
             if let subtitle = latestNotificationText {
                 Text(subtitle)
@@ -609,10 +595,11 @@ struct TabItemView: View, Equatable {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(
-            RoundedRectangle(cornerRadius: 6)
+            RoundedRectangle(cornerRadius: Self.cardCornerRadius, style: .continuous)
                 .fill(activeTabGradientOrColor)
+                .shadow(color: selectedCardShadowColor, radius: 6, y: 3)
                 .overlay {
-                    RoundedRectangle(cornerRadius: 6)
+                    RoundedRectangle(cornerRadius: Self.cardCornerRadius, style: .continuous)
                         .strokeBorder(activeBorderColor, lineWidth: activeBorderLineWidth)
                 }
                 .overlay(alignment: .leading) {
@@ -724,8 +711,49 @@ struct TabItemView: View, Equatable {
             }
             if isActive        { return Color.accentColor }
             if isMultiSelected { return Color.accentColor.opacity(0.25) }
-            return Color.clear
+            return Self.idleCardFill
         }
+    }
+
+    private static let cardCornerRadius: CGFloat = 10
+    /// Unselected workspaces are quiet cards so the gradient card stands out.
+    private static let idleCardFill = Color.primary.opacity(0.045)
+
+    /// A soft lift under the selected gradient card; none for other rows.
+    private var selectedCardShadow: Bool {
+        isActive && resolvedCustomTabColor == nil && activeTabIndicatorStyle == .solidFill
+    }
+
+    private var selectedCardShadowColor: Color {
+        selectedCardShadow ? Color(red: 0.55, green: 0.39, blue: 0.9).opacity(0.35) : .clear
+    }
+
+    @ViewBuilder
+    private var workspaceMetaChips: some View {
+        let unreadCount = notificationSummary.unreadCount
+        if unreadCount > 0 {
+            metaChip("\(unreadCount) unread", emphasized: true)
+        }
+    }
+
+    private func metaChip(_ text: String, emphasized: Bool = false) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: emphasized ? .semibold : .medium))
+            .foregroundColor(
+                usesInvertedActiveForeground
+                    ? .white
+                    : (emphasized ? Color.accentColor : .secondary)
+            )
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(
+                        usesInvertedActiveForeground
+                            ? Color.white.opacity(emphasized ? 0.32 : 0.2)
+                            : (emphasized ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.06))
+                    )
+            )
     }
 
     /// Host-accent colors when this row is a live peer-mirror workspace;

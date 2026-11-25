@@ -113,13 +113,8 @@ final class ReviewBoardVisibilityTests: XCTestCase {
         XCTAssertEqual(width, ReviewBoardSettings.maximumWidth)
     }
 
-    func testResizerKeepsAThinDividerInsideAGrabbableTarget() {
-        XCTAssertEqual(ReviewBoardResizerLayout.dividerWidth, 1)
+    func testResizerKeepsAGrabbableTarget() {
         XCTAssertGreaterThanOrEqual(ReviewBoardResizerLayout.hitTargetWidth, 9)
-        XCTAssertGreaterThan(
-            ReviewBoardResizerLayout.hitTargetWidth,
-            ReviewBoardResizerLayout.dividerWidth
-        )
     }
 
     func testMinimumWidthUsesCompactPanelLayout() {

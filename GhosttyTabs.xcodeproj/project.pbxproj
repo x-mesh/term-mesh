@@ -90,6 +90,10 @@
 			CVB00084 /* PeerRelaySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00084 /* PeerRelaySession.swift */; };
 			CVB00105 /* PeerHostStatsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00105 /* PeerHostStatsStore.swift */; };
 		DRC00002 /* DiskReclamation.swift in Sources */ = {isa = PBXBuildFile; fileRef = DRC00001 /* DiskReclamation.swift */; };
+		CCH00002 /* CardChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCH00001 /* CardChrome.swift */; };
+		PGS00002 /* PaneGapSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = PGS00001 /* PaneGapSettings.swift */; };
+		CRV00002 /* CardRingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CRV00001 /* CardRingView.swift */; };
+		NLP00002 /* NotificationLapPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = NLP00001 /* NotificationLapPolicy.swift */; };
 		WBE00002 /* WorkerBuildEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = WBE00001 /* WorkerBuildEnvironment.swift */; };
 		DDG00002 /* DelegateDiskGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDG00001 /* DelegateDiskGate.swift */; };
 			CVB00931 /* PeerTerminalQueryStripper.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00931 /* PeerTerminalQueryStripper.swift */; };
@@ -288,6 +292,8 @@
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */; };
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */; };
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */; };
+				CRT00002 /* CardRingGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CRT00001 /* CardRingGeometryTests.swift */; };
+				NLT00002 /* NotificationLapPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = NLT00001 /* NotificationLapPolicyTests.swift */; };
 			4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4704CF490000000000000001 /* RenderTokenProbeTests.swift */; };
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */; };
 				F6000000A1B2C3D4E5F60718 /* SplitNodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */; };
@@ -502,6 +508,10 @@
 			CVS00084 /* PeerRelaySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelaySession.swift; sourceTree = "<group>"; };
 			CVS00105 /* PeerHostStatsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsStore.swift; sourceTree = "<group>"; };
 		DRC00001 /* DiskReclamation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskReclamation.swift; sourceTree = "<group>"; };
+		CCH00001 /* CardChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardChrome.swift; sourceTree = "<group>"; };
+		PGS00001 /* PaneGapSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaneGapSettings.swift; sourceTree = "<group>"; };
+		CRV00001 /* CardRingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardRingView.swift; sourceTree = "<group>"; };
+		NLP00001 /* NotificationLapPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationLapPolicy.swift; sourceTree = "<group>"; };
 		WBE00001 /* WorkerBuildEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerBuildEnvironment.swift; sourceTree = "<group>"; };
 		DDG00001 /* DelegateDiskGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiskGate.swift; sourceTree = "<group>"; };
 			CVS00931 /* PeerTerminalQueryStripper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTerminalQueryStripper.swift; sourceTree = "<group>"; };
@@ -700,6 +710,8 @@
 			F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CJKIMEInputTests.swift; sourceTree = "<group>"; };
 			F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalViewComposingTests.swift; sourceTree = "<group>"; };
 			F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyConfigTests.swift; sourceTree = "<group>"; };
+			CRT00001 /* CardRingGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardRingGeometryTests.swift; sourceTree = "<group>"; };
+			NLT00001 /* NotificationLapPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationLapPolicyTests.swift; sourceTree = "<group>"; };
 			4704CF490000000000000001 /* RenderTokenProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderTokenProbeTests.swift; sourceTree = "<group>"; };
 			F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEArrowKeyTests.swift; sourceTree = "<group>"; };
 			F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplitNodeTests.swift; sourceTree = "<group>"; };
@@ -951,6 +963,10 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				CVS00084 /* PeerRelaySession.swift */,
 				CVS00105 /* PeerHostStatsStore.swift */,
 				DRC00001 /* DiskReclamation.swift */,
+				CCH00001 /* CardChrome.swift */,
+				PGS00001 /* PaneGapSettings.swift */,
+				CRV00001 /* CardRingView.swift */,
+				NLP00001 /* NotificationLapPolicy.swift */,
 				WBE00001 /* WorkerBuildEnvironment.swift */,
 				DDG00001 /* DelegateDiskGate.swift */,
 				CVS00931 /* PeerTerminalQueryStripper.swift */,
@@ -1179,6 +1195,8 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */,
 				F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */,
 				F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */,
+				CRT00001 /* CardRingGeometryTests.swift */,
+				NLT00001 /* NotificationLapPolicyTests.swift */,
 				4704CF490000000000000001 /* RenderTokenProbeTests.swift */,
 				F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */,
 				F6000001A1B2C3D4E5F60718 /* SplitNodeTests.swift */,
@@ -1476,6 +1494,10 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				CVB00084 /* PeerRelaySession.swift in Sources */,
 				CVB00105 /* PeerHostStatsStore.swift in Sources */,
 				DRC00002 /* DiskReclamation.swift in Sources */,
+				CCH00002 /* CardChrome.swift in Sources */,
+				PGS00002 /* PaneGapSettings.swift in Sources */,
+				CRV00002 /* CardRingView.swift in Sources */,
+				NLP00002 /* NotificationLapPolicy.swift in Sources */,
 				WBE00002 /* WorkerBuildEnvironment.swift in Sources */,
 				DDG00002 /* DelegateDiskGate.swift in Sources */,
 				CVB00931 /* PeerTerminalQueryStripper.swift in Sources */,
@@ -1676,6 +1698,8 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */,
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */,
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */,
+				CRT00002 /* CardRingGeometryTests.swift in Sources */,
+				NLT00002 /* NotificationLapPolicyTests.swift in Sources */,
 				4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */,
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */,
 				F6000000A1B2C3D4E5F60718 /* SplitNodeTests.swift in Sources */,

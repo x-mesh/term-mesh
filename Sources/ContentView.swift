@@ -201,7 +201,6 @@ enum ReviewBoardWindowCommand {
 }
 
 enum ReviewBoardResizerLayout {
-    static let dividerWidth: CGFloat = 1
     static let hitTargetWidth: CGFloat = 9
 }
 
@@ -585,17 +584,56 @@ struct ContentView: View {
     }
 
     private var sidebarView: some View {
-        VerticalTabsSidebar(
+        let cardShape = RoundedRectangle(cornerRadius: BonsplitCardMetrics.cornerRadius, style: .continuous)
+        // The trailing gap comes from the terminal area's own outer margin.
+        let inset = PaneGapSettings.clamped(paneCardGap)
+        // The card starts below the titlebar strip, level with the pane cards,
+        // so the traffic lights and titlebar controls sit on the window
+        // background instead of inside the card.
+        return VerticalTabsSidebar(
             updateViewModel: updateViewModel,
             selection: $sidebarSelectionState.selection,
             selectedTabIds: $selectedTabIds,
-            lastSidebarSelectionIndex: $lastSidebarSelectionIndex
+            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+            trafficLightPadding: Self.sidebarCardContentTopInset
         )
-        .frame(width: sidebarWidth)
+        .frame(width: max(0, sidebarWidth - inset))
+        // The sidebar's own material and tint are translucent; the card color
+        // under them makes it read as the same surface as the pane cards.
+        .background(Color(nsColor: BonsplitCardPalette.cardBackground(for: cardChromeAppearance)))
         // A fixed frame constrains layout, but SwiftUI still allows descendants
         // with a wider intrinsic size to draw outside it. Keep long peer names,
-        // paths, and status labels inside the sidebar boundary.
-        .clipped()
+        // paths, and status labels inside the sidebar card.
+        .clipShape(cardShape)
+        .overlay(
+            cardShape.strokeBorder(
+                Color(nsColor: BonsplitCardPalette.cardBorder(for: cardChromeAppearance, isFocused: false)),
+                lineWidth: BonsplitCardMetrics.borderWidth
+            )
+        )
+        .padding([.leading, .bottom], inset)
+        .padding(.top, titlebarPadding + BonsplitCardMetrics.outerTopMargin)
+        .frame(width: sidebarWidth)
+        .background(cardWindowBackground.ignoresSafeArea())
+        .overlay(alignment: .top) {
+            // Double-clicking the titlebar strip zooms the window, as it did
+            // when the strip was the top of the sidebar.
+            DoubleClickZoomView()
+                .frame(height: titlebarPadding)
+        }
+    }
+
+    private static let sidebarCardContentTopInset: CGFloat = 8
+
+    /// The same colors bonsplit derives for its pane cards, so the sidebar,
+    /// titlebar and panes sit on one window background.
+    private var cardChromeAppearance: BonsplitConfiguration.Appearance {
+        _ = titlebarThemeGeneration
+        return Workspace.bonsplitAppearance(from: theme.backgroundColor)
+    }
+
+    private var cardWindowBackground: Color {
+        Color(nsColor: BonsplitCardPalette.windowBackground(for: cardChromeAppearance))
     }
 
     /// Space at top of content area for the titlebar. This must be at least the actual titlebar
@@ -704,27 +742,34 @@ struct ContentView: View {
             terminalContentWithSidebarDropOverlay
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             if isReviewBoardShowing {
-                reviewBoardResizer
                 ReviewBoardPanelView(
                     viewModel: reviewBoardViewModel,
                     onClose: { isReviewBoardClosed = true }
                 )
+                // Level with the pane cards; the leading gap is the terminal
+                // area's own trailing margin.
+                .padding(.top, titlebarPadding + BonsplitCardMetrics.outerTopMargin)
+                .padding([.trailing, .bottom], PaneGapSettings.clamped(paneCardGap))
                 .frame(width: reviewBoardWidth)
+                .cardWindowBackground()
+                // The handle straddles that gap instead of taking width of its
+                // own, so this gap matches the ones between the pane cards.
+                .overlay(alignment: .leading) {
+                    reviewBoardResizer
+                        .offset(x: -(PaneGapSettings.clamped(paneCardGap) + ReviewBoardResizerLayout.hitTargetWidth) / 2)
+                }
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
         .animation(.easeOut(duration: 0.16), value: isReviewBoardShowing)
     }
 
+    /// The gap between the terminal cards and the Review Board card is the
+    /// divider, so the handle draws no line of its own; it only paints the
+    /// window background the cards sit on.
     private var reviewBoardResizer: some View {
-        Color.clear
+        cardWindowBackground
             .frame(width: ReviewBoardResizerLayout.hitTargetWidth)
-            .overlay {
-                Rectangle()
-                    .fill(Color(nsColor: .separatorColor))
-                    .frame(width: ReviewBoardResizerLayout.dividerWidth)
-                    .allowsHitTesting(false)
-            }
             .contentShape(Rectangle())
             .onHover { hovering in
                 hovering ? Self.fixedSidebarResizeCursor.set() : NSCursor.arrow.set()
@@ -767,34 +812,18 @@ struct ContentView: View {
     @AppStorage("debugTitlebarLeadingExtra") private var debugTitlebarLeadingExtra: Double = 0
 
     @State private var titlebarLeadingInset: CGFloat = 12
+    @AppStorage(PaneGapSettings.key) private var paneCardGap = PaneGapSettings.defaultValue
+    @AppStorage(PanePaddingSettings.horizontalKey) private var panePaddingX = PanePaddingSettings.defaultHorizontal
+    @AppStorage(PanePaddingSettings.topKey) private var panePaddingTop = PanePaddingSettings.defaultTop
+    @AppStorage(PanePaddingSettings.bottomKey) private var panePaddingBottom = PanePaddingSettings.defaultBottom
     private var windowIdentifier: String { "term-mesh.main.\(windowId.uuidString)" }
-    /// App chrome follows the chosen appearance, not the terminal's last
-    /// reported background. During a light-mode reload Ghostty can publish a
-    /// new white surface one run-loop before its app-level background update,
-    /// which previously left a black titlebar above an otherwise light window.
-    private var usesLightChrome: Bool {
-        !Self.isEffectivelyDark(appearanceMode)
-    }
-    private var fakeTitlebarBackground: Color {
-        _ = titlebarThemeGeneration
-        if usesLightChrome {
-            return Color(nsColor: .windowBackgroundColor)
-        }
-        let minimumChromeOpacity: CGFloat = theme.isLightBackground ? 0.90 : 0.84
-        let chromeOpacity = max(minimumChromeOpacity, theme.backgroundOpacity)
-        return Color(nsColor: theme.backgroundColor.withAlphaComponent(chromeOpacity))
-    }
-    private var fakeTitlebarTextColor: Color {
-        _ = titlebarThemeGeneration
-        return usesLightChrome
-            ? Color.black.opacity(0.78)
-            : Color.white.opacity(0.82)
-    }
-
-    /// Adaptive titlebar text color based on actual terminal background, not color scheme.
+    /// The titlebar sits on the card window background, which is derived from
+    /// the terminal background, so its text follows that color rather than the
+    /// app appearance: a light app with a dark terminal theme has a dark strip.
     private func titlebarColor(opacity: Double) -> Color {
         _ = titlebarThemeGeneration
-        return usesLightChrome ? Color.black.opacity(opacity) : Color.white.opacity(opacity)
+        let isLight = BonsplitCardPalette.cardBackground(for: cardChromeAppearance).isLightForTitlebar
+        return isLight ? Color.black.opacity(opacity) : Color.white.opacity(opacity)
     }
     private var fullscreenControls: some View {
         TitlebarControlsView(
@@ -874,12 +903,7 @@ struct ContentView: View {
         .frame(height: titlebarPadding)
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
-        .background(fakeTitlebarBackground)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor))
-                .frame(height: 1)
-        }
+        .background(cardWindowBackground)
         .overlay(alignment: .top) {
             if let progress = tabManager.titlebarProgress {
                 TitlebarProgressBar(progress: progress)
@@ -889,34 +913,32 @@ struct ContentView: View {
     }
 
     private var titlebarBranchAndDirectory: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 8) {
             if !titlebarGitBranch.isEmpty {
-                Image(systemName: titlebarIsWorktree ? "arrow.triangle.swap" : "arrow.triangle.branch")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(titlebarIsWorktree ? .cyan.opacity(0.8) : titlebarColor(opacity: 0.7))
-                Text(titlebarGitBranch)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundColor(titlebarIsWorktree ? .cyan.opacity(0.9) : titlebarColor(opacity: 0.85))
-                if !titlebarWorktreeName.isEmpty {
-                    Text("⋮")
-                        .font(.system(size: 11))
-                        .foregroundColor(titlebarColor(opacity: 0.4))
-                    Text(titlebarWorktreeName)
-                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-                        .foregroundColor(titlebarColor(opacity: 0.65))
+                HStack(spacing: 5) {
+                    Image(systemName: titlebarIsWorktree ? "arrow.triangle.swap" : "arrow.triangle.branch")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(titlebarIsWorktree ? .cyan.opacity(0.8) : titlebarColor(opacity: 0.7))
+                    Text(titlebarGitBranch)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(titlebarIsWorktree ? .cyan.opacity(0.9) : titlebarColor(opacity: 0.85))
+                    if !titlebarWorktreeName.isEmpty {
+                        Text("⋮")
+                            .font(.system(size: 11))
+                            .foregroundColor(titlebarColor(opacity: 0.4))
+                        Text(titlebarWorktreeName)
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .foregroundColor(titlebarColor(opacity: 0.65))
+                    }
+                    if titlebarGitDirty {
+                        Text(titlebarGitDirtyCount > 0 ? "±\(titlebarGitDirtyCount)" : "±")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundColor(.orange.opacity(0.9))
+                    }
                 }
-                if titlebarGitDirty {
-                    Text(titlebarGitDirtyCount > 0 ? "±\(titlebarGitDirtyCount)" : "±")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundColor(.orange.opacity(0.9))
-                }
+                .modifier(TitlebarChipBackground(appearance: cardChromeAppearance, shape: .rounded))
             }
             if !titlebarDirBasename.isEmpty {
-                if !titlebarGitBranch.isEmpty {
-                    Text("·")
-                        .font(.system(size: 11))
-                        .foregroundColor(titlebarColor(opacity: 0.4))
-                }
                 Text(titlebarDirBasename)
                     .font(.system(size: 11, weight: .regular))
                     .foregroundColor(titlebarColor(opacity: 0.6))
@@ -1144,6 +1166,7 @@ struct ContentView: View {
             // regardless of what is running.
         }
         .lineLimit(1)
+        .modifier(TitlebarChipBackground(appearance: cardChromeAppearance, shape: .capsule))
     }
 
     /// The Review Board toggle, kept out of `titlebarRightInfo`.
@@ -2271,6 +2294,27 @@ struct ContentView: View {
 
         view = AnyView(view.onChange(of: sidebarState.isVisible) { _ in
             updateSidebarResizerBandState()
+        })
+
+        view = AnyView(view.onChange(of: panePaddingX) { _ in
+            // Ghostty owns the side padding. It applies a new value to
+            // terminals created after the reload; open ones keep theirs.
+            GhosttyApp.shared.reloadConfiguration(source: "settings.panePaddingSides")
+        })
+
+        view = AnyView(view.onChange(of: panePaddingTop) { _ in
+            for workspace in tabManager.tabs { workspace.applyPanePadding() }
+        })
+
+        view = AnyView(view.onChange(of: panePaddingBottom) { _ in
+            for workspace in tabManager.tabs { workspace.applyPanePadding() }
+        })
+
+        view = AnyView(view.onChange(of: paneCardGap) { _ in
+            let gap = PaneGapSettings.clamped(paneCardGap)
+            for workspace in tabManager.tabs {
+                workspace.applyCardGap(gap)
+            }
         })
 
         view = AnyView(view.ignoresSafeArea())
@@ -5345,5 +5389,46 @@ private struct ReviewBoardTitlebarToggle: View {
         )
         .onAppear { commandKeyMonitor.start() }
         .onDisappear { commandKeyMonitor.stop() }
+    }
+}
+
+/// The white chip or capsule the titlebar groups sit in, drawn with the same
+/// card colors as the panes below so the strip reads as part of that surface.
+private struct TitlebarChipBackground: ViewModifier {
+    enum Shape {
+        case rounded
+        case capsule
+    }
+
+    private static let height: CGFloat = 22
+    private static let horizontalPadding: CGFloat = 8
+    private static let cornerRadius: CGFloat = 7
+
+    let appearance: BonsplitConfiguration.Appearance
+    let shape: Shape
+
+    func body(content: Content) -> some View {
+        let fill = Color(nsColor: BonsplitCardPalette.cardBackground(for: appearance))
+        let border = Color(nsColor: BonsplitCardPalette.cardBorder(for: appearance, isFocused: false))
+        content
+            .padding(.horizontal, Self.horizontalPadding)
+            .frame(height: Self.height)
+            .background {
+                switch shape {
+                case .rounded:
+                    RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous).fill(fill)
+                        .overlay(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous).strokeBorder(border))
+                case .capsule:
+                    Capsule().fill(fill).overlay(Capsule().strokeBorder(border))
+                }
+            }
+    }
+}
+
+private extension NSColor {
+    var isLightForTitlebar: Bool {
+        let color = usingColorSpace(.sRGB) ?? self
+        let luminance = 0.299 * color.redComponent + 0.587 * color.greenComponent + 0.114 * color.blueComponent
+        return luminance > 0.5
     }
 }
