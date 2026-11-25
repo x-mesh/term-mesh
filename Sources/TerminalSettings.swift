@@ -100,6 +100,8 @@ enum TerminalSettingsOverride {
     static let fontFamilyKey = "terminalFontFamily"
     static let fallbackFontFamilyKey = "terminalFallbackFontFamily"
     static let fontSizeKey = "terminalFontSize"
+    static let fontSmoothingKey = "terminalFontSmoothing"
+    static let fontSmoothingStrengthKey = "terminalFontSmoothingStrength"
     static let themeLightKey = "terminalThemeLight"
     static let themeDarkKey = "terminalThemeDark"
     static let backgroundOpacityKey = "terminalBackgroundOpacity"
@@ -125,6 +127,10 @@ enum TerminalSettingsOverride {
         (defaults.object(forKey: key) as? NSNumber)?.doubleValue
     }
 
+    static func storedBool(_ defaults: UserDefaults, forKey key: String) -> Bool? {
+        (defaults.object(forKey: key) as? NSNumber)?.boolValue
+    }
+
     /// The file's contents for a given defaults + appearance mode, or nil when
     /// nothing is overridden. Pure — no filesystem — so the "an unset key must
     /// not produce a line" rule is directly testable.
@@ -132,6 +138,8 @@ enum TerminalSettingsOverride {
         let fontFamily = defaults.string(forKey: fontFamilyKey) ?? ""
         let fallbackFontFamily = defaults.string(forKey: fallbackFontFamilyKey) ?? ""
         let fontSize = defaults.double(forKey: fontSizeKey)
+        let fontSmoothing = storedBool(defaults, forKey: fontSmoothingKey)
+        let fontSmoothingStrength = defaults.object(forKey: fontSmoothingStrengthKey) as? NSNumber
         let themeLight = defaults.string(forKey: themeLightKey) ?? ""
         let themeDark = defaults.string(forKey: themeDarkKey) ?? ""
         let cursorColor = defaults.string(forKey: cursorColorKey) ?? ""
@@ -154,6 +162,12 @@ enum TerminalSettingsOverride {
         }
         if fontSize > 0 {
             lines.append("font-size = \(Int(fontSize))")
+        }
+        if let fontSmoothing {
+            lines.append("font-thicken = \(fontSmoothing)")
+            if fontSmoothing, let fontSmoothingStrength {
+                lines.append("font-thicken-strength = \(min(255, max(0, fontSmoothingStrength.intValue)))")
+            }
         }
         if let theme = themeLine(light: themeLight, dark: themeDark, mode: mode) {
             lines.append(theme)
@@ -381,6 +395,17 @@ enum TerminalThemeList {
         } catch {
             return []
         }
+    }
+}
+
+// MARK: - Font Family Search
+
+enum FontFamilySearch {
+    static func filtered(_ families: [String], query: String) -> [String] {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return families }
+
+        return families.filter { $0.localizedCaseInsensitiveContains(query) }
     }
 }
 

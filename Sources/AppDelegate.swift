@@ -332,6 +332,8 @@ enum TermMeshUserDefaultsObserver {
         TerminalSettingsOverride.fontFamilyKey,
         TerminalSettingsOverride.fallbackFontFamilyKey,
         TerminalSettingsOverride.fontSizeKey,
+        TerminalSettingsOverride.fontSmoothingKey,
+        TerminalSettingsOverride.fontSmoothingStrengthKey,
         TerminalSettingsOverride.themeLightKey,
         TerminalSettingsOverride.themeDarkKey,
         TerminalSettingsOverride.backgroundOpacityKey,
