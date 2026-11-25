@@ -198,7 +198,12 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fallbackFontFamilyKey) private var terminalFallbackFontFamily = ""
     @State private var fallbackFontSupport: [String: Set<String>]?
+    @State private var terminalFontSearchQuery = ""
+    @State private var terminalFallbackFontSearchQuery = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
+    @AppStorage(TerminalSettingsOverride.fontSmoothingKey) private var terminalFontSmoothing = false
+    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = 255
+    @State private var terminalFontSmoothingStrengthDraft = 255
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
     @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
     @AppStorage(TerminalSettingsOverride.backgroundOpacityKey) private var terminalBgOpacity: Double = -1
@@ -206,6 +211,10 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.cursorStyleKey) private var terminalCursorStyle = ""
     @AppStorage(TerminalSettingsOverride.scrollbackLimitKey) private var terminalScrollback: Int = 0
     @AppStorage(TerminalSettingsOverride.unfocusedSplitOpacityKey) private var terminalUnfocusedOpacity: Double = -1
+    @AppStorage(PaneGapSettings.key) private var paneCardGap = PaneGapSettings.defaultValue
+    @AppStorage(PanePaddingSettings.horizontalKey) private var panePaddingX = PanePaddingSettings.defaultHorizontal
+    @AppStorage(PanePaddingSettings.topKey) private var panePaddingTop = PanePaddingSettings.defaultTop
+    @AppStorage(PanePaddingSettings.bottomKey) private var panePaddingBottom = PanePaddingSettings.defaultBottom
     @AppStorage(TerminalSettingsOverride.splitDividerColorKey) private var terminalDividerColor = ""
 
     @AppStorage(PeerFederationSettings.autoStartKey) private var peerFederationAutoStart = false
@@ -223,8 +232,6 @@ struct SettingsView: View {
     @Environment(\.browserHistoryService) private var browserHistory
 
     @State private var shortcutResetToken = UUID()
-    @State private var topBlurOpacity: Double = 0
-    @State private var topBlurBaselineOffset: CGFloat?
     @State private var settingsTitleLeadingInset: CGFloat = 92
     @State private var settingsSearchQuery = ""
     @State private var showClearBrowserHistoryConfirmation = false
@@ -324,12 +331,6 @@ struct SettingsView: View {
 
     private var browserInsecureHTTPAllowlistHasUnsavedChanges: Bool {
         browserInsecureHTTPAllowlistDraft != browserInsecureHTTPAllowlist
-    }
-
-    private func blurOpacity(forContentOffset offset: CGFloat) -> Double {
-        guard let baseline = topBlurBaselineOffset else { return 0 }
-        let reveal = (baseline - offset) / 24
-        return Double(min(max(reveal, 0), 1))
     }
 
     private func saveSocketPassword() {
@@ -601,6 +602,24 @@ struct SettingsView: View {
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.5))
     }
 
+    private func panePaddingRow(_ title: String, value: Binding<Double>, defaultValue: Double) -> some View {
+        SettingsCardRow(
+            LocalizedStringKey(title),
+            verbatimSubtitle: "\(Int(PanePaddingSettings.clamped(value.wrappedValue))) px",
+            controlWidth: pickerColumnWidth
+        ) {
+            HStack(spacing: 6) {
+                Slider(value: value, in: PanePaddingSettings.range, step: 1)
+                if value.wrappedValue != defaultValue {
+                    Button("Reset") { value.wrappedValue = defaultValue }
+                        .buttonStyle(.borderless)
+                        .foregroundColor(.accentColor)
+                        .font(.caption)
+                }
+            }
+        }
+    }
+
     // MARK: - Top Bar
 
     private var settingsTopBar: some View {
@@ -608,35 +627,20 @@ struct SettingsView: View {
             SettingsTitleLeadingInsetReader(inset: $settingsTitleLeadingInset)
                 .frame(width: 0, height: 0)
 
-            AboutVisualEffectBackground(material: .underWindowBackground, blendingMode: .withinWindow)
+            // Opaque under the title so scrolled settings never show through it;
+            // only the last few points fade into the content.
+            Color(nsColor: .windowBackgroundColor)
                 .mask(
                     LinearGradient(
-                        colors: [
-                            Color.black.opacity(0.9),
-                            Color.black.opacity(0.64),
-                            Color.black.opacity(0.36),
-                            Color.clear
+                        stops: [
+                            .init(color: .black, location: 0),
+                            .init(color: .black, location: 0.8),
+                            .init(color: .clear, location: 1),
                         ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                 )
-                .opacity(0.52)
-
-            AboutVisualEffectBackground(material: .underWindowBackground, blendingMode: .withinWindow)
-                .mask(
-                    LinearGradient(
-                        colors: [
-                            Color.black.opacity(0.98),
-                            Color.black.opacity(0.78),
-                            Color.black.opacity(0.42),
-                            Color.clear
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                .opacity(0.14 + (topBlurOpacity * 0.86))
 
             HStack(spacing: 12) {
                 Text(LocalizedStringKey(selectedSection.title))
@@ -677,21 +681,6 @@ struct SettingsView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
             .padding(.top, 52)
-            .background(
-                GeometryReader { proxy in
-                    Color.clear.preference(
-                        key: SettingsTopOffsetPreferenceKey.self,
-                        value: proxy.frame(in: .named("SettingsContentArea")).minY
-                    )
-                }
-            )
-        }
-        .coordinateSpace(name: "SettingsContentArea")
-        .onPreferenceChange(SettingsTopOffsetPreferenceKey.self) { value in
-            if topBlurBaselineOffset == nil {
-                topBlurBaselineOffset = value
-            }
-            topBlurOpacity = blurOpacity(forContentOffset: value)
         }
     }
 
@@ -976,25 +965,37 @@ struct SettingsView: View {
                     subtitle: terminalFontFamily.isEmpty ? "Using ghostty config value" : nil,
                     controlWidth: pickerColumnWidth
                 ) {
-                    Picker("", selection: $terminalFontFamily) {
-                        Text("Default (from config)").tag("")
-                        let fonts = MonospaceFontList.list()
-                        let monoCount = MonospaceFontList.monospaceFontCount
-                        if monoCount > 0 {
-                            Divider()
-                            ForEach(fonts.prefix(monoCount), id: \.self) { font in
-                                Text(font).tag(font)
+                    VStack(alignment: .leading, spacing: 6) {
+                        TextField("Search installed fonts", text: $terminalFontSearchQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("Search font families")
+
+                        Picker("", selection: $terminalFontFamily) {
+                            Text("Default (from config)").tag("")
+                            let fonts = MonospaceFontList.list()
+                            let monoCount = MonospaceFontList.monospaceFontCount
+                            let mono = FontFamilySearch.filtered(
+                                Array(fonts.prefix(monoCount)), query: terminalFontSearchQuery
+                            )
+                            let other = FontFamilySearch.filtered(
+                                Array(fonts.suffix(from: monoCount)), query: terminalFontSearchQuery
+                            )
+                            if !mono.isEmpty {
+                                Divider()
+                                ForEach(mono, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
+                            }
+                            if !other.isEmpty {
+                                Divider()
+                                ForEach(other, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
                             }
                         }
-                        if fonts.count > monoCount {
-                            Divider()
-                            ForEach(fonts.suffix(from: monoCount), id: \.self) { font in
-                                Text(font).tag(font)
-                            }
-                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
                 }
             }
 
@@ -1008,38 +1009,53 @@ struct SettingsView: View {
                         : "Draws characters the primary font lacks (Korean, Japanese, Chinese, etc.)",
                     controlWidth: pickerColumnWidth
                 ) {
-                    Picker("", selection: $terminalFallbackFontFamily) {
-                        Text("None").tag("")
-                        let fonts = MonospaceFontList.list()
-                        let monoCount = MonospaceFontList.monospaceFontCount
-                        let sections = fallbackFontSections(
-                            mono: Array(fonts.prefix(monoCount)),
-                            other: Array(fonts.suffix(from: monoCount))
-                        )
-                        if !terminalFallbackFontFamily.isEmpty, !fonts.contains(terminalFallbackFontFamily) {
-                            Text(terminalFallbackFontFamily).tag(terminalFallbackFontFamily)
-                        }
-                        if !sections.preferred.isEmpty {
-                            Divider()
-                            ForEach(sections.preferred, id: \.self) { font in
-                                Text(font).tag(font)
+                    VStack(alignment: .leading, spacing: 6) {
+                        TextField("Search installed fonts", text: $terminalFallbackFontSearchQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("Search fallback font families")
+
+                        Picker("", selection: $terminalFallbackFontFamily) {
+                            Text("None").tag("")
+                            let fonts = MonospaceFontList.list()
+                            let monoCount = MonospaceFontList.monospaceFontCount
+                            let sections = fallbackFontSections(
+                                mono: Array(fonts.prefix(monoCount)),
+                                other: Array(fonts.suffix(from: monoCount))
+                            )
+                            let preferred = FontFamilySearch.filtered(
+                                sections.preferred, query: terminalFallbackFontSearchQuery
+                            )
+                            let mono = FontFamilySearch.filtered(
+                                sections.mono, query: terminalFallbackFontSearchQuery
+                            )
+                            let other = FontFamilySearch.filtered(
+                                sections.other, query: terminalFallbackFontSearchQuery
+                            )
+                            if !terminalFallbackFontFamily.isEmpty, !fonts.contains(terminalFallbackFontFamily) {
+                                Text(terminalFallbackFontFamily).tag(terminalFallbackFontFamily)
+                            }
+                            if !preferred.isEmpty {
+                                Divider()
+                                ForEach(preferred, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
+                            }
+                            if !mono.isEmpty {
+                                Divider()
+                                ForEach(mono, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
+                            }
+                            if !other.isEmpty {
+                                Divider()
+                                ForEach(other, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
                             }
                         }
-                        if !sections.mono.isEmpty {
-                            Divider()
-                            ForEach(sections.mono, id: \.self) { font in
-                                Text(font).tag(font)
-                            }
-                        }
-                        if !sections.other.isEmpty {
-                            Divider()
-                            ForEach(sections.other, id: \.self) { font in
-                                Text(font).tag(font)
-                            }
-                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
                     .disabled(terminalFontFamily.isEmpty)
                     .task { await loadFallbackFontSupport() }
                 }
@@ -1075,6 +1091,62 @@ struct SettingsView: View {
                             .foregroundColor(.accentColor)
                             .font(.caption)
                         }
+                    }
+                }
+            }
+
+            if settingsMatch("font", "smoothing", "thicken", "terminal") {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Font Smoothing",
+                    subtitle: "Thickens text to match the macOS system rendering style.",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        Toggle("", isOn: $terminalFontSmoothing)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+
+                        if UserDefaults.standard.object(forKey: TerminalSettingsOverride.fontSmoothingKey) != nil {
+                            Button("Reset") {
+                                UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingKey)
+                                UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundColor(.accentColor)
+                            .font(.caption)
+                        }
+                    }
+                }
+
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Smoothing Strength",
+                    verbatimSubtitle: terminalFontSmoothing ? "\(terminalFontSmoothingStrength) / 255" : "Enable font smoothing first",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        Slider(value: Binding(
+                            get: { Double(terminalFontSmoothingStrengthDraft) },
+                            set: { terminalFontSmoothingStrengthDraft = Int($0) }
+                        ), in: 0...255, step: 1, onEditingChanged: { editing in
+                            guard !editing else { return }
+                            terminalFontSmoothingStrength = terminalFontSmoothingStrengthDraft
+                        })
+                        .disabled(!terminalFontSmoothing)
+                        .onAppear {
+                            terminalFontSmoothingStrengthDraft = terminalFontSmoothingStrength
+                        }
+                        .onChange(of: terminalFontSmoothingStrength) { value in
+                            terminalFontSmoothingStrengthDraft = value
+                        }
+
+                        Text("\(terminalFontSmoothingStrength)")
+                            .monospacedDigit()
+                            .frame(width: 28, alignment: .trailing)
+                            .foregroundStyle(terminalFontSmoothing ? .primary : .secondary)
                     }
                 }
             }
@@ -1197,6 +1269,36 @@ struct SettingsView: View {
                         }
                     }
                 }
+            }
+
+            if settingsMatch("pane", "gap", "spacing", "margin", "split", "sidebar", "card") {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Pane Spacing",
+                    verbatimSubtitle: "\(Int(PaneGapSettings.clamped(paneCardGap))) px",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        Slider(value: $paneCardGap, in: PaneGapSettings.range, step: 1)
+                        if paneCardGap != PaneGapSettings.defaultValue {
+                            Button("Reset") { paneCardGap = PaneGapSettings.defaultValue }
+                                .buttonStyle(.borderless)
+                                .foregroundColor(.accentColor)
+                                .font(.caption)
+                        }
+                    }
+                }
+            }
+
+            if settingsMatch("pane", "padding", "inset", "margin", "terminal") {
+                SettingsCardDivider()
+
+                panePaddingRow("Pane Padding (Sides)", value: $panePaddingX, defaultValue: PanePaddingSettings.defaultHorizontal)
+                SettingsCardDivider()
+                panePaddingRow("Pane Padding (Top)", value: $panePaddingTop, defaultValue: PanePaddingSettings.defaultTop)
+                SettingsCardDivider()
+                panePaddingRow("Pane Padding (Bottom)", value: $panePaddingBottom, defaultValue: PanePaddingSettings.defaultBottom)
             }
 
             if settingsMatch("split", "divider", "color", "border", "separator", "terminal") {
@@ -3214,6 +3316,10 @@ struct SettingsView: View {
         terminalFontFamily = ""
         terminalFallbackFontFamily = ""
         terminalFontSize = 0
+        terminalFontSmoothing = false
+        terminalFontSmoothingStrength = 255
+        UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingKey)
+        UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
         terminalThemeLight = ""
         terminalThemeDark = ""
         terminalBgOpacity = -1
@@ -3222,6 +3328,10 @@ struct SettingsView: View {
         terminalScrollback = 0
         terminalUnfocusedOpacity = -1
         terminalDividerColor = ""
+        panePaddingX = PanePaddingSettings.defaultHorizontal
+        panePaddingTop = PanePaddingSettings.defaultTop
+        panePaddingBottom = PanePaddingSettings.defaultBottom
+        paneCardGap = PaneGapSettings.defaultValue
         TerminalSettingsOverride.remove()
         socketControlMode = SocketControlSettings.defaultMode.rawValue
         claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled
@@ -3310,14 +3420,6 @@ private final class LatestRequest: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return request == latest
-    }
-}
-
-private struct SettingsTopOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }
 

@@ -5,10 +5,12 @@ private var splitContainerProgrammaticSyncDepth = 0
 
 private class ThemedSplitView: NSSplitView {
     var customDividerColor: NSColor?
+    /// The gap between the two pane cards; the divider is that gap.
+    var cardGap: CGFloat = BonsplitCardMetrics.gap
     private(set) var zoomedChildIndex: Int?
 
     override var dividerThickness: CGFloat {
-        zoomedChildIndex == nil ? super.dividerThickness : 0
+        zoomedChildIndex == nil ? cardGap : 0
     }
 
     func setZoomedChild(_ index: Int?) {
@@ -156,7 +158,8 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 #else
         let splitView = ThemedSplitView()
 #endif
-        splitView.customDividerColor = TabBarColors.nsColorSeparator(for: appearance)
+        splitView.customDividerColor = TabBarColors.splitGapColor
+        splitView.cardGap = appearance.cardGap
         splitView.isVertical = splitState.orientation == .horizontal
         splitView.dividerStyle = .thin
         splitView.delegate = context.coordinator
@@ -376,7 +379,11 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         splitView.wantsLayer = true
         splitView.layer?.backgroundColor = NSColor.clear.cgColor
         splitView.layer?.isOpaque = false
-        (splitView as? ThemedSplitView)?.customDividerColor = TabBarColors.nsColorSeparator(for: appearance)
+        (splitView as? ThemedSplitView)?.customDividerColor = TabBarColors.splitGapColor
+        if let themed = splitView as? ThemedSplitView, themed.cardGap != appearance.cardGap {
+            themed.cardGap = appearance.cardGap
+            themed.adjustSubviews()
+        }
 
         // Update orientation if changed
         splitView.isVertical = splitState.orientation == .horizontal

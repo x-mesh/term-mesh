@@ -153,6 +153,11 @@ final class TerminalNotificationStore: ObservableObject {
         notifications.contains { $0.tabId == tabId && $0.surfaceId == surfaceId && !$0.isRead }
     }
 
+    /// Newest first: `addNotification` inserts at the front.
+    func latestUnreadNotificationID(forTabId tabId: UUID, surfaceId: UUID?) -> UUID? {
+        notifications.first { $0.tabId == tabId && $0.surfaceId == surfaceId && !$0.isRead }?.id
+    }
+
     func latestNotification(forTabId tabId: UUID) -> TerminalNotification? {
         if let unread = notifications.first(where: { $0.tabId == tabId && !$0.isRead }) {
             return unread

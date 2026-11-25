@@ -16,6 +16,19 @@ import XCTest
 /// never written.
 final class TerminalOverrideIsolationTests: XCTestCase {
 
+    func test_fontFamilySearch_matchesCaseInsensitively() {
+        let fonts = ["JetBrains Mono", "Menlo", "SF Mono"]
+
+        XCTAssertEqual(FontFamilySearch.filtered(fonts, query: "MONO"), ["JetBrains Mono", "SF Mono"])
+    }
+
+    func test_fontFamilySearch_trimsQueryAndKeepsAllFontsWhenEmpty() {
+        let fonts = ["JetBrains Mono", "Menlo", "SF Mono"]
+
+        XCTAssertEqual(FontFamilySearch.filtered(fonts, query: "  men  "), ["Menlo"])
+        XCTAssertEqual(FontFamilySearch.filtered(fonts, query: "  \n"), fonts)
+    }
+
     private var scratch: URL!
     private var defaultsSuite: String!
     private var defaults: UserDefaults!
@@ -163,6 +176,26 @@ final class TerminalOverrideIsolationTests: XCTestCase {
         defaults.set("#5A6370", forKey: TerminalSettingsOverride.splitDividerColorKey)
         let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
         XCTAssertTrue(lines.contains("split-divider-color = #5A6370"), "got \(lines)")
+    }
+
+    func test_configLines_fontSmoothingWritesEnabledStateAndStrength() throws {
+        defaults.set(true, forKey: TerminalSettingsOverride.fontSmoothingKey)
+        defaults.set(128, forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
+
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+
+        XCTAssertTrue(lines.contains("font-thicken = true"), "got \(lines)")
+        XCTAssertTrue(lines.contains("font-thicken-strength = 128"), "got \(lines)")
+    }
+
+    func test_configLines_fontSmoothingDisabledOmitsStrength() throws {
+        defaults.set(false, forKey: TerminalSettingsOverride.fontSmoothingKey)
+        defaults.set(128, forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
+
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+
+        XCTAssertTrue(lines.contains("font-thicken = false"), "got \(lines)")
+        XCTAssertFalse(lines.contains(where: { $0.hasPrefix("font-thicken-strength =") }), "got \(lines)")
     }
 
     /// `-1` is the sentinel @AppStorage declares as its default for this key,

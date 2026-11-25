@@ -2,33 +2,24 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-private struct SelectedTabFramePreferenceKey: PreferenceKey {
-    static let defaultValue: CGRect? = nil
-
-    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
-        if let next = nextValue() {
-            value = next
-        }
-    }
-}
-
 enum TabBarStyling {
-    static func separatorSegments(
-        totalWidth: CGFloat,
-        gap: ClosedRange<CGFloat>?
-    ) -> (left: CGFloat, right: CGFloat) {
-        let clampedTotal = max(0, totalWidth)
-        guard let gap else {
-            return (left: clampedTotal, right: 0)
-        }
+    static func showsPaneTools(isFocused: Bool, isHovered: Bool) -> Bool {
+        isFocused || isHovered
+    }
 
-        let start = min(max(gap.lowerBound, 0), clampedTotal)
-        let end = min(max(gap.upperBound, 0), clampedTotal)
-        let normalizedStart = min(start, end)
-        let normalizedEnd = max(start, end)
-        let left = max(0, normalizedStart)
-        let right = max(0, clampedTotal - normalizedEnd)
-        return (left: left, right: right)
+    /// Below this width the row of tools leaves the tab too little room to show
+    /// its title, so they fold into one menu.
+    static let foldedToolsBarWidth: CGFloat = 340
+
+    static func foldsPaneTools(barWidth: CGFloat) -> Bool {
+        barWidth > 0 && barWidth < foldedToolsBarWidth
+    }
+
+    /// Before the strip is measured the width is zero; fall back to the
+    /// regular maximum rather than collapsing every tab to its minimum.
+    static func tabMaxWidth(containerWidth: CGFloat) -> CGFloat {
+        guard containerWidth > 0 else { return TabBarMetrics.tabMaxWidth }
+        return max(TabBarMetrics.tabMinWidth, min(TabBarMetrics.tabMaxWidth, containerWidth))
     }
 }
 
@@ -70,7 +61,8 @@ struct TabBarView: View {
     @State private var scrollOffset: CGFloat = 0
     @State private var contentWidth: CGFloat = 0
     @State private var containerWidth: CGFloat = 0
-    @State private var selectedTabFrameInBar: CGRect?
+    @State private var isBarHovered = false
+    @State private var barWidth: CGFloat = 0
     @StateObject private var controlKeyMonitor = TabControlShortcutKeyMonitor()
 
     private var canScrollLeft: Bool {
@@ -176,15 +168,35 @@ struct TabBarView: View {
                 .overlay(fadeOverlays)
             }
 
-            // Split buttons
-            if showSplitButtons {
-                splitButtons
-                    .saturation(tabBarSaturation)
+            // Hidden tools give their width back: a narrow pane cannot spare the
+            // row of buttons, and keeping their space truncated and scrolled
+            // its own tab.
+            if showSplitButtons,
+               TabBarStyling.showsPaneTools(isFocused: isFocused, isHovered: isBarHovered) {
+                Group {
+                    if TabBarStyling.foldsPaneTools(barWidth: barWidth) {
+                        foldedToolsMenu
+                    } else {
+                        splitButtons
+                    }
+                }
+                .saturation(tabBarSaturation)
             }
         }
+        .padding(.leading, TabBarMetrics.barLeadingInset)
+        .background(
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { barWidth = geometry.size.width }
+                    .onChange(of: geometry.size.width) { _, width in barWidth = width }
+            }
+        )
         .frame(height: TabBarMetrics.barHeight)
         .coordinateSpace(name: "tabBar")
         .contentShape(Rectangle())
+        .onHover { hovering in
+            isBarHovered = hovering
+        }
         .background(tabBarBackground)
         .background(
             TabBarHostWindowReader { window in
@@ -208,9 +220,6 @@ struct TabBarView: View {
         }
         .onAppear {
             controlKeyMonitor.start()
-        }
-        .onPreferenceChange(SelectedTabFramePreferenceKey.self) { frame in
-            selectedTabFrameInBar = frame
         }
         .onDisappear {
             controlKeyMonitor.stop()
@@ -266,16 +275,10 @@ struct TabBarView: View {
                 controller.requestTabContextAction(action, for: TabID(id: tab.id), inPane: pane.id)
             }
         )
-        .background(
-            GeometryReader { geometry in
-                Color.clear.preference(
-                    key: SelectedTabFramePreferenceKey.self,
-                    value: pane.selectedTabId == tab.id
-                        ? geometry.frame(in: .named("tabBar"))
-                        : nil
-                )
-            }
-        )
+        // The tab strip scrolls, so nothing caps a tab at the pane's width; a
+        // tab wider than its pane scrolled its icon out of view. Truncate the
+        // title instead.
+        .frame(maxWidth: TabBarStyling.tabMaxWidth(containerWidth: containerWidth))
         .onDrag {
             createItemProvider(for: tab)
         } preview: {
@@ -516,76 +519,71 @@ struct TabBarView: View {
         .padding(.trailing, 8)
     }
 
+    /// The same actions as `splitButtons`, behind one button for narrow panes.
+    @ViewBuilder
+    private var foldedToolsMenu: some View {
+        let tooltips = controller.configuration.appearance.splitButtonTooltips
+        let _ = pane.headerActionsRevision
+        let headerActions = controller.paneHeaderActions?(
+            pane.id,
+            pane.selectedTabId.map { TabID(id: $0) }
+        ) ?? []
+
+        Menu {
+            Button(tooltips.newTerminal) { controller.requestNewTab(kind: "terminal", inPane: pane.id) }
+            Button(tooltips.newBrowser) { controller.requestNewTab(kind: "browser", inPane: pane.id) }
+            Divider()
+            Button(tooltips.splitRight) { controller.splitPane(pane.id, orientation: .horizontal) }
+            Button(tooltips.splitDown) { controller.splitPane(pane.id, orientation: .vertical) }
+            if !headerActions.isEmpty {
+                Divider()
+                ForEach(headerActions) { action in
+                    Button(action.help) { action.action() }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12))
+                .foregroundStyle(TabBarColors.splitActionIcon(for: appearance, isPressed: false))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel("Pane actions")
+        .padding(.trailing, 8)
+    }
+
     // MARK: - Fade Overlays
 
     @ViewBuilder
+    /// Fades only the strip the tab pills sit in. The header shares the card's
+    /// surface, and the card's border runs along the header's top edge, so a
+    /// fade as tall as the header painted over that border.
     private var fadeOverlays: some View {
         let fadeWidth: CGFloat = 24
+        let surface = TabBarColors.paneBackground(for: appearance)
 
         HStack(spacing: 0) {
-            // Left fade
-            LinearGradient(
-                colors: [
-                    TabBarColors.barBackground(for: appearance),
-                    TabBarColors.barBackground(for: appearance).opacity(0),
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-            .frame(width: fadeWidth)
-            .opacity(canScrollLeft ? 1 : 0)
-            .allowsHitTesting(false)
+            LinearGradient(colors: [surface, surface.opacity(0)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: fadeWidth)
+                .opacity(canScrollLeft ? 1 : 0)
 
             Spacer()
 
-            // Right fade
-            LinearGradient(
-                colors: [
-                    TabBarColors.barBackground(for: appearance).opacity(0),
-                    TabBarColors.barBackground(for: appearance),
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-            .frame(width: fadeWidth)
-            .opacity(canScrollRight ? 1 : 0)
-            .allowsHitTesting(false)
+            LinearGradient(colors: [surface.opacity(0), surface], startPoint: .leading, endPoint: .trailing)
+                .frame(width: fadeWidth)
+                .opacity(canScrollRight ? 1 : 0)
         }
+        .frame(height: BonsplitCardMetrics.tabPillHeight)
+        .allowsHitTesting(false)
     }
 
     // MARK: - Background
 
-    @ViewBuilder
+    /// The header shares the card's surface, so it has no fill or separator of
+    /// its own; the pane card behind it supplies both.
     private var tabBarBackground: some View {
-        let barFill = isFocused
-            ? TabBarColors.barBackground(for: appearance)
-            : TabBarColors.barBackground(for: appearance).opacity(0.95)
-
-        Rectangle()
-            .fill(barFill)
-            .overlay(alignment: .bottom) {
-                GeometryReader { geometry in
-                    let separator = TabBarColors.separator(for: appearance)
-                    let gapRange: ClosedRange<CGFloat>? = selectedTabFrameInBar.map { frame in
-                        frame.minX...frame.maxX
-                    }
-                    let segments = TabBarStyling.separatorSegments(
-                        totalWidth: geometry.size.width,
-                        gap: gapRange
-                    )
-
-                    HStack(spacing: 0) {
-                        Rectangle()
-                            .fill(separator)
-                            .frame(width: segments.left, height: 1)
-                        Spacer(minLength: 0)
-                        Rectangle()
-                            .fill(separator)
-                            .frame(width: segments.right, height: 1)
-                    }
-                }
-                .frame(height: 1)
-            }
+        Color.clear
     }
 }
 

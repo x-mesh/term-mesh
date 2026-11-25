@@ -1083,6 +1083,14 @@ class GhosttyApp {
         keybind = shift+page_down=scroll_page_down
         keybind = shift+home=scroll_to_top
         keybind = shift+end=scroll_to_bottom
+        # term-mesh pads the terminal grid itself (Settings > Pane Padding) and
+        # snaps it to whole rows; Ghostty's own vertical padding would sit
+        # inside that and throw the row math off.
+        window-padding-y = 0
+        # The sides are Ghostty's padding so a colored row, such as a powerline
+        # prompt, can extend its background to the card edge.
+        window-padding-x = \(Int(PanePaddingSettings.currentHorizontal))
+        window-padding-color = extend
         """
         guard let url = Self.baselineDefaultsURL() else { return }
         do {

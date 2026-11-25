@@ -164,14 +164,12 @@ struct TabItemView: View {
             trailingAccessory
         }
         .padding(.horizontal, TabBarMetrics.tabHorizontalPadding)
-        .offset(y: isSelected ? 0.5 : 0)
         .frame(
             minWidth: TabBarMetrics.tabMinWidth,
             maxWidth: TabBarMetrics.tabMaxWidth,
             minHeight: TabBarMetrics.tabHeight,
             maxHeight: TabBarMetrics.tabHeight
         )
-        .padding(.bottom, isSelected ? 1 : 0)
         .background(tabBackground.saturation(saturation))
         .animation(.easeInOut(duration: 0.14), value: showsShortcutHint)
         .contentShape(Rectangle())
@@ -448,30 +446,17 @@ struct TabItemView: View {
 
     @ViewBuilder
     private var tabBackground: some View {
-        ZStack(alignment: .top) {
-            // Background fill (hover)
-            if TabItemStyling.shouldShowHoverBackground(isHovered: isHovered, isSelected: isSelected) {
-                Rectangle()
-                    .fill(TabBarColors.hoveredTabBackground(for: appearance))
+        let pill = RoundedRectangle(cornerRadius: BonsplitCardMetrics.tabPillCornerRadius, style: .continuous)
+        Group {
+            if isSelected {
+                pill.fill(TabBarColors.activeTabBackground(for: appearance))
+            } else if TabItemStyling.shouldShowHoverBackground(isHovered: isHovered, isSelected: isSelected) {
+                pill.fill(TabBarColors.hoveredTabBackground(for: appearance))
             } else {
                 Color.clear
             }
-
-            // Top accent indicator for selected tab
-            if isSelected {
-                Rectangle()
-                    .fill(Color.accentColor)
-                    .frame(height: TabBarMetrics.activeIndicatorHeight)
-            }
-
-            // Right border separator
-            HStack {
-                Spacer()
-                Rectangle()
-                    .fill(TabBarColors.separator(for: appearance))
-                    .frame(width: 1)
-            }
         }
+        .frame(height: BonsplitCardMetrics.tabPillHeight)
     }
 
     // MARK: - Close Button / Dirty Indicator

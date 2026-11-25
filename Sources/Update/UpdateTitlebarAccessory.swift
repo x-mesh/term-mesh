@@ -35,9 +35,9 @@ enum TitlebarControlsStyle: Int, CaseIterable, Identifiable {
         switch self {
         case .classic:
             return TitlebarControlsStyleConfig(
-                spacing: 10,
-                iconSize: 15,
-                buttonSize: 24,
+                spacing: 8,
+                iconSize: 13,
+                buttonSize: 22,
                 badgeSize: 14,
                 badgeOffset: CGSize(width: 2, height: -2),
                 groupBackground: false,
@@ -751,8 +751,11 @@ struct TitlebarControlsView: View {
 
     @ViewBuilder
     private func iconLabel(systemName: String, config: TitlebarControlsStyleConfig) -> some View {
+        // Regular weight in the secondary tone, like the pane cards' header
+        // tools, so the window chrome stays quieter than the content.
         let icon = Image(systemName: systemName)
-            .font(.system(size: config.iconSize, weight: .semibold))
+            .font(.system(size: config.iconSize, weight: .regular))
+            .foregroundStyle(.secondary)
             .frame(width: config.buttonSize, height: config.buttonSize)
 
         if config.buttonBackground {
