@@ -40,8 +40,10 @@ struct VerticalTabsSidebar: View {
     @AppStorage(SidebarAxisSettings.selectedAxisKey)
     private var selectedAxisRaw = SidebarAxisSettings.defaultAxis.rawValue
 
-    /// Space at top of sidebar for traffic light buttons
-    private let trafficLightPadding: CGFloat = 28
+    /// Space at the top of the sidebar content. The window's traffic lights
+    /// need the default; a host that starts the sidebar below the titlebar
+    /// passes a small inset instead.
+    var trafficLightPadding: CGFloat = 28
     private let tabRowSpacing: CGFloat = 2
 
     /// With the switch turned off there is no way to reach the Project view,
@@ -191,10 +193,6 @@ struct VerticalTabsSidebar: View {
                     }
                     .frame(width: 0, height: 0)
                 )
-                .overlay(alignment: .top) {
-                    SidebarTopScrim(height: trafficLightPadding + 20)
-                        .allowsHitTesting(false)
-                }
                 .overlay(alignment: .top) {
                     // Double-click the sidebar title-bar area to zoom the
                     // window, matching the panel top-bar behaviour.
@@ -991,23 +989,17 @@ struct SidebarAxisPicker: View, Equatable {
     }
 
     var body: some View {
-        Picker(
-            "",
-            selection: Binding(
-                get: { selection },
-                set: onSelectionChange
+        HStack(spacing: 0) {
+            UnderlineTabPicker(
+                items: SidebarAxis.allCases.map {
+                    UnderlineTabItem(value: $0.rawValue, title: $0.title, accessibilityLabel: $0.accessibilityDescription)
+                },
+                selection: selection,
+                onSelect: onSelectionChange
             )
-        ) {
-            ForEach(SidebarAxis.allCases) { axis in
-                Text(axis.title)
-                    .accessibilityLabel(axis.accessibilityDescription)
-                    .tag(axis.rawValue)
-            }
+            Spacer(minLength: 0)
         }
-        .pickerStyle(.segmented)
-        .controlSize(.small)
-        .labelsHidden()
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 16)
         .accessibilityIdentifier("sidebar.axis")
         .accessibilityLabel("Sidebar grouping")
         .help("Lead with machines, or lead with projects")
@@ -3176,6 +3168,11 @@ struct RemoteHostGroupView: View, Equatable {
                     }
                     diskBadge
                     Spacer(minLength: 4)
+                    if showsInlineOfflineStatus {
+                        Text("Offline")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.secondary.opacity(0.8))
+                    }
                 }
                 .contentShape(Rectangle())
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3404,10 +3401,18 @@ struct RemoteHostGroupView: View, Equatable {
         }
     }
 
+    /// A saved host with nothing on it says so on its own row instead of in a
+    /// second "Not connected" line under it, so a list of idle hosts stays one
+    /// line per host.
+    private var showsInlineOfflineStatus: Bool {
+        guard case .saved = host.connectionState else { return false }
+        return host.workspaces.isEmpty && offeredProjects.isEmpty
+    }
+
     @ViewBuilder
     private var hostWorkspacesContent: some View {
         if host.workspaces.isEmpty {
-            if offeredProjects.isEmpty {
+            if offeredProjects.isEmpty && !showsInlineOfflineStatus {
                 HStack(spacing: 8) {
                     if host.connectionPhase == nil {
                         Text(emptyBodyText)

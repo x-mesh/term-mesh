@@ -11,6 +11,7 @@ struct TerminalPanelView: View {
     let isSplit: Bool
     let appearance: PanelAppearance
     let hasUnreadNotification: Bool
+    let unreadNotificationID: UUID?
     let onFocus: () -> Void
     let onTriggerFlash: () -> Void
 
@@ -24,6 +25,7 @@ struct TerminalPanelView: View {
             portalZPriority: portalPriority,
             showsInactiveOverlay: isSplit && !isFocused,
             showsUnreadNotificationRing: hasUnreadNotification,
+            unreadNotificationID: unreadNotificationID,
             inactiveOverlayColor: appearance.unfocusedOverlayNSColor,
             inactiveOverlayOpacity: appearance.unfocusedOverlayOpacity,
             searchState: panel.searchState,

@@ -1766,6 +1766,46 @@
         }
       }
     },
+    "Pane Padding (Sides)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "pane 안쪽 여백 (좌우)"
+          }
+        }
+      }
+    },
+    "Pane Padding (Bottom)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "pane 안쪽 여백 (아래)"
+          }
+        }
+      }
+    },
+    "Pane Padding (Top)": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "pane 안쪽 여백 (위)"
+          }
+        }
+      }
+    },
+    "Pane Spacing": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "pane 간격"
+          }
+        }
+      }
+    },
     "Panes disconnect and reattach. Agent and shell processes on the host keep running. Shell records left behind by processes that already exited are cleared — this is the way to remove the ones Clean Up Panes reports it cannot close.": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "pane이 끊겼다가 다시 붙습니다. 호스트에서 실행 중인 에이전트와 셸 프로세스는 그대로 유지됩니다. 이미 종료된 프로세스가 남긴 셸 기록은 지워집니다 — Clean Up Panes가 닫지 못한다고 표시하는 항목을 없애는 방법입니다." } }

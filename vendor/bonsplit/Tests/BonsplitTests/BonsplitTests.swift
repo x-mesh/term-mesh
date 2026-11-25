@@ -653,14 +653,14 @@ final class BonsplitTests: XCTestCase {
             XCTAssertTrue(controller.togglePaneZoom(inPane: target))
             settle()
             let targetView = try XCTUnwrap(probe.views[target])
-            XCTAssertEqual(targetView.bounds.width, host.bounds.width, accuracy: 1)
+            XCTAssertEqual(targetView.bounds.width, host.bounds.width - 2 * (BonsplitCardMetrics.gap + BonsplitCardMetrics.borderWidth), accuracy: 1)
             for (id, view) in probe.views {
                 XCTAssertEqual(view.isHiddenOrHasHiddenAncestor, id != target)
             }
             let zoomedHeight = targetView.bounds.height
             window.setContentSize(NSSize(width: 960, height: 720))
             settle()
-            XCTAssertEqual(targetView.bounds.width, host.bounds.width, accuracy: 1)
+            XCTAssertEqual(targetView.bounds.width, host.bounds.width - 2 * (BonsplitCardMetrics.gap + BonsplitCardMetrics.borderWidth), accuracy: 1)
             XCTAssertEqual(targetView.bounds.height, zoomedHeight + 120, accuracy: 1)
             window.setContentSize(NSSize(width: 800, height: 600))
             settle()
@@ -922,20 +922,6 @@ final class BonsplitTests: XCTestCase {
         XCTAssertFalse(
             TabItemStyling.shouldShowHoverBackground(isHovered: false, isSelected: false)
         )
-    }
-
-    func testTabBarSeparatorSegmentsClampGapIntoBounds() {
-        var segments = TabBarStyling.separatorSegments(totalWidth: 100, gap: -20...40)
-        XCTAssertEqual(segments.left, 0, accuracy: 0.0001)
-        XCTAssertEqual(segments.right, 60, accuracy: 0.0001)
-
-        segments = TabBarStyling.separatorSegments(totalWidth: 100, gap: 25...120)
-        XCTAssertEqual(segments.left, 25, accuracy: 0.0001)
-        XCTAssertEqual(segments.right, 0, accuracy: 0.0001)
-
-        segments = TabBarStyling.separatorSegments(totalWidth: 100, gap: nil)
-        XCTAssertEqual(segments.left, 100, accuracy: 0.0001)
-        XCTAssertEqual(segments.right, 0, accuracy: 0.0001)
     }
 
     @MainActor

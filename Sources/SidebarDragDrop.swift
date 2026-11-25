@@ -462,40 +462,6 @@ struct SidebarDevFooter: View {
 }
 #endif
 
-struct SidebarTopScrim: View {
-    let height: CGFloat
-
-    var body: some View {
-        SidebarTopBlurEffect()
-            .frame(height: height)
-            .mask(
-                LinearGradient(
-                    colors: [
-                        Color.black.opacity(0.95),
-                        Color.black.opacity(0.75),
-                        Color.black.opacity(0.35),
-                        Color.clear
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
-    }
-}
-
-struct SidebarTopBlurEffect: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.blendingMode = .withinWindow
-        view.material = .underWindowBackground
-        view.state = .active
-        view.isEmphasized = false
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
 struct SidebarScrollViewResolver: NSViewRepresentable {
     let onResolve: (NSScrollView?) -> Void
 

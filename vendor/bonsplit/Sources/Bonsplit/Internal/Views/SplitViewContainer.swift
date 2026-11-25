@@ -17,7 +17,7 @@ struct SplitViewContainer<Content: View, EmptyContent: View>: View {
         GeometryReader { geometry in
             splitNodeContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(TabBarColors.paneBackground(for: appearance))
+                .background(TabBarColors.cardWindowBackground(for: appearance))
                 .focusable()
                 .focusEffectDisabled()
                 .onChange(of: geometry.size) { _, newSize in
@@ -27,6 +27,11 @@ struct SplitViewContainer<Content: View, EmptyContent: View>: View {
                     updateContainerFrame(geometry: geometry)
                 }
         }
+        // Outside the GeometryReader so the reported container frame, and every
+        // pane geometry derived from it, stays the area the panes occupy.
+        .padding([.leading, .trailing, .bottom], appearance.cardGap)
+        .padding(.top, BonsplitCardMetrics.outerTopMargin)
+        .background(TabBarColors.cardWindowBackground(for: appearance))
     }
 
     private func updateContainerFrame(geometry: GeometryProxy) {

@@ -4606,6 +4606,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
     var portalZPriority: Int = 0
     var showsInactiveOverlay: Bool = false
     var showsUnreadNotificationRing: Bool = false
+    var unreadNotificationID: UUID? = nil
     var inactiveOverlayColor: NSColor = .clear
     var inactiveOverlayOpacity: Double = 0
     var searchState: TerminalSurface.SearchState? = nil
@@ -4693,6 +4694,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
         var desiredIsActive: Bool = true
         var desiredIsVisibleInUI: Bool = true
         var desiredShowsUnreadNotificationRing: Bool = false
+        var desiredUnreadNotificationID: UUID?
         var desiredPortalZPriority: Int = 0
         var lastBoundHostId: ObjectIdentifier?
         var lastPaneDropZone: DropZone?
@@ -4721,6 +4723,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
         coordinator.desiredIsActive = isActive
         coordinator.desiredIsVisibleInUI = isVisibleInUI
         coordinator.desiredShowsUnreadNotificationRing = showsUnreadNotificationRing
+        coordinator.desiredUnreadNotificationID = unreadNotificationID
         coordinator.desiredPortalZPriority = portalZPriority
         coordinator.hostedView = hostedView
 #if DEBUG
@@ -4752,7 +4755,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
             opacity: CGFloat(inactiveOverlayOpacity),
             visible: showsInactiveOverlay
         )
-        hostedView.setNotificationRing(visible: showsUnreadNotificationRing)
+        hostedView.setNotificationRing(visible: showsUnreadNotificationRing, latestUnreadID: unreadNotificationID)
         hostedView.setSearchOverlay(searchState: searchState)
         // Re-applied on every update so a portal reattach (which rebinds the
         // hosted view without touching the surface) restores the button.
@@ -4798,7 +4801,10 @@ struct GhosttyTerminalView: NSViewRepresentable {
                 coordinator.lastBoundHostId = ObjectIdentifier(host)
                 hostedView.setVisibleInUI(coordinator.desiredIsVisibleInUI)
                 hostedView.setActive(coordinator.desiredIsActive)
-                hostedView.setNotificationRing(visible: coordinator.desiredShowsUnreadNotificationRing)
+                hostedView.setNotificationRing(
+                    visible: coordinator.desiredShowsUnreadNotificationRing,
+                    latestUnreadID: coordinator.desiredUnreadNotificationID
+                )
             }
             host.onGeometryChanged = { [weak host, weak coordinator] needsFullReconciliation in
                 guard let host, let coordinator else { return }
@@ -4844,6 +4850,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
         coordinator.desiredIsActive = false
         coordinator.desiredIsVisibleInUI = false
         coordinator.desiredShowsUnreadNotificationRing = false
+        coordinator.desiredUnreadNotificationID = nil
         coordinator.desiredPortalZPriority = 0
         coordinator.lastBoundHostId = nil
 

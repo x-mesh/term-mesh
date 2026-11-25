@@ -162,6 +162,10 @@ struct WorkspaceContentView: View {
                     isSplit: isSplit,
                     appearance: appearance,
                     hasUnreadNotification: hasUnreadNotification,
+                    unreadNotificationID: notificationStore.latestUnreadNotificationID(
+                        forTabId: workspace.id,
+                        surfaceId: panel.id
+                    ),
                     onFocus: {
                         // Keep bonsplit focus in sync with the AppKit first responder for the
                         // active workspace. This prevents divergence between the blue focused-tab

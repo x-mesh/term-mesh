@@ -265,8 +265,10 @@ final class GhosttySurfaceScrollView: NSView {
     private let surfaceView: GhosttyNSView
     private let inactiveOverlayView: GhosttyFlashOverlayView
     private let dropZoneOverlayView: GhosttyFlashOverlayView
-    private let notificationRingOverlayView: GhosttyFlashOverlayView
-    private let notificationRingLayer: CAShapeLayer
+    /// Drawn in the portal host beside this view so it can cover the pane's
+    /// tab bar and glow into the gap; see `CardRingView`.
+    private let cardRingView = CardRingView(frame: .zero)
+    private var lastLappedNotificationID: UUID?
     private let peerRingOverlayView: GhosttyFlashOverlayView
     private let peerRingLayer: CAShapeLayer
     /// Top-right pill showing how many peer-federation clients are
@@ -439,8 +441,6 @@ final class GhosttySurfaceScrollView: NSView {
         scrollView = GhosttyScrollView()
         inactiveOverlayView = GhosttyFlashOverlayView(frame: .zero)
         dropZoneOverlayView = GhosttyFlashOverlayView(frame: .zero)
-        notificationRingOverlayView = GhosttyFlashOverlayView(frame: .zero)
-        notificationRingLayer = CAShapeLayer()
         peerRingOverlayView = GhosttyFlashOverlayView(frame: .zero)
         peerRingLayer = CAShapeLayer()
         flashOverlayView = GhosttyFlashOverlayView(frame: .zero)
@@ -464,6 +464,11 @@ final class GhosttySurfaceScrollView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.masksToBounds = true
+        // The surface sits in the lower part of a rounded bonsplit card, one border
+        // width inside it, so only its bottom corners follow the card's curve.
+        layer?.cornerRadius = BonsplitCardMetrics.cornerRadius - BonsplitCardMetrics.borderWidth
+        layer?.cornerCurve = .continuous
+        layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
 
         backgroundView.wantsLayer = true
         backgroundView.layer?.backgroundColor = {
@@ -483,23 +488,6 @@ final class GhosttySurfaceScrollView: NSView {
         dropZoneOverlayView.layer?.cornerRadius = 8
         dropZoneOverlayView.isHidden = true
         addSubview(dropZoneOverlayView)
-        notificationRingOverlayView.wantsLayer = true
-        notificationRingOverlayView.layer?.backgroundColor = NSColor.clear.cgColor
-        notificationRingOverlayView.layer?.masksToBounds = false
-        notificationRingOverlayView.autoresizingMask = [.width, .height]
-        notificationRingLayer.fillColor = NSColor.clear.cgColor
-        notificationRingLayer.strokeColor = NSColor.systemBlue.cgColor
-        notificationRingLayer.lineWidth = 2.5
-        notificationRingLayer.lineJoin = .round
-        notificationRingLayer.lineCap = .round
-        notificationRingLayer.shadowColor = NSColor.systemBlue.cgColor
-        notificationRingLayer.shadowOpacity = 0.35
-        notificationRingLayer.shadowRadius = 3
-        notificationRingLayer.shadowOffset = .zero
-        notificationRingLayer.opacity = 0
-        notificationRingOverlayView.layer?.addSublayer(notificationRingLayer)
-        notificationRingOverlayView.isHidden = true
-        addSubview(notificationRingOverlayView)
 
         // Peer-attached ring: teal, drawn along the pane edge outside the
         // notification ring so both can be visible simultaneously
@@ -596,6 +584,19 @@ final class GhosttySurfaceScrollView: NSView {
             queue: .main
         ) { [weak self] _ in
             self?.synchronizeScrollView()
+            // The grid is snapped to whole rows of the old height.
+            self?.needsLayout = true
+        })
+
+        // The pane padding shows `backgroundView`, which only the focused
+        // pane used to repaint on a theme change; the others kept a band of
+        // the previous theme's color above and below their grid.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .ghosttyDefaultBackgroundDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.surfaceView.applySurfaceBackground()
         })
 
         observers.append(NotificationCenter.default.addObserver(
@@ -712,7 +713,9 @@ final class GhosttySurfaceScrollView: NSView {
             height: max(0, bounds.height - imeBarHeight)
         )
         backgroundView.frame = terminalBounds
-        scrollView.frame = terminalBounds
+        // The background still fills the whole area, so the padding shows the
+        // terminal's own color around the grid.
+        scrollView.frame = paddedTerminalFrame(in: terminalBounds)
         let targetSize = scrollView.bounds.size
         surfaceView.frame.size = targetSize
         documentView.frame.size.width = scrollView.bounds.width
@@ -786,7 +789,6 @@ final class GhosttySurfaceScrollView: NSView {
                 height: size.height
             )
         }
-        notificationRingOverlayView.frame = bounds
         peerRingOverlayView.frame = bounds
         flashOverlayView.frame = bounds
         let transferIndicatorSize = remotePasteTransferIndicator.fittingSize
@@ -796,7 +798,6 @@ final class GhosttySurfaceScrollView: NSView {
             width: transferIndicatorSize.width,
             height: transferIndicatorSize.height
         )
-        updateNotificationRingPath()
         updatePeerRingPath()
         updateFlashPath()
         synchronizeScrollView()
@@ -944,19 +945,82 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.commit()
     }
 
-    func setNotificationRing(visible: Bool) {
+    func setNotificationRing(visible: Bool, latestUnreadID: UUID?) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in
-                self?.setNotificationRing(visible: visible)
+                self?.setNotificationRing(visible: visible, latestUnreadID: latestUnreadID)
             }
             return
         }
 
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        notificationRingOverlayView.isHidden = !visible
-        notificationRingLayer.opacity = visible ? 1 : 0
-        CATransaction.commit()
+        let decision = NotificationLapPolicy.decide(
+            hasUnread: visible,
+            latestUnreadID: latestUnreadID,
+            lastLappedID: lastLappedNotificationID,
+            isVisibleInUI: surfaceView.isVisibleInUI && window != nil,
+            reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        )
+        lastLappedNotificationID = decision.lastLappedID
+        syncCardRing()
+        cardRingView.apply(ring: decision.ring)
+        if decision.playLap {
+            cardRingView.playLap()
+        }
+    }
+
+    override var isHidden: Bool {
+        didSet { syncCardRing() }
+    }
+
+    private func paddedTerminalFrame(in terminalBounds: NSRect) -> NSRect {
+        // The sides are Ghostty's `window-padding-x` (see the baseline config),
+        // so the app insets only the top and bottom.
+        let padded = PanePaddingSettings.contentRect(
+            in: terminalBounds,
+            horizontal: 0,
+            top: PanePaddingSettings.currentTop,
+            bottom: PanePaddingSettings.currentBottom
+        )
+        guard let surface = surfaceView.surface else { return padded }
+        let size = ghostty_surface_size(surface)
+        let scale = window?.backingScaleFactor ?? layer?.contentsScale ?? 1
+        return PanePaddingSettings.gridSnapped(padded, cellHeightPx: CGFloat(size.cell_height_px), scale: scale)
+    }
+
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        syncCardRing()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        syncCardRing()
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        syncCardRing()
+    }
+
+    /// Keeps the card ring beside this view in the portal host: same parent,
+    /// directly above it, framed to the whole card, hidden with it. Outside the
+    /// portal host (no bonsplit card around the surface) the ring is detached.
+    private func syncCardRing() {
+        guard let host = superview as? WindowTerminalHostView else {
+            if cardRingView.superview != nil { cardRingView.removeFromSuperview() }
+            return
+        }
+        if cardRingView.superview !== host {
+            host.addSubview(cardRingView, positioned: .above, relativeTo: self)
+        } else if let ringIndex = host.subviews.firstIndex(of: cardRingView),
+                  let selfIndex = host.subviews.firstIndex(of: self),
+                  ringIndex < selfIndex {
+            host.addSubview(cardRingView, positioned: .above, relativeTo: self)
+        }
+        let gap = PaneGapSettings.current
+        cardRingView.glowPadding = CardRingGeometry.glowPadding(gap: gap)
+        cardRingView.frame = CardRingGeometry.ringViewFrame(forSurfaceFrame: frame, gap: gap)
+        cardRingView.alphaValue = isHidden ? 0 : 1
     }
 
     /// Indicates whether one or more peer-federation clients are
@@ -2081,11 +2145,8 @@ final class GhosttySurfaceScrollView: NSView {
         )
     }
 
-    func debugNotificationRingState() -> (isHidden: Bool, opacity: Float) {
-        (
-            notificationRingOverlayView.isHidden,
-            notificationRingLayer.opacity
-        )
+    func debugNotificationRingState() -> (isHidden: Bool, lastLappedID: UUID?) {
+        (cardRingView.isHidden, lastLappedNotificationID)
     }
 
     func debugHasSearchOverlay() -> Bool {
@@ -2577,15 +2638,6 @@ final class GhosttySurfaceScrollView: NSView {
         let height = surfaceView.frame.height
         guard width > 0, height > 0 else { return }
         surfaceView.pushTargetSurfaceSize(CGSize(width: width, height: height))
-    }
-
-    private func updateNotificationRingPath() {
-        updateOverlayRingPath(
-            layer: notificationRingLayer,
-            bounds: notificationRingOverlayView.bounds,
-            inset: 2,
-            radius: 6
-        )
     }
 
     private func updatePeerRingPath() {

@@ -176,10 +176,14 @@ struct PaneContainerView<Content: View, EmptyContent: View>: View {
                 showSplitButtons: showSplitButtons
             )
 
-            // Content area with drop zones
+            // Inset by the border width so content hosted above SwiftUI (terminal and
+            // browser portals) leaves the card's border visible on three sides.
             contentAreaWithDropZones
+                .padding([.horizontal, .bottom], BonsplitCardMetrics.borderWidth)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(cardBackground)
+        .clipShape(cardShape)
         // Clear drop state when drag ends elsewhere (cancelled, dropped in another pane, etc.)
         .onChange(of: controller.draggingTab) { _, newValue in
 #if DEBUG
@@ -207,6 +211,24 @@ struct PaneContainerView<Content: View, EmptyContent: View>: View {
             )
 #endif
         }
+    }
+
+    // MARK: - Card
+
+    private var cardShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: BonsplitCardMetrics.cornerRadius, style: .continuous)
+    }
+
+    private var cardBackground: some View {
+        let appearance = bonsplitController.configuration.appearance
+        return cardShape
+            .fill(TabBarColors.paneBackground(for: appearance))
+            .overlay(
+                cardShape.strokeBorder(
+                    TabBarColors.cardBorder(for: appearance, isFocused: isFocused),
+                    lineWidth: BonsplitCardMetrics.borderWidth
+                )
+            )
     }
 
     // MARK: - Content Area with Drop Zones
