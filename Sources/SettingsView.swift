@@ -198,7 +198,12 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fallbackFontFamilyKey) private var terminalFallbackFontFamily = ""
     @State private var fallbackFontSupport: [String: Set<String>]?
+    @State private var terminalFontSearchQuery = ""
+    @State private var terminalFallbackFontSearchQuery = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
+    @AppStorage(TerminalSettingsOverride.fontSmoothingKey) private var terminalFontSmoothing = false
+    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = 255
+    @State private var terminalFontSmoothingStrengthDraft = 255
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
     @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
     @AppStorage(TerminalSettingsOverride.backgroundOpacityKey) private var terminalBgOpacity: Double = -1
@@ -976,25 +981,37 @@ struct SettingsView: View {
                     subtitle: terminalFontFamily.isEmpty ? "Using ghostty config value" : nil,
                     controlWidth: pickerColumnWidth
                 ) {
-                    Picker("", selection: $terminalFontFamily) {
-                        Text("Default (from config)").tag("")
-                        let fonts = MonospaceFontList.list()
-                        let monoCount = MonospaceFontList.monospaceFontCount
-                        if monoCount > 0 {
-                            Divider()
-                            ForEach(fonts.prefix(monoCount), id: \.self) { font in
-                                Text(font).tag(font)
+                    VStack(alignment: .leading, spacing: 6) {
+                        TextField("Search installed fonts", text: $terminalFontSearchQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("Search font families")
+
+                        Picker("", selection: $terminalFontFamily) {
+                            Text("Default (from config)").tag("")
+                            let fonts = MonospaceFontList.list()
+                            let monoCount = MonospaceFontList.monospaceFontCount
+                            let mono = FontFamilySearch.filtered(
+                                Array(fonts.prefix(monoCount)), query: terminalFontSearchQuery
+                            )
+                            let other = FontFamilySearch.filtered(
+                                Array(fonts.suffix(from: monoCount)), query: terminalFontSearchQuery
+                            )
+                            if !mono.isEmpty {
+                                Divider()
+                                ForEach(mono, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
+                            }
+                            if !other.isEmpty {
+                                Divider()
+                                ForEach(other, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
                             }
                         }
-                        if fonts.count > monoCount {
-                            Divider()
-                            ForEach(fonts.suffix(from: monoCount), id: \.self) { font in
-                                Text(font).tag(font)
-                            }
-                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
                 }
             }
 
@@ -1008,38 +1025,53 @@ struct SettingsView: View {
                         : "Draws characters the primary font lacks (Korean, Japanese, Chinese, etc.)",
                     controlWidth: pickerColumnWidth
                 ) {
-                    Picker("", selection: $terminalFallbackFontFamily) {
-                        Text("None").tag("")
-                        let fonts = MonospaceFontList.list()
-                        let monoCount = MonospaceFontList.monospaceFontCount
-                        let sections = fallbackFontSections(
-                            mono: Array(fonts.prefix(monoCount)),
-                            other: Array(fonts.suffix(from: monoCount))
-                        )
-                        if !terminalFallbackFontFamily.isEmpty, !fonts.contains(terminalFallbackFontFamily) {
-                            Text(terminalFallbackFontFamily).tag(terminalFallbackFontFamily)
-                        }
-                        if !sections.preferred.isEmpty {
-                            Divider()
-                            ForEach(sections.preferred, id: \.self) { font in
-                                Text(font).tag(font)
+                    VStack(alignment: .leading, spacing: 6) {
+                        TextField("Search installed fonts", text: $terminalFallbackFontSearchQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("Search fallback font families")
+
+                        Picker("", selection: $terminalFallbackFontFamily) {
+                            Text("None").tag("")
+                            let fonts = MonospaceFontList.list()
+                            let monoCount = MonospaceFontList.monospaceFontCount
+                            let sections = fallbackFontSections(
+                                mono: Array(fonts.prefix(monoCount)),
+                                other: Array(fonts.suffix(from: monoCount))
+                            )
+                            let preferred = FontFamilySearch.filtered(
+                                sections.preferred, query: terminalFallbackFontSearchQuery
+                            )
+                            let mono = FontFamilySearch.filtered(
+                                sections.mono, query: terminalFallbackFontSearchQuery
+                            )
+                            let other = FontFamilySearch.filtered(
+                                sections.other, query: terminalFallbackFontSearchQuery
+                            )
+                            if !terminalFallbackFontFamily.isEmpty, !fonts.contains(terminalFallbackFontFamily) {
+                                Text(terminalFallbackFontFamily).tag(terminalFallbackFontFamily)
+                            }
+                            if !preferred.isEmpty {
+                                Divider()
+                                ForEach(preferred, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
+                            }
+                            if !mono.isEmpty {
+                                Divider()
+                                ForEach(mono, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
+                            }
+                            if !other.isEmpty {
+                                Divider()
+                                ForEach(other, id: \.self) { font in
+                                    Text(font).tag(font)
+                                }
                             }
                         }
-                        if !sections.mono.isEmpty {
-                            Divider()
-                            ForEach(sections.mono, id: \.self) { font in
-                                Text(font).tag(font)
-                            }
-                        }
-                        if !sections.other.isEmpty {
-                            Divider()
-                            ForEach(sections.other, id: \.self) { font in
-                                Text(font).tag(font)
-                            }
-                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
                     .disabled(terminalFontFamily.isEmpty)
                     .task { await loadFallbackFontSupport() }
                 }
@@ -1075,6 +1107,62 @@ struct SettingsView: View {
                             .foregroundColor(.accentColor)
                             .font(.caption)
                         }
+                    }
+                }
+            }
+
+            if settingsMatch("font", "smoothing", "thicken", "terminal") {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Font Smoothing",
+                    subtitle: "Thickens text to match the macOS system rendering style.",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        Toggle("", isOn: $terminalFontSmoothing)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+
+                        if UserDefaults.standard.object(forKey: TerminalSettingsOverride.fontSmoothingKey) != nil {
+                            Button("Reset") {
+                                UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingKey)
+                                UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundColor(.accentColor)
+                            .font(.caption)
+                        }
+                    }
+                }
+
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Smoothing Strength",
+                    verbatimSubtitle: terminalFontSmoothing ? "\(terminalFontSmoothingStrength) / 255" : "Enable font smoothing first",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        Slider(value: Binding(
+                            get: { Double(terminalFontSmoothingStrengthDraft) },
+                            set: { terminalFontSmoothingStrengthDraft = Int($0) }
+                        ), in: 0...255, step: 1, onEditingChanged: { editing in
+                            guard !editing else { return }
+                            terminalFontSmoothingStrength = terminalFontSmoothingStrengthDraft
+                        })
+                        .disabled(!terminalFontSmoothing)
+                        .onAppear {
+                            terminalFontSmoothingStrengthDraft = terminalFontSmoothingStrength
+                        }
+                        .onChange(of: terminalFontSmoothingStrength) { value in
+                            terminalFontSmoothingStrengthDraft = value
+                        }
+
+                        Text("\(terminalFontSmoothingStrength)")
+                            .monospacedDigit()
+                            .frame(width: 28, alignment: .trailing)
+                            .foregroundStyle(terminalFontSmoothing ? .primary : .secondary)
                     }
                 }
             }
@@ -3214,6 +3302,10 @@ struct SettingsView: View {
         terminalFontFamily = ""
         terminalFallbackFontFamily = ""
         terminalFontSize = 0
+        terminalFontSmoothing = false
+        terminalFontSmoothingStrength = 255
+        UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingKey)
+        UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
         terminalThemeLight = ""
         terminalThemeDark = ""
         terminalBgOpacity = -1
