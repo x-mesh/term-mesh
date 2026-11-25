@@ -188,6 +188,16 @@ final class TerminalOverrideIsolationTests: XCTestCase {
         XCTAssertTrue(lines.contains("font-thicken-strength = 128"), "got \(lines)")
     }
 
+    func test_configLines_fontSmoothingWithoutAStoredStrengthWritesTheShownDefault() throws {
+        defaults.set(true, forKey: TerminalSettingsOverride.fontSmoothingKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertTrue(lines.contains("font-thicken = true"), "got \(lines)")
+        XCTAssertTrue(
+            lines.contains("font-thicken-strength = \(TerminalSettingsOverride.defaultFontSmoothingStrength)"),
+            "got \(lines)"
+        )
+    }
+
     func test_configLines_fontSmoothingDisabledOmitsStrength() throws {
         defaults.set(false, forKey: TerminalSettingsOverride.fontSmoothingKey)
         defaults.set(128, forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)

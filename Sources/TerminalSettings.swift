@@ -102,6 +102,10 @@ enum TerminalSettingsOverride {
     static let fontSizeKey = "terminalFontSize"
     static let fontSmoothingKey = "terminalFontSmoothing"
     static let fontSmoothingStrengthKey = "terminalFontSmoothingStrength"
+    /// The strength Settings shows before the slider is moved. Written with
+    /// smoothing turned on even when unset, so the file matches what the UI
+    /// shows instead of falling back to a value in the user's Ghostty config.
+    static let defaultFontSmoothingStrength = 255
     static let themeLightKey = "terminalThemeLight"
     static let themeDarkKey = "terminalThemeDark"
     static let backgroundOpacityKey = "terminalBackgroundOpacity"
@@ -165,8 +169,9 @@ enum TerminalSettingsOverride {
         }
         if let fontSmoothing {
             lines.append("font-thicken = \(fontSmoothing)")
-            if fontSmoothing, let fontSmoothingStrength {
-                lines.append("font-thicken-strength = \(min(255, max(0, fontSmoothingStrength.intValue)))")
+            if fontSmoothing {
+                let strength = fontSmoothingStrength?.intValue ?? defaultFontSmoothingStrength
+                lines.append("font-thicken-strength = \(min(255, max(0, strength)))")
             }
         }
         if let theme = themeLine(light: themeLight, dark: themeDark, mode: mode) {

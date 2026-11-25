@@ -202,7 +202,7 @@ struct SettingsView: View {
     @State private var terminalFallbackFontSearchQuery = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.fontSmoothingKey) private var terminalFontSmoothing = false
-    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = 255
+    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = TerminalSettingsOverride.defaultFontSmoothingStrength
     @State private var terminalFontSmoothingStrengthDraft = 255
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
     @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
