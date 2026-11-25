@@ -83,10 +83,23 @@ final class CardChromeTests: XCTestCase {
     func testExplicitDividerColorBecomesTheCardBorder() {
         let look = appearance(Self.darkTheme, border: "#112233")
         let focused = TabBarColors.nsColorCardBorder(for: look, isFocused: true).usingColorSpace(.sRGB)!
-        XCTAssertEqual(Int(round(focused.blueComponent * 255)), 51)
+        XCTAssertEqual(Int(round(focused.redComponent * 255)), 0x11)
+        XCTAssertEqual(Int(round(focused.greenComponent * 255)), 0x22)
+        XCTAssertEqual(Int(round(focused.blueComponent * 255)), 0x33)
         XCTAssertEqual(focused.alphaComponent, 1, accuracy: 0.001)
         let unfocused = TabBarColors.nsColorCardBorder(for: look, isFocused: false).usingColorSpace(.sRGB)!
         XCTAssertLessThan(unfocused.alphaComponent, 1)
+    }
+
+    func testCardGapIsHeldToItsRange() {
+        XCTAssertEqual(BonsplitConfiguration.Appearance(cardGap: -4).cardGap, BonsplitCardMetrics.gapRange.lowerBound)
+        XCTAssertEqual(BonsplitConfiguration.Appearance(cardGap: 500).cardGap, BonsplitCardMetrics.gapRange.upperBound)
+
+        var look = BonsplitConfiguration.Appearance()
+        look.cardGap = -1
+        XCTAssertEqual(look.cardGap, BonsplitCardMetrics.gapRange.lowerBound)
+        look.cardGap = 12
+        XCTAssertEqual(look.cardGap, 12)
     }
 
     func testShadowIsSofterOnLightThemes() {

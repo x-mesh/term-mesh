@@ -82,7 +82,10 @@ final class CardRingView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layerUsesCoreImageFilters = true
-        layer?.masksToBounds = false
+        // The view already extends half the gap past the card; the blurred
+        // glow is wider than that, so clip it here rather than let it draw
+        // over the neighbouring card.
+        layer?.masksToBounds = true
 
         faintLayer.fillColor = nil
         faintLayer.strokeColor = Style.faintColor.cgColor
