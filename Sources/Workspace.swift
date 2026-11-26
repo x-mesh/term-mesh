@@ -141,7 +141,6 @@ final class Workspace: Identifiable {
     @ObservationIgnored var onClosedBrowserPanel: ((ClosedBrowserPanelRestoreSnapshot) -> Void)?
 
     /// The pane zoom transition waiting for bonsplit's settle signal.
-    @ObservationIgnored private weak var zoomTransitionHostedView: GhosttySurfaceScrollView?
     @ObservationIgnored private var zoomTransitionPaneId: PaneID?
     @ObservationIgnored private var zoomTransitionGeneration = 0
 
@@ -395,28 +394,25 @@ final class Workspace: Identifiable {
         }
     }
 
-    /// Stretches the terminal in `paneId` along its zoom slide, then restores
-    /// it and glows it once bonsplit reports every level of the slide stopped.
-    /// Called right after the toggle, before any layout has moved the pane.
+    /// The longest a zoom waits for bonsplit's settle signal: one lost with a
+    /// split view torn down mid-slide must not leave the siblings hidden. Well
+    /// above the slide itself, which a busy main thread can stretch past half
+    /// a second.
+    private static let zoomSettleTimeout: TimeInterval = 2.0
+
+    /// Glows the pane in `paneId` once bonsplit reports every level of its zoom
+    /// slide stopped. The terminal is resized with the pane on every frame of
+    /// the slide, so its columns grow and shrink along with it.
     private func startZoomTransition(in paneId: PaneID) {
         guard zoomSlidesAnimate else {
             playPaneTransitionGlow(in: paneId, afterSlide: false)
             return
         }
-        let hostedView = bonsplitController.selectedTab(inPane: paneId)
-            .flatMap { panelIdFromSurfaceId($0.id) }
-            .flatMap { panels[$0] as? TerminalPanel }?
-            .hostedView
-        if let previous = zoomTransitionHostedView, previous !== hostedView {
-            previous.endZoomSnapshot()
-        }
-        hostedView?.beginZoomSnapshot()
-        zoomTransitionHostedView = hostedView
         zoomTransitionPaneId = paneId
         zoomTransitionGeneration &+= 1
         let generation = zoomTransitionGeneration
-        // Same bound as the snapshot's own: a toggle that slid nothing never settles.
-        DispatchQueue.main.asyncAfter(deadline: .now() + GhosttySurfaceScrollView.zoomSnapshotTimeout) { [weak self] in
+        // A toggle that slid nothing never settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.zoomSettleTimeout) { [weak self] in
             guard let self, self.zoomTransitionGeneration == generation else { return }
             self.zoomSlideDidSettle()
         }
@@ -445,8 +441,6 @@ final class Workspace: Identifiable {
             // A toggle back into zoom before landing already re-hid the siblings.
             if !isPaneZoomed { revealAllTerminals() }
         }
-        zoomTransitionHostedView?.endZoomSnapshot()
-        zoomTransitionHostedView = nil
         if let paneId = zoomTransitionPaneId {
             zoomTransitionPaneId = nil
             playPaneTransitionGlow(in: paneId, afterSlide: false)

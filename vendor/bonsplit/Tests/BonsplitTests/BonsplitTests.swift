@@ -884,7 +884,9 @@ final class BonsplitTests: XCTestCase {
         settle(2.5)
         XCTAssertTrue(controller.togglePaneZoom(inPane: target))
         host.layoutSubtreeIfNeeded()
-        settle(1.2)
+        // Late enough that the slide's ease-in-out curve is within a few
+        // points of its end, early enough that it is still running.
+        settle(1.9)
         let nearlyHome = targetView.convert(targetView.bounds, to: host)
         XCTAssertEqual(nearlyHome.minX, homeFrame.minX, accuracy: 10)
         XCTAssertEqual(nearlyHome.minY, homeFrame.minY, accuracy: 10)

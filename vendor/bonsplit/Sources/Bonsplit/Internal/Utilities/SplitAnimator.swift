@@ -133,8 +133,14 @@ final class SplitAnimator {
         stopIfNeeded()
     }
 
+    /// Smoothstep. The host re-lays out the pane's content on every step, and
+    /// content follows a step one frame late: a curve that front-loads the
+    /// motion (the divider's exponential ease-out covers half the distance in
+    /// the first tenth of the time) leaves the content visibly behind the pane.
+    /// This one never moves more than 1.5x the average distance per frame.
     private static func eased(_ progress: Double) -> Double {
-        progress >= 1.0 ? 1.0 : 1.0 - pow(2.0, -10.0 * progress)
+        let t = min(max(progress, 0.0), 1.0)
+        return t * t * (3.0 - 2.0 * t)
     }
 
     // MARK: - Frame Update
