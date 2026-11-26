@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Pane Transition Animation in Settings › Terminal is on by default. If you already turned it on or off, your choice is kept.
+
+### Fixed
+
+- Switching between light and dark now changes relay panes too. Before, a pane shown from another Mac kept that Mac's background and text colors. Areas a full-screen program painted in its own colors change when the program redraws.
+
 ## [0.295.0] - 2026-11-26
 
 ### Added
