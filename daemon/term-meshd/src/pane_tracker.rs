@@ -68,6 +68,9 @@ struct PaneScanner {
     inspected: HashSet<u32>,
     /// The subset of `inspected` that is a supported long-running foreground app.
     targets: HashMap<Pid, &'static str>,
+    /// Whether a target is what its terminal is running right now. Asked on
+    /// every tick, because a process moves in and out of the foreground.
+    in_foreground: fn(u32) -> Option<bool>,
 }
 
 /// Splits a fresh pid list into pids not seen before and pids that went away.
@@ -79,10 +82,15 @@ fn diff_roster(live: &HashSet<u32>, inspected: &HashSet<u32>) -> (Vec<u32>, Vec<
 
 impl PaneScanner {
     fn new() -> Self {
+        Self::with_foreground_check(in_terminal_foreground)
+    }
+
+    fn with_foreground_check(in_foreground: fn(u32) -> Option<bool>) -> Self {
         Self {
             system: System::new(),
             inspected: HashSet::new(),
             targets: HashMap::new(),
+            in_foreground,
         }
     }
 
@@ -173,6 +181,14 @@ impl PaneScanner {
 
         let mut result = HashMap::new();
         for (pid, cli) in targets {
+            // A CLI's own background helper — Codex's app-server daemon is
+            // one — keeps the panel id of the pane it was first started from
+            // and outlives the CLI in it, so that pane would show the CLI
+            // for good. Only a process its terminal is running counts.
+            // Unknown is kept, so a platform this cannot ask loses nothing.
+            if (self.in_foreground)(pid.as_u32()) == Some(false) {
+                continue;
+            }
             let Some(process) = system.process(pid) else {
                 continue;
             };
@@ -199,6 +215,58 @@ impl PaneScanner {
         }
         result
     }
+}
+
+/// Whether `pid` is in the foreground process group of its controlling
+/// terminal. `Some(false)` for a process with no terminal at all, such as a
+/// daemon that detached from the pane it was started in.
+#[cfg(target_os = "macos")]
+fn in_terminal_foreground(pid: u32) -> Option<bool> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: zero is a valid bit pattern for this plain C struct, which
+    // proc_pidinfo overwrites.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // NODEV: no controlling terminal.
+    if info.e_tdev == u32::MAX {
+        return Some(false);
+    }
+    Some(info.pbi_pgid == info.e_tpgid)
+}
+
+#[cfg(target_os = "linux")]
+fn in_terminal_foreground(pid: u32) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is parenthesised and may itself contain spaces or
+    // parentheses, so the fields are counted from the last `)`.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After the name: state, ppid, pgrp, session, tty_nr, tpgid.
+    let pgrp: i64 = fields.get(2)?.parse().ok()?;
+    let tty_nr: i64 = fields.get(4)?.parse().ok()?;
+    let tpgid: i64 = fields.get(5)?.parse().ok()?;
+    if tty_nr == 0 {
+        return Some(false);
+    }
+    Some(pgrp == tpgid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn in_terminal_foreground(_pid: u32) -> Option<bool> {
+    None
 }
 
 /// Lists every live pid with one call.
@@ -498,7 +566,7 @@ mod tests {
             .unwrap();
         let child_pid = child.id();
 
-        let mut scanner = PaneScanner::new();
+        let mut scanner = PaneScanner::with_foreground_check(|_| None);
         let mut found = None;
         for _ in 0..20 {
             let snapshot = scanner.scan();
@@ -550,6 +618,71 @@ mod tests {
     fn list_pids_includes_this_process() {
         let pids = list_pids().expect("pid list");
         assert!(pids.contains(&std::process::id()));
+    }
+
+    #[test]
+    fn scan_skips_a_cli_that_its_terminal_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &executable).unwrap();
+        let panel_id = format!("pane-tracker-background-{}", std::process::id());
+        let mut child = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "pane_tracker::tests::pane_tracker_fixture_process",
+                "--nocapture",
+            ])
+            .env("TERMMESH_PANE_TRACKER_FIXTURE", "1")
+            .env("TERMMESH_PANEL_ID", &panel_id)
+            .current_dir(temp.path())
+            .spawn()
+            .unwrap();
+
+        let mut background = PaneScanner::with_foreground_check(|_| Some(false));
+        let mut foreground = PaneScanner::with_foreground_check(|_| Some(true));
+        let mut seen_in_foreground = false;
+        for _ in 0..20 {
+            assert!(
+                !background.scan().contains_key(&panel_id),
+                "a CLI outside its terminal's foreground must not be reported"
+            );
+            if foreground.scan().contains_key(&panel_id) {
+                seen_in_foreground = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            seen_in_foreground,
+            "the same CLI in the foreground must be reported"
+        );
+    }
+
+    #[test]
+    fn terminal_foreground_check_rejects_a_process_without_a_terminal() {
+        // A detached child: setsid gives it a new session with no
+        // controlling terminal, as a daemon has.
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/usr/bin/env");
+        command
+            .args(["sh", "-c", "exec sleep 5"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: setsid is async-signal-safe and touches no shared state.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let verdict = in_terminal_foreground(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(verdict, Some(false));
     }
 
     #[test]
@@ -607,7 +740,7 @@ mod tests {
         std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &executable).unwrap();
         let panel_id = format!("pane-tracker-churn-{}", std::process::id());
 
-        let mut scanner = PaneScanner::new();
+        let mut scanner = PaneScanner::with_foreground_check(|_| None);
         assert!(!scanner.scan().contains_key(&panel_id));
 
         let mut child = std::process::Command::new(&executable)

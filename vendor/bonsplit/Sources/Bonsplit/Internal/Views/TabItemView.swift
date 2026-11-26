@@ -39,6 +39,15 @@ enum TabItemStyling {
         isHovered && !isSelected
     }
 
+    /// The cached image only stands for the data it was decoded from. When
+    /// the tab's data has moved on — cleared, or replaced before the cache
+    /// caught up — the current data is drawn instead, so a stale cache can
+    /// never keep an icon the tab no longer has.
+    static func displayedFaviconImage(cachedImage: NSImage?, cachedData: Data?, currentData: Data?) -> NSImage? {
+        if let cachedImage, cachedData == currentData { return cachedImage }
+        return currentData.flatMap { NSImage(data: $0) }
+    }
+
     static func resolvedFaviconImage(existing: NSImage?, incomingData: Data?) -> NSImage? {
         guard let incomingData else { return nil }
         if let decoded = NSImage(data: incomingData) {
@@ -87,7 +96,11 @@ struct TabItemView: View {
                 let iconTint = isSelected
                     ? TabBarColors.activeText(for: appearance)
                     : TabBarColors.inactiveText(for: appearance)
-                let faviconImage = renderedFaviconImage ?? tab.iconImageData.flatMap { NSImage(data: $0) }
+                let faviconImage = TabItemStyling.displayedFaviconImage(
+                    cachedImage: renderedFaviconImage,
+                    cachedData: renderedFaviconData,
+                    currentData: tab.iconImageData
+                )
 
                 Group {
                     if tab.isLoading {
@@ -119,7 +132,7 @@ struct TabItemView: View {
                 }
                 .frame(width: iconSlotSize, height: iconSlotSize, alignment: .center)
                 .onAppear {
-                    updateRenderedFaviconImage()
+                    updateRenderedFaviconImage(tab.iconImageData)
                     updateGlobeFallback()
                 }
                 .onDisappear {
@@ -127,8 +140,11 @@ struct TabItemView: View {
                     globeFallbackWorkItem = nil
                 }
                 .onChange(of: tab.isLoading) { _ in updateGlobeFallback() }
-                .onChange(of: tab.iconImageData) { _ in
-                    updateRenderedFaviconImage()
+                // The new value comes from the argument: inside this closure
+                // `tab` can still be the value from before the change, and
+                // caching that left a cleared logo on the tab for good.
+                .onChange(of: tab.iconImageData) { newData in
+                    updateRenderedFaviconImage(newData)
                     updateGlobeFallback()
                 }
                 .onChange(of: tab.icon) { _ in updateGlobeFallback() }
@@ -329,13 +345,13 @@ struct TabItemView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.90, execute: work)
     }
 
-    private func updateRenderedFaviconImage() {
-        guard renderedFaviconData != tab.iconImageData ||
-                (renderedFaviconImage == nil && tab.iconImageData != nil) else { return }
-        renderedFaviconData = tab.iconImageData
+    private func updateRenderedFaviconImage(_ data: Data?) {
+        guard renderedFaviconData != data ||
+                (renderedFaviconImage == nil && data != nil) else { return }
+        renderedFaviconData = data
         renderedFaviconImage = TabItemStyling.resolvedFaviconImage(
             existing: renderedFaviconImage,
-            incomingData: tab.iconImageData
+            incomingData: data
         )
     }
 

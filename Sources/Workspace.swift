@@ -987,21 +987,32 @@ final class Workspace: Identifiable {
     /// once the app is gone. Only tabs whose app changed are touched.
     func applyTerminalAgents(_ agents: [UUID: TerminalAgentCLI]) {
         for (panelId, panel) in panels {
-            guard let terminal = panel as? TerminalPanel else { continue }
-            let cli = agents[panelId]
-            guard terminal.agentCLI != cli else { continue }
-            terminal.agentCLI = cli
-            let tabId = surfaceIdFromPanelId(panelId)
-            #if DEBUG
-            dlog("tab.agentIcon panel=\(panelId.uuidString.prefix(5)) cli=\(cli?.rawValue ?? "none") tab=\(tabId == nil ? 0 : 1)")
-            #endif
-            guard let tabId else { continue }
-            bonsplitController.updateTab(
-                tabId,
-                icon: .some(cli?.symbolName ?? terminal.displayIcon),
-                iconImageData: .some(cli?.iconPNGData)
-            )
+            // A remote pane's CLI runs on its host; this Mac's daemon only
+            // ever sees the relay there and would clear what the host sent.
+            guard let terminal = panel as? TerminalPanel, terminal.remoteHostKey == nil else { continue }
+            setAgentCLI(agents[panelId], for: terminal, panelId: panelId)
         }
+    }
+
+    /// The logo for a remote pane's agent CLI, as its host reports it.
+    func applyRemoteAgentCLI(_ cli: TerminalAgentCLI?, panelId: UUID) {
+        guard let terminal = panels[panelId] as? TerminalPanel else { return }
+        setAgentCLI(cli, for: terminal, panelId: panelId)
+    }
+
+    private func setAgentCLI(_ cli: TerminalAgentCLI?, for terminal: TerminalPanel, panelId: UUID) {
+        guard terminal.agentCLI != cli else { return }
+        terminal.agentCLI = cli
+        let tabId = surfaceIdFromPanelId(panelId)
+        #if DEBUG
+        dlog("tab.agentIcon panel=\(panelId.uuidString.prefix(5)) cli=\(cli?.rawValue ?? "none") tab=\(tabId == nil ? 0 : 1)")
+        #endif
+        guard let tabId else { return }
+        bonsplitController.updateTab(
+            tabId,
+            icon: .some(cli?.symbolName ?? terminal.displayIcon),
+            iconImageData: .some(cli?.iconPNGData)
+        )
     }
 
     func installBrowserPanelSubscription(_ browserPanel: BrowserPanel) {
@@ -3849,6 +3860,9 @@ final class Workspace: Identifiable {
         }
         session.relaySession.onReconnected = { [weak panel] in
             panel?.hostedView.hidePeerDisconnectBanner()
+        }
+        session.relaySession.onRemoteAgentCLI = { [weak self] cli in
+            self?.applyRemoteAgentCLI(cli.flatMap(TerminalAgentCLI.init(rawValue:)), panelId: panelId)
         }
         session.relayStartupFailure = { error in
             let reason = "Remote leader relay failed to start: \(String(describing: error))"

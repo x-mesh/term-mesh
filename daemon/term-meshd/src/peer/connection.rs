@@ -1657,6 +1657,8 @@ fn host_stats_from(snapshot: &SystemSnapshot) -> HostStats {
         // room. Zero total means the host could not measure it.
         disk_total_bytes: snapshot.disk_total_bytes,
         disk_available_bytes: snapshot.disk_available_bytes,
+        // Filled by the push loop, which has the host this snapshot lacks.
+        surface_agents: Vec::new(),
     }
 }
 
@@ -1677,6 +1679,7 @@ fn spawn_host_stats_push(
         return None;
     }
     let mut monitor_rx = host.monitor_receiver()?;
+    let host = Arc::clone(host);
 
     Some(tokio::spawn(async move {
         loop {
@@ -1686,9 +1689,11 @@ fn spawn_host_stats_push(
             if monitor_rx.changed().await.is_err() {
                 return; // monitor gone: daemon is shutting down
             }
-            let Some(stats) = monitor_rx.borrow_and_update().as_ref().map(host_stats_from) else {
+            let Some(mut stats) = monitor_rx.borrow_and_update().as_ref().map(host_stats_from)
+            else {
                 continue; // no sample taken yet
             };
+            stats.surface_agents = crate::peer::layout::surface_agents(&host);
             let env = Envelope {
                 seq: next_seq(&seq_counter),
                 correlation_id: 0,
