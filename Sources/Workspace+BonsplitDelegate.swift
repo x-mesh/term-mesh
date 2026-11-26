@@ -559,7 +559,9 @@ extension Workspace: BonsplitDelegate {
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
 
-        if let survivor = bonsplitController.focusedPaneId {
+        // A mirror reconcile collapses and rebuilds the whole tree; it glows
+        // the pane it spawned itself once the rebuild is done.
+        if !isApplyingPeerMirrorLayout, let survivor = bonsplitController.focusedPaneId {
             playPaneTransitionGlow(in: survivor, afterSlide: false)
         }
     }
@@ -625,7 +627,9 @@ extension Workspace: BonsplitDelegate {
 
     func splitTabBar(_ controller: BonsplitController, didSplitPane originalPane: PaneID, newPane: PaneID, orientation: SplitOrientation) {
         invalidateSidebarBranchDirectoryEntriesCache()
-        playPaneTransitionGlow(in: newPane, afterSlide: true)
+        if !isApplyingPeerMirrorLayout {
+            playPaneTransitionGlow(in: newPane, afterSlide: true)
+        }
 #if DEBUG
         let panelKindForTab: (TabID) -> String = { tabId in
             guard let panelId = self.panelIdFromSurfaceId(tabId),
