@@ -1199,6 +1199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 TerminalSettingsOverride.write()
                 TerminalThemeOverride.write(for: mode.rawValue)
                 self.configProvider.reloadConfiguration(source: "appearance.toggle")
+                PeerRelaySession.releaseHostPinnedColorsInAllSessions()
                 TermMeshApp.syncGhosttyAppColorScheme(for: mode)
             }
 

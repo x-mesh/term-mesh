@@ -20,11 +20,12 @@ enum PaneGapSettings {
 /// Whether pane splits and zooms slide, and whether the pane they leave in
 /// focus glows.
 ///
-/// Off by default: the slide resizes the terminal while it moves, the same as
-/// dragging a divider, and a full-screen TUI repaints on every resize.
+/// On by default. The slide resizes the terminal while it moves, the same as
+/// dragging a divider, so a full-screen TUI repaints on every resize; turning
+/// it off in Settings avoids that.
 enum PaneTransitionAnimationSettings {
     static let key = "paneTransitionAnimations"
-    static let defaultValue = false
+    static let defaultValue = true
 
     /// Length of one split or zoom slide, in seconds.
     static let durationKey = "paneTransitionAnimationDuration"

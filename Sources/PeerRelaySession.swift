@@ -404,6 +404,145 @@ actor RelayFrameByteBudget {
     }
 }
 
+/// Where a viewer color reset (OSC 110/111) may enter the host's PtyData
+/// without landing inside an escape sequence or a UTF-8 character.
+struct RelayColorResetPlacement {
+    static let reset = Data("\u{1b}]110\u{7}\u{1b}]111\u{7}".utf8)
+
+    // Mirrors the states of Ghostty's parser (ghostty/src/terminal/
+    // parse_table.zig) that decide where a sequence ends.
+    private enum State {
+        case ground
+        case escape
+        case escapeIntermediate
+        case csi
+        /// Ends on BEL or ST; bytes 0x80-0xFF are payload.
+        case osc
+        /// Ends on ST only: BEL and bytes 0x80-0xFF are payload.
+        case dcs
+        /// Ends on ST or an 8-bit C1 control; BEL is ignored.
+        case sosPmApc
+        /// ESC inside OSC, DCS, SOS, PM or APC: `\` makes it ST.
+        case stringEscape
+    }
+
+    private var state = State.ground
+    private var utf8Remaining = 0
+    /// A fresh writer's first bytes carry the host's pinned colors, so a
+    /// reset must follow them, not precede them.
+    private var hasOutput = false
+    private var pending = false
+
+    /// The reset to write now, or nil when it waits for `afterWriting`.
+    mutating func request() -> Data? {
+        if hasOutput, isBoundary {
+            pending = false
+            return Self.reset
+        }
+        pending = true
+        return nil
+    }
+
+    /// Advances over a PtyData payload just written. Returns the waiting
+    /// reset when the host has sent bytes and the payload ends between
+    /// sequences and characters.
+    mutating func afterWriting(_ payload: Data) -> Data? {
+        for byte in payload { advance(byte) }
+        if !payload.isEmpty { hasOutput = true }
+        guard pending, hasOutput, isBoundary else { return nil }
+        pending = false
+        return Self.reset
+    }
+
+    private var isBoundary: Bool { state == .ground && utf8Remaining == 0 }
+
+    private mutating func advance(_ byte: UInt8) {
+        // CAN and SUB abort any sequence.
+        if byte == 0x18 || byte == 0x1A {
+            state = .ground
+            utf8Remaining = 0
+            return
+        }
+        switch state {
+        case .ground:
+            // Ghostty decodes UTF-8 here, so a raw 8-bit C1 byte does not
+            // start a sequence from ground.
+            if byte == 0x1B {
+                state = .escape
+                utf8Remaining = 0
+            } else if utf8Remaining > 0, byte & 0xC0 == 0x80 {
+                utf8Remaining -= 1
+            } else {
+                switch byte {
+                case 0xC2...0xDF: utf8Remaining = 1
+                case 0xE0...0xEF: utf8Remaining = 2
+                case 0xF0...0xF4: utf8Remaining = 3
+                default: utf8Remaining = 0
+                }
+            }
+        case .escape:
+            switch byte {
+            case 0x1B: break
+            case 0x80...0x9F: c1(byte)
+            case 0x5B: state = .csi
+            case 0x5D: state = .osc
+            case 0x50: state = .dcs
+            case 0x58, 0x5E, 0x5F: state = .sosPmApc
+            case 0x20...0x2F: state = .escapeIntermediate
+            case 0x30...0x7E: state = .ground
+            default: break
+            }
+        case .escapeIntermediate:
+            switch byte {
+            case 0x1B: state = .escape
+            case 0x80...0x9F: c1(byte)
+            case 0x30...0x7E: state = .ground
+            default: break
+            }
+        case .csi:
+            switch byte {
+            case 0x1B: state = .escape
+            case 0x80...0x9F: c1(byte)
+            case 0x40...0x7E: state = .ground
+            default: break
+            }
+        case .osc:
+            switch byte {
+            case 0x07: state = .ground
+            case 0x1B: state = .stringEscape
+            default: break
+            }
+        case .dcs:
+            if byte == 0x1B { state = .stringEscape }
+        case .sosPmApc:
+            switch byte {
+            case 0x1B: state = .stringEscape
+            case 0x80...0x9F: c1(byte)
+            default: break
+            }
+        case .stringEscape:
+            if byte == 0x5C {
+                state = .ground
+            } else {
+                // ESC ended the string and starts an escape sequence.
+                state = .escape
+                advance(byte)
+            }
+        }
+    }
+
+    /// Ghostty's "anywhere" transitions for an 8-bit C1 control.
+    private mutating func c1(_ byte: UInt8) {
+        switch byte {
+        case 0x9B: state = .csi
+        case 0x9D: state = .osc
+        case 0x90: state = .dcs
+        case 0x98, 0x9E, 0x9F: state = .sosPmApc
+        default: state = .ground
+        }
+    }
+}
+
 final class RelayFrameWriter: @unchecked Sendable {
     private let writeFrame: @Sendable (UInt8, Data) throws -> Void
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
@@ -440,17 +579,43 @@ final class RelayFrameWriter: @unchecked Sendable {
 
         queue.async {
             defer { Task { await self.budget.release(reservation) } }
-            guard !self.isStopped else { return }
-            do {
-                try self.writeFrame(type, framePayload)
-            } catch {
-                if self.markStopped() {
-                    Task {
-                        await self.budget.stop(error: RelayError.ioError("relay writer stopped"))
-                    }
-                    self.onFailure(error)
-                }
+            guard !self.isStopped, self.write(type: type, payload: framePayload) else { return }
+            if type == kTypePtyData, let reset = self.colorReset.afterWriting(framePayload) {
+                self.write(type: kTypePtyData, payload: reset)
             }
+        }
+    }
+
+    /// Escape and UTF-8 state of the PtyData written so far, and a color
+    /// reset waiting for a point where it cannot land inside a sequence.
+    /// Touched only on `queue`, so it sees frames in the order they leave.
+    private var colorReset = RelayColorResetPlacement()
+
+    /// Writes OSC 110/111 between whole escape sequences and characters of
+    /// the host's output: at once when the written stream is at such a point,
+    /// otherwise right after the PtyData frame that reaches one. A host
+    /// sequence can be split across frames, so a frame boundary alone is not
+    /// enough.
+    func requestColorReset() {
+        queue.async {
+            guard !self.isStopped, let reset = self.colorReset.request() else { return }
+            self.write(type: kTypePtyData, payload: reset)
+        }
+    }
+
+    @discardableResult
+    private func write(type: UInt8, payload: Data) -> Bool {
+        do {
+            try writeFrame(type, payload)
+            return true
+        } catch {
+            if markStopped() {
+                Task {
+                    await self.budget.stop(error: RelayError.ioError("relay writer stopped"))
+                }
+                onFailure(error)
+            }
+            return false
         }
     }
 
@@ -3123,6 +3288,34 @@ final class PeerRelaySession {
             // for a binary this mode never runs.
             self.relayBinaryPath = ""
         }
+        Self.liveSessions.add(self)
+    }
+
+    private static let liveSessions = NSHashTable<PeerRelaySession>.weakObjects()
+
+    /// Set once this viewer switched appearance while the session was live;
+    /// every later relay writer (a reconnect re-sends the host's pinned
+    /// colors) gets the reset again after the host's first bytes.
+    private var viewerOwnsDefaultColors = false
+
+    /// The host pins its own default colors at attach
+    /// (`peerTerminalPalettePrefix`) so a TUI's explicit colors match the
+    /// cells around them. Ghostty keeps pinned colors over the config, so a
+    /// light/dark switch on this viewer left every relay pane in the host's
+    /// colors. Called on that switch: the panes take the viewer's theme, and
+    /// explicit TUI colors follow once the program repaints.
+    static func releaseHostPinnedColorsInAllSessions() {
+        for session in liveSessions.allObjects {
+            session.releaseHostPinnedColors()
+        }
+    }
+
+    private func releaseHostPinnedColors() {
+        // Callback delivery feeds an agent session's decoder, not a terminal
+        // the host's colors were pinned on.
+        guard ptyDelivery == .relaySocket else { return }
+        viewerOwnsDefaultColors = true
+        relayFrameWriter?.requestColorReset()
     }
 
     deinit {
@@ -3497,6 +3690,7 @@ final class PeerRelaySession {
                 disconnect("writer-failure")
             }
             relayFrameWriter = liveWriter
+            if viewerOwnsDefaultColors { liveWriter.requestColorReset() }
             writer = liveWriter
             reader = RelayFrameReader(relay: relay, inputBacklog: inputBacklog)
         } else {
