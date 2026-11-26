@@ -70,6 +70,7 @@
 		A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000038 /* RemotePasteTransfer.swift */; };
 		A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000006 /* WorkspaceRetrievalStore.swift */; };
 		A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000007 /* WorkspaceRetrievalViews.swift */; };
+		A151000000000000000000D3 /* ActivityWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = A151000000000000000000D7 /* ActivityWindow.swift */; };
 		A15100000000000000000004 /* WorkspaceRetrievalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */; };
 		5A57E1F90000000000000001 /* PasteShelfStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A57E1F90000000000000003 /* PasteShelfStore.swift */; };
 		5A57E1F90000000000000002 /* PasteShelfStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A57E1F90000000000000004 /* PasteShelfStoreTests.swift */; };
@@ -117,7 +118,7 @@
 			CVB00089 /* PeerFederationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00089 /* PeerFederationSettings.swift */; };
 			CVB00950 /* PeerKeepAwake.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00950 /* PeerKeepAwake.swift */; };
 			CVB00090 /* PeerRelayBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00090 /* PeerRelayBanner.swift */; };
-			CVB00091 /* PeerConnectionsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsWindowController.swift */; };
+			CVB00091 /* PeerConnectionsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsController.swift */; };
 			CVB00092 /* PeerRelayBannerPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00092 /* PeerRelayBannerPresenter.swift */; };
 			CVB00093 /* RemoteHostStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00093 /* RemoteHostStore.swift */; };
 			CGL00001 /* RemoteLiveProject.swift in Sources */ = {isa = PBXBuildFile; fileRef = CGL00002 /* RemoteLiveProject.swift */; };
@@ -496,6 +497,7 @@
 			A15100000000000000000038 /* RemotePasteTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePasteTransfer.swift; sourceTree = "<group>"; };
 			A15100000000000000000006 /* WorkspaceRetrievalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStore.swift; sourceTree = "<group>"; };
 			A15100000000000000000007 /* WorkspaceRetrievalViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalViews.swift; sourceTree = "<group>"; };
+			A151000000000000000000D7 /* ActivityWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityWindow.swift; sourceTree = "<group>"; };
 			A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStoreTests.swift; sourceTree = "<group>"; };
 			CVS00010 /* AppearanceSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceSettings.swift; sourceTree = "<group>"; };
 			CVS00039 /* TerminalSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSettings.swift; sourceTree = "<group>"; };
@@ -540,7 +542,7 @@
 			CVS00089 /* PeerFederationSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerFederationSettings.swift; sourceTree = "<group>"; };
 			CVS00950 /* PeerKeepAwake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerKeepAwake.swift; sourceTree = "<group>"; };
 			CVS00090 /* PeerRelayBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBanner.swift; sourceTree = "<group>"; };
-			CVS00091 /* PeerConnectionsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsWindowController.swift; sourceTree = "<group>"; };
+			CVS00091 /* PeerConnectionsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsController.swift; sourceTree = "<group>"; };
 			CVS00092 /* PeerRelayBannerPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBannerPresenter.swift; sourceTree = "<group>"; };
 			CVS00093 /* RemoteHostStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostStore.swift; sourceTree = "<group>"; };
 			CGL00002 /* RemoteLiveProject.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLiveProject.swift; sourceTree = "<group>"; };
@@ -957,6 +959,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 					A15100000000000000000038 /* RemotePasteTransfer.swift */,
 					A15100000000000000000006 /* WorkspaceRetrievalStore.swift */,
 					A15100000000000000000007 /* WorkspaceRetrievalViews.swift */,
+					A151000000000000000000D7 /* ActivityWindow.swift */,
 					CVS00010 /* AppearanceSettings.swift */,
 					CVS00039 /* TerminalSettings.swift */,
 					CVS00011 /* Logging.swift */,
@@ -1000,7 +1003,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				CVS00089 /* PeerFederationSettings.swift */,
 				CVS00950 /* PeerKeepAwake.swift */,
 				CVS00090 /* PeerRelayBanner.swift */,
-				CVS00091 /* PeerConnectionsWindowController.swift */,
+				CVS00091 /* PeerConnectionsController.swift */,
 				CVS00092 /* PeerRelayBannerPresenter.swift */,
 				CVS00093 /* RemoteHostStore.swift */,
 				CGL00002 /* RemoteLiveProject.swift */,
@@ -1493,6 +1496,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 					A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */,
 					A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */,
 					A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */,
+					A151000000000000000000D3 /* ActivityWindow.swift in Sources */,
 					CVB00010 /* AppearanceSettings.swift in Sources */,
 					CVB00039 /* TerminalSettings.swift in Sources */,
 					CVB00011 /* Logging.swift in Sources */,
@@ -1536,7 +1540,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				CVB00089 /* PeerFederationSettings.swift in Sources */,
 				CVB00950 /* PeerKeepAwake.swift in Sources */,
 				CVB00090 /* PeerRelayBanner.swift in Sources */,
-				CVB00091 /* PeerConnectionsWindowController.swift in Sources */,
+				CVB00091 /* PeerConnectionsController.swift in Sources */,
 				CVB00092 /* PeerRelayBannerPresenter.swift in Sources */,
 				CVB00093 /* RemoteHostStore.swift in Sources */,
 				CGL00001 /* RemoteLiveProject.swift in Sources */,

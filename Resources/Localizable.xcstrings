@@ -4436,6 +4436,16 @@
         }
       }
     },
+    "Remote": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "원격"
+          }
+        }
+      }
+    },
     "Remote Work": {
       "localizations": {
         "ko": {

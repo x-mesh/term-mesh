@@ -11,7 +11,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
     @Published var selectedChangesetID: ChangesetID?
     @Published var pendingClosePanelID: UUID?
     @Published var errorMessage: String?
-    /// How much the remote-work path reports into Live Activity.
+    /// How much the remote-work path reports into the Activity log.
     @Published var logLevel: RemoteWorkLogLevel = .info {
         didSet {
             RemoteWorkLog.level = logLevel
@@ -30,6 +30,13 @@ final class WorkspaceRetrievalStore: ObservableObject {
     }
 
     private static let logLevelKey = "termmesh.remotework.logLevel"
+
+    /// Sets the level for the whole app. The level is one global setting, and
+    /// the Activity window changes it without a workspace in hand.
+    static func setLogLevel(_ level: RemoteWorkLogLevel) {
+        RemoteWorkLog.level = level
+        UserDefaults.standard.set(level.rawValue, forKey: logLevelKey)
+    }
     private static let dryRunKey = "termmesh.remotework.dryRun"
     @Published var visiblePresentations: Set<WorkspaceRetrievalPresentation> {
         didSet { persistPresentations() }
@@ -53,7 +60,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
         self.recoveryKey = "workspace.retrieval.recovery.\(workspaceID.uuidString)"
         let stored = defaults.stringArray(forKey: presentationKey) ?? []
         let restored = Set(stored.compactMap(WorkspaceRetrievalPresentation.init(rawValue:)))
-        self.visiblePresentations = restored.isEmpty ? [.sidebar, .drawer] : restored
+        self.visiblePresentations = restored.isEmpty ? [.sidebar] : restored
         if let data = defaults.data(forKey: recoveryKey),
            let recovery = try? JSONDecoder().decode(RecoveryState.self, from: data) {
             self.projectBindings = recovery.projectBindings
@@ -63,10 +70,10 @@ final class WorkspaceRetrievalStore: ObservableObject {
                 ![.applied, .discarded].contains($0.state)
             })?.id
         }
-        // Wired here rather than when the drawer appears. Waiting for the
-        // drawer meant nothing was collected until someone opened it, so the
-        // first thing they saw after a tunnel dropped was an empty list — the
-        // events they came to read had happened while nobody was listening.
+        // Wired here rather than when a view appears. Waiting for one meant
+        // nothing was collected until someone opened it, so the first thing
+        // they saw after a tunnel dropped was an empty list — the events they
+        // came to read had happened while nobody was listening.
         adoptLogSettings()
     }
 
@@ -258,7 +265,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
             ))
             persistRecoveryState()
         }
-        recordActivity(paneID: pane.id, message: "Attached as a read-only remote activity view")
+        noteActivity(paneID: pane.id, message: "Attached as a read-only remote activity view")
     }
 
     func removeBinding(panelID: UUID) {
@@ -267,7 +274,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
         // The pane is the only thing that could ever ask for its directory
         // again, so its remembered one would outlive every use of it.
         observedDirectories[panelID] = nil
-        recordActivity(paneID: pane.id, message: "Removed from this Workspace")
+        noteActivity(paneID: pane.id, message: "Removed from this Workspace")
         if selectedPaneID == pane.id { selectedPaneID = panes.first?.id }
         pendingClosePanelID = nil
     }
@@ -310,7 +317,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
             pane.state = .readyToClose
             pane.hasUncollectedChanges = false
         }
-        recordActivity(paneID: result.checkpoint.paneID, message: "Checkpoint fetched as Incoming changes")
+        noteActivity(paneID: result.checkpoint.paneID, message: "Checkpoint fetched as Incoming changes")
     }
 
     func failCheckpoint(panelID: UUID, message: String) {
@@ -318,8 +325,8 @@ final class WorkspaceRetrievalStore: ObservableObject {
         updatePane(panelID: panelID) { pane in pane.state = .recoveryRequired }
     }
 
-    /// Restore the drawer's diagnostic settings and route the log into Live
-    /// Activity for the currently selected pane.
+    /// Restore the diagnostic settings and route the log into this
+    /// workspace's activity for the currently selected pane.
     func adoptLogSettings() {
         if let raw = UserDefaults.standard.string(forKey: Self.logLevelKey),
            let restored = RemoteWorkLogLevel(rawValue: raw) {
@@ -340,12 +347,19 @@ final class WorkspaceRetrievalStore: ObservableObject {
         }
     }
 
-    /// How many events the drawer keeps in memory.
+    /// How many events a workspace keeps in memory.
     ///
     /// The list shows 200 and the file keeps everything, so holding more than
     /// this buys nothing and grows without bound in a session that stays
     /// connected for days.
     private static let activityLimit = 500
+
+    /// An event this store originates. The Activity window reads the
+    /// shared buffer, which otherwise only hears what `RemoteWorkLog` emits.
+    private func noteActivity(paneID: RemotePaneID?, message: String) {
+        recordActivity(paneID: paneID, message: message)
+        RemoteWorkLogBuffer.shared.record(message, severity: .info)
+    }
 
     func recordActivity(
         paneID: RemotePaneID?,
@@ -361,7 +375,7 @@ final class WorkspaceRetrievalStore: ObservableObject {
         }
     }
 
-    /// Empty the drawer so the next run reads on its own.
+    /// Empty this workspace's activity so the next run reads on its own.
     ///
     /// The on-disk log is deliberately untouched: this clears a view, and a
     /// run someone wanted to keep is still behind Reveal Log.

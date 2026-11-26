@@ -31,7 +31,16 @@ import CoreText
 @Observable @MainActor
 final class Workspace: Identifiable {
     let id: UUID
-    @ObservationIgnored lazy var retrievalStore = WorkspaceRetrievalStore(workspaceID: id)
+    @ObservationIgnored lazy var retrievalStore: WorkspaceRetrievalStore = {
+        let store = WorkspaceRetrievalStore(workspaceID: id)
+        // The workspace is what can reach the host that knows a pane's live
+        // directory, and a checkpoint needs it whether or not any view is up.
+        store.remoteDirectoryProvider = { [weak self] pane in
+            guard let self else { return nil }
+            return await self.remoteDirectory(for: pane)
+        }
+        return store
+    }()
     var title: String
     var customTitle: String?
     var isPinned: Bool = false

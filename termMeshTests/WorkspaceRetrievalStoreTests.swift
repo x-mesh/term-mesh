@@ -66,10 +66,31 @@ final class WorkspaceRetrievalStoreTests: XCTestCase {
         let workspaceID = UUID()
         let store = WorkspaceRetrievalStore(workspaceID: workspaceID, defaults: defaults)
 
-        store.visiblePresentations = [.sidebar, .drawer, .inspector]
+        XCTAssertEqual(store.visiblePresentations, [.sidebar])
+        store.visiblePresentations = [.sidebar, .inspector]
         let restored = WorkspaceRetrievalStore(workspaceID: workspaceID, defaults: defaults)
 
-        XCTAssertEqual(restored.visiblePresentations, [.sidebar, .drawer, .inspector])
+        XCTAssertEqual(restored.visiblePresentations, [.sidebar, .inspector])
+    }
+
+    func test_presentations_dropTheRetiredDrawerFromStoredState() {
+        let suite = "WorkspaceRetrievalStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let workspaceID = UUID()
+        let key = "workspace.retrieval.presentations.\(workspaceID.uuidString)"
+
+        defaults.set(["drawer", "inspector"], forKey: key)
+        XCTAssertEqual(
+            WorkspaceRetrievalStore(workspaceID: workspaceID, defaults: defaults).visiblePresentations,
+            [.inspector]
+        )
+
+        defaults.set(["drawer"], forKey: key)
+        XCTAssertEqual(
+            WorkspaceRetrievalStore(workspaceID: workspaceID, defaults: defaults).visiblePresentations,
+            [.sidebar]
+        )
     }
 
     func test_checkpointMovesPaneToReadyAndCreatesIncoming() {

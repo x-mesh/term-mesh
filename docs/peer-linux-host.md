@@ -230,7 +230,7 @@ loginctl enable-linger $USER   # keep it running after you log out
 
 ## Connecting from the Mac
 
-Peer menu → connect. Only the SSH target is required:
+Remote menu → Add Peer Host…, then connect from the sidebar. Only the SSH target is required:
 
 | Field | Value |
 |---|---|

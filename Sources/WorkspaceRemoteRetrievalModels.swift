@@ -37,10 +37,7 @@ enum PaneBindingRole: String, Codable, Sendable {
 
 enum WorkspaceRetrievalPresentation: String, Codable, CaseIterable, Sendable {
     case sidebar
-    case drawer
     case inspector
-
-    static let defaultPresentation: Self = .drawer
 }
 
 enum CheckpointBoundary: String, Codable, Sendable {

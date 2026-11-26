@@ -30,7 +30,7 @@ PeerHost
 Workspace
 ├─ PaneBinding ────────────────> RemotePane
 ├─ ProjectBinding ────────────> local origin + remote workdir
-└─ RetrievalPresentation ─────> sidebar | drawer | inspector
+└─ RetrievalPresentation ─────> sidebar | inspector
 ```
 
 ### PeerHost
@@ -132,14 +132,19 @@ Workspace
 - host 전체 보기는 별도 remote overview Workspace에서 제공한다.
 - pane의 `Temporary`, `Keep Alive`, `Linked`, `Shared` 상태를 text와 icon으로 표시한다.
 
-### B. Activity Drawer
+### B. Activity 창
 
-터미널 흐름을 유지하면서 빠르게 확인하는 기본 presentation이다.
+Workspace 아래에 붙던 Activity Drawer를 대체하는 별도 창이다. Drawer는 기본으로 열려
+터미널 높이 220pt를 차지했지만, 내용 대부분이 연결 점검 로그라 항상 볼 이유가 없었다.
 
-- 평소에는 접혀 있다.
-- Live Activity, Incoming count, Checkpoints를 tab으로 전환한다.
-- `Checkpoint Now`를 제공한다.
-- 작은 창에서는 inspector 대신 이 drawer가 상세 presentation이 된다.
+- 보기 메뉴의 `Activity`(⌘⌃D), 하단 바의 버튼, sidebar의 pane 행에서 연다.
+- `Logs` tab은 앱 전체의 remote-work 로그를 보여준다. 심각도와 문자열로 걸러 본다.
+- `Remote Work` tab은 창을 열 때 선택돼 있던 Workspace의 project binding, Incoming,
+  Checkpoints를 보여주고 `Prepare Project`, `Checkpoint Now`를 제공한다.
+- Checkpoint 실패는 창이 닫혀 있어도 Workspace 하단에 띠로 표시한다.
+- `Connections` tab은 이 Mac이 보고 있는 기기와 이 Mac을 보고 있는 기기를 보여준다.
+  별도 창이던 Peer Connections가 옮겨 온 것이다.
+- `Diagnostics` tab은 bug report에 들어가는 진단 묶음을 report를 시작하지 않고 보여준다.
 
 ### C. Changes Inspector
 
@@ -155,8 +160,7 @@ Workspace
 Workspace마다 기본 presentation을 저장한다.
 
 ```text
-drawer     default
-sidebar    structure-heavy workflows
+sidebar    default
 inspector  review-heavy workflows
 ```
 

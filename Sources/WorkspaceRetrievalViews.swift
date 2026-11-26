@@ -2,23 +2,17 @@ import AppKit
 import SwiftUI
 import Bonsplit
 
-private enum RetrievalDrawerTab: String, CaseIterable {
-    case activity = "Live Activity"
-    case incoming = "Incoming"
-    case checkpoints = "Checkpoints"
-}
-
-/// Selection math for Live Activity rows. Kept separate from AppKit modifier
+/// Selection math for the Activity log rows. Kept separate from AppKit modifier
 /// lookup so range/toggle behavior stays deterministic and unit-testable.
 enum RetrievalActivitySelection {
-    static func updating(
-        current: Set<UUID>,
-        clicked: UUID,
-        ordered: [UUID],
-        anchor: UUID?,
+    static func updating<ID: Hashable>(
+        current: Set<ID>,
+        clicked: ID,
+        ordered: [ID],
+        anchor: ID?,
         extendsRange: Bool,
         toggles: Bool
-    ) -> (selected: Set<UUID>, anchor: UUID?) {
+    ) -> (selected: Set<ID>, anchor: ID?) {
         if extendsRange,
            let anchor,
            let start = ordered.firstIndex(of: anchor),
@@ -77,7 +71,7 @@ struct WorkspaceRetrievalSidebarSection: View {
                 ForEach(store.panes) { pane in
                     Button {
                         store.selectedPaneID = pane.id
-                        store.visiblePresentations.insert(.drawer)
+                        ActivityWindowController.shared.show(tab: .remoteWork)
                     } label: {
                         HStack(spacing: 7) {
                             Image(systemName: pane.state == .recoveryRequired
@@ -184,9 +178,18 @@ struct WorkspaceRetrievalChrome<Content: View>: View {
                     RetrievalChangesInspector(workspace: workspace)
                         .frame(height: min(360, proxy.size.height * 0.55))
                         .transition(.move(edge: .bottom).combined(with: .opacity))
-                } else if store.visiblePresentations.contains(.drawer), !store.panes.isEmpty {
-                    RetrievalActivityDrawer(workspace: workspace)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
+                // Checkpoints also run on their own (a finished run, a closing
+                // session), so a failure can arrive with the Activity
+                // window closed. It is the one thing that still claims space
+                // here, and only while there is something to say.
+                if let message = store.errorMessage, !store.panes.isEmpty {
+                    RetrievalErrorBanner(message: message) {
+                        store.errorMessage = nil
+                    }
+                    .padding(.horizontal, PaneGapSettings.current)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 if !store.panes.isEmpty {
@@ -199,6 +202,7 @@ struct WorkspaceRetrievalChrome<Content: View>: View {
                 }
             }
             .animation(.easeOut(duration: 0.18), value: store.visiblePresentations)
+            .animation(.easeOut(duration: 0.18), value: store.errorMessage)
             .cardWindowBackground()
             // Safety pin: if any chrome row ever refuses to compress again,
             // it must not inflate the VStack and re-center the terminal row
@@ -240,8 +244,18 @@ private struct RetrievalPresentationBar: View {
     var body: some View {
         HStack(spacing: 2) {
             presentationButton(.sidebar, image: "sidebar.left")
-            presentationButton(.drawer, image: "rectangle.bottomhalf.inset.filled")
             presentationButton(.inspector, image: "sidebar.right")
+            Button {
+                ActivityWindowController.shared.show(tab: .remoteWork)
+            } label: {
+                Image(systemName: "stethoscope")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 26, height: 24)
+            }
+            .buttonStyle(.plain)
+            .help("Open Activity: checkpoints, incoming changes and the remote-work log")
+            .accessibilityLabel("Open Activity")
+            .accessibilityIdentifier("retrieval.openActivity")
         }
         .padding(3)
         .background(RetrievalChromePalette.elevated, in: RoundedRectangle(cornerRadius: 8))
@@ -271,399 +285,35 @@ private struct RetrievalPresentationBar: View {
     }
 }
 
-private struct RetrievalActivityDrawer: View {
-    let workspace: Workspace
-    @ObservedObject private var store: WorkspaceRetrievalStore
-    @State private var selectedTab: RetrievalDrawerTab = .activity
-    @State private var isEditingProject = false
-    @State private var editingBinding: ProjectBinding?
-    @State private var selectedActivityIDs = Set<UUID>()
-    @State private var activitySelectionAnchor: UUID?
-
-    init(workspace: Workspace) {
-        self.workspace = workspace
-        self.store = workspace.retrievalStore
-    }
+/// A failed remote-work action, shown where the workspace is.
+struct RetrievalErrorBanner: View {
+    let message: String
+    let onDismiss: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            // The toolbar's controls sum to ~620pt of minimum width. In a slot
-            // narrower than that (small window + Review Board) an HStack alone
-            // refuses to compress, inflating the chrome's VStack past its slot
-            // — which re-centered the terminal row and slid the panes out over
-            // the Review Board. Prefer the roomy layout, fall back to a
-            // horizontal scroll whose minimum is ~0 so the drawer always
-            // accepts the width it is given.
-            ViewThatFits(in: .horizontal) {
-                toolbar
-                ScrollView(.horizontal, showsIndicators: false) {
-                    toolbar
-                }
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button("Open Activity") {
+                ActivityWindowController.shared.show(tab: .logs)
             }
-            .frame(height: 38)
-            .onAppear {
-                store.adoptLogSettings()
-                // The drawer is where the live directory is needed, and the
-                // workspace is what can reach the host that knows it.
-                store.remoteDirectoryProvider = { [weak workspace] pane in
-                    guard let workspace else { return nil }
-                    return await workspace.remoteDirectory(for: pane)
-                }
-            }
-            .sheet(isPresented: $isEditingProject) {
-                ProjectBindingSheet(
-                    store: store,
-                    isPresented: $isEditingProject,
-                    editing: editingBinding
-                )
-            }
-
-
-            Divider()
-
-            // Failures used to be written to `errorMessage` and rendered only
-            // inside the close-confirmation sheet, so a button that refused to
-            // act looked like a button that did nothing. Show it here, where the
-            // press happened.
-            if let message = store.errorMessage {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(message)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.primary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 4)
-                    Button {
-                        store.errorMessage = nil
-                    } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss")
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color.orange.opacity(0.12))
-                Divider()
-            }
-
-            Group {
-                switch selectedTab {
-                case .activity: activityList
-                case .incoming: incomingList
-                case .checkpoints: checkpointList
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        }
-        .frame(height: 220)
-        .cardPanel()
-        // Below the pane cards, inset like them; the terminal area's bottom
-        // margin already separates the two.
-        .padding([.leading, .trailing, .bottom], PaneGapSettings.current)
-        .accessibilityIdentifier("retrieval.drawer")
-    }
-
-
-    /// The drawer's control row. Extracted so `body` can offer it to
-    /// `ViewThatFits` twice — once as-is, once inside a horizontal scroll —
-    /// without duplicating the controls.
-    private var toolbar: some View {
-        HStack(spacing: 10) {
-            UnderlineTabPicker(
-                items: RetrievalDrawerTab.allCases.map { tab in
-                    UnderlineTabItem(value: tab, title: tab == .incoming ? "Incoming \(store.incomingCount)" : tab.rawValue)
-                },
-                selection: selectedTab,
-                onSelect: { selectedTab = $0 }
-            )
-            .accessibilityLabel("Remote Work")
-
-            // Which pane the buttons act on. It was previously implicit —
-            // the last pane to register, or the first in the list — so a
-            // press could act on something other than what the user was
-            // looking at, with nothing on screen to say so.
-            if store.projectBindings.isEmpty {
-                Text("No project bound")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            } else {
-                Picker("Project", selection: Binding(
-                    get: { store.selectedBinding?.id },
-                    set: { store.selectedBindingID = $0 }
-                )) {
-                    ForEach(store.projectBindings, id: \.id) { binding in
-                        Text("\(binding.peerID): \(binding.remoteRoot)").tag(Optional(binding.id))
-                    }
-                }
-                .frame(maxWidth: 260)
-                .help("The project folder pair these actions act on.")
-                .accessibilityIdentifier("retrieval.target")
-            }
-            Button {
-                editingBinding = nil
-                isEditingProject = true
-            } label: {
-                Image(systemName: "plus")
-            }
-            .buttonStyle(.borderless)
-            .help("Bind a local folder to a folder on a peer.")
-            .accessibilityIdentifier("retrieval.addProject")
-            if let selected = store.selectedBinding {
-                Button {
-                    editingBinding = selected
-                    isEditingProject = true
-                } label: {
-                    Image(systemName: "pencil")
-                }
-                .buttonStyle(.borderless)
-                .help("Change or remove this project's folders.")
-                .accessibilityIdentifier("retrieval.editProject")
-            }
-
-            Spacer()
-
-            // Diagnostics live next to the buttons they explain: these
-            // actions cross a network and rewrite a Git worktree on another
-            // machine, and their preconditions refuse more often than they
-            // pass.
-            Toggle("Dry run", isOn: $store.dryRun)
-                .toggleStyle(.checkbox)
-                .help("Report what each action would do, without doing it.")
-                .accessibilityIdentifier("retrieval.dryRun")
-            // A menu rather than segments: this is a setting that gets
-            // chosen once and then left alone, and segments spend width
-            // permanently displaying the option nobody picked.
-            Picker("", selection: $store.logLevel) {
-                ForEach(RemoteWorkLogLevel.allCases) { level in
-                    Text(level.label).tag(level)
-                }
-            }
-            .pickerStyle(.menu)
-            .frame(width: 96)
-            .help("How much the actions report into Live Activity.")
-
-            Button("Prepare Project") {
-                Task { await workspace.seedRemoteProject() }
-            }
-            .disabled(store.selectedBinding == nil)
-            Button("Checkpoint Now") {
-                Task { await workspace.checkpointProject() }
-            }
-            .disabled(store.selectedBinding == nil)
-            .accessibilityIdentifier("retrieval.checkpointNow")
-            Button {
-                store.visiblePresentations.remove(.drawer)
-            } label: {
-                Image(systemName: "chevron.down")
+            .controlSize(.small)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Close Activity Drawer")
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 38)
-    }
-
-    private var activityList: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("\(store.activity.count) event(s)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Copy Selected") {
-                    copyActivity(store.activity.reversed().filter {
-                        selectedActivityIDs.contains($0.id)
-                    })
-                }
-                .controlSize(.small)
-                .disabled(selectedActivityIDs.isEmpty)
-                .help("Click rows to select them; use Command-click or Shift-click for multiple rows.")
-                .accessibilityIdentifier("retrieval.copySelectedActivity")
-                Button("Copy All") {
-                    copyActivity(store.activity.reversed())
-                }
-                .controlSize(.small)
-                .disabled(store.activity.isEmpty)
-                .accessibilityIdentifier("retrieval.copyActivity")
-                // Clears what is on screen, not the file behind Reveal Log —
-                // a run worth re-reading is still there afterwards.
-                Button("Clear Log") {
-                    store.clearActivity()
-                    selectedActivityIDs.removeAll()
-                    activitySelectionAnchor = nil
-                }
-                .controlSize(.small)
-                .disabled(store.activity.isEmpty)
-                .help("Clear the events shown here. The log file keeps them.")
-                .accessibilityIdentifier("retrieval.clearActivity")
-                Button("Reveal Log") {
-                    NSWorkspace.shared.selectFile(RemoteWorkLog.path, inFileViewerRootedAtPath: "")
-                }
-                .controlSize(.small)
-                .help(RemoteWorkLog.path)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            Divider()
-            activityEvents
+            .accessibilityLabel("Dismiss")
         }
-    }
-
-    private func activityText<S: Sequence>(_ events: S) -> String
-    where S.Element == RemotePaneActivity {
-        events.map { event in
-            let stamp = event.occurredAt.formatted(date: .omitted, time: .standard)
-            return "\(stamp)  [\(event.severity.rawValue.uppercased())] \(event.message)"
-        }.joined(separator: "\n")
-    }
-
-    private func copyActivity<S: Sequence>(_ events: S)
-    where S.Element == RemotePaneActivity {
-        let text = activityText(events)
-        guard !text.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-    }
-
-    private func selectActivity(
-        _ event: RemotePaneActivity,
-        visibleEvents: [RemotePaneActivity]
-    ) {
-        let modifiers = NSEvent.modifierFlags
-        let update = RetrievalActivitySelection.updating(
-            current: selectedActivityIDs,
-            clicked: event.id,
-            ordered: visibleEvents.map(\.id),
-            anchor: activitySelectionAnchor,
-            extendsRange: modifiers.contains(.shift),
-            toggles: modifiers.contains(.command)
-        )
-        selectedActivityIDs = update.selected
-        activitySelectionAnchor = update.anchor
-    }
-
-    private var activityEvents: some View {
-        ScrollView {
-            // Tight rows: these are log lines, and the drawer is short. The
-            // point is to see the sequence that led somewhere, which costs
-            // more when three events fill the view than any leading gains.
-            LazyVStack(alignment: .leading, spacing: 2) {
-                let visibleEvents = Array(store.activity.prefix(200))
-                ForEach(visibleEvents) { event in
-                    Button {
-                        selectActivity(event, visibleEvents: visibleEvents)
-                    } label: {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: activityIcon(for: event.severity))
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(activityColor(for: event.severity))
-                                .accessibilityLabel(event.severity.rawValue.capitalized)
-                            Text(event.occurredAt.formatted(date: .omitted, time: .standard))
-                                .font(.system(size: 10).monospacedDigit())
-                                .foregroundStyle(.secondary)
-                            Text(event.message)
-                                .font(.system(size: 11))
-                                .foregroundStyle(activityColor(for: event.severity))
-                                .fixedSize(horizontal: false, vertical: true)
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(
-                            selectedActivityIDs.contains(event.id)
-                                ? Color.accentColor.opacity(0.18) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        )
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button("Copy Event") { copyActivity([event]) }
-                    }
-                    .accessibilityAddTraits(
-                        selectedActivityIDs.contains(event.id) ? .isSelected : []
-                    )
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .onChange(of: store.activity.map(\.id)) { ids in
-            let visibleIDs = Array(ids.prefix(200))
-            selectedActivityIDs.formIntersection(visibleIDs)
-            if let activitySelectionAnchor, !visibleIDs.contains(activitySelectionAnchor) {
-                self.activitySelectionAnchor = nil
-            }
-        }
-    }
-
-    private func activityIcon(for severity: RemoteWorkLogSeverity) -> String {
-        switch severity {
-        case .info: "circle.fill"
-        case .warning: "exclamationmark.triangle.fill"
-        case .error: "xmark.octagon.fill"
-        }
-    }
-
-    private func activityColor(for severity: RemoteWorkLogSeverity) -> Color {
-        switch severity {
-        case .info: .primary
-        case .warning: .orange
-        case .error: .red
-        }
-    }
-
-    private var incomingList: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: 10) {
-                ForEach(store.incoming) { changeset in
-                    Button {
-                        store.selectedChangesetID = changeset.id
-                        store.visiblePresentations.insert(.inspector)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(String(changeset.checkpointRevision.prefix(10)))
-                                .font(.system(size: 11, weight: .semibold).monospaced())
-                            Text("\(changeset.changedPaths.count) files · \(changeset.state.rawValue)")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(width: 180, alignment: .leading)
-                        .padding(10)
-                        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 9))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(12)
-        }
-    }
-
-    private var checkpointList: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 8) {
-                ForEach(store.checkpoints) { checkpoint in
-                    HStack {
-                        Image(systemName: "bookmark.fill")
-                            .foregroundStyle(.secondary)
-                        Text(String(checkpoint.revision.prefix(12)))
-                            .font(.system(size: 11).monospaced())
-                        Text(checkpoint.boundary.rawValue)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text(checkpoint.createdAt.formatted(date: .omitted, time: .standard))
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .padding(12)
-        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier("retrieval.errorBanner")
     }
 }
 
@@ -852,7 +502,7 @@ private struct RetrievalCloseGate: View {
 /// inside a project directory — a shell opened anywhere else never gets one,
 /// and the remote path is captured at spawn and does not follow a later `cd`.
 /// Without this the actions had no subject and simply refused.
-private struct ProjectBindingSheet: View {
+struct ProjectBindingSheet: View {
     @ObservedObject var store: WorkspaceRetrievalStore
     @Binding var isPresented: Bool
     /// nil adds a project; a value edits that one.
