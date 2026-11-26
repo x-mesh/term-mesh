@@ -106,6 +106,8 @@ final class PeerWorkspaceMirrorController {
     /// only `hostWorkspaceID` above.
     private(set) var hostWorkspaceIDAliases: Set<Data>
     let hostWorkspaceTitle: String
+    var remoteLayoutIsEmpty = false
+    private(set) var supportsDurableWorkspace = false
     let connectedAt = Date()
     /// Pooled SSH generation used by the current subscription. A dead mirror
     /// must refresh this generation before dialing again; otherwise the local
@@ -246,7 +248,8 @@ final class PeerWorkspaceMirrorController {
             read: { try await transport.read() },
             write: { try await transport.write($0) }
         )
-        _ = try await session.handshake(options: Self.mirrorHandshakeOptions)
+        let info = try await session.handshake(options: Self.mirrorHandshakeOptions)
+        supportsDurableWorkspace = info.hasHostCapability(PeerCapability.workspaceDurableV1)
         guard Self.startAttemptMayCommit(
             isTornDown: isTornDown,
             dialedLeaseIsCurrent: lease === dialedLease,
@@ -585,6 +588,11 @@ final class PeerWorkspaceMirrorController {
         guard let sid = wireSurfaceID(forPanelId: panelId),
               let session = subscriptionSession else { return }
         Task { try? await session.requestNewTab(paneID: sid) }
+    }
+
+    func forwardNewTabForEmptyWorkspace() {
+        guard remoteLayoutIsEmpty, let session = subscriptionSession else { return }
+        Task { try? await session.requestNewTab(workspaceID: hostWorkspaceID) }
     }
 
     /// A local tab selection in a mirrored pane asks the host to make that
@@ -1233,7 +1241,10 @@ final class PeerWorkspaceMirrorController {
                 )
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
-                    _ = try await session.handshake(options: Self.mirrorHandshakeOptions)
+                    let info = try await session.handshake(options: Self.mirrorHandshakeOptions)
+                    self.supportsDurableWorkspace = info.hasHostCapability(
+                        PeerCapability.workspaceDurableV1
+                    )
                     workspaces = try await session.listWorkspaces()
                 } catch {
                     // Now that a failed attempt can actually fail instead of

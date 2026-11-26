@@ -1875,10 +1875,14 @@ final class Workspace: Identifiable {
         // Live mirror: forward as a host-side new-tab (keyed by the
         // pane's selected panel), create nothing locally.
         if mirrorForwardsLocalActions {
-            if let tab = bonsplitController.selectedTab(inPane: paneId),
-               let panelId = panelIdFromSurfaceId(tab.id)
-            {
-                peerMirror?.forwardNewTab(panelId: panelId)
+            if let peerMirror {
+                if let tab = bonsplitController.selectedTab(inPane: paneId),
+                   let panelId = panelIdFromSurfaceId(tab.id)
+                {
+                    peerMirror.forwardNewTab(panelId: panelId)
+                } else if peerMirror.remoteLayoutIsEmpty {
+                    peerMirror.forwardNewTabForEmptyWorkspace()
+                }
             }
             return nil
         }

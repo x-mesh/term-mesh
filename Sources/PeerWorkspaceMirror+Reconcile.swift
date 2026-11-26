@@ -146,8 +146,22 @@ extension PeerWorkspaceMirrorController {
             }
         }
 
+        if targetLeaves.isEmpty {
+            guard supportsDurableWorkspace else { return }
+            remoteLayoutIsEmpty = true
+            withRemoteApplication {
+                for panelID in Array(workspace.panels.keys) {
+                    _ = workspace.closePanel(panelID, force: true)
+                }
+            }
+            panelBySurfaceID.removeAll()
+            hostSplitToLocal.removeAll()
+            recordApplied(target)
+            return
+        }
+        remoteLayoutIsEmpty = false
+
         // ── Phase A (async, no tree mutation): sessions for new tabs.
-        guard !targetLeaves.isEmpty else { return }
         let targetTabs = targetLeaves.flatMap(Self.mirroredTabs(of:))
         let activeIDs = Set(targetTabs.map(\.surfaceID))
         // A push that DROPS a leaf is the only layout change that destroys

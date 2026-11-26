@@ -1068,7 +1068,10 @@ async fn reader_loop(
             // immediately to address the workspace it just asked for
             // (e.g. a follow-up NewTabRequest.workspace_id).
             (HandshakeState::Ready, Payload::CreateWorkspaceRequest(req)) => {
-                let workspace_id = host.create_workspace(req.title);
+                let workspace_id = host.create_workspace_with_lifetime(
+                    req.title,
+                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1),
+                );
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
@@ -1119,7 +1122,10 @@ async fn reader_loop(
                 // the tree actually changed; an invalid or refused command
                 // (unknown ids, last-pane close, garbage orientation) is a
                 // silent no-op exactly like the Swift host's perform*.
-                host.apply_control(ctl);
+                host.apply_control_with_lifetime(
+                    ctl,
+                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1),
+                );
             }
 
             (HandshakeState::Ready, Payload::AttachSurface(req)) => {
@@ -1493,6 +1499,7 @@ async fn reader_loop(
 
             (HandshakeState::Ready, Payload::DetachSurface(det)) => {
                 if let Some(entry) = attached.remove(&det.surface_id) {
+                    host.pty.note_detached(&det.surface_id);
                     reap_if_abandoned(&host, &det.surface_id);
                     entry.surface.drop_size_request(size_requester);
                     entry.cancel.notify_one();
@@ -1597,6 +1604,7 @@ async fn reader_loop(
     }
 
     for (surface_id, entry) in attached.drain() {
+        host.pty.note_detached(&surface_id);
         entry.surface.drop_size_request(size_requester);
         entry.cancel.notify_one();
         let _ = entry.task.await;
@@ -1989,7 +1997,7 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
     if host.pty.attacher_count(surface_id) > 0 {
         return;
     }
-    if !host.pty.is_ephemeral(surface_id) {
+    if !host.pty.is_temporary(surface_id) {
         return;
     }
     // A published project manifest refers to this surface for as long as it
@@ -2009,7 +2017,7 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
         if host.pty.attacher_count(&sid) > 0 {
             return;
         }
-        if !host.pty.is_ephemeral(&sid) {
+        if !host.pty.is_temporary(&sid) {
             return;
         }
         // Re-checked with the count: a manifest published during the grace
