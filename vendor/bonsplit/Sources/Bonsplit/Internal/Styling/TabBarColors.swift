@@ -212,9 +212,14 @@ enum TabBarColors {
         static let opaqueAlphaThreshold: CGFloat = 0.999
     }
 
-    /// Panes are separate cards, so the gap between them shows the window
-    /// background instead of a drawn divider line.
-    static let splitGapColor: NSColor = .clear
+    /// Panes are separate cards, so the gap between them uses the same window
+    /// background as the space around the cards. An explicit backing color is
+    /// required for opaque themes because AppKit can expose the split view's
+    /// backing layer while live-resizing a divider. Translucent themes still
+    /// return clear to avoid compositing their alpha twice.
+    static func nsColorSplitGap(for appearance: BonsplitConfiguration.Appearance) -> NSColor {
+        nsColorCardWindowBackground(for: appearance)
+    }
 
     /// A translucent theme leaves the window background clear: painting it under
     /// the cards would composite the configured alpha twice inside every card.

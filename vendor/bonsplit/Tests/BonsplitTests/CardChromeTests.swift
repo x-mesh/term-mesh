@@ -71,6 +71,19 @@ final class CardChromeTests: XCTestCase {
         XCTAssertEqual(window.alphaComponent, 0, accuracy: 0.001)
     }
 
+    func testSplitGapHasAnOpaqueBackingOnlyForOpaqueThemes() {
+        for hex in [Self.darkTheme, Self.lightTheme] {
+            let look = appearance(hex)
+            let gap = TabBarColors.nsColorSplitGap(for: look).usingColorSpace(.sRGB)!
+            let window = TabBarColors.nsColorCardWindowBackground(for: look).usingColorSpace(.sRGB)!
+            XCTAssertEqual(gap, window, hex)
+            XCTAssertEqual(gap.alphaComponent, 1, accuracy: 0.001, hex)
+        }
+
+        let translucent = TabBarColors.nsColorSplitGap(for: appearance("#1E1F22CC"))
+        XCTAssertEqual(translucent.alphaComponent, 0, accuracy: 0.001)
+    }
+
     func testTabTextReadsOnTheCardInDarkAndLightThemes() {
         for hex in [Self.darkTheme, Self.lightTheme] {
             let look = appearance(hex)
