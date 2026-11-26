@@ -292,14 +292,15 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 #else
         let splitView = ThemedSplitView()
 #endif
-        splitView.customDividerColor = TabBarColors.splitGapColor
+        let splitGapColor = TabBarColors.nsColorSplitGap(for: appearance)
+        splitView.customDividerColor = splitGapColor
         splitView.cardGap = appearance.cardGap
         splitView.isVertical = splitState.orientation == .horizontal
         splitView.dividerStyle = .thin
         splitView.delegate = context.coordinator
         splitView.wantsLayer = true
-        splitView.layer?.backgroundColor = NSColor.clear.cgColor
-        splitView.layer?.isOpaque = false
+        splitView.layer?.backgroundColor = splitGapColor.cgColor
+        splitView.layer?.isOpaque = splitGapColor.alphaComponent >= 0.999
 
         // Keep arranged subviews stable (always 2) to avoid transient "collapse" flashes when
         // replacing pane<->split content. We swap the hosted content within these containers.
@@ -520,9 +521,10 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
             }
         }
         splitView.wantsLayer = true
-        splitView.layer?.backgroundColor = NSColor.clear.cgColor
-        splitView.layer?.isOpaque = false
-        (splitView as? ThemedSplitView)?.customDividerColor = TabBarColors.splitGapColor
+        let splitGapColor = TabBarColors.nsColorSplitGap(for: appearance)
+        splitView.layer?.backgroundColor = splitGapColor.cgColor
+        splitView.layer?.isOpaque = splitGapColor.alphaComponent >= 0.999
+        (splitView as? ThemedSplitView)?.customDividerColor = splitGapColor
         if let themed = splitView as? ThemedSplitView, themed.cardGap != appearance.cardGap {
             themed.cardGap = appearance.cardGap
             themed.adjustSubviews()
