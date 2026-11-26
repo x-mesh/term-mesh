@@ -146,6 +146,7 @@ extension Workspace: BonsplitDelegate {
             currentDirectory = dir
         }
         gitBranch = panelGitBranches[panelId]
+        scheduleRemotePaneLocationRefresh(panelId: panelId, reason: .focused)
 
         // Post notification
         NotificationCenter.default.post(
@@ -396,6 +397,7 @@ extension Workspace: BonsplitDelegate {
         surfaceIdToPanelId.removeValue(forKey: tabId)
         panelDirectories.removeValue(forKey: panelId)
         panelGitBranches.removeValue(forKey: panelId)
+        forgetRemotePaneLocation(panelId: panelId)
         panelTitles.removeValue(forKey: panelId)
         panelCustomTitles.removeValue(forKey: panelId)
         panelProgramStatuses.removeValue(forKey: panelId)
@@ -539,6 +541,7 @@ extension Workspace: BonsplitDelegate {
                 panels.removeValue(forKey: panelId)
                 panelDirectories.removeValue(forKey: panelId)
                 panelGitBranches.removeValue(forKey: panelId)
+                forgetRemotePaneLocation(panelId: panelId)
                 panelTitles.removeValue(forKey: panelId)
                 panelCustomTitles.removeValue(forKey: panelId)
                 panelProgramStatuses.removeValue(forKey: panelId)

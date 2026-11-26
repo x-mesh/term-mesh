@@ -285,6 +285,15 @@ final class Workspace: Identifiable {
     @ObservationIgnored private var dominantRemoteHostKeyCache: PeerPaneHostKey??
     @ObservationIgnored private var dominantRemoteHostKeyCachedFocusedPanelId: UUID?
     @ObservationIgnored private(set) var dominantRemoteHostKeyComputationCount = 0
+    /// Where each remote pane's shell is on its host, keyed by panel.
+    ///
+    /// Kept apart from `panelDirectories` on purpose: focusing a pane copies
+    /// that map into `currentDirectory`, which new splits and the titlebar's
+    /// `git` lookup read as a path on this Mac.
+    var remotePaneLocations: [UUID: RemotePaneLocation] = [:]
+    @ObservationIgnored var remotePaneLocationRefreshes: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored var remotePaneLocationRefreshAgain: Set<UUID> = []
+    @ObservationIgnored var remotePaneLocationLastQuery: [UUID: ContinuousClock.Instant] = [:]
     var surfaceListeningPorts: [UUID: [Int]] = [:]
     var listeningPorts: [Int] = []
     @ObservationIgnored var surfaceTTYNames: [UUID: String] = [:]
@@ -1087,6 +1096,26 @@ final class Workspace: Identifiable {
 
     func hasUnreadNotification(panelId: UUID) -> Bool {
         AppDelegate.shared?.notificationStore?.hasUnreadNotification(forTabId: id, surfaceId: panelId) ?? false
+    }
+
+    /// Shows the host a remote terminal runs on as a chip in its tab, and
+    /// removes it from a local one. The one place the badge is derived, so
+    /// every path that (re)creates a tab for an existing panel calls this.
+    func syncHostBadgeForPanel(_ panelId: UUID) {
+        guard let tabId = surfaceIdFromPanelId(panelId) else { return }
+        let badge = (panels[panelId] as? TerminalPanel)?.remoteHostKey.map(Self.tabHostBadge(for:))
+        bonsplitController.updateTab(tabId, hostBadge: .some(badge))
+    }
+
+    static func tabHostBadge(for hostKey: PeerPaneHostKey) -> TabHostBadge {
+        let color = PeerHostAccent.primaryColor(for: hostKey).usingColorSpace(.sRGB)
+            ?? PeerHostAccent.primaryColor(for: hostKey)
+        return TabHostBadge(
+            label: hostKey.shortLabel,
+            red: Double(color.redComponent),
+            green: Double(color.greenComponent),
+            blue: Double(color.blueComponent)
+        )
     }
 
     func syncUnreadBadgeStateForPanel(_ panelId: UUID) {
@@ -2843,6 +2872,8 @@ final class Workspace: Identifiable {
         }
         syncPinnedStateForTab(newTabId, panelId: detached.panelId)
         syncUnreadBadgeStateForPanel(detached.panelId)
+        syncHostBadgeForPanel(detached.panelId)
+        scheduleRemotePaneLocationRefresh(panelId: detached.panelId, reason: .attached)
         normalizePinnedTabs(in: paneId)
 
         if focus {
@@ -3696,10 +3727,11 @@ final class Workspace: Identifiable {
         // the handler refuses to engage until the host sends a typed
         // snapshot, so legacy hosts keep plain local scrolling).
         panel.hostedView.scrollbackBrowseHandler = session.relaySession
-        // Always-on host signal: 2pt strip in the host's accent color
-        // (the focused-pane titlebar gradient complements this).
-        panel.hostedView.setPeerHostStrip(
-            color: PeerHostAccent.primaryColor(for: session.lease.key)
+        syncHostBadgeForPanel(panel.id)
+        recordRemotePaneLocation(
+            panelId: panel.id,
+            directory: session.originSurface.cwd,
+            branch: session.originSurface.branch
         )
         let panelId = panel.id
         session.requestPaneClose = { [weak self] in
@@ -4546,6 +4578,86 @@ final class Workspace: Identifiable {
     ///
     /// Costs a short-lived connection to the host, so this is for moments of
     /// intent (opening the binding sheet), not for anything that repeats.
+    enum RemotePaneLocationRefreshReason {
+        case focused
+        case attached
+        /// The titlebar is showing this pane. It redraws on its own tick and
+        /// whenever the pane retitles, so only the pane on screen is asked
+        /// about, however many remote panes keep retitling themselves.
+        case shownInTitlebar
+
+        /// Each query opens a host connection, and an agent CLI retitles its
+        /// pane every second. Focus and attach are rare and want the answer
+        /// now.
+        var minimumInterval: Duration {
+            switch self {
+            case .focused, .attached: .zero
+            case .shownInTitlebar: .seconds(5)
+            }
+        }
+    }
+
+    func recordRemotePaneLocation(panelId: UUID, directory: String, branch: String) {
+        let location = RemotePaneLocation(directory: directory, branch: branch)
+        guard remotePaneLocations[panelId] != location else { return }
+#if DEBUG
+        dlog(
+            "remote.location panel=\(panelId.uuidString.prefix(8)) " +
+            "dir=\(directory.isEmpty ? "-" : directory) branch=\(branch.isEmpty ? "-" : branch)"
+        )
+#endif
+        remotePaneLocations[panelId] = location
+        NotificationCenter.default.post(name: .remotePaneLocationDidChange, object: self)
+    }
+
+    func forgetRemotePaneLocation(panelId: UUID) {
+        remotePaneLocations.removeValue(forKey: panelId)
+        remotePaneLocationRefreshes.removeValue(forKey: panelId)?.cancel()
+        remotePaneLocationRefreshAgain.remove(panelId)
+        remotePaneLocationLastQuery.removeValue(forKey: panelId)
+    }
+
+    /// Re-reads where a remote pane's shell is. One query per pane at a time:
+    /// a request that arrives while one runs is folded into a single rerun.
+    /// A host that stops answering ends the query through the read timeout
+    /// of `PeerRelaySession.connectAndList`.
+    func scheduleRemotePaneLocationRefresh(panelId: UUID, reason: RemotePaneLocationRefreshReason) {
+        guard (panels[panelId] as? TerminalPanel)?.peerPaneSession != nil else { return }
+        if remotePaneLocationRefreshes[panelId] != nil {
+            remotePaneLocationRefreshAgain.insert(panelId)
+            return
+        }
+        let delay: Duration = {
+            guard let last = remotePaneLocationLastQuery[panelId] else { return .zero }
+            let remaining = reason.minimumInterval - (ContinuousClock.now - last)
+            return remaining > .zero ? remaining : .zero
+        }()
+        remotePaneLocationRefreshes[panelId] = Task { @MainActor [weak self] in
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled, let self else { return }
+            await self.queryRemotePaneLocation(panelId: panelId)
+            guard !Task.isCancelled else { return }
+            self.remotePaneLocationRefreshes[panelId] = nil
+            if self.remotePaneLocationRefreshAgain.remove(panelId) != nil {
+                self.scheduleRemotePaneLocationRefresh(panelId: panelId, reason: .shownInTitlebar)
+            }
+        }
+    }
+
+    private func queryRemotePaneLocation(panelId: UUID) async {
+        guard let session = (panels[panelId] as? TerminalPanel)?.peerPaneSession else { return }
+        remotePaneLocationLastQuery[panelId] = .now
+        let wanted = session.originSurface.surfaceID
+        do {
+            let surfaces = try await PeerPaneSession.listSurfaces(on: session.lease)
+            guard !Task.isCancelled, panels[panelId] != nil,
+                  let match = surfaces.first(where: { $0.surfaceID == wanted }) else { return }
+            recordRemotePaneLocation(panelId: panelId, directory: match.cwd, branch: match.branch)
+        } catch {
+            RemoteWorkLog.debug("location lookup for panel \(panelId.uuidString.prefix(8)) failed: \(error.localizedDescription)")
+        }
+    }
+
     func remoteDirectory(for pane: WorkspaceRemotePaneRecord) async -> String? {
         guard let panel = terminalPanel(for: pane.panelID),
               let session = panel.peerPaneSession else {

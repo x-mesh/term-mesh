@@ -1286,6 +1286,9 @@ extension Notification.Name {
     static let commandPaletteSetQueryRequested = Notification.Name("term-mesh.commandPaletteSetQueryRequested")
     static let commandPaletteRenameInputDeleteBackwardRequested = Notification.Name("term-mesh.commandPaletteRenameInputDeleteBackwardRequested")
     static let ghosttyDidUpdateGitBranch = Notification.Name("ghosttyDidUpdateGitBranch")
+    /// A remote pane's host reported a new directory or branch. `object` is
+    /// the workspace.
+    static let remotePaneLocationDidChange = Notification.Name("remotePaneLocationDidChange")
     static let ghosttyDidSetTitle = Notification.Name("ghosttyDidSetTitle")
     static let ghosttyDidFocusTab = Notification.Name("ghosttyDidFocusTab")
     static let ghosttyDidFocusSurface = Notification.Name("ghosttyDidFocusSurface")

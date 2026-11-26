@@ -721,19 +721,7 @@ final class GhosttySurfaceScrollView: NSView {
         inactiveOverlayView.frame = terminalBounds
         if let banner = peerDisconnectBannerView {
             let height: CGFloat = 32
-            // Sit just below the 2pt host strip so the always-on host
-            // signal stays visible while the banner is up.
-            let stripInset: CGFloat = peerHostStripView == nil ? 0 : 2
             banner.frame = NSRect(
-                x: terminalBounds.minX,
-                y: terminalBounds.maxY - height - stripInset,
-                width: terminalBounds.width,
-                height: height
-            )
-        }
-        if let strip = peerHostStripView {
-            let height: CGFloat = 2
-            strip.frame = NSRect(
                 x: terminalBounds.minX,
                 y: terminalBounds.maxY - height,
                 width: terminalBounds.width,
@@ -911,28 +899,6 @@ final class GhosttySurfaceScrollView: NSView {
     func hidePeerDisconnectBanner() {
         peerDisconnectBannerView?.removeFromSuperview()
         peerDisconnectBannerView = nil
-    }
-
-    // MARK: - Peer host strip (always-on remote-pane signal)
-
-    private var peerHostStripView: NSView?
-
-    /// 2pt host-colored strip along the pane's top edge, shown for
-    /// remote panes regardless of focus. nil removes it.
-    func setPeerHostStrip(color: NSColor?) {
-        if let color {
-            if peerHostStripView == nil {
-                let strip = NSView(frame: .zero)
-                strip.wantsLayer = true
-                addSubview(strip, positioned: .above, relativeTo: nil)
-                peerHostStripView = strip
-            }
-            peerHostStripView?.layer?.backgroundColor = color.cgColor
-        } else {
-            peerHostStripView?.removeFromSuperview()
-            peerHostStripView = nil
-        }
-        needsLayout = true
     }
 
     func setInactiveOverlay(color: NSColor, opacity: CGFloat, visible: Bool) {
