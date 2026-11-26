@@ -407,6 +407,29 @@ enum FontFamilySearch {
 
         return families.filter { $0.localizedCaseInsensitiveContains(query) }
     }
+
+    /// The rows a font list shows, one array per divider-separated group.
+    /// `""` is the row that clears the selection; it is listed only while the
+    /// query is empty. A selection that is not installed gets a row of its own
+    /// so the list never hides the current value.
+    static func groups(sections: [[String]], selection: String, query: String) -> [[String]] {
+        let isSearching = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        var head = isSearching ? [] : [""]
+        if !selection.isEmpty, !sections.contains(where: { $0.contains(selection) }) {
+            head += filtered([selection], query: query)
+        }
+        return ([head] + sections.map { filtered($0, query: query) }).filter { !$0.isEmpty }
+    }
+
+    /// The row an arrow key lands on. It stops at the ends, and with nothing
+    /// highlighted it starts from the end the key points away from.
+    static func moved(from current: String?, by delta: Int, in rows: [String]) -> String? {
+        guard !rows.isEmpty else { return nil }
+        guard let current, let index = rows.firstIndex(of: current) else {
+            return delta >= 0 ? rows.first : rows.last
+        }
+        return rows[min(max(index + delta, 0), rows.count - 1)]
+    }
 }
 
 // MARK: - Monospace Font List

@@ -91,6 +91,7 @@
 			CVB00105 /* PeerHostStatsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00105 /* PeerHostStatsStore.swift */; };
 		DRC00002 /* DiskReclamation.swift in Sources */ = {isa = PBXBuildFile; fileRef = DRC00001 /* DiskReclamation.swift */; };
 		CCH00002 /* CardChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCH00001 /* CardChrome.swift */; };
+		FCB00002 /* FontFamilyComboBox.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCB00001 /* FontFamilyComboBox.swift */; };
 		PGS00002 /* PaneGapSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = PGS00001 /* PaneGapSettings.swift */; };
 		CRV00002 /* CardRingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CRV00001 /* CardRingView.swift */; };
 		NLP00002 /* NotificationLapPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = NLP00001 /* NotificationLapPolicy.swift */; };
@@ -510,6 +511,7 @@
 			CVS00105 /* PeerHostStatsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsStore.swift; sourceTree = "<group>"; };
 		DRC00001 /* DiskReclamation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskReclamation.swift; sourceTree = "<group>"; };
 		CCH00001 /* CardChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardChrome.swift; sourceTree = "<group>"; };
+		FCB00001 /* FontFamilyComboBox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FontFamilyComboBox.swift; sourceTree = "<group>"; };
 		PGS00001 /* PaneGapSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaneGapSettings.swift; sourceTree = "<group>"; };
 		CRV00001 /* CardRingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardRingView.swift; sourceTree = "<group>"; };
 		NLP00001 /* NotificationLapPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationLapPolicy.swift; sourceTree = "<group>"; };
@@ -966,6 +968,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				CVS00105 /* PeerHostStatsStore.swift */,
 				DRC00001 /* DiskReclamation.swift */,
 				CCH00001 /* CardChrome.swift */,
+				FCB00001 /* FontFamilyComboBox.swift */,
 				PGS00001 /* PaneGapSettings.swift */,
 				CRV00001 /* CardRingView.swift */,
 				NLP00001 /* NotificationLapPolicy.swift */,
@@ -1498,6 +1501,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				CVB00105 /* PeerHostStatsStore.swift in Sources */,
 				DRC00002 /* DiskReclamation.swift in Sources */,
 				CCH00002 /* CardChrome.swift in Sources */,
+				FCB00002 /* FontFamilyComboBox.swift in Sources */,
 				PGS00002 /* PaneGapSettings.swift in Sources */,
 				CRV00002 /* CardRingView.swift in Sources */,
 				NLP00002 /* NotificationLapPolicy.swift in Sources */,

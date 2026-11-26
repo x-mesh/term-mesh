@@ -4,6 +4,10 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Font Family and Fallback Font in Settings › Terminal are each one control now: a button that shows the current font and opens a list you can search. Type to filter, move with the arrow keys and press Return to choose. Before, a search field sat above a separate menu.
+
 ### Fixed
 
 - Pane Padding in Settings now applies when your Ghostty config sets `window-padding-y`, `window-padding-x` or `window-padding-balance`. Before, those values took rows back out of every pane and left a gap under the prompt, even with the bottom padding at 0, and the sides slider had no effect. Inside term-mesh these three Ghostty keys are now ignored: set the padding in Settings › Pane Padding.
