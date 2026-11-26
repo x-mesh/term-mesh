@@ -185,6 +185,7 @@ extension PeerWorkspaceMirrorController {
         let missing = targetTabs.filter { panelBySurfaceID[$0.surfaceID] == nil }
         var newSessions: [Data: PeerPaneSession] = [:]
         var spawnedCount = 0
+        var spawnedPanelIDs: [UUID] = []
         for tab in missing {
             do {
                 let session = try await PeerPaneSession.attach(
@@ -252,6 +253,7 @@ extension PeerWorkspaceMirrorController {
                 workspace2.bindRemotePane(session: session, to: panel)
                 panelBySurfaceID[tab.surfaceID] = panel.id
                 spawnedCount += 1
+                spawnedPanelIDs.append(panel.id)
             }
 
             // B3 — close stale panels (their sessions tear down via
@@ -324,6 +326,16 @@ extension PeerWorkspaceMirrorController {
         // Focusing selects a tab; under the flag that selection stays local.
         withRemoteApplication {
             restoreFocus(focusedBefore, targetLeaves: targetLeaves, workspace: workspace2)
+        }
+
+        // The rebuild split every pane again, and the delegate skips the
+        // glow for those splits. Glow only what the host added; the first
+        // apply, which opens the mirror, adds every pane and glows none.
+        if lastAppliedLayout != nil {
+            for panelId in spawnedPanelIDs {
+                guard let pane = workspace2.paneId(forPanelId: panelId) else { continue }
+                workspace2.playPaneTransitionGlow(in: pane, afterSlide: true)
+            }
         }
 
         recordApplied(target)

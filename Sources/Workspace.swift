@@ -388,6 +388,9 @@ final class Workspace: Identifiable {
                   let panelId = self.panelIdFromSurfaceId(tab.id),
                   let terminal = self.panels[panelId] as? TerminalPanel else { return }
             terminal.hostedView.playTransitionGlow(delay: delay)
+            #if DEBUG
+            dlog("pane.transitionGlow panel=\(panelId.uuidString.prefix(5)) mirror=\(self.isPeerMirror ? 1 : 0)")
+            #endif
             let hold = delay + CardRingView.transitionGlowDuration
             for case let other as TerminalPanel in self.panels.values where other !== terminal {
                 other.hostedView.holdNotificationRing(for: hold)
@@ -3432,6 +3435,11 @@ final class Workspace: Identifiable {
     var mirrorForwardsLocalActions: Bool {
         guard let peerMirror else { return false }
         return !peerMirror.isApplyingRemoteLayout && !peerMirror.isTornDown
+    }
+
+    /// The mirror reconciler is rebuilding this workspace's split tree.
+    var isApplyingPeerMirrorLayout: Bool {
+        peerMirror?.isApplyingRemoteLayout == true
     }
 
     /// Host key of this workspace's "dominant" remote pane, for the
