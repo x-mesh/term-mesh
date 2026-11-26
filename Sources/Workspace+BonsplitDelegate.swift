@@ -414,6 +414,11 @@ extension Workspace: BonsplitDelegate {
         // Keep the workspace invariant: always retain at least one real panel.
         // This prevents runtime close callbacks from ever collapsing into a tabless workspace.
         if panels.isEmpty {
+            if isPeerMirror, peerMirror?.remoteLayoutIsEmpty == true {
+                scheduleTerminalGeometryReconcile()
+                scheduleFocusReconcile()
+                return
+            }
             let replacement = createReplacementTerminalPanel()
             if let replacementTabId = surfaceIdFromPanelId(replacement.id),
                let replacementPane = bonsplitController.allPaneIds.first {

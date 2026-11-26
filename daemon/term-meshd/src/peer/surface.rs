@@ -2930,13 +2930,10 @@ pub struct PtyManager {
     /// `insert_surface` (test-only path) does not populate this; production
     /// surfaces registered via `spawn_default` do.
     specs: RwLock<HashMap<Vec<u8>, SpawnSpec>>,
-    /// Surface ids whose spec must NOT survive `remove()` — split/new-tab
-    /// panes registered via `register_and_spawn_ephemeral`. Declared
-    /// surfaces (`TERMMESH_PEER_SURFACES`, via the plain `register_and_spawn`)
-    /// are the ones meant to come back after a restart; an ephemeral pane
-    /// that was just closed must not be resurrectable by a raw
-    /// `AttachSurface` for the same id while the daemon keeps running.
-    ephemeral_specs: RwLock<std::collections::HashSet<Vec<u8>>>,
+    /// Lifetime classification for every managed surface. The classification
+    /// determines whether a detached surface is reclaimed and whether its
+    /// respawn spec survives explicit removal.
+    lifetimes: RwLock<HashMap<Vec<u8>, SurfaceLifetime>>,
     /// How many peers are currently attached to each surface.
     ///
     /// A surface this host spawned on request exists for whoever asked for it.
@@ -2960,6 +2957,13 @@ pub struct PtyManager {
     /// Set before `remove` waits for a reservation. An ensure that reaches the
     /// boundary after close intent is visible must never return a dying PID.
     closing: Mutex<HashMap<Vec<u8>, usize>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceLifetime {
+    Declared,
+    Session,
+    Temporary,
 }
 
 /// Namespace UUID used to derive stable 16-byte `surface_id`s from
@@ -3130,7 +3134,7 @@ impl PtyManager {
         Self {
             surfaces: RwLock::new(HashMap::new()),
             specs: RwLock::new(HashMap::new()),
-            ephemeral_specs: RwLock::new(std::collections::HashSet::new()),
+            lifetimes: RwLock::new(HashMap::new()),
             attachers: Mutex::new(HashMap::new()),
             ensured: RwLock::new(HashMap::new()),
             ensured_persist_path: RwLock::new(None),
@@ -3478,7 +3482,7 @@ impl PtyManager {
     /// (`TERMMESH_PEER_SURFACES`), where "closed" means "gone until the
     /// next restart brings the config back", not "gone forever".
     pub fn register_and_spawn(&self, surface_id: Vec<u8>, spec: SpawnSpec) {
-        self.register_and_spawn_inner(surface_id, spec, false);
+        self.register_and_spawn_inner(surface_id, spec, SurfaceLifetime::Declared);
     }
 
     /// Same as `register_and_spawn`, but the spec is dropped along with
@@ -3488,11 +3492,15 @@ impl PtyManager {
     /// closed. Use for panes created outside `TERMMESH_PEER_SURFACES`.
     /// Whether this surface was created on a peer's request rather than
     /// declared by the operator.
-    pub fn is_ephemeral(&self, surface_id: &[u8]) -> bool {
-        self.ephemeral_specs
+    pub fn lifetime(&self, surface_id: &[u8]) -> Option<SurfaceLifetime> {
+        self.lifetimes
             .read()
-            .map(|set| set.contains(surface_id))
-            .unwrap_or(false)
+            .ok()
+            .and_then(|map| map.get(surface_id).copied())
+    }
+
+    pub fn is_temporary(&self, surface_id: &[u8]) -> bool {
+        self.lifetime(surface_id) == Some(SurfaceLifetime::Temporary)
     }
 
     /// Record that a peer attached.
@@ -3526,11 +3534,25 @@ impl PtyManager {
             .unwrap_or(0)
     }
 
-    pub fn register_and_spawn_ephemeral(&self, surface_id: Vec<u8>, spec: SpawnSpec) {
-        self.register_and_spawn_inner(surface_id, spec, true);
+    pub fn register_and_spawn_managed(
+        &self,
+        surface_id: Vec<u8>,
+        spec: SpawnSpec,
+        lifetime: SurfaceLifetime,
+    ) {
+        self.register_and_spawn_inner(surface_id, spec, lifetime);
     }
 
-    fn register_and_spawn_inner(&self, surface_id: Vec<u8>, spec: SpawnSpec, ephemeral: bool) {
+    pub fn register_and_spawn_ephemeral(&self, surface_id: Vec<u8>, spec: SpawnSpec) {
+        self.register_and_spawn_managed(surface_id, spec, SurfaceLifetime::Temporary);
+    }
+
+    fn register_and_spawn_inner(
+        &self,
+        surface_id: Vec<u8>,
+        spec: SpawnSpec,
+        lifetime: SurfaceLifetime,
+    ) {
         let Ok(reservation) = self.surface_reservation(&surface_id) else {
             tracing::error!("failed to reserve PTY surface {}", hex_short(&surface_id));
             return;
@@ -3555,12 +3577,10 @@ impl PtyManager {
                             .unwrap()
                             .insert(surface_id.clone(), surface);
                         self.specs.write().unwrap().insert(surface_id.clone(), spec);
-                        if ephemeral {
-                            self.ephemeral_specs
-                                .write()
-                                .unwrap()
-                                .insert(surface_id.clone());
-                        }
+                        self.lifetimes
+                            .write()
+                            .unwrap()
+                            .insert(surface_id.clone(), lifetime);
                         tracing::info!("spawned default PTY surface");
                     }
                     Err(e) => {
@@ -3580,19 +3600,15 @@ impl PtyManager {
     }
 
     /// Close a pane's surface: hang the child up and drop it from the
-    /// roster. The respawn spec is kept for a *declared* surface (closing
-    /// it removes it for this daemon lifetime only; a restart brings the
-    /// `TERMMESH_PEER_SURFACES` set back) but purged for an *ephemeral*
-    /// one (`register_and_spawn_ephemeral`) — otherwise a raw
-    /// `AttachSurface` for the same id would resurrect a supposedly-closed
-    /// split/new-tab pane, invisible in the layout tree, indefinitely.
+    /// roster. Declared specs remain available for a later daemon restart;
+    /// session and temporary specs are retired with their surface.
     ///
     /// The SIGHUP is explicit rather than left to `Drop` because attach
     /// relays hold `Arc` clones: waiting for the last clone would keep
     /// the shell running until every viewer detaches, which is not what
     /// "close" means.
     pub fn remove(&self, surface_id: &[u8]) -> bool {
-        match self.remove_inner(surface_id, false, false) {
+        match self.remove_inner(surface_id, false, false, false) {
             Ok(removed) => removed,
             Err(error) => {
                 tracing::error!(
@@ -3608,7 +3624,7 @@ impl PtyManager {
     /// logical record. A failed save leaves the live process and registries
     /// intact and returns the persistence error to the RPC layer.
     pub fn terminate_ensured(&self, surface_id: &[u8]) -> Result<bool, EnsureError> {
-        self.remove_inner(surface_id, true, false)
+        self.remove_inner(surface_id, true, false, true)
     }
 
     /// Explicit destructive termination for any registered surface. Cleanup
@@ -3616,7 +3632,7 @@ impl PtyManager {
     /// explicit terminate is allowed to remove the final pane in a workspace.
     /// Ensured state is still removed transactionally when it exists.
     pub fn terminate(&self, surface_id: &[u8]) -> Result<bool, EnsureError> {
-        self.remove_inner(surface_id, false, false)
+        self.remove_inner(surface_id, false, false, true)
     }
 
     /// Remove a surface only while it is still dead.
@@ -3633,7 +3649,7 @@ impl PtyManager {
     ///
     /// `Ok(false)` means the surface was live and nothing changed.
     pub fn terminate_if_dead(&self, surface_id: &[u8]) -> Result<bool, EnsureError> {
-        self.remove_inner(surface_id, false, true)
+        self.remove_inner(surface_id, false, true, false)
     }
 
     fn remove_inner(
@@ -3641,6 +3657,7 @@ impl PtyManager {
         surface_id: &[u8],
         require_ensured: bool,
         only_if_dead: bool,
+        purge_spec: bool,
     ) -> Result<bool, EnsureError> {
         if !self.begin_close(surface_id) {
             return Err(EnsureError::Internal("closing registry poisoned"));
@@ -3671,8 +3688,13 @@ impl PtyManager {
                 return Ok(false);
             }
             let removed = self.surfaces.write().unwrap().remove(surface_id);
-            let ephemeral = self.ephemeral_specs.write().unwrap().remove(surface_id);
-            let ephemeral_spec = if ephemeral {
+            let lifetime = self.lifetimes.write().unwrap().remove(surface_id);
+            let removable_spec = purge_spec
+                || matches!(
+                    lifetime,
+                    Some(SurfaceLifetime::Session | SurfaceLifetime::Temporary)
+                );
+            let ephemeral_spec = if removable_spec {
                 self.specs.write().unwrap().remove(surface_id)
             } else {
                 None
@@ -3686,11 +3708,11 @@ impl PtyManager {
                             .unwrap()
                             .insert(surface_id.to_vec(), surface);
                     }
-                    if ephemeral {
-                        self.ephemeral_specs
+                    if let Some(lifetime) = lifetime {
+                        self.lifetimes
                             .write()
                             .unwrap()
-                            .insert(surface_id.to_vec());
+                            .insert(surface_id.to_vec(), lifetime);
                     }
                     if let Some(spec) = ephemeral_spec {
                         self.specs
@@ -3716,11 +3738,11 @@ impl PtyManager {
                             .unwrap()
                             .insert(surface_id.to_vec(), surface);
                     }
-                    if ephemeral {
-                        self.ephemeral_specs
+                    if let Some(lifetime) = lifetime {
+                        self.lifetimes
                             .write()
                             .unwrap()
-                            .insert(surface_id.to_vec());
+                            .insert(surface_id.to_vec(), lifetime);
                     }
                     if let Some(spec) = ephemeral_spec {
                         self.specs

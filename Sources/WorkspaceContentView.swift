@@ -422,6 +422,11 @@ struct EmptyPanelView: View {
         _ = workspace.newTerminalSurface(inPane: paneId)
     }
 
+    private func createRemotePane() {
+        focusPane()
+        workspace.peerMirror?.forwardNewTabForEmptyWorkspace()
+    }
+
     private func createBrowser() {
         #if DEBUG
         dlog("emptyPane.newBrowser pane=\(paneId.id.uuidString.prefix(5))")
@@ -479,24 +484,31 @@ struct EmptyPanelView: View {
                 .font(.system(size: 48))
                 .foregroundStyle(.tertiary)
 
-            Text("Empty Panel")
+            Text(workspace.isPeerMirror ? "Empty Remote Session" : "Empty Panel")
                 .font(.headline)
                 .foregroundStyle(.secondary)
 
-            HStack(spacing: 12) {
-                emptyPaneActionButton(
-                    title: "Terminal",
-                    systemImage: "terminal.fill",
-                    shortcut: newSurfaceShortcut,
-                    action: createTerminal
-                )
+            if workspace.isPeerMirror {
+                Button(action: createRemotePane) {
+                    Label("New Pane", systemImage: "terminal.fill")
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                HStack(spacing: 12) {
+                    emptyPaneActionButton(
+                        title: "Terminal",
+                        systemImage: "terminal.fill",
+                        shortcut: newSurfaceShortcut,
+                        action: createTerminal
+                    )
 
-                emptyPaneActionButton(
-                    title: "Browser",
-                    systemImage: "globe",
-                    shortcut: openBrowserShortcut,
-                    action: createBrowser
-                )
+                    emptyPaneActionButton(
+                        title: "Browser",
+                        systemImage: "globe",
+                        shortcut: openBrowserShortcut,
+                        action: createBrowser
+                    )
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
