@@ -3463,6 +3463,10 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
             Ok(serde_json::to_value(snapshot).unwrap())
         }
 
+        // Which panes are running a `claude` or `codex` CLI right now, for the
+        // app's tab icons. The same PaneTracker snapshot token accounting uses.
+        "pane.agents" => Ok(pane_agents_json(&ctx.pane_tracker.snapshot())),
+
         // --- Usage Tracker (F-03/F-04) — JSONL-based real API usage ---
         "usage.snapshot" => {
             let snapshot = ctx.usage_tracker.snapshot();
@@ -6194,9 +6198,40 @@ async fn query_gui_team_workers(app_socket: &str, team_id: &str) -> Vec<String> 
     vec![]
 }
 
+/// `{"panes": {"<TERMMESH_PANEL_ID>": "claude" | "codex"}}`.
+fn pane_agents_json(panes: &HashMap<String, crate::pane_tracker::PaneInfo>) -> serde_json::Value {
+    let panes: serde_json::Map<String, serde_json::Value> = panes
+        .iter()
+        .map(|(panel_id, info)| (panel_id.clone(), serde_json::Value::from(info.cli.clone())))
+        .collect();
+    serde_json::json!({ "panes": panes })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_agents_json_maps_each_panel_to_its_cli() {
+        let info = |cli: &str| crate::pane_tracker::PaneInfo {
+            cli: cli.to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 1,
+            proc_start_unix: 0,
+        };
+        let panes = HashMap::from([
+            ("A1".to_string(), info("claude")),
+            ("B2".to_string(), info("codex")),
+        ]);
+        assert_eq!(
+            pane_agents_json(&panes),
+            serde_json::json!({ "panes": { "A1": "claude", "B2": "codex" } })
+        );
+        assert_eq!(
+            pane_agents_json(&HashMap::new()),
+            serde_json::json!({ "panes": {} })
+        );
+    }
 
     /// Regression for v0.185.1: the CLI and Swift owner both allowed a
     /// project-scoped add, but the daemon rejected it at `peer.leader.call`
