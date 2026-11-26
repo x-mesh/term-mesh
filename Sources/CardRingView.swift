@@ -60,6 +60,18 @@ final class CardRingView: NSView {
         static let fadeOutStart: NSNumber = 0.75
         static let lapAnimationKey = "term-mesh.card-ring.lap"
 
+        // Amber rather than the blue of the notification ring, so a pane that
+        // just moved never reads as one with unread output.
+        static let transitionColor = NSColor(srgbRed: 0xF0 / 255, green: 0xB3 / 255, blue: 0x5C / 255, alpha: 1)
+        static let transitionDuration: CFTimeInterval = 0.9
+        static let transitionPeakAt: NSNumber = 0.1
+        static let transitionTiming = CAMediaTimingFunction(controlPoints: 0.3, 0, 0.2, 1)
+        static let transitionAnimationKey = "term-mesh.card-ring.transition"
+        static let transitionLayers: [(lineWidth: CGFloat, blurRadius: CGFloat, peakOpacity: Float)] = [
+            (lineWidth: 6, blurRadius: 5, peakOpacity: 0.32),
+            (lineWidth: 1, blurRadius: 0, peakOpacity: 0.67),
+        ]
+
         // Longest and faintest first so the bright head draws on top.
         static let lapLayers: [LapLayerSpec] = [
             LapLayerSpec(length: 0.80, lineWidth: 14, blurRadius: 11, peakOpacity: 0.058, color: glowColor),
@@ -77,6 +89,10 @@ final class CardRingView: NSView {
 
     private let faintLayer = CAShapeLayer()
     private var lapLayers: [(layer: CAShapeLayer, spec: LapLayerSpec)] = []
+    private var transitionLayers: [(layer: CAShapeLayer, peakOpacity: Float)] = []
+    private var ringShown = false
+    private var transitionGlowGeneration = 0
+    private var isPlayingTransitionGlow = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -110,6 +126,20 @@ final class CardRingView: NSView {
             layer?.addSublayer(shape)
             lapLayers.append((shape, spec))
         }
+
+        for spec in Style.transitionLayers {
+            let shape = CAShapeLayer()
+            shape.fillColor = nil
+            shape.strokeColor = Style.transitionColor.cgColor
+            shape.lineWidth = spec.lineWidth
+            shape.opacity = 0
+            if spec.blurRadius > 0, let blur = CIFilter(name: "CIGaussianBlur") {
+                blur.setValue(spec.blurRadius, forKey: kCIInputRadiusKey)
+                shape.filters = [blur]
+            }
+            layer?.addSublayer(shape)
+            transitionLayers.append((shape, spec.peakOpacity))
+        }
         isHidden = true
     }
 
@@ -135,14 +165,47 @@ final class CardRingView: NSView {
         CATransaction.setDisableActions(true)
         switch ring {
         case .hidden:
-            isHidden = true
+            ringShown = false
+            isHidden = !isPlayingTransitionGlow
             faintLayer.opacity = 0
             for entry in lapLayers { entry.layer.removeAnimation(forKey: Style.lapAnimationKey) }
         case .faint:
+            ringShown = true
             isHidden = false
             faintLayer.opacity = 1
         }
         CATransaction.commit()
+    }
+
+    /// Glows the card once in amber after a split, close or zoom leaves this
+    /// pane in focus. `delay` lets the glow start when the slide stops.
+    func playTransitionGlow(delay: CFTimeInterval) {
+        transitionGlowGeneration += 1
+        let generation = transitionGlowGeneration
+        isPlayingTransitionGlow = true
+        isHidden = false
+
+        let begin = CACurrentMediaTime() + delay
+        for entry in transitionLayers {
+            let fade = CAKeyframeAnimation(keyPath: "opacity")
+            fade.values = [0, entry.peakOpacity, 0]
+            fade.keyTimes = [0, Style.transitionPeakAt, 1]
+            fade.timingFunctions = [
+                CAMediaTimingFunction(name: .easeOut),
+                Style.transitionTiming,
+            ]
+            fade.duration = Style.transitionDuration
+            fade.beginTime = begin
+            fade.fillMode = .backwards
+            entry.layer.removeAnimation(forKey: Style.transitionAnimationKey)
+            entry.layer.add(fade, forKey: Style.transitionAnimationKey)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + Style.transitionDuration) { [weak self] in
+            guard let self, self.transitionGlowGeneration == generation else { return }
+            self.isPlayingTransitionGlow = false
+            if !self.ringShown { self.isHidden = true }
+        }
     }
 
     func playLap() {
@@ -189,6 +252,10 @@ final class CardRingView: NSView {
         for entry in lapLayers {
             entry.layer.frame = bounds
             entry.layer.path = twice
+        }
+        for entry in transitionLayers {
+            entry.layer.frame = bounds
+            entry.layer.path = loop
         }
         CATransaction.commit()
     }

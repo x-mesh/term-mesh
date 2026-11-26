@@ -17,6 +17,21 @@ enum PaneGapSettings {
     }
 }
 
+/// Whether pane splits and zooms slide, and whether the pane they leave in
+/// focus glows.
+///
+/// Off by default: the slide resizes the terminal while it moves, the same as
+/// dragging a divider, and a full-screen TUI repaints on every resize.
+enum PaneTransitionAnimationSettings {
+    static let key = "paneTransitionAnimations"
+    static let defaultValue = false
+    static let duration: Double = 0.2
+
+    static var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? defaultValue
+    }
+}
+
 /// Space between a pane card's edge and the terminal grid.
 ///
 /// Applied by the app around the surface view rather than through Ghostty's
