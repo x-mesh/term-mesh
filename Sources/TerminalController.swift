@@ -92,6 +92,7 @@ class TerminalController {
         "browser.tab.switch",
         "debug.shortcut.simulate",
         "debug.command_palette.toggle",
+        "debug.activity.show",
         "debug.notification.focus",
         "debug.app.activate"
     ]
@@ -1410,6 +1411,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugSheetDismiss(params: params))
         case "debug.command_palette.toggle":
             return v2Result(id: id, self.v2DebugToggleCommandPalette(params: params))
+        case "debug.activity.show":
+            return v2Result(id: id, self.v2DebugActivityShow(params: params))
         case "debug.agent.transcript":
             return v2Result(id: id, self.v2DebugAgentTranscript(params: params))
         case "debug.agent.render_stats":
@@ -1785,6 +1788,7 @@ class TerminalController {
             "debug.sheet.state",
             "debug.sheet.dismiss",
             "debug.command_palette.toggle",
+            "debug.activity.show",
             "debug.agent.transcript",
             "debug.agent.render_stats",
             "debug.window.drag_resize",

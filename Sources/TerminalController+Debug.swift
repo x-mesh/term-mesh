@@ -205,6 +205,44 @@ extension TerminalController {
             : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    /// Opens the Activity window, optionally on `tab` (a
+    /// `ActivityWindowController.Tab.key`), and reports what it shows. Main-actor exception: it
+    /// orders an AppKit window front.
+    func v2DebugActivityShow(params: [String: Any]) -> V2CallResult {
+        var tab: ActivityWindowController.Tab?
+        if let requested = v2String(params, "tab") {
+            guard let parsed = ActivityWindowController.Tab(key: requested) else {
+                return .err(
+                    code: "invalid_params",
+                    message: "tab must be one of logs, connections, remote_work, diagnostics",
+                    data: nil
+                )
+            }
+            tab = parsed
+        }
+        var result: V2CallResult = .err(code: "internal_error", message: "Activity did not open", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            result = .ok(ActivityWindowController.shared.show(tab: tab))
+        }
+        guard v2Bool(params, "snapshot") == true, case .ok(let shown) = result,
+              var payload = shown as? [String: Any] else { return result }
+        // A second hop, so SwiftUI has laid the chosen tab out before the
+        // view is drawn into the bitmap. Drawn in-process: capturing another
+        // window from outside needs Screen Recording permission.
+        Thread.sleep(forTimeInterval: 0.4)
+        _ = v2MainExec(timeout: 5) {
+            guard let view = ActivityWindowController.shared.window?.contentView,
+                  let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("term-mesh-activity-\(UUID().uuidString).png")
+            guard let png = bitmap.representation(using: .png, properties: [:]),
+                  (try? png.write(to: url)) != nil else { return }
+            payload["snapshot_path"] = url.path
+        }
+        return .ok(payload)
+    }
+
     func v2DebugShortcutSimulate(params: [String: Any]) -> V2CallResult {
         guard let combo = v2String(params, "combo") else {
             return .err(code: "invalid_params", message: "Missing combo", data: nil)

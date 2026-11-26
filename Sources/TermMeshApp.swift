@@ -602,10 +602,9 @@ struct TermMeshApp: App {
                 )
 
                 Button {
-                    AppDelegate.shared?.tabManager?.selectedWorkspace?
-                        .retrievalStore.togglePresentation(.drawer)
+                    ActivityWindowController.shared.show()
                 } label: {
-                    commandLabel("Toggle Activity Drawer")
+                    commandLabel("Activity")
                 }
                 .keyboardShortcut("d", modifiers: [.command, .control])
 

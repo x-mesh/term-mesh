@@ -1,5 +1,7 @@
-// Phase E-5: a small floating window listing every active peer
-// federation relay window the app currently hosts. Each row shows the
+// Phase E-5: lists every active peer federation relay window the app
+// currently hosts, as the Connections tab of the Activity window. It was a
+// floating window of its own; next to the log it explains, one window serves
+// both. Each row shows the
 // host (SSH target if available, otherwise the peer name or local socket
 // path), the connection type, the remote target title, the time the
 // relay opened, and a Disconnect button.
@@ -37,8 +39,11 @@ final class InboundDisconnectButton: NSButton {
 }
 
 @MainActor
-final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegate {
-    static let shared = PeerConnectionsWindowController()
+final class PeerConnectionsController: NSObject {
+    static let shared = PeerConnectionsController()
+
+    /// The two tables, for whoever hosts them.
+    let contentView = NSView()
 
     private var rows: [PeerRelayConnectionInfo] = []
     private var inboundRows: [PeerHostCoordinator.InboundConnectionRow] = []
@@ -49,19 +54,8 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
     private var inboundObserverToken: NSObjectProtocol?
     private var inboundReloadGeneration = 0
 
-    init() {
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 460),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        win.title = "Peer Connections"
-        win.level = .floating
-        win.isReleasedWhenClosed = false
-        win.center()
-        super.init(window: win)
-        win.delegate = self
+    override init() {
+        super.init()
         installContent()
         observerToken = NotificationCenter.default.addObserver(
             forName: PeerClientCoordinator.relaysDidChangeNotification,
@@ -85,8 +79,6 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
 #endif
     }
 
-    required init?(coder: NSCoder) { fatalError("not used") }
-
     deinit {
         if let t = observerToken {
             NotificationCenter.default.removeObserver(t)
@@ -97,26 +89,33 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
     }
 
     func showAndFocus() {
-        if window?.isVisible != true {
-            window?.makeKeyAndOrderFront(nil)
-        } else {
-            window?.makeKeyAndOrderFront(nil)
-        }
+        ActivityWindowController.shared.show(tab: .connections)
+    }
+
+    /// Loads the lists and keeps them current while they are on screen.
+    func activate() {
         reload()
+        guard refreshTimer == nil else { return }
         // Tick once a second so "Attached 12s ago" stays current. The
         // inbound list is re-read too: which side owns a pane's size changes
         // on focus, and nothing notifies that.
-        refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.tableView?.reloadData()
-                self?.inboundTableView?.reloadData()
-                self?.reloadInbound()
+                guard let self else { return }
+                // The tab going away or its window closing ends the polling;
+                // neither reliably tells a SwiftUI-hosted AppKit view.
+                guard self.contentView.window?.isVisible == true else {
+                    self.deactivate()
+                    return
+                }
+                self.tableView?.reloadData()
+                self.inboundTableView?.reloadData()
+                self.reloadInbound()
             }
         }
     }
 
-    func windowWillClose(_ notification: Notification) {
+    func deactivate() {
         refreshTimer?.invalidate()
         refreshTimer = nil
     }
@@ -124,7 +123,6 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
     // MARK: - Layout
 
     private func installContent() {
-        guard let window else { return }
         let outgoing = makeTable(columns: [
             ("host", "Host", 220),
             ("kind", "Type", 76),
@@ -146,8 +144,7 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
 
         let outgoingLabel = makeSectionLabel("Outgoing — machines this Mac is viewing")
         let incomingLabel = makeSectionLabel("Incoming — machines viewing this Mac")
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
+        let container = contentView
         for view in [outgoingLabel, outgoing.scroll, incomingLabel, incoming.scroll] {
             container.addSubview(view)
         }
@@ -165,7 +162,6 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
             incoming.scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
             incoming.scroll.heightAnchor.constraint(equalTo: outgoing.scroll.heightAnchor),
         ])
-        window.contentView = container
     }
 
     private func makeTable(columns: [(String, String, CGFloat)]) -> (scroll: NSScrollView, table: NSTableView) {
@@ -226,13 +222,13 @@ final class PeerConnectionsWindowController: NSWindowController, NSWindowDelegat
     }
 }
 
-extension PeerConnectionsWindowController: NSTableViewDataSource {
+extension PeerConnectionsController: NSTableViewDataSource {
     func numberOfRows(in tableView: NSTableView) -> Int {
         tableView === inboundTableView ? inboundRows.count : rows.count
     }
 }
 
-extension PeerConnectionsWindowController: NSTableViewDelegate {
+extension PeerConnectionsController: NSTableViewDelegate {
     func tableView(_ tableView: NSTableView,
                    viewFor tableColumn: NSTableColumn?,
                    row: Int) -> NSView? {
