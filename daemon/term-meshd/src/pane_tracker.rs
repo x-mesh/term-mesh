@@ -23,6 +23,8 @@ pub struct PaneTracker {
 }
 
 impl PaneTracker {
+    const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
@@ -34,7 +36,7 @@ impl PaneTracker {
         let state = self.state.clone();
         let scanner = Arc::new(Mutex::new(PaneScanner::new()));
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3));
+            let mut interval = tokio::time::interval(Self::POLL_INTERVAL);
             interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
@@ -64,7 +66,7 @@ struct PaneScanner {
     system: System,
     /// Every live pid that has already been classified.
     inspected: HashSet<u32>,
-    /// The subset of `inspected` that is a `claude` or `codex` CLI.
+    /// The subset of `inspected` that is a supported long-running foreground app.
     targets: HashMap<Pid, &'static str>,
 }
 
@@ -115,7 +117,9 @@ impl PaneScanner {
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&appeared),
             false,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+            ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet),
         );
         for pid in appeared {
             self.inspected.insert(pid.as_u32());
@@ -129,7 +133,9 @@ impl PaneScanner {
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+            ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet),
         );
         self.inspected.clear();
         self.targets.clear();
@@ -176,15 +182,20 @@ impl PaneScanner {
             let Some(cwd) = process.cwd() else {
                 continue;
             };
-            result.insert(
-                panel_id,
-                PaneInfo {
-                    cli,
-                    cwd: cwd.to_string_lossy().into_owned(),
-                    pid: pid.as_u32(),
-                    proc_start_unix: i64::try_from(process.start_time()).unwrap_or(0),
-                },
-            );
+            let candidate = PaneInfo {
+                cli,
+                cwd: cwd.to_string_lossy().into_owned(),
+                pid: pid.as_u32(),
+                proc_start_unix: i64::try_from(process.start_time()).unwrap_or(0),
+            };
+            let replace = result.get(&panel_id).is_none_or(|current: &PaneInfo| {
+                app_priority(&candidate.cli) > app_priority(&current.cli)
+                    || (app_priority(&candidate.cli) == app_priority(&current.cli)
+                        && candidate.proc_start_unix > current.proc_start_unix)
+            });
+            if replace {
+                result.insert(panel_id, candidate);
+            }
         }
         result
     }
@@ -233,9 +244,50 @@ fn cli_name(process: &sysinfo::Process) -> Option<&'static str> {
         .exe()
         .and_then(|path| path.file_name())
         .and_then(|name| name.to_str());
-    ["claude", "codex"]
+    process_name
         .into_iter()
-        .find(|candidate| process_name == Some(*candidate) || executable_name == Some(*candidate))
+        .chain(executable_name)
+        .chain(process.cmd().iter().filter_map(|part| part.to_str()))
+        .filter_map(|part| {
+            let basename = std::path::Path::new(part)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(part);
+            app_name(basename)
+        })
+        .max_by_key(|app| app_priority(app))
+}
+
+fn app_name(name: &str) -> Option<&'static str> {
+    let lowered = name.to_ascii_lowercase();
+    let normalized = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    match normalized {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "kiro" | "kiro-cli" | "kiro-cli-term" => Some("kiro"),
+        "gemini" => Some("gemini"),
+        "opencode" => Some("opencode"),
+        "nvim" | "vim" => Some("neovim"),
+        "tmux" => Some("tmux"),
+        "zellij" => Some("zellij"),
+        "lazygit" => Some("lazygit"),
+        "k9s" => Some("k9s"),
+        "btop" | "htop" => Some("system-monitor"),
+        "node" => Some("node"),
+        value if value == "python" || value == "python3" || value.starts_with("python3.") => {
+            Some("python")
+        }
+        _ => None,
+    }
+}
+
+fn app_priority(app: &str) -> u8 {
+    match app {
+        "claude" | "codex" | "kiro" | "gemini" | "opencode" => 3,
+        "neovim" | "tmux" | "zellij" | "lazygit" | "k9s" | "system-monitor" => 2,
+        "python" | "node" => 1,
+        _ => 0,
+    }
 }
 
 // SECURITY: process environments contain API keys and tokens. Extract only
@@ -482,6 +534,47 @@ mod tests {
     fn list_pids_includes_this_process() {
         let pids = list_pids().expect("pid list");
         assert!(pids.contains(&std::process::id()));
+    }
+
+    #[test]
+    fn supported_app_names_cover_the_first_icon_set() {
+        let cases = [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("kiro-cli", "kiro"),
+            ("kiro-cli-term", "kiro"),
+            ("gemini", "gemini"),
+            ("opencode", "opencode"),
+            ("nvim", "neovim"),
+            ("vim", "neovim"),
+            ("tmux", "tmux"),
+            ("zellij", "zellij"),
+            ("lazygit", "lazygit"),
+            ("k9s", "k9s"),
+            ("btop", "system-monitor"),
+            ("htop", "system-monitor"),
+            ("python", "python"),
+            ("python3", "python"),
+            ("python3.13", "python"),
+            ("node", "node"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(app_name(input), Some(expected), "{input}");
+        }
+        assert_eq!(app_name("cargo"), None);
+    }
+
+    #[test]
+    fn app_priority_keeps_agent_or_tui_over_its_runtime() {
+        assert!(app_priority("gemini") > app_priority("node"));
+        assert!(app_priority("neovim") > app_priority("python"));
+        assert_eq!(app_priority("tmux"), app_priority("zellij"));
+    }
+
+    #[test]
+    fn polling_budget_matches_the_tab_icon_latency_contract() {
+        assert_eq!(PaneTracker::POLL_INTERVAL, Duration::from_millis(250));
+        assert!(PaneTracker::POLL_INTERVAL * 2 <= Duration::from_millis(500));
     }
 
     #[test]
