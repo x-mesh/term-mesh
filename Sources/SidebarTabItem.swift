@@ -274,16 +274,21 @@ struct TabItemView: View, Equatable {
     }
 
     private var activeBorderLineWidth: CGFloat {
+        guard isActive else { return 1 }
         switch activeTabIndicatorStyle {
         case .leftRail:
             return 0
         case .solidFill:
-            return isActive ? 1.5 : 0
+            return 1.5
         }
     }
 
     private var activeBorderColor: Color {
-        guard isActive else { return .clear }
+        guard isActive else {
+            // A hairline edge so an unselected workspace reads as its own card;
+            // without it the rows ran together on a light sidebar.
+            return Color.primary.opacity(isHovering ? 0.18 : 0.1)
+        }
         switch activeTabIndicatorStyle {
         case .leftRail:
             return .clear
@@ -702,7 +707,7 @@ struct TabItemView: View, Equatable {
         case .leftRail:
             if isActive        { return Color.accentColor }
             if isMultiSelected { return Color.accentColor.opacity(0.25) }
-            return Color.clear
+            return Self.idleCardFill
         case .solidFill:
             if let custom = resolvedCustomTabColor {
                 if isActive        { return custom }
