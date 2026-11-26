@@ -185,7 +185,7 @@ extension PeerWorkspaceMirrorController {
         let missing = targetTabs.filter { panelBySurfaceID[$0.surfaceID] == nil }
         var newSessions: [Data: PeerPaneSession] = [:]
         var spawnedCount = 0
-        var spawnedPanelIDs: [UUID] = []
+        var spawnedPanels: [(surfaceID: Data, panelID: UUID)] = []
         for tab in missing {
             do {
                 let session = try await PeerPaneSession.attach(
@@ -253,7 +253,7 @@ extension PeerWorkspaceMirrorController {
                 workspace2.bindRemotePane(session: session, to: panel)
                 panelBySurfaceID[tab.surfaceID] = panel.id
                 spawnedCount += 1
-                spawnedPanelIDs.append(panel.id)
+                spawnedPanels.append((tab.surfaceID, panel.id))
             }
 
             // B3 — close stale panels (their sessions tear down via
@@ -329,11 +329,14 @@ extension PeerWorkspaceMirrorController {
         }
 
         // The rebuild split every pane again, and the delegate skips the
-        // glow for those splits. Glow only what the host added; the first
-        // apply, which opens the mirror, adds every pane and glows none.
-        if lastAppliedLayout != nil {
-            for panelId in spawnedPanelIDs {
-                guard let pane = workspace2.paneId(forPanelId: panelId) else { continue }
+        // glow for those splits. Glow only surfaces the host added since the
+        // last applied layout: a recovery pass respawns panes the host
+        // already had, and the first apply (or a reconnect, which clears
+        // the layout) opens every pane and glows none.
+        if let last = lastAppliedLayout {
+            let previousSurfaceIDs = Set(Self.preorderLeaves(last).flatMap(Self.mirroredTabs(of:)).map(\.surfaceID))
+            for spawned in spawnedPanels where !previousSurfaceIDs.contains(spawned.surfaceID) {
+                guard let pane = workspace2.paneId(forPanelId: spawned.panelID) else { continue }
                 workspace2.playPaneTransitionGlow(in: pane, afterSlide: true)
             }
         }
