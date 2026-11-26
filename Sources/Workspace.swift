@@ -983,8 +983,8 @@ final class Workspace: Identifiable {
     }
 
 
-    /// Puts each terminal's agent CLI logo on its tab, and takes it off once
-    /// the CLI is gone. Only tabs whose CLI changed are touched.
+    /// Puts each terminal's foreground-app icon on its tab, and takes it off
+    /// once the app is gone. Only tabs whose app changed are touched.
     func applyTerminalAgents(_ agents: [UUID: TerminalAgentCLI]) {
         for (panelId, panel) in panels {
             guard let terminal = panel as? TerminalPanel else { continue }
@@ -996,7 +996,11 @@ final class Workspace: Identifiable {
             dlog("tab.agentIcon panel=\(panelId.uuidString.prefix(5)) cli=\(cli?.rawValue ?? "none") tab=\(tabId == nil ? 0 : 1)")
             #endif
             guard let tabId else { continue }
-            bonsplitController.updateTab(tabId, iconImageData: .some(cli?.iconPNGData))
+            bonsplitController.updateTab(
+                tabId,
+                icon: .some(cli?.symbolName ?? terminal.displayIcon),
+                iconImageData: .some(cli?.iconPNGData)
+            )
         }
     }
 

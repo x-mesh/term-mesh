@@ -11,14 +11,21 @@ final class TerminalAgentIconsTests: XCTestCase {
     func testDaemonAnswerMapsPanelIDsToKnownCLIs() {
         let claudePanel = UUID()
         let codexPanel = UUID()
+        let geminiPanel = UUID()
+        let neovimPanel = UUID()
         let agents = TerminalAgentIconMonitor.agents(from: [
             claudePanel.uuidString: "claude",
             codexPanel.uuidString: "codex",
-            UUID().uuidString: "gemini",
+            geminiPanel.uuidString: "gemini",
+            neovimPanel.uuidString: "neovim",
+            UUID().uuidString: "unknown",
             "not-a-uuid": "claude",
         ])
 
-        XCTAssertEqual(agents, [claudePanel: .claude, codexPanel: .codex])
+        XCTAssertEqual(agents, [
+            claudePanel: .claude, codexPanel: .codex,
+            geminiPanel: .gemini, neovimPanel: .neovim,
+        ])
     }
 
     func testBothLogosLoadAsTabIcons() throws {
@@ -26,6 +33,27 @@ final class TerminalAgentIconsTests: XCTestCase {
             let data = try XCTUnwrap(cli.iconPNGData, "\(cli) logo asset is missing")
             let image = try XCTUnwrap(NSImage(data: data), "\(cli) icon is not decodable")
             XCTAssertEqual(image.size.width, image.size.height, "\(cli) icon must be square")
+        }
+    }
+
+    func testCategoryIconsExistWithoutAddingLauncherAssets() {
+        let apps = TerminalAgentCLI.allCases.filter { $0.iconPNGData == nil }
+        XCTAssertFalse(apps.isEmpty)
+        for app in apps {
+            let name = try? XCTUnwrap(app.symbolName)
+            XCTAssertNotNil(name.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }, "missing symbol for \(app)")
+        }
+    }
+
+    func testPollingCadenceBoundsIconTransitionLatency() {
+        XCTAssertLessThanOrEqual(TerminalAgentIconMonitor.interval * 2, 0.5)
+    }
+
+    func testEverySupportedAppUsesExactlyOneIconChannel() {
+        for app in TerminalAgentCLI.allCases {
+            let hasLogo = app.iconPNGData != nil
+            let hasSymbol = app.symbolName != nil
+            XCTAssertNotEqual(hasLogo, hasSymbol, "\(app) must use one icon channel")
         }
     }
 }

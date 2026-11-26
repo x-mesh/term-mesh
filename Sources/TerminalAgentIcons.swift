@@ -1,15 +1,44 @@
 import AppKit
 
 /// An agent CLI the daemon's `PaneTracker` reports running in a terminal pane.
-enum TerminalAgentCLI: String {
+enum TerminalAgentCLI: String, CaseIterable {
     case claude
     case codex
+    case kiro
+    case gemini
+    case opencode
+    case neovim
+    case tmux
+    case zellij
+    case lazygit
+    case k9s
+    case systemMonitor = "system-monitor"
+    case python
+    case node
+
+    var symbolName: String? {
+        switch self {
+        case .claude, .codex: return nil
+        case .kiro: return "wand.and.stars"
+        case .gemini: return "sparkles"
+        case .opencode: return "chevron.left.forwardslash.chevron.right"
+        case .neovim: return "pencil.and.outline"
+        case .tmux: return "rectangle.split.2x1"
+        case .zellij: return "rectangle.split.3x1"
+        case .lazygit: return "arrow.triangle.branch"
+        case .k9s: return "shippingbox"
+        case .systemMonitor: return "chart.xyaxis.line"
+        case .python: return "curlybraces"
+        case .node: return "hexagon"
+        }
+    }
 
     /// The logo for the tab strip, which draws `iconImageData` in full color.
     var iconPNGData: Data? {
         switch self {
         case .claude: return Self.claudeIcon
         case .codex: return Self.codexIcon
+        default: return nil
         }
     }
 
@@ -48,9 +77,10 @@ enum TerminalAgentCLI: String {
 final class TerminalAgentIconMonitor {
     static let shared = TerminalAgentIconMonitor()
 
-    /// The daemon's `PaneTracker` rescans every three seconds; polling faster
-    /// would only repeat its answer.
-    private static let interval: TimeInterval = 3
+    /// The daemon uses the same cadence. Keeping both at 250 ms bounds a
+    /// foreground-app transition to roughly half a second without an event
+    /// protocol or a versioned wire change.
+    static let interval: TimeInterval = 0.25
 
     private var timer: Timer?
     private var pollInFlight = false
@@ -58,6 +88,7 @@ final class TerminalAgentIconMonitor {
 
     func start() {
         guard timer == nil else { return }
+        poll()
         timer = Timer.scheduledTimer(withTimeInterval: Self.interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
