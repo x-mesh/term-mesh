@@ -4,6 +4,25 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.295.0] - 2026-11-26
+
+### Added
+
+- Settings › Terminal has a Pane Transition Animation switch, off by default. With it on, a new pane slides in from the divider, a zoomed pane grows from its own place to fill the split area and shrinks back when you zoom out, and the pane left in focus after a split, close or zoom glows once in amber. The zoomed terminal moves with its pane instead of growing from the top-left corner. System Reduce Motion turns the slides off; the glow still plays.
+- Pane Transition Duration sets how long the slides take, from 100 to 600 ms (200 ms by default). It is available while the switch is on.
+
+### Changed
+
+- Font Family and Fallback Font in Settings › Terminal are each one control now: a button that shows the current font and opens a list you can search. Type to filter, move with the arrow keys and press Return to choose. Before, a search field sat above a separate menu.
+- The default Pane Padding (Bottom) is 6 px instead of 10 px. A value you already set in Settings is kept.
+- The light that sweeps around a pane card on a new notification runs at 30 fps, and at most two panes sweep at once; the others show the faint ring without the sweep. On a 120 Hz display, notifications arriving in eight panes at once used to hold WindowServer at about 85% of a CPU core. With these limits it stays near 34%.
+
+### Fixed
+
+- Pane Padding in Settings now applies when your Ghostty config sets `window-padding-y`, `window-padding-x` or `window-padding-balance`. Before, those values took rows back out of every pane and left a gap under the prompt, even with the bottom padding at 0, and the sides slider had no effect. Inside term-mesh these three Ghostty keys are now ignored: set the padding in Settings › Pane Padding.
+- Turning on Font Smoothing without moving the strength slider now applies the 255 that Settings shows. Before, a strength from your Ghostty config applied instead.
+- Workspace cards in the sidebar that are not selected have a faint fill and edge, so rows no longer run together. Peer host rows keep their workspace and pane count and the Offline label on one line, and the host name is no longer cut short in a narrow sidebar.
+
 ### Changed
 
 - Font Family and Fallback Font in Settings › Terminal are each one control now: a button that shows the current font and opens a list you can search. Type to filter, move with the arrow keys and press Return to choose. Before, a search field sat above a separate menu.
