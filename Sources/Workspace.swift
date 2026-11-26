@@ -366,6 +366,11 @@ final class Workspace: Identifiable {
         bonsplitController.configuration.appearance.enableAnimations = enabled
     }
 
+    func applyPaneTransitionDuration(_ duration: Double) {
+        guard bonsplitController.configuration.appearance.animationDuration != duration else { return }
+        bonsplitController.configuration.appearance.animationDuration = duration
+    }
+
     /// Glows the terminal shown in `paneId` once its slide has stopped.
     ///
     /// Resolved on the next main-loop turn: a keyboard split attaches its
