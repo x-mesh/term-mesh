@@ -84,7 +84,6 @@ final class TerminalAgentIconMonitor {
 
     private var timer: Timer?
     private var pollInFlight = false
-    private var lastSnapshot: [String: String]?
     private let queue = DispatchQueue(label: "term-mesh.terminal-agent-icons", qos: .utility)
 
     func start() {
@@ -104,8 +103,7 @@ final class TerminalAgentIconMonitor {
                 self.pollInFlight = false
                 // No answer (daemon not running, or older than `pane.agents`):
                 // leave the icons as they are rather than clearing them.
-                guard let panes, panes != self.lastSnapshot else { return }
-                self.lastSnapshot = panes
+                guard let panes else { return }
                 self.apply(panes)
             }
         }

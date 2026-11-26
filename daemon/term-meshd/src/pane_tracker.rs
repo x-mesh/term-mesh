@@ -244,10 +244,9 @@ fn cli_name(process: &sysinfo::Process) -> Option<&'static str> {
         .exe()
         .and_then(|path| path.file_name())
         .and_then(|name| name.to_str());
-    process_name
+    let direct = process_name
         .into_iter()
         .chain(executable_name)
-        .chain(process.cmd().iter().filter_map(|part| part.to_str()))
         .filter_map(|part| {
             let basename = std::path::Path::new(part)
                 .file_name()
@@ -255,7 +254,24 @@ fn cli_name(process: &sysinfo::Process) -> Option<&'static str> {
                 .unwrap_or(part);
             app_name(basename)
         })
-        .max_by_key(|app| app_priority(app))
+        .max_by_key(|app| app_priority(app));
+    match direct {
+        Some("node") => node_entrypoint_app(process).or(direct),
+        _ => direct,
+    }
+}
+
+fn node_entrypoint_app(process: &sysinfo::Process) -> Option<&'static str> {
+    let script = process.cmd().get(1)?.to_str()?;
+    let path = std::path::Path::new(script);
+    let basename = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if matches!(basename.as_str(), "gemini" | "gemini.js" | "gemini.mjs")
+        || script.contains("@google/gemini-cli")
+    {
+        Some("gemini")
+    } else {
+        None
+    }
 }
 
 fn app_name(name: &str) -> Option<&'static str> {
@@ -569,6 +585,13 @@ mod tests {
         assert!(app_priority("gemini") > app_priority("node"));
         assert!(app_priority("neovim") > app_priority("python"));
         assert_eq!(app_priority("tmux"), app_priority("zellij"));
+    }
+
+    #[test]
+    fn arbitrary_arguments_are_not_classified_as_apps() {
+        assert_eq!(app_name("sleep"), None);
+        assert_eq!(app_name("python3 script.py"), None);
+        assert_eq!(app_name("--label=node"), None);
     }
 
     #[test]
