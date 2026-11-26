@@ -575,6 +575,24 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testTabIconCacheNeverOutlivesTheDataItWasDecodedFrom() throws {
+        let image = NSImage(size: NSSize(width: 2, height: 2))
+        image.lockFocus()
+        NSColor.red.setFill()
+        NSRect(x: 0, y: 0, width: 2, height: 2).fill()
+        image.unlockFocus()
+        let logo = try XCTUnwrap(image.tiffRepresentation)
+        let other = try XCTUnwrap(NSImage(size: NSSize(width: 3, height: 3)).tiffRepresentation ?? Data([1]))
+        let cached = try XCTUnwrap(NSImage(data: logo))
+
+        // The cache matches the tab: it is used as is.
+        XCTAssertTrue(TabItemStyling.displayedFaviconImage(cachedImage: cached, cachedData: logo, currentData: logo) === cached)
+        // The logo was cleared but the cache still holds it: nothing is drawn.
+        XCTAssertNil(TabItemStyling.displayedFaviconImage(cachedImage: cached, cachedData: logo, currentData: nil))
+        // The cache caught a value from before the change: the current data wins.
+        XCTAssertFalse(TabItemStyling.displayedFaviconImage(cachedImage: cached, cachedData: logo, currentData: other) === cached)
+    }
+
     func testHostBadgeLabelIsLeftOutWhenTheTitleAlreadyNamesTheHost() {
         XCTAssertTrue(TabHostBadgeStyle.showsLabel(title: "Terminal 2", badgeLabel: "jwserver68"))
         XCTAssertFalse(TabHostBadgeStyle.showsLabel(title: "root@jwserver68: ~/fastgzip", badgeLabel: "jwserver68"))

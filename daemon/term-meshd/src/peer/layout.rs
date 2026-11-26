@@ -1436,6 +1436,49 @@ pub fn set_transcript_provider(provider: TranscriptProvider) {
     let _ = TRANSCRIPT_PROVIDER.set(provider);
 }
 
+/// `TERMMESH_PANEL_ID` → agent CLI for every pane process the daemon's pane
+/// tracker has found. A surface's panel id is its `hex_id`.
+pub type SurfaceAgentProvider = Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>;
+
+/// Installed once at boot, like the transcript reader and for the same
+/// reason: the pane tracker lives in the daemon, not in the peer server.
+static SURFACE_AGENT_PROVIDER: std::sync::OnceLock<SurfaceAgentProvider> =
+    std::sync::OnceLock::new();
+
+pub fn set_surface_agent_provider(provider: SurfaceAgentProvider) {
+    let _ = SURFACE_AGENT_PROVIDER.set(provider);
+}
+
+/// The agent CLI running in each of this host's surfaces, for `HostStats`.
+/// Empty when no provider is installed, which every test and embedder gets.
+pub fn surface_agents(host: &PeerHost) -> Vec<peer_proto::v1::SurfaceAgent> {
+    let Some(provider) = SURFACE_AGENT_PROVIDER.get() else {
+        return Vec::new();
+    };
+    surface_agents_from(&host.pty.list(), &provider())
+}
+
+/// Pure half of [`surface_agents`], so the pairing is testable without a
+/// running tracker.
+pub fn surface_agents_from(
+    surfaces: &[Arc<PtySurface>],
+    agents_by_panel_id: &HashMap<String, String>,
+) -> Vec<peer_proto::v1::SurfaceAgent> {
+    if agents_by_panel_id.is_empty() {
+        return Vec::new();
+    }
+    surfaces
+        .iter()
+        .filter_map(|surface| {
+            let cli = agents_by_panel_id.get(&super::surface::hex_id(&surface.surface_id))?;
+            Some(peer_proto::v1::SurfaceAgent {
+                surface_id: surface.surface_id.clone(),
+                cli: cli.clone(),
+            })
+        })
+        .collect()
+}
+
 pub struct PeerHost {
     pub pty: Arc<PtyManager>,
     /// Every workspace this host currently serves, keyed by workspace id.
