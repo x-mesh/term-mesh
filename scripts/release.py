@@ -1035,9 +1035,29 @@ def install_notes(changelog: Path, version: str, notes: str) -> None:
     if not notes.lstrip().startswith(heading):
         raise ReleaseError(f"notes must start with {heading}")
     marker = "## [Unreleased]"
-    if marker not in body:
+    start = body.find(marker)
+    if start < 0:
         raise ReleaseError("CHANGELOG.md has no Unreleased heading")
-    changelog.write_text(body.replace(marker, marker + "\n\n" + notes.strip(), 1) + ("" if body.endswith("\n") else "\n"))
+    # The notes replace what feature PRs wrote under Unreleased. Leaving it in
+    # place put those entries a second time at the end of the new section.
+    after = start + len(marker)
+    next_heading = body.find("\n## [", after)
+    end = len(body) if next_heading < 0 else next_heading + 1
+    pending = [
+        line.strip() for line in body[after:end].splitlines()
+        if line.strip().startswith("- ")
+    ]
+    missing = [entry for entry in pending if entry not in notes]
+    if missing:
+        listed = "\n".join(missing)
+        raise ReleaseError(
+            "release notes leave out entries under Unreleased; add them to the notes, "
+            f"or remove them from CHANGELOG.md on develop:\n{listed}"
+        )
+    rest = body[end:]
+    changelog.write_text(
+        body[:after] + "\n\n" + notes.strip() + ("\n\n" + rest if rest else "\n")
+    )
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:

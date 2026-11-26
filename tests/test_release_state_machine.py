@@ -35,6 +35,41 @@ class ReleaseStateMachineTests(unittest.TestCase):
             self.assertEqual(changelog.read_text(), once)
             self.assertEqual(once.count("## [0.202.0]"), 1)
 
+    def test_install_notes_moves_unreleased_entries_instead_of_repeating_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Fix it.\n\n## [0.201.0]\n\n- Old.\n"
+            )
+            notes = "## [0.202.0] - 2026-08-21\n\n### Fixed\n\n- Fix it.\n- Fix more.\n"
+            release.install_notes(changelog, "0.202.0", notes)
+            self.assertEqual(
+                changelog.read_text(),
+                "# Changelog\n\n## [Unreleased]\n\n## [0.202.0] - 2026-08-21\n\n### Fixed\n\n"
+                "- Fix it.\n- Fix more.\n\n## [0.201.0]\n\n- Old.\n",
+            )
+
+    def test_install_notes_refuses_notes_that_drop_an_unreleased_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            original = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Keep me.\n\n## [0.201.0]\n"
+            changelog.write_text(original)
+            notes = "## [0.202.0] - 2026-08-21\n\n### Fixed\n\n- Something else.\n"
+            with self.assertRaisesRegex(release.ReleaseError, "- Keep me."):
+                release.install_notes(changelog, "0.202.0", notes)
+            self.assertEqual(changelog.read_text(), original)
+
+    def test_install_notes_handles_unreleased_as_the_last_section(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [Unreleased]\n\n- Fix it.\n")
+            notes = "## [0.1.0] - 2026-08-21\n\n- Fix it.\n"
+            release.install_notes(changelog, "0.1.0", notes)
+            self.assertEqual(
+                changelog.read_text(),
+                "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-08-21\n\n- Fix it.\n",
+            )
+
     def test_remote_mutations_require_explicit_yes(self):
         args = type("Args", (), {"yes": False})()
         with self.assertRaisesRegex(release.ReleaseError, "require --yes"):
