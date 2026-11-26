@@ -981,6 +981,10 @@ final class GhosttySurfaceScrollView: NSView {
         cardRingView.playTransitionGlow(delay: delay)
     }
 
+    func holdNotificationRing(for duration: CFTimeInterval) {
+        cardRingView.holdNotificationRing(for: duration)
+    }
+
     /// The longest a zoom snapshot stays up without `endZoomSnapshot`: a
     /// settle signal lost with a split view torn down mid-slide must not leave
     /// the terminal at its old grid size. Well above the slide itself, which a

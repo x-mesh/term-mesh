@@ -371,7 +371,9 @@ final class Workspace: Identifiable {
         bonsplitController.configuration.appearance.animationDuration = duration
     }
 
-    /// Glows the terminal shown in `paneId` once its slide has stopped.
+    /// Glows the terminal shown in `paneId` once its slide has stopped, and
+    /// hides the unread-notification rings of the other terminals until the
+    /// glow ends so only the transitioning pane is outlined.
     ///
     /// Resolved on the next main-loop turn: a keyboard split attaches its
     /// terminal after bonsplit reports the new pane.
@@ -386,6 +388,10 @@ final class Workspace: Identifiable {
                   let panelId = self.panelIdFromSurfaceId(tab.id),
                   let terminal = self.panels[panelId] as? TerminalPanel else { return }
             terminal.hostedView.playTransitionGlow(delay: delay)
+            let hold = delay + CardRingView.transitionGlowDuration
+            for case let other as TerminalPanel in self.panels.values where other !== terminal {
+                other.hostedView.holdNotificationRing(for: hold)
+            }
         }
     }
 

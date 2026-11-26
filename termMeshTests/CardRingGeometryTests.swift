@@ -80,6 +80,43 @@ final class CardRingTransitionGlowTests: XCTestCase {
         wait(0.6)
         XCTAssertTrue(ring.isHidden)
     }
+
+    /// While another pane glows, only that pane may be outlined.
+    func testHeldNotificationRingStaysHiddenUntilTheHoldEnds() {
+        let ring = CardRingView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        ring.apply(ring: .faint)
+        XCTAssertEqual(ring.notificationRingOpacity, 1)
+
+        ring.holdNotificationRing(for: 0.3)
+        XCTAssertEqual(ring.notificationRingOpacity, 0)
+        // The surface re-applies its ring on every update; that must not end the hold.
+        ring.apply(ring: .faint)
+        XCTAssertEqual(ring.notificationRingOpacity, 0)
+
+        wait(0.4)
+        XCTAssertEqual(ring.notificationRingOpacity, 1)
+    }
+
+    func testHoldDoesNotBringBackARingReadDuringIt() {
+        let ring = CardRingView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        ring.apply(ring: .faint)
+        ring.holdNotificationRing(for: 0.2)
+        ring.apply(ring: .hidden)
+        wait(0.3)
+        XCTAssertEqual(ring.notificationRingOpacity, 0)
+    }
+
+    func testARestartedHoldIsNotEndedByTheEarlierOnesTimer() {
+        let ring = CardRingView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        ring.apply(ring: .faint)
+        ring.holdNotificationRing(for: 0.3)
+        wait(0.2)
+        ring.holdNotificationRing(for: 0.3)
+        wait(0.2)
+        XCTAssertEqual(ring.notificationRingOpacity, 0, "the first hold's end must not show the ring")
+        wait(0.2)
+        XCTAssertEqual(ring.notificationRingOpacity, 1)
+    }
 }
 
 /// The sweep slot pool is shared by every ring, so a ring that leaks its slot
