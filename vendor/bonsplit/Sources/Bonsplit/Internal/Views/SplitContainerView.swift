@@ -121,11 +121,15 @@ private class ThemedSplitView: NSSplitView {
         let to = slide.zoomingIn ? bounds : inSplit
         let t = slide.progress
         func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { (a + (b - a) * t).rounded() }
+        // Round the edges, not the size: a width rounded apart from its origin
+        // moves the far edge a point back and forth between frames.
+        let minX = lerp(from.minX, to.minX)
+        let minY = lerp(from.minY, to.minY)
         arrangedSubviews[slide.child].frame = NSRect(
-            x: lerp(from.minX, to.minX),
-            y: lerp(from.minY, to.minY),
-            width: lerp(from.width, to.width),
-            height: lerp(from.height, to.height)
+            x: minX,
+            y: minY,
+            width: max(lerp(from.maxX, to.maxX) - minX, 0),
+            height: max(lerp(from.maxY, to.maxY) - minY, 0)
         )
     }
 
