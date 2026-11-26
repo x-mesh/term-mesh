@@ -575,6 +575,62 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testHostBadgeLabelIsLeftOutWhenTheTitleAlreadyNamesTheHost() {
+        XCTAssertTrue(TabHostBadgeStyle.showsLabel(title: "Terminal 2", badgeLabel: "jwserver68"))
+        XCTAssertFalse(TabHostBadgeStyle.showsLabel(title: "root@jwserver68: ~/fastgzip", badgeLabel: "jwserver68"))
+        XCTAssertFalse(TabHostBadgeStyle.showsLabel(title: "root@JWSERVER68", badgeLabel: "jwserver68"))
+        XCTAssertFalse(TabHostBadgeStyle.showsLabel(title: "Terminal 2", badgeLabel: "  "))
+    }
+
+    func testHostBadgeLabelColorMeetsTextContrastOnBothBackgrounds() {
+        func luminance(_ c: (red: Double, green: Double, blue: Double)) -> Double {
+            func channel(_ v: Double) -> Double { v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+            return 0.2126 * channel(c.red) + 0.7152 * channel(c.green) + 0.0722 * channel(c.blue)
+        }
+        func contrast(_ a: (red: Double, green: Double, blue: Double), _ b: (red: Double, green: Double, blue: Double)) -> Double {
+            let (hi, lo) = (max(luminance(a), luminance(b)), min(luminance(a), luminance(b)))
+            return (hi + 0.05) / (lo + 0.05)
+        }
+        func chip(_ c: TabHostBadge, over base: Double) -> (red: Double, green: Double, blue: Double) {
+            let a = TabHostBadgeStyle.backgroundOpacity
+            return (base * (1 - a) + c.red * a, base * (1 - a) + c.green * a, base * (1 - a) + c.blue * a)
+        }
+        // The host palette's primary colors (PeerHostAccent).
+        let hosts = [(0.25, 0.60, 0.85), (0.95, 0.50, 0.35), (0.30, 0.70, 0.60), (0.70, 0.35, 0.95)]
+        for (r, g, b) in hosts {
+            let badge = TabHostBadge(label: "h", red: r, green: g, blue: b)
+            XCTAssertGreaterThan(contrast(badge.labelRGB(onLightBackground: true), chip(badge, over: 0.945)), 4.5)
+            XCTAssertGreaterThan(contrast(badge.labelRGB(onLightBackground: false), chip(badge, over: 0.15)), 4.5)
+        }
+    }
+
+    @MainActor
+    func testHostBadgeSurvivesUpdateSplitAndTransferEncoding() throws {
+        let controller = BonsplitController()
+        let badge = TabHostBadge(label: "jwserver68", red: 0.93, green: 0.5, blue: 0.35)
+        let tabId = try XCTUnwrap(controller.createTab(title: "Terminal 2"))
+        XCTAssertNil(controller.tab(tabId)?.hostBadge)
+
+        controller.updateTab(tabId, hostBadge: .some(badge))
+        XCTAssertEqual(controller.tab(tabId)?.hostBadge, badge)
+
+        // A plain update leaves the badge alone; `.some(nil)` removes it.
+        controller.updateTab(tabId, title: "renamed")
+        XCTAssertEqual(controller.tab(tabId)?.hostBadge, badge)
+
+        let tab = try XCTUnwrap(controller.tab(tabId))
+        let newPane = try XCTUnwrap(controller.splitPane(orientation: .horizontal, withTab: tab))
+        XCTAssertEqual(controller.tabs(inPane: newPane).first?.hostBadge, badge)
+
+        let item = TabItem(id: UUID(), title: "Terminal 2", hostBadge: badge)
+        let decoded = try JSONDecoder().decode(TabItem.self, from: JSONEncoder().encode(item))
+        XCTAssertEqual(decoded.hostBadge, badge)
+
+        controller.updateTab(tabId, hostBadge: .some(nil))
+        XCTAssertNil(controller.tab(tabId)?.hostBadge)
+    }
+
+    @MainActor
     func testTogglePaneZoomTracksState() {
         let controller = BonsplitController()
         guard let originalPane = controller.focusedPaneId else {
