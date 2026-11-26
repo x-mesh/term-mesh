@@ -1014,6 +1014,7 @@ class GhosttyApp {
                 return
             }
 
+            loadTermMeshPanePaddingOverride(fallbackConfig)
             ghostty_config_finalize(fallbackConfig)
             updateDefaultBackground(from: fallbackConfig, source: "initialize.fallbackConfig")
 
@@ -1066,6 +1067,7 @@ class GhosttyApp {
         loadLegacyGhosttyConfigIfNeeded(config)
         loadTermMeshThemeOverride(config)
         loadTermMeshSettingsOverride(config)
+        loadTermMeshPanePaddingOverride(config)
         ghostty_config_finalize(config)
     }
 
@@ -1083,16 +1085,38 @@ class GhosttyApp {
         keybind = shift+page_down=scroll_page_down
         keybind = shift+home=scroll_to_top
         keybind = shift+end=scroll_to_bottom
-        # term-mesh pads the terminal grid itself (Settings > Pane Padding) and
-        # snaps it to whole rows; Ghostty's own vertical padding would sit
-        # inside that and throw the row math off.
-        window-padding-y = 0
-        # The sides are Ghostty's padding so a colored row, such as a powerline
-        # prompt, can extend its background to the card edge.
-        window-padding-x = \(Int(PanePaddingSettings.currentHorizontal))
+        # A colored row, such as a powerline prompt, extends its background
+        # through the side padding to the card edge.
         window-padding-color = extend
         """
-        guard let url = Self.baselineDefaultsURL() else { return }
+        loadGeneratedConfig(named: "baseline-defaults.ghostty", contents: contents, into: config)
+    }
+
+    /// Pane padding belongs to Settings > Pane Padding, so this loads AFTER the
+    /// user's Ghostty config. term-mesh insets the terminal grid itself and
+    /// snaps it to whole rows; a `window-padding-y` or `window-padding-balance`
+    /// from the user's config would take rows back out of that height and leave
+    /// the remainder under the prompt.
+    private func loadTermMeshPanePaddingOverride(_ config: ghostty_config_t) {
+        loadGeneratedConfig(
+            named: "pane-padding-override.ghostty",
+            contents: Self.panePaddingOverrideContents(horizontal: PanePaddingSettings.currentHorizontal),
+            into: config
+        )
+    }
+
+    static func panePaddingOverrideContents(horizontal: CGFloat) -> String {
+        """
+        # term-mesh pane padding. Loaded after the user config: Settings > Pane
+        # Padding owns these keys.
+        window-padding-y = 0
+        window-padding-x = \(Int(horizontal))
+        window-padding-balance = false
+        """
+    }
+
+    private func loadGeneratedConfig(named name: String, contents: String, into config: ghostty_config_t) {
+        guard let url = Self.generatedConfigURL(named: name) else { return }
         do {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
@@ -1101,7 +1125,7 @@ class GhosttyApp {
             try contents.write(to: url, atomically: true, encoding: .utf8)
         } catch {
             #if DEBUG
-            Self.initLog("failed to write baseline defaults: \(error)")
+            Self.initLog("failed to write \(name): \(error)")
             #endif
             return
         }
@@ -1110,13 +1134,13 @@ class GhosttyApp {
         }
     }
 
-    private static func baselineDefaultsURL() -> URL? {
+    private static func generatedConfigURL(named name: String) -> URL? {
         guard let dir = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first else { return nil }
         return dir
             .appendingPathComponent("com.term-mesh.app", isDirectory: true)
-            .appendingPathComponent("baseline-defaults.ghostty")
+            .appendingPathComponent(name)
     }
 
 

@@ -293,6 +293,7 @@
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */; };
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */; };
 				CRT00002 /* CardRingGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CRT00001 /* CardRingGeometryTests.swift */; };
+				PPO00002 /* PanePaddingConfigOrderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPO00001 /* PanePaddingConfigOrderTests.swift */; };
 				NLT00002 /* NotificationLapPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = NLT00001 /* NotificationLapPolicyTests.swift */; };
 			4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4704CF490000000000000001 /* RenderTokenProbeTests.swift */; };
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */; };
@@ -711,6 +712,7 @@
 			F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalViewComposingTests.swift; sourceTree = "<group>"; };
 			F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyConfigTests.swift; sourceTree = "<group>"; };
 			CRT00001 /* CardRingGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardRingGeometryTests.swift; sourceTree = "<group>"; };
+			PPO00001 /* PanePaddingConfigOrderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PanePaddingConfigOrderTests.swift; sourceTree = "<group>"; };
 			NLT00001 /* NotificationLapPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationLapPolicyTests.swift; sourceTree = "<group>"; };
 			4704CF490000000000000001 /* RenderTokenProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderTokenProbeTests.swift; sourceTree = "<group>"; };
 			F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEArrowKeyTests.swift; sourceTree = "<group>"; };
@@ -1196,6 +1198,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */,
 				F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */,
 				CRT00001 /* CardRingGeometryTests.swift */,
+				PPO00001 /* PanePaddingConfigOrderTests.swift */,
 				NLT00001 /* NotificationLapPolicyTests.swift */,
 				4704CF490000000000000001 /* RenderTokenProbeTests.swift */,
 				F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */,
@@ -1699,6 +1702,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */,
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */,
 				CRT00002 /* CardRingGeometryTests.swift in Sources */,
+				PPO00002 /* PanePaddingConfigOrderTests.swift in Sources */,
 				NLT00002 /* NotificationLapPolicyTests.swift in Sources */,
 				4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */,
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */,
