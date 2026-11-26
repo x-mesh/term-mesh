@@ -20,7 +20,7 @@ Accepted forms:
    python3 scripts/release.py plan [<version>] --json
    ```
 
-2. Use `latest_tag` and `git log <latest-tag>..origin/develop --no-merges` to draft one changelog section. Include only user-visible changes and contributor credits. The section must start with `## [X.Y.Z] - YYYY-MM-DD`. Write it to a temporary file.
+2. Use `latest_tag` and `git log <latest-tag>..origin/develop --no-merges` to draft one changelog section. Include only user-visible changes and contributor credits. The section must start with `## [X.Y.Z] - YYYY-MM-DD`. Start from the entries already under `## [Unreleased]` in `CHANGELOG.md` on `origin/develop` and keep each one word for word: `prepare` moves them into the new section and refuses notes that leave one out. Write it to a temporary file.
 
 3. Run the daemon test suite on the pinned develop SHA. A test that fails on `develop` blocks the release until it is understood: the relay E2E below exercises one path and does not cover the rest of the daemon. Run it on the same mac-sub checkout the E2E uses, detached at the pinned SHA, and finish it before the E2E starts. The runner takes one topology at a time.
 
