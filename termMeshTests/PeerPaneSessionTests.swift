@@ -7513,17 +7513,17 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
         relay.ioSnapshot["bytes_received"] as? UInt64 ?? 0
     }
 
-    /// The host pins its default colors at attach; a viewer light/dark switch
-    /// must hand every live relay pane the reset so it takes the viewer's theme.
+    /// Callback delivery feeds an agent session's decoder, not a terminal the
+    /// host pinned colors on, so an appearance switch must not write into it.
     @MainActor
-    func testAppearanceSwitchReleasesHostPinnedColors() {
+    func testAppearanceSwitchLeavesCallbackDeliveryUntouched() {
         let relay = makeCallbackSession(feed: FrameFeed(), surfaceID: Data(repeating: 0xB3, count: 16))
         let received = ChunkCollector()
         relay.onPtyData = { received.append($0) }
 
         PeerRelaySession.releaseHostPinnedColorsInAllSessions()
 
-        XCTAssertEqual(received.all, [Data("\u{1b}]110\u{7}\u{1b}]111\u{7}".utf8)])
+        XCTAssertEqual(received.all, [])
         withExtendedLifetime(relay) {}
     }
 
@@ -13265,5 +13265,103 @@ final class PeerHostRegistrySimulationTests: XCTestCase {
         // otherwise carry its state into a later test using the same path.
         registry.disconnectTransport(for: key)
         return trial.violations
+    }
+}
+
+/// A viewer color reset must enter the host's output only between whole
+/// escape sequences and characters: a host sequence can be split across
+/// relay frames, and a reset inside it would break both.
+final class RelayColorResetPlacementTests: XCTestCase {
+    private let reset = RelayColorResetPlacement.reset
+
+    func testResetWaitsForTheHostsFirstBytes() {
+        var placement = RelayColorResetPlacement()
+        XCTAssertNil(placement.request(), "the host's pinned colors have not arrived yet")
+        XCTAssertEqual(placement.afterWriting(Data("\u{1b}]11;rgb:0d0d/1111/1717\u{7}$ ".utf8)), reset)
+    }
+
+    func testResetGoesOutAtOnceBetweenSequences() {
+        var placement = RelayColorResetPlacement()
+        XCTAssertNil(placement.afterWriting(Data("prompt $ ".utf8)))
+        XCTAssertEqual(placement.request(), reset)
+    }
+
+    func testResetWaitsOutASequenceSplitAcrossFrames() {
+        let splits: [(String, [UInt8], [UInt8])] = [
+            ("CSI", Array("\u{1b}[38;5".utf8), Array(";208m".utf8)),
+            ("OSC with BEL", Array("\u{1b}]0;ti".utf8), Array("tle\u{7}".utf8)),
+            ("OSC with ST", Array("\u{1b}]0;title\u{1b}".utf8), Array("\\".utf8)),
+            ("DCS", Array("\u{1b}P1$r".utf8), Array("0m\u{1b}\\".utf8)),
+            ("bare ESC", [0x1B], Array("[H".utf8)),
+            ("ESC intermediate", Array("\u{1b}(".utf8), Array("B".utf8)),
+            ("UTF-8", [0xED, 0x95], [0x9C]),
+        ]
+        for (name, head, tail) in splits {
+            var placement = RelayColorResetPlacement()
+            XCTAssertNil(placement.afterWriting(Data("x".utf8)), name)
+            XCTAssertNil(placement.afterWriting(Data(head)), name)
+            XCTAssertNil(placement.request(), "\(name): must not land inside the sequence")
+            XCTAssertEqual(placement.afterWriting(Data(tail)), reset, name)
+        }
+    }
+
+    func testCancelEndsASequence() {
+        var placement = RelayColorResetPlacement()
+        XCTAssertNil(placement.afterWriting(Data("\u{1b}[12".utf8)))
+        XCTAssertNil(placement.request())
+        XCTAssertEqual(placement.afterWriting(Data([0x18])), reset)
+    }
+
+    func testOneRequestWritesOneReset() {
+        var placement = RelayColorResetPlacement()
+        XCTAssertNil(placement.afterWriting(Data("ok".utf8)))
+        XCTAssertEqual(placement.request(), reset)
+        XCTAssertNil(placement.afterWriting(Data("more".utf8)))
+    }
+
+    /// The writer queue orders the reset with the frames around it.
+    func testWriterPutsTheResetAfterTheFrameThatCompletesASequence() async throws {
+        let written = FrameLog()
+        let writer = RelayFrameWriter(
+            writeFrame: { type, payload in written.append(type, payload) },
+            onFailure: { _ in }
+        )
+        let head = Data("\u{1b}[38;5".utf8)
+        let tail = Data(";208mtext".utf8)
+
+        try await writer.enqueue(type: 0x01, payload: head)
+        writer.requestColorReset()
+        try await writer.enqueue(type: 0x01, payload: tail)
+        try await written.waitForCount(3)
+
+        XCTAssertEqual(written.payloads, [head, tail, reset])
+    }
+
+    private final class FrameLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var frames: [(UInt8, Data)] = []
+
+        func append(_ type: UInt8, _ payload: Data) {
+            lock.lock()
+            frames.append((type, payload))
+            lock.unlock()
+        }
+
+        var payloads: [Data] {
+            lock.lock()
+            defer { lock.unlock() }
+            return frames.map(\.1)
+        }
+
+        func waitForCount(_ count: Int, timeout: TimeInterval = 5) async throws {
+            let deadline = Date().addingTimeInterval(timeout)
+            while payloads.count < count {
+                guard Date() < deadline else {
+                    XCTFail("wrote \(payloads.count) frames, expected \(count)")
+                    return
+                }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
     }
 }

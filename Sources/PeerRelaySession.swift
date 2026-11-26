@@ -404,6 +404,109 @@ actor RelayFrameByteBudget {
     }
 }
 
+/// Where a viewer color reset (OSC 110/111) may enter the host's PtyData
+/// without landing inside an escape sequence or a UTF-8 character.
+struct RelayColorResetPlacement {
+    static let reset = Data("\u{1b}]110\u{7}\u{1b}]111\u{7}".utf8)
+
+    private enum State {
+        case ground
+        case escape
+        case escapeIntermediate
+        case csi
+        case string
+        case stringEscape
+    }
+
+    private var state = State.ground
+    private var utf8Remaining = 0
+    /// A fresh writer's first bytes carry the host's pinned colors, so a
+    /// reset must follow them, not precede them.
+    private var hasOutput = false
+    private var pending = false
+
+    /// The reset to write now, or nil when it waits for `afterWriting`.
+    mutating func request() -> Data? {
+        if hasOutput, isBoundary {
+            pending = false
+            return Self.reset
+        }
+        pending = true
+        return nil
+    }
+
+    /// Advances over a PtyData payload just written. Returns the waiting
+    /// reset when the payload ends between sequences and characters.
+    mutating func afterWriting(_ payload: Data) -> Data? {
+        for byte in payload { advance(byte) }
+        if !payload.isEmpty { hasOutput = true }
+        guard pending, isBoundary else { return nil }
+        pending = false
+        return Self.reset
+    }
+
+    private var isBoundary: Bool { state == .ground && utf8Remaining == 0 }
+
+    private mutating func advance(_ byte: UInt8) {
+        // CAN and SUB abort any sequence.
+        if byte == 0x18 || byte == 0x1A {
+            state = .ground
+            utf8Remaining = 0
+            return
+        }
+        switch state {
+        case .ground:
+            if byte == 0x1B {
+                state = .escape
+                utf8Remaining = 0
+            } else if utf8Remaining > 0, byte & 0xC0 == 0x80 {
+                utf8Remaining -= 1
+            } else {
+                switch byte {
+                case 0xC2...0xDF: utf8Remaining = 1
+                case 0xE0...0xEF: utf8Remaining = 2
+                case 0xF0...0xF4: utf8Remaining = 3
+                default: utf8Remaining = 0
+                }
+            }
+        case .escape:
+            switch byte {
+            case 0x1B, 0x00...0x1F, 0x7F: break
+            case 0x5B: state = .csi
+            case 0x5D, 0x50, 0x58, 0x5E, 0x5F: state = .string
+            case 0x20...0x2F: state = .escapeIntermediate
+            default: state = .ground
+            }
+        case .escapeIntermediate:
+            switch byte {
+            case 0x1B: state = .escape
+            case 0x30...0x7E: state = .ground
+            default: break
+            }
+        case .csi:
+            switch byte {
+            case 0x1B: state = .escape
+            case 0x40...0x7E: state = .ground
+            default: break
+            }
+        case .string:
+            switch byte {
+            case 0x07: state = .ground
+            case 0x1B: state = .stringEscape
+            default: break
+            }
+        case .stringEscape:
+            if byte == 0x5C {
+                state = .ground
+            } else {
+                // ESC ended the string and starts an escape sequence.
+                state = .escape
+                advance(byte)
+            }
+        }
+    }
+}
+
 final class RelayFrameWriter: @unchecked Sendable {
     private let writeFrame: @Sendable (UInt8, Data) throws -> Void
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
@@ -440,17 +543,43 @@ final class RelayFrameWriter: @unchecked Sendable {
 
         queue.async {
             defer { Task { await self.budget.release(reservation) } }
-            guard !self.isStopped else { return }
-            do {
-                try self.writeFrame(type, framePayload)
-            } catch {
-                if self.markStopped() {
-                    Task {
-                        await self.budget.stop(error: RelayError.ioError("relay writer stopped"))
-                    }
-                    self.onFailure(error)
-                }
+            guard !self.isStopped, self.write(type: type, payload: framePayload) else { return }
+            if type == kTypePtyData, let reset = self.colorReset.afterWriting(framePayload) {
+                self.write(type: kTypePtyData, payload: reset)
             }
+        }
+    }
+
+    /// Escape and UTF-8 state of the PtyData written so far, and a color
+    /// reset waiting for a point where it cannot land inside a sequence.
+    /// Touched only on `queue`, so it sees frames in the order they leave.
+    private var colorReset = RelayColorResetPlacement()
+
+    /// Writes OSC 110/111 between whole escape sequences and characters of
+    /// the host's output: at once when the written stream is at such a point,
+    /// otherwise right after the PtyData frame that reaches one. A host
+    /// sequence can be split across frames, so a frame boundary alone is not
+    /// enough.
+    func requestColorReset() {
+        queue.async {
+            guard !self.isStopped, let reset = self.colorReset.request() else { return }
+            self.write(type: kTypePtyData, payload: reset)
+        }
+    }
+
+    @discardableResult
+    private func write(type: UInt8, payload: Data) -> Bool {
+        do {
+            try writeFrame(type, payload)
+            return true
+        } catch {
+            if markStopped() {
+                Task {
+                    await self.budget.stop(error: RelayError.ioError("relay writer stopped"))
+                }
+                onFailure(error)
+            }
+            return false
         }
     }
 
@@ -3128,9 +3257,10 @@ final class PeerRelaySession {
 
     private static let liveSessions = NSHashTable<PeerRelaySession>.weakObjects()
 
-    /// OSC 110/111: return the foreground and background to the viewer's
-    /// configured defaults.
-    static let hostPinnedColorsReset = Data("\u{1b}]110\u{7}\u{1b}]111\u{7}".utf8)
+    /// Set once this viewer switched appearance while the session was live;
+    /// every later relay writer (a reconnect re-sends the host's pinned
+    /// colors) gets the reset again after the host's first bytes.
+    private var viewerOwnsDefaultColors = false
 
     /// The host pins its own default colors at attach
     /// (`peerTerminalPalettePrefix`) so a TUI's explicit colors match the
@@ -3145,14 +3275,11 @@ final class PeerRelaySession {
     }
 
     private func releaseHostPinnedColors() {
-        let reset = Self.hostPinnedColorsReset
-        switch ptyDelivery {
-        case .callback:
-            ptyDataSink.emit(reset)
-        case .relaySocket:
-            guard let writer = relayFrameWriter else { return }
-            Task { try? await writer.enqueue(type: kTypePtyData, payload: reset) }
-        }
+        // Callback delivery feeds an agent session's decoder, not a terminal
+        // the host's colors were pinned on.
+        guard ptyDelivery == .relaySocket else { return }
+        viewerOwnsDefaultColors = true
+        relayFrameWriter?.requestColorReset()
     }
 
     deinit {
@@ -3527,6 +3654,7 @@ final class PeerRelaySession {
                 disconnect("writer-failure")
             }
             relayFrameWriter = liveWriter
+            if viewerOwnsDefaultColors { liveWriter.requestColorReset() }
             writer = liveWriter
             reader = RelayFrameReader(relay: relay, inputBacklog: inputBacklog)
         } else {
