@@ -811,6 +811,98 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testZoomSlideSettlesOnceAndCountsFromItsFirstFrame() throws {
+        try XCTSkipIf(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, "Reduce Motion turns the slide off")
+        let controller = BonsplitController()
+        controller.configuration.appearance.enableAnimations = false
+        let pane = try XCTUnwrap(controller.focusedPaneId)
+        let second = try XCTUnwrap(controller.splitPane(pane, orientation: .horizontal))
+        let target = try XCTUnwrap(controller.splitPane(second, orientation: .vertical))
+        controller.configuration.appearance.enableAnimations = true
+        controller.configuration.appearance.animationDuration = 0.2
+        var settles = 0
+        controller.onZoomSlideSettled = { settles += 1 }
+        let probe = ZoomMountProbe()
+        let host = NSHostingView(rootView: BonsplitView(controller: controller) { _, pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        } emptyPane: { pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        })
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+
+        func settle(_ seconds: TimeInterval = 0.5) {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+            host.layoutSubtreeIfNeeded()
+        }
+        settle()
+        let fullWidth = host.bounds.width - 2 * (BonsplitCardMetrics.gap + BonsplitCardMetrics.borderWidth)
+        let targetView = try XCTUnwrap(probe.views[target])
+
+        // Both nested levels slide; the host hears once, after the last one.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle(0.06)
+        XCTAssertEqual(settles, 0)
+        settle()
+        XCTAssertEqual(settles, 1)
+
+        // A reversal cuts the first slide off; only the second one settles.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle(0.06)
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle()
+        XCTAssertEqual(settles, 2)
+
+        // Time the main thread spends blocked right after the slide starts
+        // must not count against its duration.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle()
+        XCTAssertNil(controller.zoomedPaneId)
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        host.layoutSubtreeIfNeeded()
+        Thread.sleep(forTimeInterval: 0.25)
+        settle(0.05)
+        XCTAssertLessThan(targetView.bounds.width, fullWidth - 1, "the slide is still running")
+        settle()
+        XCTAssertEqual(targetView.bounds.width, fullWidth, accuracy: 1)
+
+        // A nested pane zooming out heads for its own place in the split, not
+        // for a layout guessed from the hidden siblings' stale frames.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle()
+        XCTAssertNil(controller.zoomedPaneId)
+        controller.configuration.appearance.animationDuration = 2.0
+        settle(0.05)
+        let homeFrame = targetView.convert(targetView.bounds, to: host)
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle(2.5)
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        host.layoutSubtreeIfNeeded()
+        settle(1.2)
+        let nearlyHome = targetView.convert(targetView.bounds, to: host)
+        XCTAssertEqual(nearlyHome.minX, homeFrame.minX, accuracy: 10)
+        XCTAssertEqual(nearlyHome.minY, homeFrame.minY, accuracy: 10)
+        XCTAssertEqual(nearlyHome.width, homeFrame.width, accuracy: 10)
+        XCTAssertEqual(nearlyHome.height, homeFrame.height, accuracy: 10)
+        settle(1.5)
+        controller.configuration.appearance.animationDuration = 0.2
+
+        // With animations off nothing slides, so nothing settles.
+        let before = settles
+        controller.configuration.appearance.enableAnimations = false
+        settle(0.05)
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle()
+        XCTAssertEqual(settles, before)
+    }
+
+    @MainActor
     func testSplitClearsExistingPaneZoom() {
         let controller = BonsplitController()
         guard let originalPane = controller.focusedPaneId else {

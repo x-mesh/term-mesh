@@ -9,26 +9,43 @@ private class ThemedSplitView: NSSplitView {
     var cardGap: CGFloat = BonsplitCardMetrics.gap
     private(set) var zoomedChildIndex: Int?
 
-    /// A zoom slide in flight: `child` moves from `from` to `to`; a nil rect
-    /// stands for this view's bounds, which can change while it runs.
+    /// A zoom slide in flight: `child` moves between its place in the split
+    /// and the whole of this view. Both ends are worked out from the current
+    /// bounds on every frame, because a nested split view is resized by its
+    /// ancestors' slides while its own runs.
     private struct ZoomSlide {
         let id: UUID
         let child: Int
-        let from: NSRect?
-        let to: NSRect?
+        let zoomingIn: Bool
+        /// Where a reversal cut the previous slide off; the slide starts there
+        /// instead of at its usual end.
+        let interruptedFrame: NSRect?
         var progress: CGFloat
     }
     private var zoomSlide: ZoomSlide?
+    /// The model's divider position, as a fraction of the space the two
+    /// children share. Set by the owner before each `setZoomedChild`: while a
+    /// child is zoomed, the hidden sibling's frame no longer says where the
+    /// divider belongs.
+    var zoomDividerFraction: CGFloat = 0.5
     /// Runs after a zoom slide ends so the owner can re-apply the model's
     /// divider position, which it could not do while the slide owned layout.
     var onZoomSlideEnd: (() -> Void)?
+    /// Report every slide's start and stop, including one cut off by a
+    /// reversal, so the controller can tell when all levels have settled.
+    var onZoomSlideBegan: ((UUID) -> Void)?
+    var onZoomSlideStopped: ((UUID) -> Void)?
 
     /// True while zoom, or a zoom slide, decides the children's frames rather
     /// than the divider.
     var ownsChildLayout: Bool { zoomedChildIndex != nil || zoomSlide != nil }
 
+    /// Zero while zoom or a zoom slide owns the layout: the host draws dividers
+    /// from this and the children's frames (term-mesh's portal overlay paints
+    /// them above the terminals), and the children are not where a divider
+    /// would put them. The slide spaces the children with `cardGap` itself.
     override var dividerThickness: CGFloat {
-        zoomedChildIndex == nil ? cardGap : 0
+        ownsChildLayout ? 0 : cardGap
     }
 
     func setZoomedChild(_ index: Int?, slideDuration: CFTimeInterval? = nil) {
@@ -51,21 +68,42 @@ private class ThemedSplitView: NSSplitView {
 
         guard let slideDuration else { return }
         if let index, let startFrame, startFrame != bounds {
-            startZoomSlide(child: index, from: interruptedFrame ?? startFrame, to: nil, duration: slideDuration)
+            startZoomSlide(child: index, zoomingIn: true, interruptedFrame: interruptedFrame, duration: slideDuration)
         } else if index == nil, let previous, arrangedSubviews.indices.contains(previous) {
             // The siblings stay hidden until the zoomed pane is back in place,
             // so the pane shrinks into empty space instead of under them.
-            let target = arrangedSubviews[previous].frame
             for (childIndex, child) in arrangedSubviews.enumerated() where childIndex != previous {
                 child.isHidden = true
             }
-            startZoomSlide(child: previous, from: interruptedFrame, to: target, duration: slideDuration)
+            startZoomSlide(child: previous, zoomingIn: false, interruptedFrame: interruptedFrame, duration: slideDuration)
         }
     }
 
-    private func startZoomSlide(child: Int, from: NSRect?, to: NSRect?, duration: CFTimeInterval) {
+    /// Where `child` sits when nothing is zoomed, at the model's divider
+    /// position within the current bounds. This view is flipped, so the first
+    /// child is the top one of a vertical stack.
+    private func unzoomedFrame(of child: Int) -> NSRect {
+        let extent = isVertical ? bounds.width : bounds.height
+        let first = (max(extent - cardGap, 0) * min(max(zoomDividerFraction, 0), 1)).rounded()
+        let start = child == 0 ? 0 : first + cardGap
+        let length = child == 0 ? first : max(extent - first - cardGap, 0)
+        return isVertical
+            ? NSRect(x: start, y: 0, width: length, height: bounds.height)
+            : NSRect(x: 0, y: start, width: bounds.width, height: length)
+    }
+
+    private func startZoomSlide(child: Int, zoomingIn: Bool, interruptedFrame: NSRect?, duration: CFTimeInterval) {
         let id = UUID()
-        zoomSlide = ZoomSlide(id: id, child: child, from: from, to: to, progress: 0)
+        zoomSlide = ZoomSlide(
+            id: id, child: child, zoomingIn: zoomingIn, interruptedFrame: interruptedFrame, progress: 0
+        )
+        onZoomSlideBegan?(id)
+#if DEBUG
+        dlog(
+            "zoom.slide.begin id=\(id.uuidString.prefix(5)) child=\(child) in=\(zoomingIn ? 1 : 0) " +
+            "interrupted=\(interruptedFrame == nil ? 0 : 1) bounds=\(debugRectString(bounds))"
+        )
+#endif
         SplitAnimator.shared.animateProgress(duration: duration) { [weak self] progress in
             guard let self, self.zoomSlide?.id == id else { return }
             self.zoomSlide?.progress = progress
@@ -78,8 +116,9 @@ private class ThemedSplitView: NSSplitView {
 
     private func applyZoomSlideFrame() {
         guard let slide = zoomSlide, arrangedSubviews.indices.contains(slide.child) else { return }
-        let from = slide.from ?? bounds
-        let to = slide.to ?? bounds
+        let inSplit = unzoomedFrame(of: slide.child)
+        let from = slide.interruptedFrame ?? (slide.zoomingIn ? inSplit : bounds)
+        let to = slide.zoomingIn ? bounds : inSplit
         let t = slide.progress
         func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { (a + (b - a) * t).rounded() }
         arrangedSubviews[slide.child].frame = NSRect(
@@ -93,8 +132,12 @@ private class ThemedSplitView: NSSplitView {
     /// Ends the slide in progress, if any. `reveal` shows the siblings a
     /// zoom-out hid and hands layout back to the divider.
     private func endZoomSlide(reveal: Bool) {
-        guard zoomSlide != nil else { return }
+        guard let id = zoomSlide?.id else { return }
         zoomSlide = nil
+        defer { onZoomSlideStopped?(id) }
+#if DEBUG
+        dlog("zoom.slide.end id=\(id.uuidString.prefix(5)) reveal=\(reveal ? 1 : 0)")
+#endif
         guard zoomedChildIndex == nil else {
             adjustSubviews()
             return
@@ -461,6 +504,9 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
             guard let splitView, let coordinator else { return }
             coordinator.syncPosition(coordinator.splitState.dividerPosition, in: splitView)
         }
+        themedSplit?.zoomDividerFraction = splitState.dividerPosition
+        themedSplit?.onZoomSlideBegan = { [weak controller] id in controller?.zoomSlideBegan(id) }
+        themedSplit?.onZoomSlideStopped = { [weak controller] id in controller?.zoomSlideEnded(id) }
         themedSplit?.setZoomedChild(zoomedChild, slideDuration: slidesZoom ? animationDuration : nil)
         if restoringZoom {
             // An ancestor's layout suppresses nested divider sync during zoom restoration.
