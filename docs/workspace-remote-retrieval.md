@@ -137,7 +137,7 @@ Workspace
 Workspace 아래에 붙던 Activity Drawer를 대체하는 별도 창이다. Drawer는 기본으로 열려
 터미널 높이 220pt를 차지했지만, 내용 대부분이 연결 점검 로그라 항상 볼 이유가 없었다.
 
-- 메뉴의 `Activity`(⌘⌃D), 하단 바의 버튼, sidebar의 pane 행에서 연다.
+- 보기 메뉴의 `Activity`(⌘⌃D), 하단 바의 버튼, sidebar의 pane 행에서 연다.
 - `Logs` tab은 앱 전체의 remote-work 로그를 보여준다. 심각도와 문자열로 걸러 본다.
 - `Remote Work` tab은 창을 열 때 선택돼 있던 Workspace의 project binding, Incoming,
   Checkpoints를 보여주고 `Prepare Project`, `Checkpoint Now`를 제공한다.

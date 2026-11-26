@@ -326,51 +326,46 @@ struct TermMeshApp: App {
                 // -- Worktrees --
                 Divider()
 
-                Button {
-                    NotificationCenter.default.post(name: .worktreeWorkspaceRequested, object: nil)
-                } label: {
-                    commandLabel("New Worktree Workspace")
-                }
-                .keyboardShortcut("n", modifiers: [.command, .option, .shift])
-
-                Button(termMeshDaemon.worktreeEnabled
-                    ? "✓ Worktree Sandbox"
-                    : "  Worktree Sandbox"
-                ) {
-                    let newValue = !termMeshDaemon.worktreeEnabled
-                    termMeshDaemon.worktreeEnabled = newValue
-                    if newValue {
-                        DispatchQueue.global(qos: .utility).async { [daemon = self.termMeshDaemon] in
-                            let connected = daemon.ping()
-                            if !connected {
-                                DispatchQueue.main.async {
-                                    let alert = NSAlert()
-                                    alert.messageText = "Worktree Sandbox"
-                                    alert.informativeText = "term-meshd daemon is not running.\nNew tabs will open without sandbox until the daemon is started."
-                                    alert.alertStyle = .warning
-                                    alert.addButton(withTitle: "OK")
-                                    alert.presentAsSheet()
+                Menu(LanguageSettings.localized("Worktrees")) {
+                    Button(termMeshDaemon.worktreeEnabled
+                        ? "✓ Worktree Sandbox"
+                        : "  Worktree Sandbox"
+                    ) {
+                        let newValue = !termMeshDaemon.worktreeEnabled
+                        termMeshDaemon.worktreeEnabled = newValue
+                        if newValue {
+                            DispatchQueue.global(qos: .utility).async { [daemon = self.termMeshDaemon] in
+                                let connected = daemon.ping()
+                                if !connected {
+                                    DispatchQueue.main.async {
+                                        let alert = NSAlert()
+                                        alert.messageText = "Worktree Sandbox"
+                                        alert.informativeText = "term-meshd daemon is not running.\nNew tabs will open without sandbox until the daemon is started."
+                                        alert.alertStyle = .warning
+                                        alert.addButton(withTitle: "OK")
+                                        alert.presentAsSheet()
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                Toggle(isOn: $worktreeAutoCleanup) { commandLabel("Worktree Auto-Cleanup") }
+                    Toggle(isOn: $worktreeAutoCleanup) { commandLabel("Worktree Auto-Cleanup") }
 
-                Divider()
+                    Divider()
 
-                Button {
-                    cleanupStaleWorktrees()
-                } label: {
-                    commandLabel("Clean Up Stale Worktrees")
-                }
+                    Button {
+                        cleanupStaleWorktrees()
+                    } label: {
+                        commandLabel("Clean Up Stale Worktrees")
+                    }
 
-                Button {
-                    let path = termMeshDaemon.worktreeBaseDir
-                    NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
-                } label: {
-                    commandLabel("Open Worktree Directory…")
+                    Button {
+                        let path = termMeshDaemon.worktreeBaseDir
+                        NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
+                    } label: {
+                        commandLabel("Open Worktree Directory…")
+                    }
                 }
             }
 
@@ -413,17 +408,6 @@ struct TermMeshApp: App {
                     commandLabel("Check for Updates…")
                 }
                 InstallUpdateMenuItem(model: appDelegate.updateViewModel)
-                Divider()
-                Button {
-                    DashboardController.shared.showDashboard()
-                } label: {
-                    commandLabel("Term-Mesh Dashboard (Window)")
-                }
-                Button {
-                    openDashboardSplit()
-                } label: {
-                    commandLabel("Term-Mesh Dashboard (Split)")
-                }
             }
 
 #if DEBUG
@@ -476,49 +460,7 @@ struct TermMeshApp: App {
                 }
             }
 
-            CommandMenu(LanguageSettings.localized("Notifications")) {
-                let snapshot = notificationMenuSnapshot
-
-                Button(snapshot.stateHintTitle) {}
-                    .disabled(true)
-
-                if !snapshot.recentNotifications.isEmpty {
-                    Divider()
-
-                    ForEach(snapshot.recentNotifications) { notification in
-                        Button(notificationMenuItemTitle(for: notification)) {
-                            openNotificationFromMainMenu(notification)
-                        }
-                    }
-
-                    Divider()
-                }
-
-                splitCommandButton(title: "Show Notifications", shortcut: showNotificationsMenuShortcut) {
-                    showNotificationsPopover()
-                }
-
-                splitCommandButton(title: "Jump to Latest Unread", shortcut: jumpToUnreadMenuShortcut) {
-                    appDelegate.jumpToLatestUnread()
-                }
-                .disabled(!snapshot.hasUnreadNotifications)
-
-                Button {
-                    notificationStore.markAllRead()
-                } label: {
-                    commandLabel("Mark All Read")
-                }
-                .disabled(!snapshot.hasUnreadNotifications)
-
-                Button {
-                    notificationStore.clearAll()
-                } label: {
-                    commandLabel("Clear All")
-                }
-                .disabled(!snapshot.hasNotifications)
-            }
-
-            CommandMenu(LanguageSettings.localized("Peer")) {
+            CommandMenu(LanguageSettings.localized("Remote")) {
                 Menu(LanguageSettings.localized("Host This Mac")) {
                     Button {
                         PeerHostCoordinator.shared.startServer(nil)
@@ -584,39 +526,6 @@ struct TermMeshApp: App {
                 Divider()
 
                 Button {
-                    showSettingsPanel(navigateTo: .peerFederation)
-                } label: {
-                    commandLabel("Peer Federation Settings…")
-                }
-            }
-
-            CommandMenu(LanguageSettings.localized("Remote Work")) {
-                Button {
-                    ReviewBoardWindowCommand.requestToggle()
-                } label: {
-                    commandLabel("Toggle Review Board")
-                }
-                .keyboardShortcut(
-                    ReviewBoardSettings.toggleShortcutKey,
-                    modifiers: ReviewBoardSettings.toggleShortcutModifiers
-                )
-
-                Button {
-                    ActivityWindowController.shared.show()
-                } label: {
-                    commandLabel("Activity")
-                }
-                .keyboardShortcut("d", modifiers: [.command, .control])
-
-                Button {
-                    AppDelegate.shared?.tabManager?.selectedWorkspace?
-                        .retrievalStore.togglePresentation(.inspector)
-                } label: {
-                    commandLabel("Toggle Changes Inspector")
-                }
-                .keyboardShortcut("i", modifiers: [.command, .control])
-
-                Button {
                     guard let workspace = AppDelegate.shared?.tabManager?.selectedWorkspace,
                           let panelID = workspace.retrievalStore.selectedPane?.panelID else { return }
                     Task { await workspace.checkpointRemotePane(panelID: panelID, closeAfterCheckpoint: false) }
@@ -624,6 +533,14 @@ struct TermMeshApp: App {
                     commandLabel("Checkpoint Now")
                 }
                 .keyboardShortcut("k", modifiers: [.command, .control])
+
+                Divider()
+
+                Button {
+                    showSettingsPanel(navigateTo: .peerFederation)
+                } label: {
+                    commandLabel("Peer Federation Settings…")
+                }
             }
 
 #if DEBUG
@@ -729,6 +646,13 @@ struct TermMeshApp: App {
                 splitCommandButton(title: "New Project…", shortcut: newProjectMenuShortcut, registerShortcut: false) {
                     MainWindowPresentationRouter.post(name: .projectCreationRequested)
                 }
+
+                Button {
+                    NotificationCenter.default.post(name: .worktreeWorkspaceRequested, object: nil)
+                } label: {
+                    commandLabel("New Worktree Workspace")
+                }
+                .keyboardShortcut("n", modifiers: [.command, .option, .shift])
             }
 
             // Close tab/workspace
@@ -838,6 +762,44 @@ struct TermMeshApp: App {
                     }
                 }
 
+                Button {
+                    ActivityWindowController.shared.show()
+                } label: {
+                    commandLabel("Activity")
+                }
+                .keyboardShortcut("d", modifiers: [.command, .control])
+
+                Button {
+                    ReviewBoardWindowCommand.requestToggle()
+                } label: {
+                    commandLabel("Toggle Review Board")
+                }
+                .keyboardShortcut(
+                    ReviewBoardSettings.toggleShortcutKey,
+                    modifiers: ReviewBoardSettings.toggleShortcutModifiers
+                )
+
+                Button {
+                    AppDelegate.shared?.tabManager?.selectedWorkspace?
+                        .retrievalStore.togglePresentation(.inspector)
+                } label: {
+                    commandLabel("Toggle Changes Inspector")
+                }
+                .keyboardShortcut("i", modifiers: [.command, .control])
+
+                Divider()
+
+                Button {
+                    DashboardController.shared.showDashboard()
+                } label: {
+                    commandLabel("Term-Mesh Dashboard (Window)")
+                }
+                Button {
+                    openDashboardSplit()
+                } label: {
+                    commandLabel("Term-Mesh Dashboard (Split)")
+                }
+
                 Divider()
 
                 splitCommandButton(title: "Next Surface", shortcut: nextSurfaceMenuShortcut) {
@@ -846,68 +808,6 @@ struct TermMeshApp: App {
 
                 splitCommandButton(title: "Previous Surface", shortcut: prevSurfaceMenuShortcut) {
                     activeTabManager.selectPreviousSurface()
-                }
-
-                Button {
-                    activeTabManager.focusedBrowserPanel?.goBack()
-                } label: {
-                    commandLabel("Back")
-                }
-                .keyboardShortcut("[", modifiers: .command)
-
-                Button {
-                    activeTabManager.focusedBrowserPanel?.goForward()
-                } label: {
-                    commandLabel("Forward")
-                }
-                .keyboardShortcut("]", modifiers: .command)
-
-                Button {
-                    activeTabManager.focusedBrowserPanel?.reload()
-                } label: {
-                    commandLabel("Reload Page")
-                }
-                .keyboardShortcut("r", modifiers: .command)
-
-                splitCommandButton(title: "Toggle Developer Tools", shortcut: toggleBrowserDeveloperToolsMenuShortcut) {
-                    let manager = activeTabManager
-                    if !manager.toggleDeveloperToolsFocusedBrowser() {
-                        NSSound.beep()
-                    }
-                }
-
-                splitCommandButton(title: "Show JavaScript Console", shortcut: showBrowserJavaScriptConsoleMenuShortcut) {
-                    let manager = activeTabManager
-                    if !manager.showJavaScriptConsoleFocusedBrowser() {
-                        NSSound.beep()
-                    }
-                }
-
-                Button {
-                    _ = activeTabManager.zoomInFocusedBrowser()
-                } label: {
-                    commandLabel("Zoom In")
-                }
-                .keyboardShortcut("=", modifiers: .command)
-
-                Button {
-                    _ = activeTabManager.zoomOutFocusedBrowser()
-                } label: {
-                    commandLabel("Zoom Out")
-                }
-                .keyboardShortcut("-", modifiers: .command)
-
-                Button {
-                    _ = activeTabManager.resetZoomFocusedBrowser()
-                } label: {
-                    commandLabel("Actual Size")
-                }
-                .keyboardShortcut("0", modifiers: .command)
-
-                Button {
-                    browserHistory.clearHistory()
-                } label: {
-                    commandLabel("Clear Browser History")
                 }
 
                 splitCommandButton(title: "Next Workspace", shortcut: nextWorkspaceMenuShortcut) {
@@ -920,6 +820,72 @@ struct TermMeshApp: App {
 
                 splitCommandButton(title: "Rename Workspace…", shortcut: renameWorkspaceMenuShortcut) {
                     _ = AppDelegate.shared?.promptRenameSelectedWorkspace()
+                }
+
+                Divider()
+
+                Menu(LanguageSettings.localized("Browser")) {
+                    Button {
+                        activeTabManager.focusedBrowserPanel?.goBack()
+                    } label: {
+                        commandLabel("Back")
+                    }
+                    .keyboardShortcut("[", modifiers: .command)
+
+                    Button {
+                        activeTabManager.focusedBrowserPanel?.goForward()
+                    } label: {
+                        commandLabel("Forward")
+                    }
+                    .keyboardShortcut("]", modifiers: .command)
+
+                    Button {
+                        activeTabManager.focusedBrowserPanel?.reload()
+                    } label: {
+                        commandLabel("Reload Page")
+                    }
+                    .keyboardShortcut("r", modifiers: .command)
+
+                    splitCommandButton(title: "Toggle Developer Tools", shortcut: toggleBrowserDeveloperToolsMenuShortcut) {
+                        let manager = activeTabManager
+                        if !manager.toggleDeveloperToolsFocusedBrowser() {
+                            NSSound.beep()
+                        }
+                    }
+
+                    splitCommandButton(title: "Show JavaScript Console", shortcut: showBrowserJavaScriptConsoleMenuShortcut) {
+                        let manager = activeTabManager
+                        if !manager.showJavaScriptConsoleFocusedBrowser() {
+                            NSSound.beep()
+                        }
+                    }
+
+                    Button {
+                        _ = activeTabManager.zoomInFocusedBrowser()
+                    } label: {
+                        commandLabel("Zoom In")
+                    }
+                    .keyboardShortcut("=", modifiers: .command)
+
+                    Button {
+                        _ = activeTabManager.zoomOutFocusedBrowser()
+                    } label: {
+                        commandLabel("Zoom Out")
+                    }
+                    .keyboardShortcut("-", modifiers: .command)
+
+                    Button {
+                        _ = activeTabManager.resetZoomFocusedBrowser()
+                    } label: {
+                        commandLabel("Actual Size")
+                    }
+                    .keyboardShortcut("0", modifiers: .command)
+
+                    Button {
+                        browserHistory.clearHistory()
+                    } label: {
+                        commandLabel("Clear Browser History")
+                    }
                 }
 
                 Divider()
@@ -967,13 +933,33 @@ struct TermMeshApp: App {
 
                 Divider()
 
-                splitCommandButton(title: "Jump to Latest Unread", shortcut: jumpToUnreadMenuShortcut) {
-                    AppDelegate.shared?.jumpToLatestUnread()
-                }
+
+                let snapshot = notificationMenuSnapshot
 
                 splitCommandButton(title: "Show Notifications", shortcut: showNotificationsMenuShortcut) {
                     showNotificationsPopover()
                 }
+
+                // Never disabled: this item carries the registered shortcut,
+                // and a menu state that lags a new notification would swallow
+                // the key press that is meant to jump to it.
+                splitCommandButton(title: "Jump to Latest Unread", shortcut: jumpToUnreadMenuShortcut) {
+                    AppDelegate.shared?.jumpToLatestUnread()
+                }
+
+                Button {
+                    notificationStore.markAllRead()
+                } label: {
+                    commandLabel("Mark All Read")
+                }
+                .disabled(!snapshot.hasUnreadNotifications)
+
+                Button {
+                    notificationStore.clearAll()
+                } label: {
+                    commandLabel("Clear All")
+                }
+                .disabled(!snapshot.hasNotifications)
             }
             } // Group: File & Navigation Commands
         }
@@ -1207,19 +1193,6 @@ struct TermMeshApp: App {
             return fallback
         }
         return shortcut
-    }
-
-    private func notificationMenuItemTitle(for notification: TerminalNotification) -> String {
-        let tabTitle = appDelegate.tabTitle(for: notification.tabId)
-        return MenuBarNotificationLineFormatter.menuTitle(notification: notification, tabTitle: tabTitle)
-    }
-
-    private func openNotificationFromMainMenu(_ notification: TerminalNotification) {
-        _ = appDelegate.openNotification(
-            tabId: notification.tabId,
-            surfaceId: notification.surfaceId,
-            notificationId: notification.id
-        )
     }
 
     private func performSplitFromMenu(direction: SplitDirection) {
