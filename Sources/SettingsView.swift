@@ -202,8 +202,8 @@ struct SettingsView: View {
     @State private var terminalFallbackFontSearchQuery = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.fontSmoothingKey) private var terminalFontSmoothing = false
-    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = 255
-    @State private var terminalFontSmoothingStrengthDraft = 255
+    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = TerminalSettingsOverride.defaultFontSmoothingStrength
+    @State private var terminalFontSmoothingStrengthDraft = TerminalSettingsOverride.defaultFontSmoothingStrength
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
     @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
     @AppStorage(TerminalSettingsOverride.backgroundOpacityKey) private var terminalBgOpacity: Double = -1
@@ -3317,7 +3317,7 @@ struct SettingsView: View {
         terminalFallbackFontFamily = ""
         terminalFontSize = 0
         terminalFontSmoothing = false
-        terminalFontSmoothingStrength = 255
+        terminalFontSmoothingStrength = TerminalSettingsOverride.defaultFontSmoothingStrength
         UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingKey)
         UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
         terminalThemeLight = ""
