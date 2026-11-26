@@ -2812,6 +2812,41 @@ extension TerminalController {
         return resp == "OK" ? .ok([:]) : .err(code: "internal_error", message: resp, data: nil)
     }
 
+    /// `debug.card_ring.status`: how many card rings are sweeping right now.
+    /// For measurement only: `limit` replaces the sweep slot pool, and `fps`
+    /// sets the frame rate later sweeps ask for (0 = the display's rate).
+    func v2DebugCardRingStatus(params: [String: Any]) -> V2CallResult {
+        var newLimit: Int?
+        if let raw = params["limit"] {
+            guard let value = (raw as? NSNumber)?.intValue, value >= 0 else {
+                return .err(code: "invalid_params", message: "limit must be a non-negative integer", data: nil)
+            }
+            newLimit = value
+        }
+        var newFrameRate: Float?
+        if let raw = params["fps"] {
+            guard let value = (raw as? NSNumber)?.floatValue, value >= 0, value <= 240 else {
+                return .err(code: "invalid_params", message: "fps must be between 0 and 240", data: nil)
+            }
+            newFrameRate = value
+        }
+        var active = 0
+        var limit = 0
+        var fps: Float = 0
+        // Card ring state lives on the main thread; this is a debug call, not a hot path.
+        let completed = v2MainExec(timeout: 2) {
+            if let newLimit { CardRingView.debugSetLapLimit(newLimit) }
+            if let newFrameRate { CardRingView.debugSetLapFrameRate(newFrameRate) }
+            active = CardRingView.debugActiveLaps
+            limit = CardRingView.debugLapLimit
+            fps = CardRingView.debugLapFrameRate
+        }
+        guard completed else {
+            return .err(code: "timeout", message: "main thread did not answer", data: nil)
+        }
+        return .ok(["active_laps": active, "limit": limit, "fps": fps])
+    }
+
     func v2DebugScreenshot(params: [String: Any]) -> V2CallResult {
         let label = v2String(params, "label") ?? ""
         let resp = captureScreenshot(label)

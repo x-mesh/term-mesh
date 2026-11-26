@@ -8,6 +8,7 @@ All notable changes to term-mesh are documented here.
 
 - Font Family and Fallback Font in Settings › Terminal are each one control now: a button that shows the current font and opens a list you can search. Type to filter, move with the arrow keys and press Return to choose. Before, a search field sat above a separate menu.
 - The default Pane Padding (Bottom) is 6 px instead of 10 px. A value you already set in Settings is kept.
+- The light that sweeps around a pane card on a new notification runs at 30 fps, and at most two panes sweep at once; the others show the faint ring without the sweep. On a 120 Hz display, notifications arriving in eight panes at once used to hold WindowServer at about 85% of a CPU core. With these limits it stays near 34%.
 
 ### Fixed
 

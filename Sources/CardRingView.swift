@@ -59,6 +59,11 @@ final class CardRingView: NSView {
         static let fadeInEnd: NSNumber = 0.18
         static let fadeOutStart: NSNumber = 0.75
         static let lapAnimationKey = "term-mesh.card-ring.lap"
+        /// Any sweep makes WindowServer recomposite the window every frame. On
+        /// a 120 Hz display two sweeps took it from 6% to 64% of a core; at
+        /// 30 fps they took it to 34%, and the slow five-second sweep still
+        /// reads as smooth.
+        static let lapFrameRate: Float = 30
 
         // Amber rather than the blue of the notification ring, so a pane that
         // just moved never reads as one with unread output.
@@ -93,6 +98,12 @@ final class CardRingView: NSView {
     private var ringShown = false
     private var transitionGlowGeneration = 0
     private var isPlayingTransitionGlow = false
+
+    /// Shared by every ring on the main thread; see `NotificationLapSlots`.
+    private static var lapSlots = NotificationLapSlots()
+    private var holdsLapSlot = false
+    /// Tells a finished sweep apart from one that a restart replaced.
+    private var lapGeneration = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -208,7 +219,21 @@ final class CardRingView: NSView {
         }
     }
 
+    /// Sweeps the ring once, unless the rings already sweeping use every slot.
     func playLap() {
+        guard Self.lapSlots.acquire(alreadyHeld: holdsLapSlot) else { return }
+        holdsLapSlot = true
+        lapGeneration += 1
+        let generation = lapGeneration
+        CATransaction.begin()
+        // Runs when the sweep ends or is removed, for example when the
+        // notification is read. A restart bumps the generation first, so the
+        // replaced sweep's completion does not give the slot back.
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self, self.lapGeneration == generation, self.holdsLapSlot else { return }
+            self.holdsLapSlot = false
+            Self.lapSlots.release()
+        }
         for entry in lapLayers {
             let range0 = CardRingGeometry.strokeRange(headProgress: 0, length: entry.spec.length)
             let range1 = CardRingGeometry.strokeRange(headProgress: 1, length: entry.spec.length)
@@ -228,10 +253,47 @@ final class CardRingView: NSView {
             let group = CAAnimationGroup()
             group.animations = [start, end, fade]
             group.duration = Style.lapDuration
+            if let range = Self.lapFrameRateRange {
+                group.preferredFrameRateRange = range
+                for part in [start, end, fade] as [CAAnimation] { part.preferredFrameRateRange = range }
+            }
             entry.layer.removeAnimation(forKey: Style.lapAnimationKey)
             entry.layer.add(group, forKey: Style.lapAnimationKey)
         }
+        CATransaction.commit()
     }
+
+    deinit {
+        // A ring removed mid-sweep never reaches its completion block.
+        if holdsLapSlot { Self.lapSlots.release() }
+    }
+
+    /// Frame rate the sweep asks for; nil leaves it to the display.
+    private static var lapFrameRateRange: CAFrameRateRange? = frameRateRange(Style.lapFrameRate)
+
+    private static func frameRateRange(_ fps: Float) -> CAFrameRateRange? {
+        fps > 0 ? CAFrameRateRange(minimum: fps / 2, maximum: fps, preferred: fps) : nil
+    }
+
+    #if DEBUG
+    static var debugLapFrameRate: Float = Style.lapFrameRate
+
+    /// 0 lets the display choose. Applies to sweeps started afterwards.
+    static func debugSetLapFrameRate(_ fps: Float) {
+        debugLapFrameRate = fps
+        lapFrameRateRange = frameRateRange(fps)
+    }
+
+    static var debugActiveLaps: Int { lapSlots.active }
+    static var debugLapLimit = NotificationLapSlots.limit
+
+    /// Replaces the slot pool for measurement. Call it with no sweep running:
+    /// the new pool starts empty.
+    static func debugSetLapLimit(_ limit: Int) {
+        debugLapLimit = limit
+        lapSlots = NotificationLapSlots(limit: limit)
+    }
+    #endif
 
     private func updatePaths() {
         let outline = bounds.insetBy(

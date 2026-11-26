@@ -1569,6 +1569,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPanelSnapshotReset(params: params))
         case "debug.window.screenshot":
             return v2Result(id: id, self.v2DebugScreenshot(params: params))
+        case "debug.card_ring.status":
+            return v2Result(id: id, self.v2DebugCardRingStatus(params: params))
         case "debug.window.click":
             return v2Result(id: id, self.v2DebugWindowClick(params: params))
         case "debug.drag.simulate_file_drop":
@@ -1821,6 +1823,7 @@ class TerminalController {
             "debug.panel_snapshot",
             "debug.panel_snapshot.reset",
             "debug.window.screenshot",
+            "debug.card_ring.status",
             "debug.drag.simulate_file_drop",
             "debug.drag.seed_pasteboard",
             "debug.drag.clear_pasteboard",

@@ -82,6 +82,52 @@ final class CardRingTransitionGlowTests: XCTestCase {
     }
 }
 
+/// The sweep slot pool is shared by every ring, so a ring that leaks its slot
+/// stops sweeps in every pane for the rest of the session.
+@MainActor
+final class CardRingLapSlotTests: XCTestCase {
+    private func makeRing() -> CardRingView {
+        CardRingView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+    }
+
+    override func setUp() {
+        super.setUp()
+        CardRingView.debugSetLapLimit(1)
+    }
+
+    override func tearDown() {
+        CardRingView.debugSetLapLimit(NotificationLapSlots.limit)
+        super.tearDown()
+    }
+
+    func testARingReleasedMidSweepGivesItsSlotBack() {
+        weak var released: CardRingView?
+        autoreleasepool {
+            let ring = makeRing()
+            released = ring
+            ring.playLap()
+            XCTAssertEqual(CardRingView.debugActiveLaps, 1)
+        }
+
+        // No run loop turn in between, so the sweep's completion cannot have
+        // returned the slot: only the ring's teardown can.
+        XCTAssertNil(released, "the ring must be gone for this test to mean anything")
+        XCTAssertEqual(CardRingView.debugActiveLaps, 0)
+
+        let next = makeRing()
+        next.playLap()
+        XCTAssertEqual(CardRingView.debugActiveLaps, 1, "the freed slot must be usable by another ring")
+    }
+
+    func testASweepPastTheLimitIsSkipped() {
+        let first = makeRing()
+        let second = makeRing()
+        first.playLap()
+        second.playLap()
+        XCTAssertEqual(CardRingView.debugActiveLaps, 1)
+    }
+}
+
 final class PanePaddingSettingsTests: XCTestCase {
     func testContentRectInsetsSidesTopAndBottomSeparately() {
         let bounds = NSRect(x: 0, y: 0, width: 400, height: 300)

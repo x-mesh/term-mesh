@@ -63,4 +63,39 @@ final class NotificationLapPolicyTests: XCTestCase {
         let decision = decide(latest: nil, lastLapped: first)
         XCTAssertEqual(decision, NotificationLapDecision(ring: .faint, playLap: false, lastLappedID: first))
     }
+
+    func testLapSlotsRefuseASweepPastTheLimit() {
+        var slots = NotificationLapSlots(limit: 2)
+        XCTAssertTrue(slots.acquire(alreadyHeld: false))
+        XCTAssertTrue(slots.acquire(alreadyHeld: false))
+        XCTAssertFalse(slots.acquire(alreadyHeld: false))
+        XCTAssertEqual(slots.active, 2)
+    }
+
+    func testLapSlotsLetAHolderRestartWithoutTakingAnotherSlot() {
+        var slots = NotificationLapSlots(limit: 1)
+        XCTAssertTrue(slots.acquire(alreadyHeld: false))
+        XCTAssertTrue(slots.acquire(alreadyHeld: true))
+        XCTAssertEqual(slots.active, 1)
+    }
+
+    func testLapSlotsFreeASlotWhenASweepEnds() {
+        var slots = NotificationLapSlots(limit: 1)
+        XCTAssertTrue(slots.acquire(alreadyHeld: false))
+        XCTAssertFalse(slots.acquire(alreadyHeld: false))
+        slots.release()
+        XCTAssertTrue(slots.acquire(alreadyHeld: false))
+    }
+
+    func testLapSlotsNeverCountBelowZero() {
+        var slots = NotificationLapSlots(limit: 1)
+        slots.release()
+        XCTAssertEqual(slots.active, 0)
+        XCTAssertTrue(slots.acquire(alreadyHeld: false))
+        XCTAssertFalse(slots.acquire(alreadyHeld: false))
+    }
+
+    func testShippedLimitAllowsTwoSweepsAtOnce() {
+        XCTAssertEqual(NotificationLapSlots.limit, 2)
+    }
 }
