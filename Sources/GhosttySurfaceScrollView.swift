@@ -268,6 +268,12 @@ final class GhosttySurfaceScrollView: NSView {
     /// Drawn in the portal host beside this view so it can cover the pane's
     /// tab bar and glow into the gap; see `CardRingView`.
     private let cardRingView = CardRingView(frame: .zero)
+    /// While a pane zoom slides: the terminal's last frame, unscaled, riding the
+    /// moving pane, and the surface size held until the slide settles. See
+    /// `beginZoomSnapshot`.
+    private var zoomSnapshotView: NSView?
+    private var zoomFrozenSurfaceSize: NSSize?
+    private var zoomSnapshotGeneration = 0
     private var lastLappedNotificationID: UUID?
     private let peerRingOverlayView: GhosttyFlashOverlayView
     private let peerRingLayer: CAShapeLayer
@@ -716,8 +722,10 @@ final class GhosttySurfaceScrollView: NSView {
         // The background still fills the whole area, so the padding shows the
         // terminal's own color around the grid.
         scrollView.frame = paddedTerminalFrame(in: terminalBounds)
-        let targetSize = scrollView.bounds.size
-        surfaceView.frame.size = targetSize
+        if zoomFrozenSurfaceSize == nil {
+            surfaceView.frame.size = scrollView.bounds.size
+        }
+        zoomSnapshotView?.frame = scrollView.frame
         documentView.frame.size.width = scrollView.bounds.width
         inactiveOverlayView.frame = terminalBounds
         if let banner = peerDisconnectBannerView {
@@ -968,12 +976,88 @@ final class GhosttySurfaceScrollView: NSView {
         }
     }
 
+    func playTransitionGlow(delay: CFTimeInterval) {
+        syncCardRing()
+        cardRingView.playTransitionGlow(delay: delay)
+    }
+
+    /// The longest a zoom snapshot stays up without `endZoomSnapshot`: a
+    /// settle signal lost with a split view torn down mid-slide must not leave
+    /// the terminal at its old grid size. Well above the slide itself, which a
+    /// busy main thread can stretch past half a second.
+    static let zoomSnapshotTimeout: TimeInterval = 2.0
+
+    /// Covers the terminal with its current frame, unscaled and pinned to the
+    /// pane's top-left corner as the pane zoom slides, and holds the surface at
+    /// its current size until `endZoomSnapshot`. Resized frame by frame, the
+    /// terminal kept redrawing a smaller grid into a growing pane, so it seemed
+    /// to grow toward the bottom-right wherever the pane sat; the still frame
+    /// moves with the pane instead. Holding the size also makes the slide one
+    /// PTY resize instead of several.
+    /// Returns false when the surface has no frame to show yet.
+    @discardableResult
+    func beginZoomSnapshot() -> Bool {
+        if zoomFrozenSurfaceSize == nil {
+            // Fresh start, or a new slide during the previous one's fade-out:
+            // take the frame the terminal shows now.
+            guard window != nil, let contents = surfaceView.layer?.contents else { return false }
+            zoomSnapshotView?.removeFromSuperview()
+            let snapshot = NSView(frame: scrollView.frame)
+            snapshot.wantsLayer = true
+            snapshot.layer?.contents = contents
+            // Unscaled, at the same corner Ghostty draws from: the pane grows
+            // or shrinks around the text, never the text itself.
+            snapshot.layer?.contentsGravity = surfaceView.layer?.contentsGravity ?? .topLeft
+            snapshot.layer?.masksToBounds = true
+            snapshot.layer?.contentsScale = surfaceView.layer?.contentsScale ?? 1
+            addSubview(snapshot, positioned: .above, relativeTo: scrollView)
+            zoomSnapshotView = snapshot
+            zoomFrozenSurfaceSize = surfaceView.frame.size
+            scrollView.alphaValue = 0
+        }
+        // A reversal mid-slide keeps the frame already up.
+        zoomSnapshotGeneration &+= 1
+        let generation = zoomSnapshotGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.zoomSnapshotTimeout) { [weak self] in
+            guard let self, self.zoomSnapshotGeneration == generation else { return }
+            self.endZoomSnapshot()
+        }
+        return true
+    }
+
+    /// Gives the terminal its new size and fades the snapshot out once the
+    /// terminal can have drawn at that size.
+    func endZoomSnapshot() {
+        guard zoomFrozenSurfaceSize != nil, let snapshot = zoomSnapshotView else { return }
+        zoomSnapshotGeneration &+= 1
+        let generation = zoomSnapshotGeneration
+        zoomFrozenSurfaceSize = nil
+        synchronizeGeometryAndContent()
+        refreshSurfaceNow()
+        // Ghostty coalesces grid resizes for 25 ms before the renderer sees the
+        // new grid, so the first frames at the new size still hold the old grid
+        // in the top-left corner. Keep the snapshot over them.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self, self.zoomSnapshotGeneration == generation else { return }
+            self.scrollView.alphaValue = 1
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.1
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                snapshot.animator().alphaValue = 0
+            } completionHandler: { [weak self] in
+                guard let self, self.zoomSnapshotGeneration == generation else { return }
+                snapshot.removeFromSuperview()
+                self.zoomSnapshotView = nil
+            }
+        }
+    }
+
     override var isHidden: Bool {
         didSet { syncCardRing() }
     }
 
     private func paddedTerminalFrame(in terminalBounds: NSRect) -> NSRect {
-        // The sides are Ghostty's `window-padding-x` (see the baseline config),
+        // The sides are Ghostty's `window-padding-x` (see the pane padding override),
         // so the app insets only the top and bottom.
         let padded = PanePaddingSettings.contentRect(
             in: terminalBounds,
@@ -2634,6 +2718,7 @@ final class GhosttySurfaceScrollView: NSView {
     /// Match upstream Ghostty behavior: use content area width (excluding non-content
     /// regions such as scrollbar space) when telling libghostty the terminal size.
     private func synchronizeCoreSurface() {
+        guard zoomFrozenSurfaceSize == nil else { return }
         let width = scrollView.contentSize.width
         let height = surfaceView.frame.height
         guard width > 0, height > 0 else { return }

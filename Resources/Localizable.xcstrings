@@ -2221,6 +2221,26 @@
         }
       }
     },
+    "Search installed fonts": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "설치된 글꼴 검색"
+          }
+        }
+      }
+    },
+    "No matching fonts": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "일치하는 글꼴 없음"
+          }
+        }
+      }
+    },
     "Default (from config)": {
       "localizations": {
         "ko": {

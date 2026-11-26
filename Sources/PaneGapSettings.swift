@@ -17,6 +17,33 @@ enum PaneGapSettings {
     }
 }
 
+/// Whether pane splits and zooms slide, and whether the pane they leave in
+/// focus glows.
+///
+/// Off by default: the slide resizes the terminal while it moves, the same as
+/// dragging a divider, and a full-screen TUI repaints on every resize.
+enum PaneTransitionAnimationSettings {
+    static let key = "paneTransitionAnimations"
+    static let defaultValue = false
+
+    /// Length of one split or zoom slide, in seconds.
+    static let durationKey = "paneTransitionAnimationDuration"
+    static let defaultDuration: Double = 0.2
+    static let durationRange: ClosedRange<Double> = 0.1...0.6
+
+    static var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? defaultValue
+    }
+
+    static func clampedDuration(_ value: Double) -> Double {
+        min(max(value, durationRange.lowerBound), durationRange.upperBound)
+    }
+
+    static var duration: Double {
+        clampedDuration(UserDefaults.standard.object(forKey: durationKey) as? Double ?? defaultDuration)
+    }
+}
+
 /// Space between a pane card's edge and the terminal grid.
 ///
 /// Applied by the app around the surface view rather than through Ghostty's
@@ -32,7 +59,7 @@ enum PanePaddingSettings {
     static let bottomKey = "paneContentPaddingBottom"
     static let defaultHorizontal = Double(BonsplitCardMetrics.gap)
     static let defaultTop: Double = 2
-    static let defaultBottom: Double = 10
+    static let defaultBottom: Double = 6
     static let range: ClosedRange<Double> = 0...24
 
     static func clamped(_ value: Double) -> CGFloat {

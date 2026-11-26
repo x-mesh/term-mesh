@@ -29,6 +29,46 @@ final class TerminalOverrideIsolationTests: XCTestCase {
         XCTAssertEqual(FontFamilySearch.filtered(fonts, query: "  \n"), fonts)
     }
 
+    func test_fontFamilyGroups_listTheClearingRowFirstAndKeepSectionsApart() {
+        let groups = FontFamilySearch.groups(
+            sections: [["Menlo", "SF Mono"], ["Helvetica"]], selection: "Menlo", query: ""
+        )
+
+        XCTAssertEqual(groups, [[""], ["Menlo", "SF Mono"], ["Helvetica"]])
+    }
+
+    func test_fontFamilyGroups_whileSearchingDropTheClearingRowAndEmptySections() {
+        let groups = FontFamilySearch.groups(
+            sections: [["Menlo", "SF Mono"], ["Helvetica"]], selection: "", query: "mono"
+        )
+
+        XCTAssertEqual(groups, [["SF Mono"]])
+    }
+
+    func test_fontFamilyGroups_keepASelectionThatIsNotInstalled() {
+        let sections = [["Menlo"], ["Helvetica"]]
+
+        XCTAssertEqual(
+            FontFamilySearch.groups(sections: sections, selection: "Gone Mono", query: ""),
+            [["", "Gone Mono"], ["Menlo"], ["Helvetica"]]
+        )
+        XCTAssertEqual(
+            FontFamilySearch.groups(sections: sections, selection: "Gone Mono", query: "hel"),
+            [["Helvetica"]]
+        )
+    }
+
+    func test_fontFamilyMove_stopsAtTheEndsAndStartsFromTheNearEnd() {
+        let rows = ["", "Menlo", "SF Mono"]
+
+        XCTAssertEqual(FontFamilySearch.moved(from: "Menlo", by: 1, in: rows), "SF Mono")
+        XCTAssertEqual(FontFamilySearch.moved(from: "SF Mono", by: 1, in: rows), "SF Mono")
+        XCTAssertEqual(FontFamilySearch.moved(from: "", by: -1, in: rows), "")
+        XCTAssertEqual(FontFamilySearch.moved(from: nil, by: 1, in: rows), "")
+        XCTAssertEqual(FontFamilySearch.moved(from: "Not Listed", by: -1, in: rows), "SF Mono")
+        XCTAssertNil(FontFamilySearch.moved(from: "Menlo", by: 1, in: []))
+    }
+
     private var scratch: URL!
     private var defaultsSuite: String!
     private var defaults: UserDefaults!
@@ -186,6 +226,16 @@ final class TerminalOverrideIsolationTests: XCTestCase {
 
         XCTAssertTrue(lines.contains("font-thicken = true"), "got \(lines)")
         XCTAssertTrue(lines.contains("font-thicken-strength = 128"), "got \(lines)")
+    }
+
+    func test_configLines_fontSmoothingWithoutAStoredStrengthWritesTheShownDefault() throws {
+        defaults.set(true, forKey: TerminalSettingsOverride.fontSmoothingKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertTrue(lines.contains("font-thicken = true"), "got \(lines)")
+        XCTAssertTrue(
+            lines.contains("font-thicken-strength = \(TerminalSettingsOverride.defaultFontSmoothingStrength)"),
+            "got \(lines)"
+        )
     }
 
     func test_configLines_fontSmoothingDisabledOmitsStrength() throws {

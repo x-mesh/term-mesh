@@ -197,7 +197,9 @@ extension BonsplitConfiguration {
         }
 
         static func clampedCardGap(_ value: CGFloat) -> CGFloat {
-            min(max(value, BonsplitCardMetrics.gapRange.lowerBound), BonsplitCardMetrics.gapRange.upperBound)
+            // NaN fails every comparison, so min/max would hand it back unchanged.
+            guard !value.isNaN else { return BonsplitCardMetrics.gap }
+            return min(max(value, BonsplitCardMetrics.gapRange.lowerBound), BonsplitCardMetrics.gapRange.upperBound)
         }
 
         // MARK: - Presets

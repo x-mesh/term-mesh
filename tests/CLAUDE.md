@@ -32,6 +32,12 @@ ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v1.sh'
 ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v2.sh tests_v2/test_trigger_flash.py'
 ```
 
+화면 픽셀이나 렌더링 부하를 재는 실행은 `scripts/awake-run.sh`로 감싼다. mac-sub는 10분 무입력이면 화면이 꺼지고, 꺼진 화면이나 잠금 화면에서는 앱 창이 합성되지 않아 결과가 무효다. 스크립트는 시작 전에 화면을 깨우고, 잠금 유예가 지나 잠겨 있으면 실행하지 않고 75로 끝낸다(SSH로는 풀 수 없으니 직접 풀어야 한다).
+
+```bash
+ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/awake-run.sh --sleep-after -- ./scripts/run-tests-v2.sh tests_v2/test_trigger_flash.py'
+```
+
 러너는 launch 시 `socketControlMode full`(레거시 alias; `migrateMode`가 변환) + `TERMMESH_UI_TEST_MODE=1`(결정론적 startup)로 socket 접근을 강제하고, 신선한 workspace 하나로 부트스트랩한다. 단일 실행 시 socket을 켜려면 launch에 `--env TERMMESH_SOCKET_MODE=allowAll`를 준다. socket 경로는 `TERMMESH_SOCKET`/`TERMMESH_SOCKET_PATH`로 주입(레거시 `CMUX_*`도 허용되나 **새 코드에서 쓰지 않는다**).
 
 ## 표준 테스트 구조

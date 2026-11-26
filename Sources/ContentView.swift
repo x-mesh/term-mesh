@@ -813,6 +813,9 @@ struct ContentView: View {
 
     @State private var titlebarLeadingInset: CGFloat = 12
     @AppStorage(PaneGapSettings.key) private var paneCardGap = PaneGapSettings.defaultValue
+    @AppStorage(PaneTransitionAnimationSettings.key) private var paneTransitionAnimations = PaneTransitionAnimationSettings.defaultValue
+    @AppStorage(PaneTransitionAnimationSettings.durationKey)
+    private var paneTransitionAnimationDuration = PaneTransitionAnimationSettings.defaultDuration
     @AppStorage(PanePaddingSettings.horizontalKey) private var panePaddingX = PanePaddingSettings.defaultHorizontal
     @AppStorage(PanePaddingSettings.topKey) private var panePaddingTop = PanePaddingSettings.defaultTop
     @AppStorage(PanePaddingSettings.bottomKey) private var panePaddingBottom = PanePaddingSettings.defaultBottom
@@ -2314,6 +2317,19 @@ struct ContentView: View {
             let gap = PaneGapSettings.clamped(paneCardGap)
             for workspace in tabManager.tabs {
                 workspace.applyCardGap(gap)
+            }
+        })
+
+        view = AnyView(view.onChange(of: paneTransitionAnimations) { _ in
+            for workspace in tabManager.tabs {
+                workspace.applyPaneTransitionAnimations(paneTransitionAnimations)
+            }
+        })
+
+        view = AnyView(view.onChange(of: paneTransitionAnimationDuration) { _ in
+            let duration = PaneTransitionAnimationSettings.clampedDuration(paneTransitionAnimationDuration)
+            for workspace in tabManager.tabs {
+                workspace.applyPaneTransitionDuration(duration)
             }
         })
 

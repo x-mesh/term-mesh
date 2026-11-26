@@ -198,12 +198,10 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fallbackFontFamilyKey) private var terminalFallbackFontFamily = ""
     @State private var fallbackFontSupport: [String: Set<String>]?
-    @State private var terminalFontSearchQuery = ""
-    @State private var terminalFallbackFontSearchQuery = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.fontSmoothingKey) private var terminalFontSmoothing = false
-    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = 255
-    @State private var terminalFontSmoothingStrengthDraft = 255
+    @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = TerminalSettingsOverride.defaultFontSmoothingStrength
+    @State private var terminalFontSmoothingStrengthDraft = TerminalSettingsOverride.defaultFontSmoothingStrength
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
     @AppStorage(TerminalSettingsOverride.themeDarkKey) private var terminalThemeDark = ""
     @AppStorage(TerminalSettingsOverride.backgroundOpacityKey) private var terminalBgOpacity: Double = -1
@@ -212,6 +210,9 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.scrollbackLimitKey) private var terminalScrollback: Int = 0
     @AppStorage(TerminalSettingsOverride.unfocusedSplitOpacityKey) private var terminalUnfocusedOpacity: Double = -1
     @AppStorage(PaneGapSettings.key) private var paneCardGap = PaneGapSettings.defaultValue
+    @AppStorage(PaneTransitionAnimationSettings.key) private var paneTransitionAnimations = PaneTransitionAnimationSettings.defaultValue
+    @AppStorage(PaneTransitionAnimationSettings.durationKey)
+    private var paneTransitionAnimationDuration = PaneTransitionAnimationSettings.defaultDuration
     @AppStorage(PanePaddingSettings.horizontalKey) private var panePaddingX = PanePaddingSettings.defaultHorizontal
     @AppStorage(PanePaddingSettings.topKey) private var panePaddingTop = PanePaddingSettings.defaultTop
     @AppStorage(PanePaddingSettings.bottomKey) private var panePaddingBottom = PanePaddingSettings.defaultBottom
@@ -965,37 +966,14 @@ struct SettingsView: View {
                     subtitle: terminalFontFamily.isEmpty ? "Using ghostty config value" : nil,
                     controlWidth: pickerColumnWidth
                 ) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        TextField("Search installed fonts", text: $terminalFontSearchQuery)
-                            .textFieldStyle(.roundedBorder)
-                            .accessibilityLabel("Search font families")
-
-                        Picker("", selection: $terminalFontFamily) {
-                            Text("Default (from config)").tag("")
-                            let fonts = MonospaceFontList.list()
-                            let monoCount = MonospaceFontList.monospaceFontCount
-                            let mono = FontFamilySearch.filtered(
-                                Array(fonts.prefix(monoCount)), query: terminalFontSearchQuery
-                            )
-                            let other = FontFamilySearch.filtered(
-                                Array(fonts.suffix(from: monoCount)), query: terminalFontSearchQuery
-                            )
-                            if !mono.isEmpty {
-                                Divider()
-                                ForEach(mono, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                            if !other.isEmpty {
-                                Divider()
-                                ForEach(other, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
+                    let fonts = MonospaceFontList.list()
+                    let monoCount = MonospaceFontList.monospaceFontCount
+                    FontFamilyComboBox(
+                        selection: $terminalFontFamily,
+                        emptyTitle: "Default (from config)",
+                        sections: [Array(fonts.prefix(monoCount)), Array(fonts.suffix(from: monoCount))],
+                        accessibilityLabel: "Font Family"
+                    )
                 }
             }
 
@@ -1009,53 +987,18 @@ struct SettingsView: View {
                         : "Draws characters the primary font lacks (Korean, Japanese, Chinese, etc.)",
                     controlWidth: pickerColumnWidth
                 ) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        TextField("Search installed fonts", text: $terminalFallbackFontSearchQuery)
-                            .textFieldStyle(.roundedBorder)
-                            .accessibilityLabel("Search fallback font families")
-
-                        Picker("", selection: $terminalFallbackFontFamily) {
-                            Text("None").tag("")
-                            let fonts = MonospaceFontList.list()
-                            let monoCount = MonospaceFontList.monospaceFontCount
-                            let sections = fallbackFontSections(
-                                mono: Array(fonts.prefix(monoCount)),
-                                other: Array(fonts.suffix(from: monoCount))
-                            )
-                            let preferred = FontFamilySearch.filtered(
-                                sections.preferred, query: terminalFallbackFontSearchQuery
-                            )
-                            let mono = FontFamilySearch.filtered(
-                                sections.mono, query: terminalFallbackFontSearchQuery
-                            )
-                            let other = FontFamilySearch.filtered(
-                                sections.other, query: terminalFallbackFontSearchQuery
-                            )
-                            if !terminalFallbackFontFamily.isEmpty, !fonts.contains(terminalFallbackFontFamily) {
-                                Text(terminalFallbackFontFamily).tag(terminalFallbackFontFamily)
-                            }
-                            if !preferred.isEmpty {
-                                Divider()
-                                ForEach(preferred, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                            if !mono.isEmpty {
-                                Divider()
-                                ForEach(mono, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                            if !other.isEmpty {
-                                Divider()
-                                ForEach(other, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
+                    let fonts = MonospaceFontList.list()
+                    let monoCount = MonospaceFontList.monospaceFontCount
+                    let sections = fallbackFontSections(
+                        mono: Array(fonts.prefix(monoCount)),
+                        other: Array(fonts.suffix(from: monoCount))
+                    )
+                    FontFamilyComboBox(
+                        selection: $terminalFallbackFontFamily,
+                        emptyTitle: "None",
+                        sections: [sections.preferred, sections.mono, sections.other],
+                        accessibilityLabel: "Fallback Font"
+                    )
                     .disabled(terminalFontFamily.isEmpty)
                     .task { await loadFallbackFontSupport() }
                 }
@@ -1289,6 +1232,44 @@ struct SettingsView: View {
                         }
                     }
                 }
+            }
+
+            if settingsMatch("pane", "animation", "transition", "motion", "split", "zoom", "glow", "duration", "speed") {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Pane Transition Animation",
+                    subtitle: "Slide panes when splitting or zooming, and briefly glow the pane that gets focus. Each slide resizes the terminal like dragging a divider."
+                ) {
+                    Toggle("", isOn: $paneTransitionAnimations)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Pane Transition Duration",
+                    verbatimSubtitle: "\(Int((PaneTransitionAnimationSettings.clampedDuration(paneTransitionAnimationDuration) * 1000).rounded())) ms",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        Slider(
+                            value: $paneTransitionAnimationDuration,
+                            in: PaneTransitionAnimationSettings.durationRange,
+                            step: 0.05
+                        )
+                        if paneTransitionAnimationDuration != PaneTransitionAnimationSettings.defaultDuration {
+                            Button("Reset") {
+                                paneTransitionAnimationDuration = PaneTransitionAnimationSettings.defaultDuration
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundColor(.accentColor)
+                            .font(.caption)
+                        }
+                    }
+                }
+                .disabled(!paneTransitionAnimations)
             }
 
             if settingsMatch("pane", "padding", "inset", "margin", "terminal") {
@@ -3317,7 +3298,7 @@ struct SettingsView: View {
         terminalFallbackFontFamily = ""
         terminalFontSize = 0
         terminalFontSmoothing = false
-        terminalFontSmoothingStrength = 255
+        terminalFontSmoothingStrength = TerminalSettingsOverride.defaultFontSmoothingStrength
         UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingKey)
         UserDefaults.standard.removeObject(forKey: TerminalSettingsOverride.fontSmoothingStrengthKey)
         terminalThemeLight = ""
@@ -3332,6 +3313,8 @@ struct SettingsView: View {
         panePaddingTop = PanePaddingSettings.defaultTop
         panePaddingBottom = PanePaddingSettings.defaultBottom
         paneCardGap = PaneGapSettings.defaultValue
+        paneTransitionAnimations = PaneTransitionAnimationSettings.defaultValue
+        paneTransitionAnimationDuration = PaneTransitionAnimationSettings.defaultDuration
         TerminalSettingsOverride.remove()
         socketControlMode = SocketControlSettings.defaultMode.rawValue
         claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled

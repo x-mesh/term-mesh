@@ -100,6 +100,16 @@ final class CardChromeTests: XCTestCase {
         XCTAssertEqual(look.cardGap, BonsplitCardMetrics.gapRange.lowerBound)
         look.cardGap = 12
         XCTAssertEqual(look.cardGap, 12)
+        look.cardGap = 500
+        XCTAssertEqual(look.cardGap, BonsplitCardMetrics.gapRange.upperBound)
+    }
+
+    func testNaNCardGapFallsBackToTheDefault() {
+        XCTAssertEqual(BonsplitConfiguration.Appearance(cardGap: .nan).cardGap, BonsplitCardMetrics.gap)
+        var look = BonsplitConfiguration.Appearance()
+        look.cardGap = .nan
+        XCTAssertEqual(look.cardGap, BonsplitCardMetrics.gap)
+        XCTAssertEqual(BonsplitConfiguration.Appearance(cardGap: .infinity).cardGap, BonsplitCardMetrics.gapRange.upperBound)
     }
 
     func testShadowIsSofterOnLightThemes() {

@@ -140,6 +140,15 @@ final class Workspace: Identifiable {
     /// Callback used by TabManager to capture recently closed browser panels for Cmd+Shift+T restore.
     @ObservationIgnored var onClosedBrowserPanel: ((ClosedBrowserPanelRestoreSnapshot) -> Void)?
 
+    /// The pane zoom transition waiting for bonsplit's settle signal.
+    @ObservationIgnored private weak var zoomTransitionHostedView: GhosttySurfaceScrollView?
+    @ObservationIgnored private var zoomTransitionPaneId: PaneID?
+    @ObservationIgnored private var zoomTransitionGeneration = 0
+
+    /// The pane a sliding zoom-out is shrinking back into place. Its siblings'
+    /// cards stay hidden until it lands, so their terminals do too.
+    private(set) var zoomOutLandingPaneId: PaneID?
+
     // MARK: - Pane Zoom
 
     /// Whether any pane is currently zoomed (delegates to bonsplit's native zoom).
@@ -148,6 +157,7 @@ final class Workspace: Identifiable {
     /// Toggle zoom on the focused pane. If already zoomed, restores original layout.
     func togglePaneZoom() {
         let wasZoomed = isPaneZoomed
+        let previouslyZoomedPaneId = bonsplitController.zoomedPaneId
         bonsplitController.togglePaneZoom()
         let isZoomed = isPaneZoomed
 
@@ -171,9 +181,12 @@ final class Workspace: Identifiable {
             }
         } else if wasZoomed && !isZoomed {
             // Restore portal visibility for all terminal panels after zoom exit.
-            for (_, panel) in panels {
-                guard let terminal = panel as? TerminalPanel else { continue }
-                terminal.hostedView.setVisibleInUI(true)
+            // A sliding zoom-out keeps the siblings' cards hidden until the pane
+            // lands; their terminals wait for the same moment (`zoomSlideDidSettle`).
+            if zoomSlidesAnimate, let previouslyZoomedPaneId {
+                zoomOutLandingPaneId = previouslyZoomedPaneId
+            } else {
+                revealAllTerminals()
             }
         }
 
@@ -181,6 +194,14 @@ final class Workspace: Identifiable {
         // didChangeGeometry — run the reconcile safety net explicitly so a
         // dropped anchor-geometry callback can't leave a stale-size surface.
         scheduleTerminalGeometryReconcile()
+
+        if wasZoomed != isZoomed {
+            if let paneId = bonsplitController.zoomedPaneId ?? bonsplitController.focusedPaneId {
+                startZoomTransition(in: paneId)
+            } else {
+                zoomSlideDidSettle()
+            }
+        }
 
         // No manual announcement here any more. Zoom state lives in
         // `bonsplitController.zoomedPaneId`, which is itself `@Observable`, and
@@ -293,7 +314,8 @@ final class Workspace: Identifiable {
         let chromeColors = resolvedChromeColors(from: config)
         return BonsplitConfiguration.Appearance(
             splitButtonTooltips: Self.currentSplitButtonTooltips(),
-            enableAnimations: false,
+            animationDuration: PaneTransitionAnimationSettings.duration,
+            enableAnimations: PaneTransitionAnimationSettings.isEnabled,
             chromeColors: chromeColors,
             cardGap: PaneGapSettings.current
         )
@@ -320,7 +342,8 @@ final class Workspace: Identifiable {
         let chromeColors = resolvedChromeColors(from: backgroundColor)
         return BonsplitConfiguration.Appearance(
             splitButtonTooltips: Self.currentSplitButtonTooltips(),
-            enableAnimations: false,
+            animationDuration: PaneTransitionAnimationSettings.duration,
+            enableAnimations: PaneTransitionAnimationSettings.isEnabled,
             chromeColors: chromeColors,
             cardGap: PaneGapSettings.current
         )
@@ -336,6 +359,92 @@ final class Workspace: Identifiable {
     func applyCardGap(_ gap: CGFloat) {
         guard bonsplitController.configuration.appearance.cardGap != gap else { return }
         bonsplitController.configuration.appearance.cardGap = gap
+    }
+
+    func applyPaneTransitionAnimations(_ enabled: Bool) {
+        guard bonsplitController.configuration.appearance.enableAnimations != enabled else { return }
+        bonsplitController.configuration.appearance.enableAnimations = enabled
+    }
+
+    func applyPaneTransitionDuration(_ duration: Double) {
+        guard bonsplitController.configuration.appearance.animationDuration != duration else { return }
+        bonsplitController.configuration.appearance.animationDuration = duration
+    }
+
+    /// Glows the terminal shown in `paneId` once its slide has stopped.
+    ///
+    /// Resolved on the next main-loop turn: a keyboard split attaches its
+    /// terminal after bonsplit reports the new pane.
+    func playPaneTransitionGlow(in paneId: PaneID, afterSlide: Bool) {
+        let appearance = bonsplitController.configuration.appearance
+        guard appearance.enableAnimations else { return }
+        let slides = afterSlide && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let delay = slides ? appearance.animationDuration : 0
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  let tab = self.bonsplitController.selectedTab(inPane: paneId),
+                  let panelId = self.panelIdFromSurfaceId(tab.id),
+                  let terminal = self.panels[panelId] as? TerminalPanel else { return }
+            terminal.hostedView.playTransitionGlow(delay: delay)
+        }
+    }
+
+    /// Stretches the terminal in `paneId` along its zoom slide, then restores
+    /// it and glows it once bonsplit reports every level of the slide stopped.
+    /// Called right after the toggle, before any layout has moved the pane.
+    private func startZoomTransition(in paneId: PaneID) {
+        guard zoomSlidesAnimate else {
+            playPaneTransitionGlow(in: paneId, afterSlide: false)
+            return
+        }
+        let hostedView = bonsplitController.selectedTab(inPane: paneId)
+            .flatMap { panelIdFromSurfaceId($0.id) }
+            .flatMap { panels[$0] as? TerminalPanel }?
+            .hostedView
+        if let previous = zoomTransitionHostedView, previous !== hostedView {
+            previous.endZoomSnapshot()
+        }
+        hostedView?.beginZoomSnapshot()
+        zoomTransitionHostedView = hostedView
+        zoomTransitionPaneId = paneId
+        zoomTransitionGeneration &+= 1
+        let generation = zoomTransitionGeneration
+        // Same bound as the snapshot's own: a toggle that slid nothing never settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + GhosttySurfaceScrollView.zoomSnapshotTimeout) { [weak self] in
+            guard let self, self.zoomTransitionGeneration == generation else { return }
+            self.zoomSlideDidSettle()
+        }
+    }
+
+    /// Matches the condition under which bonsplit slides a zoom.
+    private var zoomSlidesAnimate: Bool {
+        bonsplitController.configuration.appearance.enableAnimations
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func revealAllTerminals() {
+        for (_, panel) in panels {
+            guard let terminal = panel as? TerminalPanel else { continue }
+            terminal.hostedView.setVisibleInUI(true)
+        }
+    }
+
+    private func zoomSlideDidSettle() {
+#if DEBUG
+        dlog("zoom.settle pane=\(zoomTransitionPaneId.map { String($0.id.uuidString.prefix(5)) } ?? "nil")")
+#endif
+        zoomTransitionGeneration &+= 1
+        if zoomOutLandingPaneId != nil {
+            zoomOutLandingPaneId = nil
+            // A toggle back into zoom before landing already re-hid the siblings.
+            if !isPaneZoomed { revealAllTerminals() }
+        }
+        zoomTransitionHostedView?.endZoomSnapshot()
+        zoomTransitionHostedView = nil
+        if let paneId = zoomTransitionPaneId {
+            zoomTransitionPaneId = nil
+            playPaneTransitionGlow(in: paneId, afterSlide: false)
+        }
     }
 
     func applyGhosttyChrome(from config: GhosttyConfig, reason: String = "unspecified") {
@@ -455,6 +564,9 @@ final class Workspace: Identifiable {
         bonsplitController.delegate = self
         bonsplitController.onExternalTabDrop = { [weak self] request in
             self?.handleExternalTabDrop(request) ?? false
+        }
+        bonsplitController.onZoomSlideSettled = { [weak self] in
+            self?.zoomSlideDidSettle()
         }
         configurePaneHeaderActions()
         observeRemoteExposures()

@@ -73,6 +73,13 @@ public final class BonsplitController {
         didSet { internalController.onFileDrop = onFileDrop }
     }
 
+    /// Called once every pane zoom slide started by a zoom toggle has stopped,
+    /// whether it finished or was cut off. Not called when the toggle slides
+    /// nothing, as with animations off.
+    @ObservationIgnored public var onZoomSlideSettled: (() -> Void)? {
+        didSet { internalController.onZoomSlideSettled = onZoomSlideSettled }
+    }
+
     /// Handler for tab drops originating from another Bonsplit controller (e.g. another workspace/window).
     /// Return `true` when the drop has been handled by the host application.
     @ObservationIgnored public var onExternalTabDrop: ((ExternalTabDropRequest) -> Bool)?

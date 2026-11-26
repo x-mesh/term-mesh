@@ -56,6 +56,27 @@ final class SplitViewController {
     /// Receives the dropped URLs and the pane ID where the drop occurred.
     @ObservationIgnored var onFileDrop: ((_ urls: [URL], _ paneId: PaneID) -> Bool)?
 
+    @ObservationIgnored var onZoomSlideSettled: (() -> Void)?
+
+    /// Zoom slides in flight, one per nested split view that moves. Emptied on
+    /// each zoom toggle, so a slide whose split view was torn down mid-flight
+    /// cannot keep a later toggle from settling.
+    @ObservationIgnored private var zoomSlidesInFlight: Set<UUID> = []
+
+    func zoomSlideBegan(_ id: UUID) {
+        zoomSlidesInFlight.insert(id)
+    }
+
+    func zoomSlideEnded(_ id: UUID) {
+        guard zoomSlidesInFlight.remove(id) != nil, zoomSlidesInFlight.isEmpty else { return }
+        // A reversal ends a slide and starts the next one in the same pass;
+        // settle only if nothing started by the next main-loop turn.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.zoomSlidesInFlight.isEmpty else { return }
+            self.onZoomSlideSettled?()
+        }
+    }
+
     /// During drop, SwiftUI may keep the source tab view alive briefly (default removal animation)
     /// even after we've updated the model. Hide it explicitly so it disappears immediately.
     var dragHiddenSourceTabId: UUID?
@@ -111,6 +132,7 @@ final class SplitViewController {
     @discardableResult
     func clearPaneZoom() -> Bool {
         guard zoomedPaneId != nil else { return false }
+        zoomSlidesInFlight.removeAll()
         zoomedPaneId = nil
         return true
     }
@@ -118,6 +140,7 @@ final class SplitViewController {
     @discardableResult
     func togglePaneZoom(_ paneId: PaneID) -> Bool {
         guard rootNode.findPane(paneId) != nil else { return false }
+        zoomSlidesInFlight.removeAll()
 
         if zoomedPaneId == paneId {
             zoomedPaneId = nil
