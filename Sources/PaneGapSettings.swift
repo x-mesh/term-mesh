@@ -25,10 +25,22 @@ enum PaneGapSettings {
 enum PaneTransitionAnimationSettings {
     static let key = "paneTransitionAnimations"
     static let defaultValue = false
-    static let duration: Double = 0.2
+
+    /// Length of one split or zoom slide, in seconds.
+    static let durationKey = "paneTransitionAnimationDuration"
+    static let defaultDuration: Double = 0.2
+    static let durationRange: ClosedRange<Double> = 0.1...0.6
 
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: key) as? Bool ?? defaultValue
+    }
+
+    static func clampedDuration(_ value: Double) -> Double {
+        min(max(value, durationRange.lowerBound), durationRange.upperBound)
+    }
+
+    static var duration: Double {
+        clampedDuration(UserDefaults.standard.object(forKey: durationKey) as? Double ?? defaultDuration)
     }
 }
 

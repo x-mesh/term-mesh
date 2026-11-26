@@ -211,6 +211,8 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.unfocusedSplitOpacityKey) private var terminalUnfocusedOpacity: Double = -1
     @AppStorage(PaneGapSettings.key) private var paneCardGap = PaneGapSettings.defaultValue
     @AppStorage(PaneTransitionAnimationSettings.key) private var paneTransitionAnimations = PaneTransitionAnimationSettings.defaultValue
+    @AppStorage(PaneTransitionAnimationSettings.durationKey)
+    private var paneTransitionAnimationDuration = PaneTransitionAnimationSettings.defaultDuration
     @AppStorage(PanePaddingSettings.horizontalKey) private var panePaddingX = PanePaddingSettings.defaultHorizontal
     @AppStorage(PanePaddingSettings.topKey) private var panePaddingTop = PanePaddingSettings.defaultTop
     @AppStorage(PanePaddingSettings.bottomKey) private var panePaddingBottom = PanePaddingSettings.defaultBottom
@@ -1232,7 +1234,7 @@ struct SettingsView: View {
                 }
             }
 
-            if settingsMatch("pane", "animation", "transition", "motion", "split", "zoom", "glow") {
+            if settingsMatch("pane", "animation", "transition", "motion", "split", "zoom", "glow", "duration", "speed") {
                 SettingsCardDivider()
 
                 SettingsCardRow(
@@ -1243,6 +1245,31 @@ struct SettingsView: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                 }
+
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Pane Transition Duration",
+                    verbatimSubtitle: "\(Int((PaneTransitionAnimationSettings.clampedDuration(paneTransitionAnimationDuration) * 1000).rounded())) ms",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        Slider(
+                            value: $paneTransitionAnimationDuration,
+                            in: PaneTransitionAnimationSettings.durationRange,
+                            step: 0.05
+                        )
+                        if paneTransitionAnimationDuration != PaneTransitionAnimationSettings.defaultDuration {
+                            Button("Reset") {
+                                paneTransitionAnimationDuration = PaneTransitionAnimationSettings.defaultDuration
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundColor(.accentColor)
+                            .font(.caption)
+                        }
+                    }
+                }
+                .disabled(!paneTransitionAnimations)
             }
 
             if settingsMatch("pane", "padding", "inset", "margin", "terminal") {
@@ -3287,6 +3314,7 @@ struct SettingsView: View {
         panePaddingBottom = PanePaddingSettings.defaultBottom
         paneCardGap = PaneGapSettings.defaultValue
         paneTransitionAnimations = PaneTransitionAnimationSettings.defaultValue
+        paneTransitionAnimationDuration = PaneTransitionAnimationSettings.defaultDuration
         TerminalSettingsOverride.remove()
         socketControlMode = SocketControlSettings.defaultMode.rawValue
         claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled

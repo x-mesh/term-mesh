@@ -19,7 +19,10 @@ final class SplitAnimator {
     }
 
     private struct ProgressAnimation {
-        let startTime: CFTimeInterval
+        /// Set on the first display frame, not when the animation is requested:
+        /// the layout that starts a zoom can hold the main thread for most of
+        /// the duration, and a clock started earlier would skip those frames.
+        var startTime: CFTimeInterval?
         let duration: CFTimeInterval
         let step: (CGFloat) -> Void
         let onComplete: () -> Void
@@ -102,7 +105,8 @@ final class SplitAnimator {
     }
 
     /// Calls `step` once per display frame with the eased progress (0...1),
-    /// then `onComplete` after the final step. The first step runs at once.
+    /// then `onComplete` after the final step. The first step runs at once;
+    /// `duration` is counted from the first display frame after this call.
     @discardableResult
     func animateProgress(
         duration: CFTimeInterval,
@@ -112,7 +116,7 @@ final class SplitAnimator {
         let id = UUID()
         step(0)
         progressAnimations[id] = ProgressAnimation(
-            startTime: CACurrentMediaTime(),
+            startTime: nil,
             duration: duration,
             step: step,
             onComplete: onComplete
@@ -166,7 +170,11 @@ final class SplitAnimator {
 
         var finished: [() -> Void] = []
         for (id, animation) in progressAnimations {
-            let progress = min((currentTime - animation.startTime) / animation.duration, 1.0)
+            guard let startTime = animation.startTime else {
+                progressAnimations[id]?.startTime = currentTime
+                continue
+            }
+            let progress = min((currentTime - startTime) / animation.duration, 1.0)
             animation.step(CGFloat(Self.eased(progress)))
             if progress >= 1.0 {
                 progressAnimations.removeValue(forKey: id)
