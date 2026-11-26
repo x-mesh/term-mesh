@@ -1573,6 +1573,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugCardRingStatus(params: params))
         case "debug.window.click":
             return v2Result(id: id, self.v2DebugWindowClick(params: params))
+        case "debug.appearance.set":
+            return v2Result(id: id, self.v2DebugAppearanceSet(params: params))
         case "debug.drag.simulate_file_drop":
             return v2Result(id: id, self.v2DebugDragSimulateFileDrop(params: params))
         case "debug.drag.seed_pasteboard", "debug.drag_pasteboard.seed":
@@ -1824,6 +1826,7 @@ class TerminalController {
             "debug.panel_snapshot.reset",
             "debug.window.screenshot",
             "debug.card_ring.status",
+            "debug.appearance.set",
             "debug.drag.simulate_file_drop",
             "debug.drag.seed_pasteboard",
             "debug.drag.clear_pasteboard",

@@ -3123,6 +3123,36 @@ final class PeerRelaySession {
             // for a binary this mode never runs.
             self.relayBinaryPath = ""
         }
+        Self.liveSessions.add(self)
+    }
+
+    private static let liveSessions = NSHashTable<PeerRelaySession>.weakObjects()
+
+    /// OSC 110/111: return the foreground and background to the viewer's
+    /// configured defaults.
+    static let hostPinnedColorsReset = Data("\u{1b}]110\u{7}\u{1b}]111\u{7}".utf8)
+
+    /// The host pins its own default colors at attach
+    /// (`peerTerminalPalettePrefix`) so a TUI's explicit colors match the
+    /// cells around them. Ghostty keeps pinned colors over the config, so a
+    /// light/dark switch on this viewer left every relay pane in the host's
+    /// colors. Called on that switch: the panes take the viewer's theme, and
+    /// explicit TUI colors follow once the program repaints.
+    static func releaseHostPinnedColorsInAllSessions() {
+        for session in liveSessions.allObjects {
+            session.releaseHostPinnedColors()
+        }
+    }
+
+    private func releaseHostPinnedColors() {
+        let reset = Self.hostPinnedColorsReset
+        switch ptyDelivery {
+        case .callback:
+            ptyDataSink.emit(reset)
+        case .relaySocket:
+            guard let writer = relayFrameWriter else { return }
+            Task { try? await writer.enqueue(type: kTypePtyData, payload: reset) }
+        }
     }
 
     deinit {

@@ -7513,6 +7513,20 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
         relay.ioSnapshot["bytes_received"] as? UInt64 ?? 0
     }
 
+    /// The host pins its default colors at attach; a viewer light/dark switch
+    /// must hand every live relay pane the reset so it takes the viewer's theme.
+    @MainActor
+    func testAppearanceSwitchReleasesHostPinnedColors() {
+        let relay = makeCallbackSession(feed: FrameFeed(), surfaceID: Data(repeating: 0xB3, count: 16))
+        let received = ChunkCollector()
+        relay.onPtyData = { received.append($0) }
+
+        PeerRelaySession.releaseHostPinnedColorsInAllSessions()
+
+        XCTAssertEqual(received.all, [Data("\u{1b}]110\u{7}\u{1b}]111\u{7}".utf8)])
+        withExtendedLifetime(relay) {}
+    }
+
     // (a) + (c): live chunks reach the callback in arrival order, and none
     // of the relay-only setup exists to gate them.
     @MainActor
