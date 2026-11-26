@@ -1067,8 +1067,53 @@ class GhosttyApp {
         loadLegacyGhosttyConfigIfNeeded(config)
         loadTermMeshThemeOverride(config)
         loadTermMeshSettingsOverride(config)
+        loadTermMeshCursorShellIntegrationOverride(config)
         loadTermMeshPanePaddingOverride(config)
         ghostty_config_finalize(config)
+    }
+
+    /// Shell integration's `cursor` feature asks for a bar at every prompt,
+    /// which Ghostty honours over `cursor-style`, so Settings > Cursor Style
+    /// had no visible effect at the prompt. Choosing a style turns that
+    /// feature off. Runs after every other layer so the features the user
+    /// configured are the ones carried forward.
+    private func loadTermMeshCursorShellIntegrationOverride(_ config: ghostty_config_t) {
+        let cursorStyle = UserDefaults.standard.string(forKey: TerminalSettingsOverride.cursorStyleKey) ?? ""
+        guard !cursorStyle.isEmpty else { return }
+        guard let contents = Self.cursorShellIntegrationOverrideContents(config: config) else {
+            #if DEBUG
+            Self.initLog("cursor style override: could not read shell-integration-features")
+            #endif
+            return
+        }
+        loadGeneratedConfig(
+            named: "cursor-shell-integration-override.ghostty",
+            contents: contents,
+            into: config
+        )
+    }
+
+    /// Bit order of Ghostty's `ShellIntegrationFeatures` packed struct
+    /// (ghostty/src/config/Config.zig). A config line resets every field it
+    /// does not name to Ghostty's default, so each one is written explicitly.
+    static let shellIntegrationFeatureNames = ["cursor", "sudo", "title", "ssh-env", "ssh-terminfo", "path"]
+
+    static func cursorShellIntegrationOverrideContents(config: ghostty_config_t) -> String? {
+        var bits: UInt32 = 0
+        let key = "shell-integration-features"
+        guard ghostty_config_get(config, &bits, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
+        return cursorShellIntegrationOverrideContents(features: bits)
+    }
+
+    static func cursorShellIntegrationOverrideContents(features: UInt32) -> String {
+        let parts = shellIntegrationFeatureNames.enumerated().map { index, name in
+            index == 0 || features & (1 << UInt32(index)) == 0 ? "no-\(name)" : name
+        }
+        return """
+        # term-mesh cursor style override. Settings > Cursor Style is set, so
+        # shell integration must not replace the cursor at the prompt.
+        shell-integration-features = \(parts.joined(separator: ","))
+        """
     }
 
     /// Baseline defaults loaded BEFORE user config so user's ~/.config/ghostty/config
