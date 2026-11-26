@@ -10,6 +10,8 @@ All notable changes to term-mesh are documented here.
 
 ### Fixed
 
+- Cursor Style in Settings › Terminal now shows at the shell prompt. Before, Ghostty's shell integration set a bar cursor at every prompt, so Block and Underline only appeared while a command ran. Choosing a style turns off that part of shell integration and keeps its other features; Default (from config) leaves it as before. Panes opened after the change use it.
+- With Pane Transition Animation on, only the pane that glows after a split, close or zoom is outlined. The faint unread-notification rings on the other panes hide until the glow ends and then come back.
 - Switching between light and dark now changes relay panes too. Before, a pane shown from another Mac kept that Mac's background and text colors. Areas a full-screen program painted in its own colors change when the program redraws.
 
 ## [0.295.0] - 2026-11-26
