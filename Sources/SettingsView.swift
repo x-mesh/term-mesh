@@ -198,8 +198,6 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fallbackFontFamilyKey) private var terminalFallbackFontFamily = ""
     @State private var fallbackFontSupport: [String: Set<String>]?
-    @State private var terminalFontSearchQuery = ""
-    @State private var terminalFallbackFontSearchQuery = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.fontSmoothingKey) private var terminalFontSmoothing = false
     @AppStorage(TerminalSettingsOverride.fontSmoothingStrengthKey) private var terminalFontSmoothingStrength = TerminalSettingsOverride.defaultFontSmoothingStrength
@@ -965,37 +963,14 @@ struct SettingsView: View {
                     subtitle: terminalFontFamily.isEmpty ? "Using ghostty config value" : nil,
                     controlWidth: pickerColumnWidth
                 ) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        TextField("Search installed fonts", text: $terminalFontSearchQuery)
-                            .textFieldStyle(.roundedBorder)
-                            .accessibilityLabel("Search font families")
-
-                        Picker("", selection: $terminalFontFamily) {
-                            Text("Default (from config)").tag("")
-                            let fonts = MonospaceFontList.list()
-                            let monoCount = MonospaceFontList.monospaceFontCount
-                            let mono = FontFamilySearch.filtered(
-                                Array(fonts.prefix(monoCount)), query: terminalFontSearchQuery
-                            )
-                            let other = FontFamilySearch.filtered(
-                                Array(fonts.suffix(from: monoCount)), query: terminalFontSearchQuery
-                            )
-                            if !mono.isEmpty {
-                                Divider()
-                                ForEach(mono, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                            if !other.isEmpty {
-                                Divider()
-                                ForEach(other, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
+                    let fonts = MonospaceFontList.list()
+                    let monoCount = MonospaceFontList.monospaceFontCount
+                    FontFamilyComboBox(
+                        selection: $terminalFontFamily,
+                        emptyTitle: "Default (from config)",
+                        sections: [Array(fonts.prefix(monoCount)), Array(fonts.suffix(from: monoCount))],
+                        accessibilityLabel: "Font Family"
+                    )
                 }
             }
 
@@ -1009,53 +984,18 @@ struct SettingsView: View {
                         : "Draws characters the primary font lacks (Korean, Japanese, Chinese, etc.)",
                     controlWidth: pickerColumnWidth
                 ) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        TextField("Search installed fonts", text: $terminalFallbackFontSearchQuery)
-                            .textFieldStyle(.roundedBorder)
-                            .accessibilityLabel("Search fallback font families")
-
-                        Picker("", selection: $terminalFallbackFontFamily) {
-                            Text("None").tag("")
-                            let fonts = MonospaceFontList.list()
-                            let monoCount = MonospaceFontList.monospaceFontCount
-                            let sections = fallbackFontSections(
-                                mono: Array(fonts.prefix(monoCount)),
-                                other: Array(fonts.suffix(from: monoCount))
-                            )
-                            let preferred = FontFamilySearch.filtered(
-                                sections.preferred, query: terminalFallbackFontSearchQuery
-                            )
-                            let mono = FontFamilySearch.filtered(
-                                sections.mono, query: terminalFallbackFontSearchQuery
-                            )
-                            let other = FontFamilySearch.filtered(
-                                sections.other, query: terminalFallbackFontSearchQuery
-                            )
-                            if !terminalFallbackFontFamily.isEmpty, !fonts.contains(terminalFallbackFontFamily) {
-                                Text(terminalFallbackFontFamily).tag(terminalFallbackFontFamily)
-                            }
-                            if !preferred.isEmpty {
-                                Divider()
-                                ForEach(preferred, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                            if !mono.isEmpty {
-                                Divider()
-                                ForEach(mono, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                            if !other.isEmpty {
-                                Divider()
-                                ForEach(other, id: \.self) { font in
-                                    Text(font).tag(font)
-                                }
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
+                    let fonts = MonospaceFontList.list()
+                    let monoCount = MonospaceFontList.monospaceFontCount
+                    let sections = fallbackFontSections(
+                        mono: Array(fonts.prefix(monoCount)),
+                        other: Array(fonts.suffix(from: monoCount))
+                    )
+                    FontFamilyComboBox(
+                        selection: $terminalFallbackFontFamily,
+                        emptyTitle: "None",
+                        sections: [sections.preferred, sections.mono, sections.other],
+                        accessibilityLabel: "Fallback Font"
+                    )
                     .disabled(terminalFontFamily.isEmpty)
                     .task { await loadFallbackFontSupport() }
                 }

@@ -973,7 +973,7 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func paddedTerminalFrame(in terminalBounds: NSRect) -> NSRect {
-        // The sides are Ghostty's `window-padding-x` (see the baseline config),
+        // The sides are Ghostty's `window-padding-x` (see the pane padding override),
         // so the app insets only the top and bottom.
         let padded = PanePaddingSettings.contentRect(
             in: terminalBounds,
