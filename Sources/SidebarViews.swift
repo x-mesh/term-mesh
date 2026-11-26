@@ -3146,6 +3146,7 @@ struct RemoteHostGroupView: View, Equatable {
                         .foregroundColor(host.isConnected ? .primary : .secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
+                        .layoutPriority(1)
                     if isCollapsedHostBusy {
                         Image(systemName: "bolt.fill")
                             .font(.system(size: 7.5, weight: .semibold))
@@ -3159,6 +3160,10 @@ struct RemoteHostGroupView: View, Equatable {
                             .font(.system(size: 10))
                             .monospacedDigit()
                             .foregroundColor(Color.secondary.opacity(0.7))
+                            // Left flexible, the count wrapped onto three lines
+                            // and squeezed the host name down to its first letter.
+                            .lineLimit(1)
+                            .fixedSize()
                         if busy > 0 {
                             Circle()
                                 .fill(Color.orange)
@@ -3172,6 +3177,8 @@ struct RemoteHostGroupView: View, Equatable {
                         Text("Offline")
                             .font(.system(size: 10))
                             .foregroundColor(Color.secondary.opacity(0.8))
+                            .lineLimit(1)
+                            .fixedSize()
                     }
                 }
                 .contentShape(Rectangle())
