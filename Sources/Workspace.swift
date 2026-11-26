@@ -182,6 +182,10 @@ final class Workspace: Identifiable {
         // dropped anchor-geometry callback can't leave a stale-size surface.
         scheduleTerminalGeometryReconcile()
 
+        if wasZoomed != isZoomed, let paneId = bonsplitController.zoomedPaneId ?? bonsplitController.focusedPaneId {
+            playPaneTransitionGlow(in: paneId, afterSlide: true)
+        }
+
         // No manual announcement here any more. Zoom state lives in
         // `bonsplitController.zoomedPaneId`, which is itself `@Observable`, and
         // the two views that show it — the titlebar indicator and the pane
@@ -293,7 +297,8 @@ final class Workspace: Identifiable {
         let chromeColors = resolvedChromeColors(from: config)
         return BonsplitConfiguration.Appearance(
             splitButtonTooltips: Self.currentSplitButtonTooltips(),
-            enableAnimations: false,
+            animationDuration: PaneTransitionAnimationSettings.duration,
+            enableAnimations: PaneTransitionAnimationSettings.isEnabled,
             chromeColors: chromeColors,
             cardGap: PaneGapSettings.current
         )
@@ -320,7 +325,8 @@ final class Workspace: Identifiable {
         let chromeColors = resolvedChromeColors(from: backgroundColor)
         return BonsplitConfiguration.Appearance(
             splitButtonTooltips: Self.currentSplitButtonTooltips(),
-            enableAnimations: false,
+            animationDuration: PaneTransitionAnimationSettings.duration,
+            enableAnimations: PaneTransitionAnimationSettings.isEnabled,
             chromeColors: chromeColors,
             cardGap: PaneGapSettings.current
         )
@@ -336,6 +342,29 @@ final class Workspace: Identifiable {
     func applyCardGap(_ gap: CGFloat) {
         guard bonsplitController.configuration.appearance.cardGap != gap else { return }
         bonsplitController.configuration.appearance.cardGap = gap
+    }
+
+    func applyPaneTransitionAnimations(_ enabled: Bool) {
+        guard bonsplitController.configuration.appearance.enableAnimations != enabled else { return }
+        bonsplitController.configuration.appearance.enableAnimations = enabled
+    }
+
+    /// Glows the terminal shown in `paneId` once its slide has stopped.
+    ///
+    /// Resolved on the next main-loop turn: a keyboard split attaches its
+    /// terminal after bonsplit reports the new pane.
+    func playPaneTransitionGlow(in paneId: PaneID, afterSlide: Bool) {
+        let appearance = bonsplitController.configuration.appearance
+        guard appearance.enableAnimations else { return }
+        let slides = afterSlide && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let delay = slides ? appearance.animationDuration : 0
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  let tab = self.bonsplitController.selectedTab(inPane: paneId),
+                  let panelId = self.panelIdFromSurfaceId(tab.id),
+                  let terminal = self.panels[panelId] as? TerminalPanel else { return }
+            terminal.hostedView.playTransitionGlow(delay: delay)
+        }
     }
 
     func applyGhosttyChrome(from config: GhosttyConfig, reason: String = "unspecified") {

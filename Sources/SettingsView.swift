@@ -210,6 +210,7 @@ struct SettingsView: View {
     @AppStorage(TerminalSettingsOverride.scrollbackLimitKey) private var terminalScrollback: Int = 0
     @AppStorage(TerminalSettingsOverride.unfocusedSplitOpacityKey) private var terminalUnfocusedOpacity: Double = -1
     @AppStorage(PaneGapSettings.key) private var paneCardGap = PaneGapSettings.defaultValue
+    @AppStorage(PaneTransitionAnimationSettings.key) private var paneTransitionAnimations = PaneTransitionAnimationSettings.defaultValue
     @AppStorage(PanePaddingSettings.horizontalKey) private var panePaddingX = PanePaddingSettings.defaultHorizontal
     @AppStorage(PanePaddingSettings.topKey) private var panePaddingTop = PanePaddingSettings.defaultTop
     @AppStorage(PanePaddingSettings.bottomKey) private var panePaddingBottom = PanePaddingSettings.defaultBottom
@@ -1228,6 +1229,19 @@ struct SettingsView: View {
                                 .font(.caption)
                         }
                     }
+                }
+            }
+
+            if settingsMatch("pane", "animation", "transition", "motion", "split", "zoom", "glow") {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Pane Transition Animation",
+                    subtitle: "Slide panes when splitting or zooming, and briefly glow the pane that gets focus. Each slide resizes the terminal like dragging a divider."
+                ) {
+                    Toggle("", isOn: $paneTransitionAnimations)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                 }
             }
 
@@ -3272,6 +3286,7 @@ struct SettingsView: View {
         panePaddingTop = PanePaddingSettings.defaultTop
         panePaddingBottom = PanePaddingSettings.defaultBottom
         paneCardGap = PaneGapSettings.defaultValue
+        paneTransitionAnimations = PaneTransitionAnimationSettings.defaultValue
         TerminalSettingsOverride.remove()
         socketControlMode = SocketControlSettings.defaultMode.rawValue
         claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled

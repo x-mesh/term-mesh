@@ -968,6 +968,11 @@ final class GhosttySurfaceScrollView: NSView {
         }
     }
 
+    func playTransitionGlow(delay: CFTimeInterval) {
+        syncCardRing()
+        cardRingView.playTransitionGlow(delay: delay)
+    }
+
     override var isHidden: Bool {
         didSet { syncCardRing() }
     }
