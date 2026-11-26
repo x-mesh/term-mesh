@@ -4,6 +4,8 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.296.0] - 2026-11-26
+
 ### Changed
 
 - Pane Transition Animation in Settings › Terminal is on by default. If you already turned it on or off, your choice is kept.
