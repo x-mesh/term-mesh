@@ -9,12 +9,36 @@ private class ThemedSplitView: NSSplitView {
     var cardGap: CGFloat = BonsplitCardMetrics.gap
     private(set) var zoomedChildIndex: Int?
 
+    /// A zoom slide in flight: `child` moves from `from` to `to`; a nil rect
+    /// stands for this view's bounds, which can change while it runs.
+    private struct ZoomSlide {
+        let id: UUID
+        let child: Int
+        let from: NSRect?
+        let to: NSRect?
+        var progress: CGFloat
+    }
+    private var zoomSlide: ZoomSlide?
+    /// Runs after a zoom slide ends so the owner can re-apply the model's
+    /// divider position, which it could not do while the slide owned layout.
+    var onZoomSlideEnd: (() -> Void)?
+
+    /// True while zoom, or a zoom slide, decides the children's frames rather
+    /// than the divider.
+    var ownsChildLayout: Bool { zoomedChildIndex != nil || zoomSlide != nil }
+
     override var dividerThickness: CGFloat {
         zoomedChildIndex == nil ? cardGap : 0
     }
 
-    func setZoomedChild(_ index: Int?) {
+    func setZoomedChild(_ index: Int?, slideDuration: CFTimeInterval? = nil) {
         guard zoomedChildIndex != index else { return }
+        let interruptedFrame = zoomSlide.flatMap { slide in
+            arrangedSubviews.indices.contains(slide.child) ? arrangedSubviews[slide.child].frame : nil
+        }
+        endZoomSlide(reveal: false)
+        let previous = zoomedChildIndex
+        let startFrame = index.flatMap { arrangedSubviews.indices.contains($0) ? arrangedSubviews[$0].frame : nil }
         splitContainerProgrammaticSyncDepth += 1
         defer { splitContainerProgrammaticSyncDepth -= 1 }
         zoomedChildIndex = index
@@ -24,6 +48,64 @@ private class ThemedSplitView: NSSplitView {
         }
         adjustSubviews()
         needsDisplay = true
+
+        guard let slideDuration else { return }
+        if let index, let startFrame, startFrame != bounds {
+            startZoomSlide(child: index, from: interruptedFrame ?? startFrame, to: nil, duration: slideDuration)
+        } else if index == nil, let previous, arrangedSubviews.indices.contains(previous) {
+            // The siblings stay hidden until the zoomed pane is back in place,
+            // so the pane shrinks into empty space instead of under them.
+            let target = arrangedSubviews[previous].frame
+            for (childIndex, child) in arrangedSubviews.enumerated() where childIndex != previous {
+                child.isHidden = true
+            }
+            startZoomSlide(child: previous, from: interruptedFrame, to: target, duration: slideDuration)
+        }
+    }
+
+    private func startZoomSlide(child: Int, from: NSRect?, to: NSRect?, duration: CFTimeInterval) {
+        let id = UUID()
+        zoomSlide = ZoomSlide(id: id, child: child, from: from, to: to, progress: 0)
+        SplitAnimator.shared.animateProgress(duration: duration) { [weak self] progress in
+            guard let self, self.zoomSlide?.id == id else { return }
+            self.zoomSlide?.progress = progress
+            self.applyZoomSlideFrame()
+        } onComplete: { [weak self] in
+            guard let self, self.zoomSlide?.id == id else { return }
+            self.endZoomSlide(reveal: true)
+        }
+    }
+
+    private func applyZoomSlideFrame() {
+        guard let slide = zoomSlide, arrangedSubviews.indices.contains(slide.child) else { return }
+        let from = slide.from ?? bounds
+        let to = slide.to ?? bounds
+        let t = slide.progress
+        func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { (a + (b - a) * t).rounded() }
+        arrangedSubviews[slide.child].frame = NSRect(
+            x: lerp(from.minX, to.minX),
+            y: lerp(from.minY, to.minY),
+            width: lerp(from.width, to.width),
+            height: lerp(from.height, to.height)
+        )
+    }
+
+    /// Ends the slide in progress, if any. `reveal` shows the siblings a
+    /// zoom-out hid and hands layout back to the divider.
+    private func endZoomSlide(reveal: Bool) {
+        guard zoomSlide != nil else { return }
+        zoomSlide = nil
+        guard zoomedChildIndex == nil else {
+            adjustSubviews()
+            return
+        }
+        if reveal {
+            for child in arrangedSubviews { child.isHidden = false }
+        }
+        splitContainerProgrammaticSyncDepth += 1
+        super.adjustSubviews()
+        splitContainerProgrammaticSyncDepth -= 1
+        onZoomSlideEnd?()
     }
 
     /// Reveal a child that the split entry animation hid.
@@ -32,7 +114,7 @@ private class ThemedSplitView: NSSplitView {
     /// `setZoomedChild` returns early on an unchanged index and would never re-hide it.
     /// Returns false when the reveal was suppressed.
     func revealEntryAnimationChild(_ index: Int) -> Bool {
-        guard zoomedChildIndex == nil else { return false }
+        guard !ownsChildLayout else { return false }
         guard arrangedSubviews.indices.contains(index) else { return false }
         arrangedSubviews[index].isHidden = false
         return true
@@ -41,10 +123,15 @@ private class ThemedSplitView: NSSplitView {
     override func adjustSubviews() {
         guard let index = zoomedChildIndex else {
             super.adjustSubviews()
+            applyZoomSlideFrame()
             return
         }
         guard arrangedSubviews.indices.contains(index) else { return }
-        arrangedSubviews[index].frame = bounds
+        if zoomSlide != nil {
+            applyZoomSlideFrame()
+        } else {
+            arrangedSubviews[index].frame = bounds
+        }
     }
 
     override func resizeSubviews(withOldSize oldSize: NSSize) {
@@ -210,6 +297,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 
         // Capture animation settings for async block
         let shouldAnimate = enableAnimations && animationOrigin != nil
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let duration = animationDuration
 
         if animationOrigin != nil {
@@ -368,7 +456,12 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         }
         let themedSplit = splitView as? ThemedSplitView
         let restoringZoom = themedSplit?.zoomedChildIndex != nil && zoomedChild == nil
-        themedSplit?.setZoomedChild(zoomedChild)
+        let slidesZoom = enableAnimations && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        themedSplit?.onZoomSlideEnd = { [weak splitView, weak coordinator = context.coordinator] in
+            guard let splitView, let coordinator else { return }
+            coordinator.syncPosition(coordinator.splitState.dividerPosition, in: splitView)
+        }
+        themedSplit?.setZoomedChild(zoomedChild, slideDuration: slidesZoom ? animationDuration : nil)
         if restoringZoom {
             // An ancestor's layout suppresses nested divider sync during zoom restoration.
             DispatchQueue.main.async { [weak splitView, weak coordinator = context.coordinator] in
@@ -665,7 +758,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 #endif
         /// Apply external position changes to the NSSplitView
         func setPositionSafely(_ position: CGFloat, in splitView: NSSplitView, layout: Bool = true) {
-            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return }
+            guard (splitView as? ThemedSplitView)?.ownsChildLayout != true else { return }
             isSyncingProgrammatically = true
             splitContainerProgrammaticSyncDepth += 1
             defer {
@@ -683,7 +776,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         /// Pass `layout: false` when called from within a resize delegate callback to avoid
         /// reentrant NSHostingView layout (which SwiftUI silently skips, causing pane disappearance).
         func syncPosition(_ statePosition: CGFloat, in splitView: NSSplitView, layout: Bool = true) {
-            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return }
+            guard (splitView as? ThemedSplitView)?.ownsChildLayout != true else { return }
             guard !isAnimating else { return }
             guard !isSyncingProgrammatically else { return }
             guard splitContainerProgrammaticSyncDepth == 0 else { return }
@@ -731,7 +824,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 
         func splitViewWillResizeSubviews(_ notification: Notification) {
             guard let splitView = notification.object as? NSSplitView else { return }
-            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else {
+            guard (splitView as? ThemedSplitView)?.ownsChildLayout != true else {
                 isDragging = false
                 return
             }
@@ -844,7 +937,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
             // Skip position updates during animation
             guard !isAnimating else { return }
             guard let splitView = notification.object as? NSSplitView else { return }
-            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return }
+            guard (splitView as? ThemedSplitView)?.ownsChildLayout != true else { return }
 #if DEBUG
             let subframes = splitView.arrangedSubviews.enumerated().map { (i, v) in
                 "\(i)=\(Int(v.frame.width))x\(Int(v.frame.height))"
@@ -954,13 +1047,13 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         }
 
         func splitView(_ splitView: NSSplitView, effectiveRect proposedEffectiveRect: NSRect, forDrawnRect drawnRect: NSRect, ofDividerAt dividerIndex: Int) -> NSRect {
-            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return .zero }
+            guard (splitView as? ThemedSplitView)?.ownsChildLayout != true else { return .zero }
             let expanded = drawnRect.insetBy(dx: -5, dy: -5)
             return proposedEffectiveRect.union(expanded)
         }
 
         func splitView(_ splitView: NSSplitView, additionalEffectiveRectOfDividerAt dividerIndex: Int) -> NSRect {
-            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return .zero }
+            guard (splitView as? ThemedSplitView)?.ownsChildLayout != true else { return .zero }
             guard splitView.arrangedSubviews.count >= dividerIndex + 2 else { return .zero }
 
             let first = splitView.arrangedSubviews[dividerIndex].frame

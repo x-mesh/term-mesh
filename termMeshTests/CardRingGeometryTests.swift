@@ -42,6 +42,46 @@ final class CardRingGeometryTests: XCTestCase {
     }
 }
 
+@MainActor
+final class CardRingTransitionGlowTests: XCTestCase {
+    private func wait(_ seconds: TimeInterval) {
+        RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+    }
+
+    func testGlowShowsAHiddenRingOnlyUntilItEnds() {
+        let ring = CardRingView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        XCTAssertTrue(ring.isHidden)
+
+        ring.playTransitionGlow(delay: 0)
+        XCTAssertFalse(ring.isHidden)
+        // A notification ring turning off mid-glow must not cut the glow short.
+        ring.apply(ring: .hidden)
+        XCTAssertFalse(ring.isHidden)
+
+        wait(1.1)
+        XCTAssertTrue(ring.isHidden)
+    }
+
+    func testGlowLeavesAShownNotificationRingVisible() {
+        let ring = CardRingView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        ring.apply(ring: .faint)
+        ring.playTransitionGlow(delay: 0)
+        wait(1.1)
+        XCTAssertFalse(ring.isHidden)
+    }
+
+    func testARestartedGlowIsNotHiddenByTheEarlierOnesTimer() {
+        let ring = CardRingView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        ring.playTransitionGlow(delay: 0)
+        wait(0.6)
+        ring.playTransitionGlow(delay: 0)
+        wait(0.5)
+        XCTAssertFalse(ring.isHidden, "the first glow's end must not hide the second")
+        wait(0.6)
+        XCTAssertTrue(ring.isHidden)
+    }
+}
+
 final class PanePaddingSettingsTests: XCTestCase {
     func testContentRectInsetsSidesTopAndBottomSeparately() {
         let bounds = NSRect(x: 0, y: 0, width: 400, height: 300)

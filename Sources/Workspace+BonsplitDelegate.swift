@@ -558,6 +558,10 @@ extension Workspace: BonsplitDelegate {
 
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
+
+        if let survivor = bonsplitController.focusedPaneId {
+            playPaneTransitionGlow(in: survivor, afterSlide: false)
+        }
     }
 
     /// Live mirror: bonsplit-UI splits (tab-bar buttons, drag-to-edge)
@@ -621,6 +625,7 @@ extension Workspace: BonsplitDelegate {
 
     func splitTabBar(_ controller: BonsplitController, didSplitPane originalPane: PaneID, newPane: PaneID, orientation: SplitOrientation) {
         invalidateSidebarBranchDirectoryEntriesCache()
+        playPaneTransitionGlow(in: newPane, afterSlide: true)
 #if DEBUG
         let panelKindForTab: (TabID) -> String = { tabId in
             guard let panelId = self.panelIdFromSurfaceId(tabId),
