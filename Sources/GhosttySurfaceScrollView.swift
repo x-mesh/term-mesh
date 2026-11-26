@@ -268,7 +268,7 @@ final class GhosttySurfaceScrollView: NSView {
     /// Drawn in the portal host beside this view so it can cover the pane's
     /// tab bar and glow into the gap; see `CardRingView`.
     private let cardRingView = CardRingView(frame: .zero)
-    /// While a pane zoom slides: the terminal's last frame, stretched over the
+    /// While a pane zoom slides: the terminal's last frame, unscaled, riding the
     /// moving pane, and the surface size held until the slide settles. See
     /// `beginZoomSnapshot`.
     private var zoomSnapshotView: NSView?
@@ -987,12 +987,13 @@ final class GhosttySurfaceScrollView: NSView {
     /// busy main thread can stretch past half a second.
     static let zoomSnapshotTimeout: TimeInterval = 2.0
 
-    /// Covers the terminal with its current frame, stretched to the pane as the
-    /// pane zoom slides, and holds the surface at its current size until
-    /// `endZoomSnapshot`. Ghostty draws its grid from the top-left corner, so a
-    /// terminal resized frame by frame appears to grow toward the bottom-right
-    /// wherever the pane sits; the stretched frame grows the way the pane does.
-    /// Holding the size also makes the slide one PTY resize instead of several.
+    /// Covers the terminal with its current frame, unscaled and pinned to the
+    /// pane's top-left corner as the pane zoom slides, and holds the surface at
+    /// its current size until `endZoomSnapshot`. Resized frame by frame, the
+    /// terminal kept redrawing a smaller grid into a growing pane, so it seemed
+    /// to grow toward the bottom-right wherever the pane sat; the still frame
+    /// moves with the pane instead. Holding the size also makes the slide one
+    /// PTY resize instead of several.
     /// Returns false when the surface has no frame to show yet.
     @discardableResult
     func beginZoomSnapshot() -> Bool {
@@ -1004,7 +1005,10 @@ final class GhosttySurfaceScrollView: NSView {
             let snapshot = NSView(frame: scrollView.frame)
             snapshot.wantsLayer = true
             snapshot.layer?.contents = contents
-            snapshot.layer?.contentsGravity = .resize
+            // Unscaled, at the same corner Ghostty draws from: the pane grows
+            // or shrinks around the text, never the text itself.
+            snapshot.layer?.contentsGravity = surfaceView.layer?.contentsGravity ?? .topLeft
+            snapshot.layer?.masksToBounds = true
             snapshot.layer?.contentsScale = surfaceView.layer?.contentsScale ?? 1
             addSubview(snapshot, positioned: .above, relativeTo: scrollView)
             zoomSnapshotView = snapshot
