@@ -4,6 +4,10 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- A terminal tab shows the Claude or Codex logo while `claude` or `codex` runs in that pane, and the terminal icon again once it exits. The tab updates within a few seconds. Panes shown from another Mac keep the terminal icon.
+
 ### Fixed
 
 - With Pane Transition Animation on, splitting a pane in a workspace mirrored from another Mac glows only the new pane. Before, several panes of the mirror glowed at once, because the mirror rebuilds its whole layout after each change on the host.

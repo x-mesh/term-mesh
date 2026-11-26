@@ -1379,6 +1379,16 @@ final class TermMeshDaemon: ObservableObject {
         let _ = rpcCall(method: "usage.scan", params: [:])
     }
 
+    /// `TERMMESH_PANEL_ID` → `claude` / `codex` for each pane running one of
+    /// those CLIs. Nil when the daemon did not answer; polled every few
+    /// seconds, so a failure is not logged.
+    func paneAgents() -> [String: String]? {
+        guard case .success(let result) = rpcCallResult(method: "pane.agents", params: [:], timeout: 2),
+              let panes = (result as? [String: Any])?["panes"] as? [String: String]
+        else { return nil }
+        return panes
+    }
+
     /// The resource monitor's latest system-wide sample, or nil when the
     /// daemon has not taken one yet (it answers `{}` until its first tick).
     ///

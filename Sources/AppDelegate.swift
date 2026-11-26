@@ -864,6 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 guard let self, self.daemon is TermMeshDaemon else { return }
                 (self.daemon as! TermMeshDaemon).startEventSubscription()
             }
+            TerminalAgentIconMonitor.shared.start()
         }
 
         // Fix initial terminal size (intermittent cursor-in-middle-of-prompt bug):

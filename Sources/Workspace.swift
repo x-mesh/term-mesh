@@ -971,6 +971,23 @@ final class Workspace: Identifiable {
     }
 
 
+    /// Puts each terminal's agent CLI logo on its tab, and takes it off once
+    /// the CLI is gone. Only tabs whose CLI changed are touched.
+    func applyTerminalAgents(_ agents: [UUID: TerminalAgentCLI]) {
+        for (panelId, panel) in panels {
+            guard let terminal = panel as? TerminalPanel else { continue }
+            let cli = agents[panelId]
+            guard terminal.agentCLI != cli else { continue }
+            terminal.agentCLI = cli
+            let tabId = surfaceIdFromPanelId(panelId)
+            #if DEBUG
+            dlog("tab.agentIcon panel=\(panelId.uuidString.prefix(5)) cli=\(cli?.rawValue ?? "none") tab=\(tabId == nil ? 0 : 1)")
+            #endif
+            guard let tabId else { continue }
+            bonsplitController.updateTab(tabId, iconImageData: .some(cli?.iconPNGData))
+        }
+    }
+
     func installBrowserPanelSubscription(_ browserPanel: BrowserPanel) {
         let subscription = Publishers.CombineLatest3(
             browserPanel.$pageTitle.removeDuplicates(),
