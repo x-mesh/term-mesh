@@ -1413,6 +1413,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugToggleCommandPalette(params: params))
         case "debug.activity.show":
             return v2Result(id: id, self.v2DebugActivityShow(params: params))
+        case "debug.menu.dump":
+            return v2Result(id: id, self.v2DebugMenuDump())
         case "debug.agent.transcript":
             return v2Result(id: id, self.v2DebugAgentTranscript(params: params))
         case "debug.agent.render_stats":
@@ -1789,6 +1791,7 @@ class TerminalController {
             "debug.sheet.dismiss",
             "debug.command_palette.toggle",
             "debug.activity.show",
+            "debug.menu.dump",
             "debug.agent.transcript",
             "debug.agent.render_stats",
             "debug.window.drag_resize",

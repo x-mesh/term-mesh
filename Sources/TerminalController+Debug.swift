@@ -243,6 +243,46 @@ extension TerminalController {
         return .ok(payload)
     }
 
+    /// The main menu as AppKit holds it: every item's title, key equivalent,
+    /// modifiers and enabled state. Moving a menu item can drop its key
+    /// equivalent or register one twice, and neither shows until the key is
+    /// pressed; comparing two dumps does. Main-actor exception: it reads
+    /// `NSApp.mainMenu`.
+    func v2DebugMenuDump() -> V2CallResult {
+        func modifierNames(_ mask: NSEvent.ModifierFlags) -> [String] {
+            var names: [String] = []
+            if mask.contains(.control) { names.append("ctrl") }
+            if mask.contains(.option) { names.append("opt") }
+            if mask.contains(.shift) { names.append("shift") }
+            if mask.contains(.command) { names.append("cmd") }
+            return names
+        }
+        func dump(_ menu: NSMenu) -> [[String: Any]] {
+            // SwiftUI fills a submenu when it is about to open; ask for that
+            // so a menu nobody has opened yet is not reported empty.
+            menu.update()
+            return menu.items.map { item in
+                var entry: [String: Any] = [
+                    "title": item.title,
+                    "separator": item.isSeparatorItem,
+                    "enabled": item.isEnabled,
+                    "key": item.keyEquivalent,
+                    "modifiers": item.keyEquivalent.isEmpty ? [] : modifierNames(item.keyEquivalentModifierMask),
+                ]
+                if let submenu = item.submenu {
+                    entry["children"] = dump(submenu)
+                }
+                return entry
+            }
+        }
+        var result: V2CallResult = .err(code: "not_found", message: "No main menu", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let menu = NSApp.mainMenu else { return }
+            result = .ok(["menus": dump(menu)])
+        }
+        return result
+    }
+
     func v2DebugShortcutSimulate(params: [String: Any]) -> V2CallResult {
         guard let combo = v2String(params, "combo") else {
             return .err(code: "invalid_params", message: "Missing combo", data: nil)
