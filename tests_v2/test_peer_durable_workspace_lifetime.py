@@ -47,6 +47,19 @@ def main() -> int:
                 )
                 second.detach_surface(surface.surface_id)
             require(any(s.surface_id == surface.surface_id for s in durable.list_surfaces()), "durable surface disappeared on detach")
+            with PeerClient(
+                str(daemon.peer_socket_path),
+                capabilities=[WORKSPACE_LIFECYCLE_CAPABILITY],
+            ) as legacy_viewer:
+                legacy_viewer.handshake()
+                legacy_viewer.attach_surface(surface.surface_id)
+                durable.close_workspace_pane(surface.surface_id)
+                mixed = workspace(durable, workspace_id)
+                require(
+                    mixed and mixed.pane_count == 1,
+                    f"durable close bypassed a legacy viewer: {mixed}",
+                )
+                legacy_viewer.detach_surface(surface.surface_id)
             durable.close_workspace_pane(surface.surface_id)
             empty = workspace(durable, workspace_id)
             require(empty and empty.pane_count == 0, f"last durable pane did not leave an empty session: {empty}")
