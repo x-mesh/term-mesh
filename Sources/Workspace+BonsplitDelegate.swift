@@ -366,7 +366,8 @@ extension Workspace: BonsplitDelegate {
                 panel: panel,
                 title: resolvedPanelTitle(panelId: panelId, fallback: panel.displayTitle),
                 icon: panel.displayIcon,
-                iconImageData: browserPanel?.faviconPNGData,
+                iconImageData: browserPanel?.faviconPNGData
+                    ?? (panel as? TerminalPanel)?.agentCLI?.iconPNGData,
                 kind: surfaceKind(for: panel),
                 isLoading: browserPanel?.isLoading ?? false,
                 isPinned: pinnedPanelIds.contains(panelId),
