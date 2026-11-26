@@ -1479,7 +1479,10 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id: vec![0x22; 16],
                     display_name: "reviewer".into(),
-                    capabilities: peer_proto::capability::supported_vec(),
+                    capabilities: peer_proto::capability::supported_vec()
+                        .into_iter()
+                        .filter(|value| *value != peer_proto::capability::WORKSPACE_DURABLE_V1)
+                        .collect(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),

@@ -37,11 +37,23 @@ def main() -> int:
             require(len(created) == 1, f"expected one durable seed surface, got {len(created)}")
             surface = created[0]
             durable.attach_surface(surface.surface_id)
-            durable.detach_surface(surface.surface_id)
+            with PeerClient(str(daemon.peer_socket_path)) as second:
+                second.handshake()
+                second.attach_surface(surface.surface_id)
+                durable.detach_surface(surface.surface_id)
+                require(
+                    any(s.surface_id == surface.surface_id for s in second.list_surfaces()),
+                    "one viewer detach disrupted another viewer",
+                )
+                second.detach_surface(surface.surface_id)
             require(any(s.surface_id == surface.surface_id for s in durable.list_surfaces()), "durable surface disappeared on detach")
             durable.close_workspace_pane(surface.surface_id)
             empty = workspace(durable, workspace_id)
             require(empty and empty.pane_count == 0, f"last durable pane did not leave an empty session: {empty}")
+            require(
+                all(s.surface_id != surface.surface_id for s in durable.list_surfaces()),
+                "closed durable surface remained attachable",
+            )
             durable.new_workspace_tab(workspace_id)
             restored = workspace(durable, workspace_id)
             require(restored and restored.pane_count == 1, f"New Pane did not repopulate empty session: {restored}")

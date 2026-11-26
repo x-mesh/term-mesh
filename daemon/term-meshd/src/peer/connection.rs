@@ -526,6 +526,7 @@ async fn reader_loop(
                     seq_counter.clone(),
                     peer_id.clone(),
                     Arc::clone(&wants_workspace_roster),
+                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1),
                 ));
                 // Only for a client that advertised host.stats.v1; everyone
                 // else costs nothing. Aborted on teardown below rather than
@@ -1124,7 +1125,8 @@ async fn reader_loop(
                 // silent no-op exactly like the Swift host's perform*.
                 host.apply_control_with_lifetime(
                     ctl,
-                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1),
+                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1)
+                        && host.clients.all_clients_support_durable_workspace(),
                 );
             }
 

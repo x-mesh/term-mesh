@@ -724,6 +724,7 @@ struct RegisteredClient {
     /// including a viewer watching one pane, which had already been sent
     /// the scoped delta it actually needed.
     wants_roster: Arc<AtomicBool>,
+    supports_durable_workspace: bool,
 }
 
 struct PendingLeaderResponse {
@@ -816,7 +817,7 @@ impl Broadcaster {
         seq: Arc<AtomicU64>,
         peer_id: Vec<u8>,
     ) -> BroadcastGuard {
-        self.register_with_roster_flag(tx, seq, peer_id, Arc::new(AtomicBool::new(false)))
+        self.register_with_roster_flag(tx, seq, peer_id, Arc::new(AtomicBool::new(false)), false)
     }
 
     /// `register`, plus the handle the connection flips when it subscribes to
@@ -827,6 +828,7 @@ impl Broadcaster {
         seq: Arc<AtomicU64>,
         peer_id: Vec<u8>,
         wants_roster: Arc<AtomicBool>,
+        supports_durable_workspace: bool,
     ) -> BroadcastGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.clients.lock().unwrap().insert(
@@ -836,6 +838,7 @@ impl Broadcaster {
                 peer_id,
                 seq,
                 wants_roster,
+                supports_durable_workspace,
             },
         );
         self.client_changes.send_modify(|generation| {
@@ -861,6 +864,14 @@ impl Broadcaster {
             .unwrap()
             .values()
             .any(|client| client.wants_roster.load(Ordering::Relaxed))
+    }
+
+    pub fn all_clients_support_durable_workspace(&self) -> bool {
+        let clients = self.clients.lock().unwrap();
+        !clients.is_empty()
+            && clients
+                .values()
+                .all(|client| client.supports_durable_workspace)
     }
 
     /// Send only to connections that subscribed to the roster.
@@ -3360,23 +3371,20 @@ impl PeerHost {
 
     fn close_pane(self: &Arc<Self>, pane_id: &[u8], durable: bool) -> Option<Vec<u8>> {
         let ws_id = self.workspace_id_for_surface(pane_id)?;
-        let removed = match self.with_store(&ws_id, |store| {
-            if durable {
-                store.close_pane_allow_empty(pane_id)
+        let removed = {
+            let mut workspaces = self.workspaces.lock().unwrap();
+            let entry = workspaces.get_mut(&ws_id)?;
+            let result = if durable {
+                entry.store.close_pane_allow_empty(pane_id)
             } else {
-                store.close_pane(pane_id)
-            }
-        }) {
-            Some(Ok(removed)) => removed,
-            // LastPane / NotFound / workspace already gone: silent no-op —
-            // the client observes "nothing happened", same as the Swift host.
-            _ => return None,
-        };
-        if durable {
-            if let Some(entry) = self.workspaces.lock().unwrap().get_mut(&ws_id) {
+                entry.store.close_pane(pane_id)
+            };
+            let removed = result.ok()?;
+            if durable {
                 entry.allows_empty = entry.store.is_empty();
             }
-        }
+            removed
+        };
         // PTYs die outside the layout lock. `PtyManager::remove` decides
         // spec fate: declared surfaces keep theirs (a restart brings them
         // back via TERMMESH_PEER_SURFACES anyway), ephemeral ones lose
@@ -3384,11 +3392,7 @@ impl PeerHost {
         // AttachSurface for the same id.
         let mut index = self.surface_workspace.lock().unwrap();
         for sid in removed {
-            if durable {
-                self.pty.terminate(&sid).ok();
-            } else {
-                self.pty.remove(&sid);
-            }
+            self.pty.remove(&sid);
             index.remove(&sid);
         }
         drop(index);
@@ -5353,6 +5357,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             vec![0xD1; 16],
             Arc::clone(&wants),
+            false,
         );
         wants.store(true, Ordering::Relaxed);
         assert!(host.clients.has_roster_subscriber());
@@ -6053,6 +6058,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             vec![3; 16],
             Arc::new(AtomicBool::new(true)),
+            false,
         );
         restarted.terminate_surface(&leader.surface_id).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {

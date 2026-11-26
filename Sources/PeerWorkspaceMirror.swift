@@ -249,7 +249,6 @@ final class PeerWorkspaceMirrorController {
             write: { try await transport.write($0) }
         )
         let info = try await session.handshake(options: Self.mirrorHandshakeOptions)
-        supportsDurableWorkspace = info.hasHostCapability(PeerCapability.workspaceDurableV1)
         guard Self.startAttemptMayCommit(
             isTornDown: isTornDown,
             dialedLeaseIsCurrent: lease === dialedLease,
@@ -261,6 +260,7 @@ final class PeerWorkspaceMirrorController {
             await transport.close()
             throw CancellationError()
         }
+        supportsDurableWorkspace = info.hasHostCapability(PeerCapability.workspaceDurableV1)
         subscriptionTransport = transport
         subscriptionSession = session
         subscriptionAlive = true
@@ -1240,11 +1240,11 @@ final class PeerWorkspaceMirrorController {
                     write: { try await transport.write($0) }
                 )
                 let workspaces: [Termmesh_Peer_V1_Workspace]
+                let supportsDurableWorkspace: Bool
                 do {
                     let info = try await session.handshake(options: Self.mirrorHandshakeOptions)
-                    self.supportsDurableWorkspace = info.hasHostCapability(
-                        PeerCapability.workspaceDurableV1
-                    )
+                    supportsDurableWorkspace = info.hasHostCapability(
+                        PeerCapability.workspaceDurableV1)
                     workspaces = try await session.listWorkspaces()
                 } catch {
                     // Now that a failed attempt can actually fail instead of
@@ -1268,6 +1268,7 @@ final class PeerWorkspaceMirrorController {
                     await transport.close()
                     return
                 }
+                self.supportsDurableWorkspace = supportsDurableWorkspace
                 guard let target = matchAndAdoptWorkspace(workspaces) else {
                     await transport.close()
                     markHostWorkspaceGone()
