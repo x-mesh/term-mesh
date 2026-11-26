@@ -409,12 +409,20 @@ actor RelayFrameByteBudget {
 struct RelayColorResetPlacement {
     static let reset = Data("\u{1b}]110\u{7}\u{1b}]111\u{7}".utf8)
 
+    // Mirrors the states of Ghostty's parser (ghostty/src/terminal/
+    // parse_table.zig) that decide where a sequence ends.
     private enum State {
         case ground
         case escape
         case escapeIntermediate
         case csi
-        case string
+        /// Ends on BEL or ST; bytes 0x80-0xFF are payload.
+        case osc
+        /// Ends on ST only: BEL and bytes 0x80-0xFF are payload.
+        case dcs
+        /// Ends on ST or an 8-bit C1 control; BEL is ignored.
+        case sosPmApc
+        /// ESC inside OSC, DCS, SOS, PM or APC: `\` makes it ST.
         case stringEscape
     }
 
@@ -436,11 +444,12 @@ struct RelayColorResetPlacement {
     }
 
     /// Advances over a PtyData payload just written. Returns the waiting
-    /// reset when the payload ends between sequences and characters.
+    /// reset when the host has sent bytes and the payload ends between
+    /// sequences and characters.
     mutating func afterWriting(_ payload: Data) -> Data? {
         for byte in payload { advance(byte) }
         if !payload.isEmpty { hasOutput = true }
-        guard pending, isBoundary else { return nil }
+        guard pending, hasOutput, isBoundary else { return nil }
         pending = false
         return Self.reset
     }
@@ -456,6 +465,8 @@ struct RelayColorResetPlacement {
         }
         switch state {
         case .ground:
+            // Ghostty decodes UTF-8 here, so a raw 8-bit C1 byte does not
+            // start a sequence from ground.
             if byte == 0x1B {
                 state = .escape
                 utf8Remaining = 0
@@ -471,28 +482,42 @@ struct RelayColorResetPlacement {
             }
         case .escape:
             switch byte {
-            case 0x1B, 0x00...0x1F, 0x7F: break
+            case 0x1B: break
+            case 0x80...0x9F: c1(byte)
             case 0x5B: state = .csi
-            case 0x5D, 0x50, 0x58, 0x5E, 0x5F: state = .string
+            case 0x5D: state = .osc
+            case 0x50: state = .dcs
+            case 0x58, 0x5E, 0x5F: state = .sosPmApc
             case 0x20...0x2F: state = .escapeIntermediate
-            default: state = .ground
+            case 0x30...0x7E: state = .ground
+            default: break
             }
         case .escapeIntermediate:
             switch byte {
             case 0x1B: state = .escape
+            case 0x80...0x9F: c1(byte)
             case 0x30...0x7E: state = .ground
             default: break
             }
         case .csi:
             switch byte {
             case 0x1B: state = .escape
+            case 0x80...0x9F: c1(byte)
             case 0x40...0x7E: state = .ground
             default: break
             }
-        case .string:
+        case .osc:
             switch byte {
             case 0x07: state = .ground
             case 0x1B: state = .stringEscape
+            default: break
+            }
+        case .dcs:
+            if byte == 0x1B { state = .stringEscape }
+        case .sosPmApc:
+            switch byte {
+            case 0x1B: state = .stringEscape
+            case 0x80...0x9F: c1(byte)
             default: break
             }
         case .stringEscape:
@@ -503,6 +528,17 @@ struct RelayColorResetPlacement {
                 state = .escape
                 advance(byte)
             }
+        }
+    }
+
+    /// Ghostty's "anywhere" transitions for an 8-bit C1 control.
+    private mutating func c1(_ byte: UInt8) {
+        switch byte {
+        case 0x9B: state = .csi
+        case 0x9D: state = .osc
+        case 0x90: state = .dcs
+        case 0x98, 0x9E, 0x9F: state = .sosPmApc
+        default: state = .ground
         }
     }
 }

@@ -13292,6 +13292,11 @@ final class RelayColorResetPlacementTests: XCTestCase {
             ("OSC with BEL", Array("\u{1b}]0;ti".utf8), Array("tle\u{7}".utf8)),
             ("OSC with ST", Array("\u{1b}]0;title\u{1b}".utf8), Array("\\".utf8)),
             ("DCS", Array("\u{1b}P1$r".utf8), Array("0m\u{1b}\\".utf8)),
+            ("DCS with BEL in its payload", Array("\u{1b}Ptmux;\u{7}".utf8), Array("x\u{1b}\\".utf8)),
+            ("APC with BEL", Array("\u{1b}_G\u{7}".utf8), Array("\u{1b}\\".utf8)),
+            ("8-bit CSI after ESC", [0x1B, 0x9B, 0x33], Array("1m".utf8)),
+            ("8-bit OSC after ESC", [0x1B, 0x9D, 0x30, 0x3B], [0x74, 0x07]),
+            ("8-bit DCS inside CSI", Array("\u{1b}[1".utf8) + [0x90, 0x71], Array("\u{1b}\\".utf8)),
             ("bare ESC", [0x1B], Array("[H".utf8)),
             ("ESC intermediate", Array("\u{1b}(".utf8), Array("B".utf8)),
             ("UTF-8", [0xED, 0x95], [0x9C]),
@@ -13303,6 +13308,27 @@ final class RelayColorResetPlacementTests: XCTestCase {
             XCTAssertNil(placement.request(), "\(name): must not land inside the sequence")
             XCTAssertEqual(placement.afterWriting(Data(tail)), reset, name)
         }
+    }
+
+    func testEmptyFirstFrameDoesNotLetTheResetPrecedeTheHostsBytes() {
+        var placement = RelayColorResetPlacement()
+        XCTAssertNil(placement.request())
+        XCTAssertNil(placement.afterWriting(Data()), "nothing from the host yet")
+        XCTAssertEqual(placement.afterWriting(Data("\u{1b}]11;rgb:0d0d/1111/1717\u{7}".utf8)), reset)
+    }
+
+    func testEightBitSTEndsAnAPCString() {
+        var placement = RelayColorResetPlacement()
+        XCTAssertNil(placement.afterWriting(Data("\u{1b}_Gpayload".utf8)))
+        XCTAssertNil(placement.request())
+        XCTAssertEqual(placement.afterWriting(Data([0x9C])), reset)
+    }
+
+    func testHighBytesInsideOSCArePayload() {
+        var placement = RelayColorResetPlacement()
+        XCTAssertNil(placement.afterWriting(Data("\u{1b}]0;".utf8) + Data([0x9C])))
+        XCTAssertNil(placement.request(), "0x9C is OSC payload, not ST")
+        XCTAssertEqual(placement.afterWriting(Data([0x07])), reset)
     }
 
     func testCancelEndsASequence() {
