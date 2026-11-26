@@ -59,6 +59,28 @@ class ReleaseStateMachineTests(unittest.TestCase):
                 release.install_notes(changelog, "0.202.0", notes)
             self.assertEqual(changelog.read_text(), original)
 
+    def test_install_notes_refuses_a_reworded_entry_that_only_contains_the_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [Unreleased]\n\n- Fix it.\n\n## [0.201.0]\n")
+            notes = "## [0.202.0] - 2026-08-21\n\n- Fix it. And more.\n"
+            with self.assertRaisesRegex(release.ReleaseError, "- Fix it."):
+                release.install_notes(changelog, "0.202.0", notes)
+
+    def test_install_notes_reads_a_heading_inside_a_code_block_as_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n## [Unreleased]\n\n- Show it:\n\n  ```\n## [not a heading]\n- not an entry\n  ```\n\n"
+                "- Fix it.\n\n## [0.201.0]\n\n- Old.\n"
+            )
+            notes = "## [0.202.0] - 2026-08-21\n\n- Show it:\n- Fix it.\n"
+            release.install_notes(changelog, "0.202.0", notes)
+            body = changelog.read_text()
+            self.assertEqual(body.count("- Fix it."), 1)
+            self.assertNotIn("## [not a heading]", body)
+            self.assertTrue(body.endswith("- Fix it.\n\n## [0.201.0]\n\n- Old.\n"), body)
+
     def test_install_notes_handles_unreleased_as_the_last_section(self):
         with tempfile.TemporaryDirectory() as directory:
             changelog = Path(directory) / "CHANGELOG.md"

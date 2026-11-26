@@ -1027,6 +1027,25 @@ def cleanup(state: dict[str, Any], *, keep_worktrees: bool) -> None:
     mark(state, "cleanup", **receipt)
 
 
+def unreleased_block(body: str, after: int) -> tuple[int, list[str]]:
+    """Where the Unreleased block that starts at `after` ends, and its list
+    entries. A `## [` line or a `- ` line inside a fenced code block is text,
+    not a section heading or an entry."""
+    offset = after
+    fenced = False
+    entries: list[str] = []
+    for line in body[after:].splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and offset > after and line.startswith("## ["):
+            return offset, entries
+        elif not fenced and stripped.startswith("- "):
+            entries.append(stripped)
+        offset += len(line)
+    return len(body), entries
+
+
 def install_notes(changelog: Path, version: str, notes: str) -> None:
     heading = f"## [{version}]"
     body = changelog.read_text()
@@ -1041,13 +1060,9 @@ def install_notes(changelog: Path, version: str, notes: str) -> None:
     # The notes replace what feature PRs wrote under Unreleased. Leaving it in
     # place put those entries a second time at the end of the new section.
     after = start + len(marker)
-    next_heading = body.find("\n## [", after)
-    end = len(body) if next_heading < 0 else next_heading + 1
-    pending = [
-        line.strip() for line in body[after:end].splitlines()
-        if line.strip().startswith("- ")
-    ]
-    missing = [entry for entry in pending if entry not in notes]
+    end, pending = unreleased_block(body, after)
+    note_lines = {line.strip() for line in notes.splitlines()}
+    missing = [entry for entry in pending if entry not in note_lines]
     if missing:
         listed = "\n".join(missing)
         raise ReleaseError(
