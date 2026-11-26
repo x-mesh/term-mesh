@@ -145,7 +145,8 @@ struct WorkspaceContentView: View {
                 let isFocused = isWorkspaceInputActive && workspace.focusedPanelId == panel.id
                 let isSelectedInPane = workspace.bonsplitController.selectedTab(inPane: paneId)?.id == tab.id
                 let isHiddenByPaneZoom: Bool = {
-                    guard let zoomed = workspace.bonsplitController.zoomedPaneId else { return false }
+                    guard let zoomed = workspace.bonsplitController.zoomedPaneId
+                        ?? workspace.zoomOutLandingPaneId else { return false }
                     return zoomed != paneId
                 }()
                 let isVisibleInUI = isWorkspaceVisible && isSelectedInPane && !isHiddenByPaneZoom
