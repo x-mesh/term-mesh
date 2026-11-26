@@ -726,6 +726,91 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testPaneZoomSlideMovesThroughAndEndsWhereInstantZoomEnds() throws {
+        try XCTSkipIf(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, "Reduce Motion turns the slide off")
+        let controller = BonsplitController()
+        controller.configuration.appearance.enableAnimations = false
+        let pane = try XCTUnwrap(controller.focusedPaneId)
+        let second = try XCTUnwrap(controller.splitPane(pane, orientation: .horizontal))
+        let third = try XCTUnwrap(controller.splitPane(second, orientation: .vertical))
+        controller.configuration.appearance.enableAnimations = true
+        controller.configuration.appearance.animationDuration = 0.2
+        let probe = ZoomMountProbe()
+        let host = NSHostingView(rootView: BonsplitView(controller: controller) { _, pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        } emptyPane: { pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        })
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+
+        func settle(_ seconds: TimeInterval = 0.5) {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+            host.layoutSubtreeIfNeeded()
+        }
+        func frames() -> [PaneID: NSRect] {
+            probe.views.mapValues { $0.convert($0.bounds, to: host) }
+        }
+        func assertFramesEqual(_ actual: [PaneID: NSRect], _ expected: [PaneID: NSRect], _ message: String) {
+            for (id, rect) in expected {
+                guard let got = actual[id] else { return XCTFail("missing pane: \(message)") }
+                XCTAssertEqual(got.minX, rect.minX, accuracy: 1, message)
+                XCTAssertEqual(got.minY, rect.minY, accuracy: 1, message)
+                XCTAssertEqual(got.width, rect.width, accuracy: 1, message)
+                XCTAssertEqual(got.height, rect.height, accuracy: 1, message)
+            }
+        }
+        settle()
+        let originalFrames = frames()
+        let fullWidth = host.bounds.width - 2 * (BonsplitCardMetrics.gap + BonsplitCardMetrics.borderWidth)
+        let target = third
+        let targetView = try XCTUnwrap(probe.views[target])
+        let originalWidth = targetView.bounds.width
+
+        // Mid-slide the pane is between its own size and the full width.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle(0.06)
+        XCTAssertGreaterThan(targetView.bounds.width, originalWidth + 1)
+        XCTAssertLessThan(targetView.bounds.width, fullWidth - 1)
+
+        settle()
+        XCTAssertEqual(targetView.bounds.width, fullWidth, accuracy: 1)
+        for (id, view) in probe.views {
+            XCTAssertEqual(view.isHiddenOrHasHiddenAncestor, id != target)
+        }
+
+        // Zoom out keeps the siblings hidden until the pane is back in place.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle(0.06)
+        XCTAssertLessThan(targetView.bounds.width, fullWidth - 1)
+        for (id, view) in probe.views where id != target {
+            XCTAssertTrue(view.isHiddenOrHasHiddenAncestor, "siblings appear only after the slide")
+        }
+        settle()
+        for (_, view) in probe.views {
+            XCTAssertFalse(view.isHiddenOrHasHiddenAncestor)
+        }
+        assertFramesEqual(frames(), originalFrames, "after a full zoom in and out")
+
+        // Reversing mid-slide still lands on the original layout.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle(0.06)
+        XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+        settle()
+        XCTAssertNil(controller.zoomedPaneId)
+        for (_, view) in probe.views {
+            XCTAssertFalse(view.isHiddenOrHasHiddenAncestor)
+        }
+        assertFramesEqual(frames(), originalFrames, "after reversing mid-slide")
+    }
+
+    @MainActor
     func testSplitClearsExistingPaneZoom() {
         let controller = BonsplitController()
         guard let originalPane = controller.focusedPaneId else {
