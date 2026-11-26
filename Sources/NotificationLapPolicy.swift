@@ -33,3 +33,31 @@ enum NotificationLapPolicy {
         return NotificationLapDecision(ring: .faint, playLap: !reduceMotion, lastLappedID: latestUnreadID)
     }
 }
+
+/// Caps how many card rings sweep at once. Each sweep animates blurred
+/// layers: on a 120 Hz display seven at once held WindowServer at 85% of a
+/// core against 67% for two. A sweep that finds no free slot is skipped and
+/// the ring stays faint.
+struct NotificationLapSlots {
+    static let limit = 2
+
+    private(set) var active = 0
+    private let limit: Int
+
+    init(limit: Int = NotificationLapSlots.limit) {
+        self.limit = limit
+    }
+
+    /// Takes a slot for a ring that is not sweeping yet. A ring that already
+    /// holds one keeps it when its sweep restarts.
+    mutating func acquire(alreadyHeld: Bool) -> Bool {
+        if alreadyHeld { return true }
+        guard active < limit else { return false }
+        active += 1
+        return true
+    }
+
+    mutating func release() {
+        active = max(0, active - 1)
+    }
+}
