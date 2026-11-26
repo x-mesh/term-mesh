@@ -32,7 +32,7 @@ enum PanePaddingSettings {
     static let bottomKey = "paneContentPaddingBottom"
     static let defaultHorizontal = Double(BonsplitCardMetrics.gap)
     static let defaultTop: Double = 2
-    static let defaultBottom: Double = 10
+    static let defaultBottom: Double = 6
     static let range: ClosedRange<Double> = 0...24
 
     static func clamped(_ value: Double) -> CGFloat {

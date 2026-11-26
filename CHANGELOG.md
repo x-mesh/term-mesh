@@ -7,6 +7,7 @@ All notable changes to term-mesh are documented here.
 ### Changed
 
 - Font Family and Fallback Font in Settings › Terminal are each one control now: a button that shows the current font and opens a list you can search. Type to filter, move with the arrow keys and press Return to choose. Before, a search field sat above a separate menu.
+- The default Pane Padding (Bottom) is 6 px instead of 10 px. A value you already set in Settings is kept.
 
 ### Fixed
 
