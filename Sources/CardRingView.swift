@@ -98,6 +98,8 @@ final class CardRingView: NSView {
     private var ringShown = false
     private var transitionGlowGeneration = 0
     private var isPlayingTransitionGlow = false
+    private var notificationRingHoldGeneration = 0
+    private var isHoldingNotificationRing = false
 
     /// Shared by every ring on the main thread; see `NotificationLapSlots`.
     private static var lapSlots = NotificationLapSlots()
@@ -183,7 +185,7 @@ final class CardRingView: NSView {
         case .faint:
             ringShown = true
             isHidden = false
-            faintLayer.opacity = 1
+            faintLayer.opacity = isHoldingNotificationRing ? 0 : 1
         }
         CATransaction.commit()
     }
@@ -218,6 +220,35 @@ final class CardRingView: NSView {
             if !self.ringShown { self.isHidden = true }
         }
     }
+
+    /// How long `playTransitionGlow` stays visible after its delay.
+    static var transitionGlowDuration: CFTimeInterval { Style.transitionDuration }
+
+    /// Hides the unread-notification ring while another pane plays its
+    /// transition glow, so only that pane is outlined. The ring returns,
+    /// faded in, when the hold ends.
+    func holdNotificationRing(for duration: CFTimeInterval) {
+        notificationRingHoldGeneration += 1
+        let generation = notificationRingHoldGeneration
+        isHoldingNotificationRing = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        faintLayer.opacity = 0
+        for entry in lapLayers { entry.layer.isHidden = true }
+        CATransaction.commit()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self, self.notificationRingHoldGeneration == generation else { return }
+            self.isHoldingNotificationRing = false
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for entry in self.lapLayers { entry.layer.isHidden = false }
+            CATransaction.commit()
+            self.faintLayer.opacity = self.ringShown ? 1 : 0
+        }
+    }
+
+    var notificationRingOpacity: Float { faintLayer.opacity }
 
     /// Sweeps the ring once, unless the rings already sweeping use every slot.
     func playLap() {

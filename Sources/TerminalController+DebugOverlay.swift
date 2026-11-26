@@ -85,6 +85,22 @@ extension TerminalController {
         return .ok(outcome)
     }
 
+    /// `debug.appearance.set`: the titlebar sun/moon toggle, for tests. Writes
+    /// the mode in-process so the defaults observer applies it, which an
+    /// external `defaults write` does not trigger.
+    func v2DebugAppearanceSet(params: [String: Any]) -> V2CallResult {
+        guard let raw = v2String(params, "mode"), AppearanceMode(rawValue: raw) != nil else {
+            return .err(code: "invalid_params", message: "mode must be system, light, dark or auto", data: nil)
+        }
+        let completed = v2MainExec(timeout: 2) {
+            UserDefaults.standard.set(raw, forKey: AppearanceSettings.appearanceModeKey)
+        }
+        guard completed else {
+            return .err(code: "timeout", message: "main thread did not answer", data: nil)
+        }
+        return .ok(["mode": raw])
+    }
+
     func v2DebugDragSimulateFileDrop(params: [String: Any]) -> V2CallResult {
         guard let surfaceId = v2String(params, "surface_id"),
               let paths = v2String(params, "paths") else {

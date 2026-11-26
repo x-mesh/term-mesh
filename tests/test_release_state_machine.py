@@ -35,6 +35,74 @@ class ReleaseStateMachineTests(unittest.TestCase):
             self.assertEqual(changelog.read_text(), once)
             self.assertEqual(once.count("## [0.202.0]"), 1)
 
+    def test_install_notes_moves_unreleased_entries_instead_of_repeating_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Fix it.\n\n## [0.201.0]\n\n- Old.\n"
+            )
+            notes = "## [0.202.0] - 2026-08-21\n\n### Fixed\n\n- Fix it.\n- Fix more.\n"
+            release.install_notes(changelog, "0.202.0", notes)
+            self.assertEqual(
+                changelog.read_text(),
+                "# Changelog\n\n## [Unreleased]\n\n## [0.202.0] - 2026-08-21\n\n### Fixed\n\n"
+                "- Fix it.\n- Fix more.\n\n## [0.201.0]\n\n- Old.\n",
+            )
+
+    def test_install_notes_refuses_notes_that_drop_an_unreleased_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            original = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Keep me.\n\n## [0.201.0]\n"
+            changelog.write_text(original)
+            notes = "## [0.202.0] - 2026-08-21\n\n### Fixed\n\n- Something else.\n"
+            with self.assertRaisesRegex(release.ReleaseError, "- Keep me."):
+                release.install_notes(changelog, "0.202.0", notes)
+            self.assertEqual(changelog.read_text(), original)
+
+    def test_install_notes_refuses_a_reworded_entry_that_only_contains_the_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [Unreleased]\n\n- Fix it.\n\n## [0.201.0]\n")
+            notes = "## [0.202.0] - 2026-08-21\n\n- Fix it. And more.\n"
+            with self.assertRaisesRegex(release.ReleaseError, "- Fix it."):
+                release.install_notes(changelog, "0.202.0", notes)
+
+    def test_install_notes_reads_a_heading_inside_a_code_block_as_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n## [Unreleased]\n\n- Show it:\n\n  ```\n## [not a heading]\n- not an entry\n  ```\n\n"
+                "- Fix it.\n\n## [0.201.0]\n\n- Old.\n"
+            )
+            notes = "## [0.202.0] - 2026-08-21\n\n- Show it:\n- Fix it.\n"
+            release.install_notes(changelog, "0.202.0", notes)
+            body = changelog.read_text()
+            self.assertEqual(body.count("- Fix it."), 1)
+            self.assertNotIn("## [not a heading]", body)
+            self.assertTrue(body.endswith("- Fix it.\n\n## [0.201.0]\n\n- Old.\n"), body)
+
+    def test_install_notes_keeps_a_code_block_open_across_a_different_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n## [Unreleased]\n\n- Show it:\n\n  ```\n~~~\n## [not a heading]\n  ```\n\n"
+                "- Keep me.\n\n## [0.201.0]\n"
+            )
+            notes = "## [0.202.0] - 2026-08-21\n\n- Show it:\n"
+            with self.assertRaisesRegex(release.ReleaseError, "- Keep me."):
+                release.install_notes(changelog, "0.202.0", notes)
+
+    def test_install_notes_handles_unreleased_as_the_last_section(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [Unreleased]\n\n- Fix it.\n")
+            notes = "## [0.1.0] - 2026-08-21\n\n- Fix it.\n"
+            release.install_notes(changelog, "0.1.0", notes)
+            self.assertEqual(
+                changelog.read_text(),
+                "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-08-21\n\n- Fix it.\n",
+            )
+
     def test_remote_mutations_require_explicit_yes(self):
         args = type("Args", (), {"yes": False})()
         with self.assertRaisesRegex(release.ReleaseError, "require --yes"):

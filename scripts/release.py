@@ -1027,6 +1027,32 @@ def cleanup(state: dict[str, Any], *, keep_worktrees: bool) -> None:
     mark(state, "cleanup", **receipt)
 
 
+def unreleased_block(body: str, after: int) -> tuple[int, list[str]]:
+    """Where the Unreleased block that starts at `after` ends, and its list
+    entries. A `## [` line or a `- ` line inside a fenced code block is text,
+    not a section heading or an entry."""
+    offset = after
+    fence = ""  # the opening fence while inside a code block
+    entries: list[str] = []
+    for line in body[after:].splitlines(keepends=True):
+        stripped = line.strip()
+        marker = re.match(r"`{3,}|~{3,}", stripped)
+        if fence:
+            # CommonMark: only a bare fence of the same character, at least as
+            # long as the opening one, closes the block.
+            if marker and stripped == marker.group(0) and marker.group(0)[0] == fence[0] \
+                    and len(marker.group(0)) >= len(fence):
+                fence = ""
+        elif marker:
+            fence = marker.group(0)
+        elif offset > after and line.startswith("## ["):
+            return offset, entries
+        elif stripped.startswith("- "):
+            entries.append(stripped)
+        offset += len(line)
+    return len(body), entries
+
+
 def install_notes(changelog: Path, version: str, notes: str) -> None:
     heading = f"## [{version}]"
     body = changelog.read_text()
@@ -1035,9 +1061,25 @@ def install_notes(changelog: Path, version: str, notes: str) -> None:
     if not notes.lstrip().startswith(heading):
         raise ReleaseError(f"notes must start with {heading}")
     marker = "## [Unreleased]"
-    if marker not in body:
+    start = body.find(marker)
+    if start < 0:
         raise ReleaseError("CHANGELOG.md has no Unreleased heading")
-    changelog.write_text(body.replace(marker, marker + "\n\n" + notes.strip(), 1) + ("" if body.endswith("\n") else "\n"))
+    # The notes replace what feature PRs wrote under Unreleased. Leaving it in
+    # place put those entries a second time at the end of the new section.
+    after = start + len(marker)
+    end, pending = unreleased_block(body, after)
+    note_lines = {line.strip() for line in notes.splitlines()}
+    missing = [entry for entry in pending if entry not in note_lines]
+    if missing:
+        listed = "\n".join(missing)
+        raise ReleaseError(
+            "release notes leave out entries under Unreleased; add them to the notes, "
+            f"or remove them from CHANGELOG.md on develop:\n{listed}"
+        )
+    rest = body[end:]
+    changelog.write_text(
+        body[:after] + "\n\n" + notes.strip() + ("\n\n" + rest if rest else "\n")
+    )
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
