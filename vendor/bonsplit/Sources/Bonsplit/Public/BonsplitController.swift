@@ -215,6 +215,7 @@ public final class BonsplitController {
     ///   - showsNotificationBadge: New badge state (pass nil to keep current)
     ///   - isLoading: New loading/busy state (pass nil to keep current)
     ///   - isPinned: New pinned state (pass nil to keep current)
+    ///   - hostBadge: New host badge (pass nil to keep current, pass .some(nil) to remove)
     public func updateTab(
         _ tabId: TabID,
         title: String? = nil,
@@ -225,7 +226,8 @@ public final class BonsplitController {
         isDirty: Bool? = nil,
         showsNotificationBadge: Bool? = nil,
         isLoading: Bool? = nil,
-        isPinned: Bool? = nil
+        isPinned: Bool? = nil,
+        hostBadge: TabHostBadge?? = nil
     ) {
         guard let (pane, tabIndex) = findTabInternal(tabId) else { return }
 
@@ -255,6 +257,9 @@ public final class BonsplitController {
         }
         if let isPinned = isPinned {
             pane.tabs[tabIndex].isPinned = isPinned
+        }
+        if let hostBadge, pane.tabs[tabIndex].hostBadge != hostBadge {
+            pane.tabs[tabIndex].hostBadge = hostBadge
         }
     }
 
@@ -433,7 +438,8 @@ public final class BonsplitController {
                 isDirty: tab.isDirty,
                 showsNotificationBadge: tab.showsNotificationBadge,
                 isLoading: tab.isLoading,
-                isPinned: tab.isPinned
+                isPinned: tab.isPinned,
+                hostBadge: tab.hostBadge
             )
         } else {
             internalTab = nil

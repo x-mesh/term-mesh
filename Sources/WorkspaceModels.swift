@@ -204,6 +204,14 @@ struct SidebarProgressState {
     let label: String?
 }
 
+/// A remote pane's shell location as its host reports it. Either field is
+/// empty when the host does not know it: not a git checkout, or a daemon too
+/// old to report the branch.
+struct RemotePaneLocation: Equatable {
+    var directory: String
+    var branch: String
+}
+
 struct SidebarGitBranchState {
     let branch: String
     let isDirty: Bool
