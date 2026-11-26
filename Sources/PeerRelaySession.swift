@@ -2527,6 +2527,19 @@ final class PeerRelaySession {
     ) async -> Void)?
     var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
     var onReconnected: (@MainActor () -> Void)?
+    /// The agent CLI ("claude", "codex") the host reports in this surface's
+    /// terminal foreground, nil once it is gone. Called on change only. A
+    /// host that predates `HostStats.surface_agents` reports none.
+    var onRemoteAgentCLI: (@MainActor (_ cli: String?) -> Void)?
+    private var reportedRemoteAgentCLI: String?
+    private var hasReportedRemoteAgentCLI = false
+
+    private func noteRemoteAgentCLI(_ cli: String?) {
+        guard !hasReportedRemoteAgentCLI || reportedRemoteAgentCLI != cli else { return }
+        hasReportedRemoteAgentCLI = true
+        reportedRemoteAgentCLI = cli
+        onRemoteAgentCLI?(cli)
+    }
     /// Pooled SSH recovery hook installed by `PeerPaneSession`. The relay
     /// carries the generation it originally attached through so sibling panes
     /// coalesce one half-alive tunnel reset instead of restarting each other.
@@ -4220,6 +4233,12 @@ final class PeerRelaySession {
                                 PeerHostStatsStore.shared.record(stats, for: hostKey)
                             }
                         }
+                        // The same push names the surfaces that run an agent
+                        // CLI; this pane cares only about its own.
+                        let agentCLI = stats.surfaceAgents
+                            .first(where: { $0.surfaceID == mySurfaceID })
+                            .map(\.cli)
+                        await MainActor.run { self.noteRemoteAgentCLI(agentCLI) }
                     case .relayTelemetry(let sample):
                         telemetryStore.record(sample, surfaceID: mySurfaceID)
                     case .teamCallResponse(let response):

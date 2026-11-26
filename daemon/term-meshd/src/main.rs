@@ -665,6 +665,18 @@ async fn main() -> anyhow::Result<()> {
         pane_tracker.clone(),
         usage_tracker.clone(),
     ));
+    // Lets HostStats tell a viewer which of this host's surfaces run Claude
+    // or Codex; the tracker already keys each one by its surface's panel id.
+    {
+        let pane_tracker = pane_tracker.clone();
+        peer::layout::set_surface_agent_provider(std::sync::Arc::new(move || {
+            pane_tracker
+                .snapshot()
+                .into_iter()
+                .map(|(panel_id, info)| (panel_id, info.cli))
+                .collect()
+        }));
+    }
 
     let mut peer_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
         std::env::var("TERMMESH_PEER_SOCKET")

@@ -2452,6 +2452,27 @@ public nonisolated struct Termmesh_Peer_V1_HostStats: Sendable {
 
   public var diskAvailableBytes: UInt64 = 0
 
+  /// The surfaces of this host that run an agent CLI in their terminal's
+  /// foreground, so a viewer can badge a remote pane the way it badges a
+  /// local one. Only surfaces with a CLI are listed; an absent surface runs
+  /// none. Empty on hosts that predate the field.
+  public var surfaceAgents: [Termmesh_Peer_V1_SurfaceAgent] = []
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_SurfaceAgent: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var surfaceID: Data = Data()
+
+  /// "claude" or "codex".
+  public var cli: String = String()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -6753,7 +6774,7 @@ nonisolated extension Termmesh_Peer_V1_WorkspaceLayoutChanged: SwiftProtobuf.Mes
 
 nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".HostStats"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}load_1m\0\u{3}cpu_count\0\u{3}memory_percent\0\u{3}memory_used_bytes\0\u{3}memory_total_bytes\0\u{3}disk_read_bytes_per_sec\0\u{3}disk_write_bytes_per_sec\0\u{3}net_rx_bytes_per_sec\0\u{3}net_tx_bytes_per_sec\0\u{3}load_5m\0\u{3}load_15m\0\u{3}disk_total_bytes\0\u{3}disk_available_bytes\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}load_1m\0\u{3}cpu_count\0\u{3}memory_percent\0\u{3}memory_used_bytes\0\u{3}memory_total_bytes\0\u{3}disk_read_bytes_per_sec\0\u{3}disk_write_bytes_per_sec\0\u{3}net_rx_bytes_per_sec\0\u{3}net_tx_bytes_per_sec\0\u{3}load_5m\0\u{3}load_15m\0\u{3}disk_total_bytes\0\u{3}disk_available_bytes\0\u{3}surface_agents\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6774,6 +6795,7 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
       case 11: try { try decoder.decodeSingularDoubleField(value: &self.load15M) }()
       case 12: try { try decoder.decodeSingularUInt64Field(value: &self.diskTotalBytes) }()
       case 13: try { try decoder.decodeSingularUInt64Field(value: &self.diskAvailableBytes) }()
+      case 14: try { try decoder.decodeRepeatedMessageField(value: &self.surfaceAgents) }()
       default: break
       }
     }
@@ -6819,6 +6841,9 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
     if self.diskAvailableBytes != 0 {
       try visitor.visitSingularUInt64Field(value: self.diskAvailableBytes, fieldNumber: 13)
     }
+    if !self.surfaceAgents.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.surfaceAgents, fieldNumber: 14)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -6836,6 +6861,42 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
     if lhs.load15M != rhs.load15M {return false}
     if lhs.diskTotalBytes != rhs.diskTotalBytes {return false}
     if lhs.diskAvailableBytes != rhs.diskAvailableBytes {return false}
+    if lhs.surfaceAgents != rhs.surfaceAgents {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_SurfaceAgent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".SurfaceAgent"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}cli\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.cli) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 1)
+    }
+    if !self.cli.isEmpty {
+      try visitor.visitSingularStringField(value: self.cli, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_SurfaceAgent, rhs: Termmesh_Peer_V1_SurfaceAgent) -> Bool {
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.cli != rhs.cli {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
