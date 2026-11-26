@@ -1032,15 +1032,22 @@ def unreleased_block(body: str, after: int) -> tuple[int, list[str]]:
     entries. A `## [` line or a `- ` line inside a fenced code block is text,
     not a section heading or an entry."""
     offset = after
-    fenced = False
+    fence = ""  # the opening fence while inside a code block
     entries: list[str] = []
     for line in body[after:].splitlines(keepends=True):
         stripped = line.strip()
-        if stripped.startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and offset > after and line.startswith("## ["):
+        marker = re.match(r"`{3,}|~{3,}", stripped)
+        if fence:
+            # CommonMark: only a bare fence of the same character, at least as
+            # long as the opening one, closes the block.
+            if marker and stripped == marker.group(0) and marker.group(0)[0] == fence[0] \
+                    and len(marker.group(0)) >= len(fence):
+                fence = ""
+        elif marker:
+            fence = marker.group(0)
+        elif offset > after and line.startswith("## ["):
             return offset, entries
-        elif not fenced and stripped.startswith("- "):
+        elif stripped.startswith("- "):
             entries.append(stripped)
         offset += len(line)
     return len(body), entries

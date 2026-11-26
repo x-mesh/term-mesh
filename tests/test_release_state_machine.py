@@ -81,6 +81,17 @@ class ReleaseStateMachineTests(unittest.TestCase):
             self.assertNotIn("## [not a heading]", body)
             self.assertTrue(body.endswith("- Fix it.\n\n## [0.201.0]\n\n- Old.\n"), body)
 
+    def test_install_notes_keeps_a_code_block_open_across_a_different_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changelog = Path(directory) / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n## [Unreleased]\n\n- Show it:\n\n  ```\n~~~\n## [not a heading]\n  ```\n\n"
+                "- Keep me.\n\n## [0.201.0]\n"
+            )
+            notes = "## [0.202.0] - 2026-08-21\n\n- Show it:\n"
+            with self.assertRaisesRegex(release.ReleaseError, "- Keep me."):
+                release.install_notes(changelog, "0.202.0", notes)
+
     def test_install_notes_handles_unreleased_as_the_last_section(self):
         with tempfile.TemporaryDirectory() as directory:
             changelog = Path(directory) / "CHANGELOG.md"
