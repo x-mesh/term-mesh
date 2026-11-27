@@ -8012,6 +8012,45 @@ final class RelayFrameByteBudgetTests: XCTestCase {
         await budget.release(resumed)
         await budget.release(admitted)
     }
+
+    func testWriterCompletionReportsSuccessOnlyAfterTheFrameWrites() async throws {
+        let wrote = expectation(description: "frame written")
+        let completion = expectation(description: "completion")
+        let lock = NSLock()
+        var outcome: Bool?
+        let writer = RelayFrameWriter(
+            writeFrame: { _, _ in wrote.fulfill() },
+            onFailure: { _ in }
+        )
+
+        try await writer.enqueue(type: 0x01, payload: Data([1])) { success in
+            lock.lock(); outcome = success; lock.unlock()
+            completion.fulfill()
+        }
+        await fulfillment(of: [wrote, completion], timeout: 1)
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(outcome, true)
+    }
+
+    func testWriterCompletionReportsCancelledWhenStoppedBeforeAdmission() async {
+        let completion = expectation(description: "cancelled completion")
+        let lock = NSLock()
+        var outcome: Bool?
+        let writer = RelayFrameWriter(writeFrame: { _, _ in }, onFailure: { _ in })
+        writer.stop()
+
+        do {
+            try await writer.enqueue(type: 0x01, payload: Data([1])) { success in
+                lock.lock(); outcome = success; lock.unlock()
+                completion.fulfill()
+            }
+            XCTFail("stopped writer accepted a frame")
+        } catch {
+        }
+        await fulfillment(of: [completion], timeout: 1)
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(outcome, false)
+    }
 }
 
 // MARK: - Relay input diagnostics

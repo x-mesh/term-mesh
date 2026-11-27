@@ -572,19 +572,33 @@ final class RelayFrameWriter: @unchecked Sendable {
     func enqueue(
         type: UInt8,
         payload: Data,
-        onWritten: (@Sendable () -> Void)? = nil
+        onCompletion: (@Sendable (Bool) -> Void)? = nil
     ) async throws {
         let framePayload = payload
-        let reservation = try await budget.acquire(bytes: payload.count + 5)
+        let reservation: UUID
+        do {
+            reservation = try await budget.acquire(bytes: payload.count + 5)
+        } catch {
+            onCompletion?(false)
+            throw error
+        }
         guard !isStopped else {
             await budget.release(reservation)
+            onCompletion?(false)
             throw RelayError.ioError("relay writer stopped")
         }
 
         queue.async {
             defer { Task { await self.budget.release(reservation) } }
-            guard !self.isStopped, self.write(type: type, payload: framePayload) else { return }
-            onWritten?()
+            guard !self.isStopped else {
+                onCompletion?(false)
+                return
+            }
+            guard self.write(type: type, payload: framePayload) else {
+                onCompletion?(false)
+                return
+            }
+            onCompletion?(true)
             if type == kTypePtyData, let reset = self.colorReset.afterWriting(framePayload) {
                 self.write(type: kTypePtyData, payload: reset)
             }
@@ -3860,12 +3874,12 @@ final class PeerRelaySession {
         if let writer {
             deliverPtyData = { data, receivedAtNs in
                 let generation = resumeTransitionGate.currentGeneration()
-                try await writer.enqueue(type: kTypePtyData, payload: data) {
+                try await writer.enqueue(type: kTypePtyData, payload: data) { written in
                     guard let receivedAtNs else { return }
                     outputLatencyStats.record(.init(
                         generation: generation,
                         receiveToFeedNs: DispatchTime.now().uptimeNanoseconds &- receivedAtNs,
-                        outcome: .written
+                        outcome: written ? .written : .cancelled
                     ))
                 }
                 ioStats.noteEnqueued(data.count)
