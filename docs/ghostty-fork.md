@@ -258,6 +258,31 @@ over this summary.
 - Upstreamable: maybe. Mixed names such as `v2한글.txt` now split at the
   Hangul character.
 
+### 9) Keep a shell prompt's text on resize (`resize-keep-prompt`)
+
+- Commit: `3341fca6c` (fix(terminal): keep a shell prompt's text on resize with resize-keep-prompt)
+- Files: `src/config/Config.zig`, `src/termio/Termio.zig`,
+  `src/terminal/Terminal.zig`, `src/terminal/Screen.zig`,
+  `src/terminal/PageList.zig`
+- On a resize with the cursor at an OSC 133 prompt, upstream reflows the
+  prompt rows as blank rows (`Resize.blank`) and clears them, so the shell
+  can redraw the prompt over the same rows. A prompt that takes about
+  100 ms to render (starship reading git status) then shows blank on every
+  step of a split drag, which looks like flicker.
+- With `resize-keep-prompt = true` the prompt rows keep their row count and
+  still end their lines, but `reflowClippedRow` copies each row's text cut
+  to the new width, and `Screen.resize` skips `clearPromptForRedraw`. A wide
+  character cut at the edge is dropped. The shell's redraw replaces the old
+  text.
+- The option defaults to false, so upstream behavior and tests are
+  unchanged. term-mesh turns it on in `loadTermMeshBaselineDefaults`.
+- Turning off the clear in the shell instead (`redraw=0`, or no shell
+  integration) is not equivalent: the prompt then reflows, its row count
+  changes, and zsh's redraw overwrote the output line above it.
+- Merge note: if upstream changes `Resize.blank` or `reflowBlankRow`, keep
+  `reflowClippedRow` in step with them.
+- Upstreamable: maybe, as a config option.
+
 ## ghostty-org sync
 
 manaflow-ai stopped full syncs after 2026-07-22. The fork keeps the cmux
