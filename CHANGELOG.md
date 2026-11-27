@@ -6,7 +6,7 @@ All notable changes to term-mesh are documented here.
 
 ### Added
 
-- A terminal tab shows the Claude or Codex logo while `claude` or `codex` runs in that pane, and the terminal icon again once it exits. The tab updates within a few seconds. Panes shown from another Mac keep the terminal icon.
+- A terminal tab shows an icon for the program running in that pane, and the terminal icon again once it exits. Claude and Codex show their logos; Kiro, Gemini, OpenCode, Neovim and Vim, tmux, Zellij, Lazygit, K9s, btop and htop, Python and Node show a matching symbol. The tab changes within about half a second. A pane shown from another Mac shows the icon for what runs on that Mac, when that Mac runs this version too.
 
 ### Fixed
 
