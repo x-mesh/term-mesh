@@ -87,6 +87,10 @@ final class TerminalPanel: Panel, ObservableObject {
         "terminal.fill"
     }
 
+    /// The foreground app the daemon last reported in this pane; its logo or
+    /// category symbol replaces the tab's terminal glyph.
+    var agentCLI: TerminalAgentCLI?
+
     var isDirty: Bool {
         // Bonsplit's "dirty" indicator is a very small dot in the tab strip.
         //

@@ -122,7 +122,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     private static let setupReadTimeoutSeconds: TimeInterval = 10
 
     /// Posted whenever the active-relays roster changes (open / close).
-    /// `PeerConnectionsWindowController` listens to refresh its table.
+    /// `PeerConnectionsController` listens to refresh its table.
     static let relaysDidChangeNotification = Notification.Name("PeerClientCoordinatorRelaysDidChange")
 
     /// Holding onto the window controllers here keeps their reader Tasks
@@ -1160,7 +1160,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     }
 
     @objc func showConnections(_ sender: Any?) {
-        PeerConnectionsWindowController.shared.showAndFocus()
+        PeerConnectionsController.shared.showAndFocus()
     }
 
     /// Open a workspace relay window initiated from the sidebar.
@@ -2363,6 +2363,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // means nothing ever arrived from the host.
                 row["io"] = session.relaySession.ioSnapshot
                 row["relay_telemetry"] = session.relaySession.relayTelemetrySnapshot
+                row["output_latency"] = session.relaySession.outputLatencySnapshot
                 if includeInputLatency {
                     row["input_latency"] = session.relaySession.inputLatencySnapshot
                 }

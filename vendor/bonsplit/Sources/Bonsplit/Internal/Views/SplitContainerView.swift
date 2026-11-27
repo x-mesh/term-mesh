@@ -121,11 +121,15 @@ private class ThemedSplitView: NSSplitView {
         let to = slide.zoomingIn ? bounds : inSplit
         let t = slide.progress
         func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { (a + (b - a) * t).rounded() }
+        // Round the edges, not the size: a width rounded apart from its origin
+        // moves the far edge a point back and forth between frames.
+        let minX = lerp(from.minX, to.minX)
+        let minY = lerp(from.minY, to.minY)
         arrangedSubviews[slide.child].frame = NSRect(
-            x: lerp(from.minX, to.minX),
-            y: lerp(from.minY, to.minY),
-            width: lerp(from.width, to.width),
-            height: lerp(from.height, to.height)
+            x: minX,
+            y: minY,
+            width: max(lerp(from.maxX, to.maxX) - minX, 0),
+            height: max(lerp(from.maxY, to.maxY) - minY, 0)
         )
     }
 
@@ -288,14 +292,15 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 #else
         let splitView = ThemedSplitView()
 #endif
-        splitView.customDividerColor = TabBarColors.splitGapColor
+        let splitGapColor = TabBarColors.nsColorSplitGap(for: appearance)
+        splitView.customDividerColor = splitGapColor
         splitView.cardGap = appearance.cardGap
         splitView.isVertical = splitState.orientation == .horizontal
         splitView.dividerStyle = .thin
         splitView.delegate = context.coordinator
         splitView.wantsLayer = true
-        splitView.layer?.backgroundColor = NSColor.clear.cgColor
-        splitView.layer?.isOpaque = false
+        splitView.layer?.backgroundColor = splitGapColor.cgColor
+        splitView.layer?.isOpaque = splitGapColor.alphaComponent >= 0.999
 
         // Keep arranged subviews stable (always 2) to avoid transient "collapse" flashes when
         // replacing pane<->split content. We swap the hosted content within these containers.
@@ -516,9 +521,10 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
             }
         }
         splitView.wantsLayer = true
-        splitView.layer?.backgroundColor = NSColor.clear.cgColor
-        splitView.layer?.isOpaque = false
-        (splitView as? ThemedSplitView)?.customDividerColor = TabBarColors.splitGapColor
+        let splitGapColor = TabBarColors.nsColorSplitGap(for: appearance)
+        splitView.layer?.backgroundColor = splitGapColor.cgColor
+        splitView.layer?.isOpaque = splitGapColor.alphaComponent >= 0.999
+        (splitView as? ThemedSplitView)?.customDividerColor = splitGapColor
         if let themed = splitView as? ThemedSplitView, themed.cardGap != appearance.cardGap {
             themed.cardGap = appearance.cardGap
             themed.adjustSubviews()

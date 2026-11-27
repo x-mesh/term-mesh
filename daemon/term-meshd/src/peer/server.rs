@@ -106,10 +106,8 @@ pub async fn serve(
     let entries = persist::boot(&workspaces_path, &default_name_fallback);
     let host = Arc::new(PeerHost::with_workspaces(manager, entries));
     super::install_remote_leader_router(&host.clients);
-    // Restored non-default workspaces come back with an empty tree
-    // (only {id, name} is persisted — shells are daemon children). Seed
-    // each a first pane so every workspace is immediately attachable,
-    // instead of surfacing "no panes" on the client's first open.
+    // Restored workspaces persist identity only, so give each one a legacy
+    // temporary seed. A negotiated durable close can empty it later.
     host.seed_empty_workspaces();
     // M2: create/rename/delete workspace-lifecycle RPCs persist through
     // this path — wired here (rather than baked into `with_workspaces`)
@@ -1272,7 +1270,10 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id: vec![0x11; 16],
                     display_name: "integration-test".into(),
-                    capabilities: peer_proto::capability::supported_vec(),
+                    capabilities: peer_proto::capability::supported_vec()
+                        .into_iter()
+                        .filter(|value| *value != peer_proto::capability::WORKSPACE_DURABLE_V1)
+                        .collect(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
@@ -1478,7 +1479,10 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id: vec![0x22; 16],
                     display_name: "reviewer".into(),
-                    capabilities: peer_proto::capability::supported_vec(),
+                    capabilities: peer_proto::capability::supported_vec()
+                        .into_iter()
+                        .filter(|value| *value != peer_proto::capability::WORKSPACE_DURABLE_V1)
+                        .collect(),
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
@@ -3810,6 +3814,23 @@ mod integration_tests {
     use tokio::net::unix::{OwnedReadHalf as TestReadHalf, OwnedWriteHalf as TestWriteHalf};
 
     async fn handshake(sock_path: &std::path::Path) -> (TestReadHalf, TestWriteHalf) {
+        handshake_offering(sock_path, peer_proto::capability::supported_vec()).await
+    }
+
+    /// A client without `workspace.durable.v1`: the daemon refuses to close
+    /// its last pane instead of leaving an empty durable session.
+    async fn legacy_handshake(sock_path: &std::path::Path) -> (TestReadHalf, TestWriteHalf) {
+        let capabilities = peer_proto::capability::supported_vec()
+            .into_iter()
+            .filter(|value| *value != peer_proto::capability::WORKSPACE_DURABLE_V1)
+            .collect();
+        handshake_offering(sock_path, capabilities).await
+    }
+
+    async fn handshake_offering(
+        sock_path: &std::path::Path,
+        capabilities: Vec<String>,
+    ) -> (TestReadHalf, TestWriteHalf) {
         let stream = UnixStream::connect(sock_path).await.unwrap();
         let (mut reader, mut writer) = stream.into_split();
         write_envelope(
@@ -3821,7 +3842,7 @@ mod integration_tests {
                     protocol_version: PROTOCOL_VERSION.into(),
                     peer_id: vec![0x22; 16],
                     display_name: "wc-test".into(),
-                    capabilities: peer_proto::capability::supported_vec(),
+                    capabilities,
                     app_version: "test".into(),
                     cli_bin_dirs: vec![],
                     session_host_socket: String::new(),
@@ -3984,7 +4005,8 @@ mod integration_tests {
 
     /// Requests that change nothing must not fan a push out: activating
     /// the already-active tab, closing the last pane (refused), and a
-    /// garbage orientation are all silent no-ops.
+    /// garbage orientation are all silent no-ops. Only a client without
+    /// `workspace.durable.v1` is refused the last-pane close.
     #[tokio::test]
     async fn workspace_control_noop_requests_do_not_push() {
         let tmp = TempDir::new().unwrap();
@@ -4004,7 +4026,7 @@ mod integration_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        let (mut reader, mut writer) = handshake(&sock_path).await;
+        let (mut reader, mut writer) = legacy_handshake(&sock_path).await;
         let pane = first_pane_id(&mut reader, &mut writer).await;
 
         // Re-activating the active tab.

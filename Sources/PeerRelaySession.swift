@@ -569,17 +569,36 @@ final class RelayFrameWriter: @unchecked Sendable {
         self.budget = budget
     }
 
-    func enqueue(type: UInt8, payload: Data) async throws {
+    func enqueue(
+        type: UInt8,
+        payload: Data,
+        onCompletion: (@Sendable (Bool) -> Void)? = nil
+    ) async throws {
         let framePayload = payload
-        let reservation = try await budget.acquire(bytes: payload.count + 5)
+        let reservation: UUID
+        do {
+            reservation = try await budget.acquire(bytes: payload.count + 5)
+        } catch {
+            onCompletion?(false)
+            throw error
+        }
         guard !isStopped else {
             await budget.release(reservation)
+            onCompletion?(false)
             throw RelayError.ioError("relay writer stopped")
         }
 
         queue.async {
             defer { Task { await self.budget.release(reservation) } }
-            guard !self.isStopped, self.write(type: type, payload: framePayload) else { return }
+            guard !self.isStopped else {
+                onCompletion?(false)
+                return
+            }
+            guard self.write(type: type, payload: framePayload) else {
+                onCompletion?(false)
+                return
+            }
+            onCompletion?(true)
             if type == kTypePtyData, let reset = self.colorReset.afterWriting(framePayload) {
                 self.write(type: kTypePtyData, payload: reset)
             }
@@ -639,6 +658,74 @@ final class RelayFrameWriter: @unchecked Sendable {
         guard !stopped else { return false }
         stopped = true
         return true
+    }
+}
+
+/// Bounded, payload-free timing from a live peer `PtyData` receipt to the
+/// completed write into the local Ghostty relay helper. This is the last
+/// app-controlled feed boundary, not a claim about GPU presentation timing.
+final class RelayOutputLatencyStats: @unchecked Sendable {
+    enum Outcome: String, CaseIterable { case written, cancelled }
+    struct Sample {
+        let generation: UInt64
+        let receiveToFeedNs: UInt64
+        let outcome: Outcome
+    }
+
+    private let lock = NSLock()
+    private let capacity: Int
+    private var samples: [Sample] = []
+    private var nextIndex = 0
+    private var overflowCount: UInt64 = 0
+    private var cancelledCount: UInt64 = 0
+
+    init(capacity: Int = 512) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        samples.reserveCapacity(capacity)
+    }
+
+    func record(_ sample: Sample) {
+        lock.lock()
+        defer { lock.unlock() }
+        if sample.outcome == .cancelled { cancelledCount &+= 1 }
+        if samples.count < capacity {
+            samples.append(sample)
+        } else {
+            samples[nextIndex] = sample
+            overflowCount &+= 1
+        }
+        nextIndex = (nextIndex + 1) % capacity
+    }
+
+    func snapshot() -> [String: Any] {
+        lock.lock()
+        let generation = samples.map(\.generation).max() ?? 0
+        let values = samples.filter { $0.generation == generation && $0.outcome == .written }
+            .map(\.receiveToFeedNs).sorted()
+        let overflow = overflowCount
+        let cancelled = cancelledCount
+        let count = samples.count
+        lock.unlock()
+        func percentile(_ p: Int) -> Double? {
+            guard !values.isEmpty else { return nil }
+            return Double(values[(values.count * p + 99) / 100 - 1]) / 1_000_000
+        }
+        var timing: [String: Any] = ["n": values.count]
+        if let p50 = percentile(50), let p95 = percentile(95), let max = values.last {
+            timing["p50_ms"] = p50
+            timing["p95_ms"] = p95
+            timing["max_ms"] = Double(max) / 1_000_000
+        }
+        return [
+            "scope": "active_live_ptydata_receive_to_relay_feed",
+            "window_capacity": capacity,
+            "window_samples": count,
+            "session_generation": generation,
+            "sample_overflow_count": overflow,
+            "cancelled_count": cancelled,
+            "receive_to_feed": timing,
+        ]
     }
 }
 
@@ -2226,6 +2313,7 @@ final class PeerRelaySession {
     private let ioStats = RelayIOStats()
     private let relayTelemetry = RelayTelemetryStore()
     private let inputLatencyStats = RelayInputLatencyStats()
+    private let outputLatencyStats = RelayOutputLatencyStats()
     /// Shared by the helper reader and detached input pump. Callback delivery
     /// has no helper reader, so its diagnostic stays at zero.
     private let inputBacklog = RelayInputBacklogTracker()
@@ -2314,6 +2402,8 @@ final class PeerRelaySession {
     var inputLatencySnapshot: [String: Any] {
         inputLatencyStats.snapshot(backlog: inputBacklog.snapshot())
     }
+
+    var outputLatencySnapshot: [String: Any] { outputLatencyStats.snapshot() }
 
     /// One-line counter summary for the disconnect / watchdog log lines.
     var ioSummary: String {
@@ -2527,6 +2617,19 @@ final class PeerRelaySession {
     ) async -> Void)?
     var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
     var onReconnected: (@MainActor () -> Void)?
+    /// The agent CLI ("claude", "codex") the host reports in this surface's
+    /// terminal foreground, nil once it is gone. Called on change only. A
+    /// host that predates `HostStats.surface_agents` reports none.
+    var onRemoteAgentCLI: (@MainActor (_ cli: String?) -> Void)?
+    private var reportedRemoteAgentCLI: String?
+    private var hasReportedRemoteAgentCLI = false
+
+    private func noteRemoteAgentCLI(_ cli: String?) {
+        guard !hasReportedRemoteAgentCLI || reportedRemoteAgentCLI != cli else { return }
+        hasReportedRemoteAgentCLI = true
+        reportedRemoteAgentCLI = cli
+        onRemoteAgentCLI?(cli)
+    }
     /// Pooled SSH recovery hook installed by `PeerPaneSession`. The relay
     /// carries the generation it originally attached through so sibling panes
     /// coalesce one half-alive tunnel reset instead of restarting each other.
@@ -3701,6 +3804,7 @@ final class PeerRelaySession {
         // must be bound before those closures are created.
         let resumeTransitionGate = self.resumeTransitionGate
         let inputLatencyStats = self.inputLatencyStats
+        let outputLatencyStats = self.outputLatencyStats
         let inputBacklog = self.inputBacklog
         // Gap-heal timing. The relay path hangs it off the resize coalescer
         // (which also owns resize forwarding and so needs the session);
@@ -3766,14 +3870,22 @@ final class PeerRelaySession {
         // healthy one.
         let ptyDataSink = self.ptyDataSink
         let ioStats = self.ioStats
-        let deliverPtyData: @Sendable (Data) async throws -> Void
+        let deliverPtyData: @Sendable (Data, UInt64?) async throws -> Void
         if let writer {
-            deliverPtyData = { data in
-                try await writer.enqueue(type: kTypePtyData, payload: data)
+            deliverPtyData = { data, receivedAtNs in
+                let generation = resumeTransitionGate.currentGeneration()
+                try await writer.enqueue(type: kTypePtyData, payload: data) { written in
+                    guard let receivedAtNs else { return }
+                    outputLatencyStats.record(.init(
+                        generation: generation,
+                        receiveToFeedNs: DispatchTime.now().uptimeNanoseconds &- receivedAtNs,
+                        outcome: written ? .written : .cancelled
+                    ))
+                }
                 ioStats.noteEnqueued(data.count)
             }
         } else {
-            deliverPtyData = { data in
+            deliverPtyData = { data, _ in
                 if ptyDataSink.emit(data) {
                     ioStats.noteEnqueued(data.count)
                 } else {
@@ -3816,6 +3928,10 @@ final class PeerRelaySession {
                     var gapCount = 0
                     for await chunk in ptyStream {
                         if Task.isCancelled { break }
+                        // Timestamp before gap bookkeeping and recovery scheduling so
+                        // the metric covers this pump's whole receive-to-feed path.
+                        let receivedAtNs = PeerFederationSettings.outputPathTelemetryEnabled
+                            ? DispatchTime.now().uptimeNanoseconds : nil
                         if let expected = expectedByteSeq, chunk.byteSeq > expected {
                             let gap = chunk.byteSeq - expected
                             gapBytesTotal += gap
@@ -3855,7 +3971,7 @@ final class PeerRelaySession {
                             #endif
                         }
                         do {
-                            try await deliverPtyData(chunk.payload)
+                            try await deliverPtyData(chunk.payload, receivedAtNs)
                         } catch {
                             disconnect("hostToRelay-enqueue-failed error=\(error)")
                             return
@@ -3997,6 +4113,10 @@ final class PeerRelaySession {
                     // guard makes a shared session's stray frame a drop, not a
                     // mis-echo to the wrong pane's relay) falls to `default`.
                     case .ptyData(let sid, let byteSeq, let data) where sid == mySurfaceID:
+                        // Take the optional timestamp before any gap or resume
+                        // bookkeeping. Disabled diagnostics take no timestamp.
+                        let receivedAtNs = PeerFederationSettings.outputPathTelemetryEnabled
+                            ? DispatchTime.now().uptimeNanoseconds : nil
                         // P9 gap detection: a byte_seq that jumps past the end of
                         // the previous frame means the host's broadcast dropped
                         // (Lagged) the bytes in between under load — the terminal
@@ -4084,7 +4204,7 @@ final class PeerRelaySession {
                         switch route {
                         case .forward(let payload), .overflowFlush(let payload):
                             do {
-                                try await deliverPtyData(payload)
+                                try await deliverPtyData(payload, receivedAtNs)
                             } catch {
                                 endReason = "hostToRelay-enqueue-failed error=\(error)"
                                 break pumpLoop
@@ -4220,6 +4340,12 @@ final class PeerRelaySession {
                                 PeerHostStatsStore.shared.record(stats, for: hostKey)
                             }
                         }
+                        // The same push names the surfaces that run an agent
+                        // CLI; this pane cares only about its own.
+                        let agentCLI = stats.surfaceAgents
+                            .first(where: { $0.surfaceID == mySurfaceID })
+                            .map(\.cli)
+                        await MainActor.run { self.noteRemoteAgentCLI(agentCLI) }
                     case .relayTelemetry(let sample):
                         telemetryStore.record(sample, surfaceID: mySurfaceID)
                     case .teamCallResponse(let response):

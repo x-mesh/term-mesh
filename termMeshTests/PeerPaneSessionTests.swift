@@ -8012,6 +8012,85 @@ final class RelayFrameByteBudgetTests: XCTestCase {
         await budget.release(resumed)
         await budget.release(admitted)
     }
+
+    func testWriterCompletionReportsSuccessOnlyAfterTheFrameWrites() async throws {
+        let wrote = expectation(description: "frame written")
+        let completion = expectation(description: "completion")
+        let lock = NSLock()
+        var outcome: Bool?
+        let writer = RelayFrameWriter(
+            writeFrame: { _, _ in wrote.fulfill() },
+            onFailure: { _ in }
+        )
+
+        try await writer.enqueue(type: 0x01, payload: Data([1])) { success in
+            lock.lock(); outcome = success; lock.unlock()
+            completion.fulfill()
+        }
+        await fulfillment(of: [wrote, completion], timeout: 1)
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(outcome, true)
+    }
+
+    func testWriterCompletionReportsCancelledWhenStoppedBeforeAdmission() async {
+        let completion = expectation(description: "cancelled completion")
+        let lock = NSLock()
+        var outcome: Bool?
+        let writer = RelayFrameWriter(writeFrame: { _, _ in }, onFailure: { _ in })
+        writer.stop()
+
+        do {
+            try await writer.enqueue(type: 0x01, payload: Data([1])) { success in
+                lock.lock(); outcome = success; lock.unlock()
+                completion.fulfill()
+            }
+            XCTFail("stopped writer accepted a frame")
+        } catch {
+        }
+        await fulfillment(of: [completion], timeout: 1)
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(outcome, false)
+    }
+
+    func testWriterCompletionRecordsOutputLatencyForWriteAndFailure() async throws {
+        let stats = RelayOutputLatencyStats()
+        let wrote = expectation(description: "successful write completion")
+        let failed = expectation(description: "failed write completion")
+        let lock = NSLock()
+        var writeCount = 0
+        let writer = RelayFrameWriter(
+            writeFrame: { _, _ in
+                lock.lock()
+                defer { lock.unlock() }
+                writeCount += 1
+                if writeCount == 2 { throw RelayError.ioError("fixture write failure") }
+            },
+            onFailure: { _ in }
+        )
+        let receivedAt = DispatchTime.now().uptimeNanoseconds
+        try await writer.enqueue(type: 0x01, payload: Data([1])) { success in
+            stats.record(.init(
+                generation: 1,
+                receiveToFeedNs: DispatchTime.now().uptimeNanoseconds &- receivedAt,
+                outcome: success ? .written : .cancelled
+            ))
+            wrote.fulfill()
+        }
+        try await writer.enqueue(type: 0x01, payload: Data([2])) { success in
+            stats.record(.init(
+                generation: 1,
+                receiveToFeedNs: 1,
+                outcome: success ? .written : .cancelled
+            ))
+            failed.fulfill()
+        }
+        await fulfillment(of: [wrote, failed], timeout: 1)
+
+        let snapshot = stats.snapshot()
+        XCTAssertEqual(snapshot["cancelled_count"] as? UInt64, 1)
+        let timing = try XCTUnwrap(snapshot["receive_to_feed"] as? [String: Any])
+        XCTAssertEqual(timing["n"] as? Int, 1)
+    }
 }
 
 // MARK: - Relay input diagnostics
@@ -8186,6 +8265,32 @@ final class RelayInputLatencyStatsTests: XCTestCase {
         XCTAssertEqual(snapshot["window_samples"] as? Int, 1)
         let queue = try XCTUnwrap(snapshot["queue"] as? [String: Any])
         XCTAssertEqual(queue["max_ms"] as? Double, 2)
+    }
+}
+
+final class RelayOutputLatencyStatsTests: XCTestCase {
+    func testEmptySnapshotDoesNotInventLatency() throws {
+        let stats = RelayOutputLatencyStats()
+        let timing = try XCTUnwrap(stats.snapshot()["receive_to_feed"] as? [String: Any])
+        XCTAssertEqual(timing["n"] as? Int, 0)
+        XCTAssertNil(timing["p50_ms"])
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: stats.snapshot()))
+    }
+
+    func testCurrentGenerationAndOverflowAreBounded() throws {
+        let stats = RelayOutputLatencyStats(capacity: 2)
+        stats.record(.init(generation: 1, receiveToFeedNs: 900_000_000, outcome: .written))
+        stats.record(.init(generation: 2, receiveToFeedNs: 2_000_000, outcome: .written))
+        stats.record(.init(generation: 2, receiveToFeedNs: 4_000_000, outcome: .cancelled))
+        stats.record(.init(generation: 2, receiveToFeedNs: 6_000_000, outcome: .written))
+
+        let snapshot = stats.snapshot()
+        XCTAssertEqual(snapshot["window_samples"] as? Int, 2)
+        XCTAssertGreaterThan(snapshot["sample_overflow_count"] as? UInt64 ?? 0, 0)
+        XCTAssertEqual(snapshot["cancelled_count"] as? UInt64, 1)
+        let timing = try XCTUnwrap(snapshot["receive_to_feed"] as? [String: Any])
+        XCTAssertEqual(timing["n"] as? Int, 1)
+        XCTAssertEqual(timing["p50_ms"] as? Double, 6)
     }
 }
 

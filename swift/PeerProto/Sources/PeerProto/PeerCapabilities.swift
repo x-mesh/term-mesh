@@ -33,6 +33,8 @@ public enum PeerCapability {
     /// This replaces sidebar process/socket polling while preserving a single
     /// authoritative source for additions, removals, and layout metadata.
     public static let workspaceListSubscribeV1 = "workspace.list.subscribe.v1"
+    /// Negotiated daemon-owned session lifetime and empty-workspace support.
+    public static let workspaceDurableV1 = "workspace.durable.v1"
     /// Deterministic daemon-owned surface reconciliation via
     /// `EnsureSurfaceRequest`/`EnsureSurfaceResponse`.
     public static let surfaceEnsureV1 = "surface.ensure.v1"
@@ -129,7 +131,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, overflowResyncV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1, agentPresentationAppendV1, surfaceTranscriptV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceDurableV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, overflowResyncV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1, agentPresentationAppendV1, surfaceTranscriptV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input

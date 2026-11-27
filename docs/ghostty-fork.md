@@ -258,6 +258,31 @@ over this summary.
 - Upstreamable: maybe. Mixed names such as `v2한글.txt` now split at the
   Hangul character.
 
+### 9) Keep a shell prompt's text on resize (`resize-keep-prompt`)
+
+- Commit: `3341fca6c` (fix(terminal): keep a shell prompt's text on resize with resize-keep-prompt)
+- Files: `src/config/Config.zig`, `src/termio/Termio.zig`,
+  `src/terminal/Terminal.zig`, `src/terminal/Screen.zig`,
+  `src/terminal/PageList.zig`
+- On a resize with the cursor at an OSC 133 prompt, upstream reflows the
+  prompt rows as blank rows (`Resize.blank`) and clears them, so the shell
+  can redraw the prompt over the same rows. A prompt that takes about
+  100 ms to render (starship reading git status) then shows blank on every
+  step of a split drag, which looks like flicker.
+- With `resize-keep-prompt = true` the prompt rows keep their row count and
+  still end their lines, but `reflowClippedRow` copies each row's text cut
+  to the new width, and `Screen.resize` skips `clearPromptForRedraw`. A wide
+  character cut at the edge is dropped. The shell's redraw replaces the old
+  text.
+- The option defaults to false, so upstream behavior and tests are
+  unchanged. term-mesh turns it on in `loadTermMeshBaselineDefaults`.
+- Turning off the clear in the shell instead (`redraw=0`, or no shell
+  integration) is not equivalent: the prompt then reflows, its row count
+  changes, and zsh's redraw overwrote the output line above it.
+- Merge note: if upstream changes `Resize.blank` or `reflowBlankRow`, keep
+  `reflowClippedRow` in step with them.
+- Upstreamable: maybe, as a config option.
+
 ## ghostty-org sync
 
 manaflow-ai stopped full syncs after 2026-07-22. The fork keeps the cmux
@@ -269,6 +294,7 @@ patches and merges `ghostty-org/main` in dated stages.
 | 2 | `b58ef1d678` (2026-10-20, before #14519) | 0.16 | `e29bd7968` |
 | 3 | `cf5519b22f` (2026-11-08) | 0.17 | `2b65b2e243` |
 | 4 | `d4cf6ec225` (2026-11-16) | 0.17.1 | `f274207bd` |
+| 5 | `19da8d4c75` (2026-11-26) | 0.17.1 | `3c9f85e09` |
 
 Stage 1 resolution rules. Use the same rules in later stages.
 
@@ -393,6 +419,32 @@ Stage 4 adds these rules:
 Test reference for stage 4: `zig build test -Demit-macos-app=false` gives
 4569 passed, 32 skipped, 1 failed (the same OpenGL test).
 `zig build test-lib-vt` passes.
+
+Stage 5 adds these rules:
+
+- `src/Surface.zig` mouse mods: upstream `805b44a11` and `f07c80a7c` fix
+  the same bug as the cmux binding-mods comparison. Use the upstream code.
+- `src/font/shaper/run.zig`: keep the cmux bidi run iterator. Upstream's
+  trimming (`5749a0f67`, `7f8b1c956`, `6874ea6dd`) moved the row end into
+  `RunIterator.init`; the cmux iterator uses that `max` and no longer
+  computes its own in `resolveRowLayout`. The skin tone rule from
+  `7a1dbc215` is in `presentationForCell`; the fallback retry merged as is.
+- `src/font/shaper/coretext.zig`: keep the cmux tests and add upstream's
+  grid replacement test. `testGridWithFont` also maps the cmux `arabic` and
+  `julia_mono` test fonts.
+- `src/config/url.zig`: keep the cmux path branches. From `ff61ef60d`,
+  a path no longer ends in `;`, `!` or `?`, keeps the dots of a final `.`
+  or `..` segment, and does not continue across a space after `:`, `;`,
+  `!` or `?`. `no_trailing_colon` stays separate. The cmux exception that
+  lets a path end in `.` or `,` at the end of a line stays, so upstream's
+  cases that end a line with a period (`See /etc/hosts.`) run mid-line
+  here. At the end of a line the fork still matches `/etc/hosts.`.
+
+Test reference for stage 5: `zig build test -Demit-macos-app=false` gives
+4605 passed, 32 skipped, 1 failed (the same OpenGL test). The step also
+runs `xcodebuild test -scheme Ghostty`, which fails
+`KeyboardLayoutTests.characterAppliesModifiers` with the Korean 2-Set
+input source, as in stage 3. `zig build test-lib-vt` passes.
 
 ## Merge conflict notes
 

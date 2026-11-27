@@ -70,6 +70,7 @@
 		A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000038 /* RemotePasteTransfer.swift */; };
 		A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000006 /* WorkspaceRetrievalStore.swift */; };
 		A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000007 /* WorkspaceRetrievalViews.swift */; };
+		A151000000000000000000D3 /* ActivityWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = A151000000000000000000D7 /* ActivityWindow.swift */; };
 		A15100000000000000000004 /* WorkspaceRetrievalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */; };
 		5A57E1F90000000000000001 /* PasteShelfStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A57E1F90000000000000003 /* PasteShelfStore.swift */; };
 		5A57E1F90000000000000002 /* PasteShelfStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A57E1F90000000000000004 /* PasteShelfStoreTests.swift */; };
@@ -93,6 +94,7 @@
 		CCH00002 /* CardChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCH00001 /* CardChrome.swift */; };
 		FCB00002 /* FontFamilyComboBox.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCB00001 /* FontFamilyComboBox.swift */; };
 		PGS00002 /* PaneGapSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = PGS00001 /* PaneGapSettings.swift */; };
+		TAI00002 /* TerminalAgentIcons.swift in Sources */ = {isa = PBXBuildFile; fileRef = TAI00001 /* TerminalAgentIcons.swift */; };
 		CRV00002 /* CardRingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CRV00001 /* CardRingView.swift */; };
 		NLP00002 /* NotificationLapPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = NLP00001 /* NotificationLapPolicy.swift */; };
 		WBE00002 /* WorkerBuildEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = WBE00001 /* WorkerBuildEnvironment.swift */; };
@@ -116,7 +118,7 @@
 			CVB00089 /* PeerFederationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00089 /* PeerFederationSettings.swift */; };
 			CVB00950 /* PeerKeepAwake.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00950 /* PeerKeepAwake.swift */; };
 			CVB00090 /* PeerRelayBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00090 /* PeerRelayBanner.swift */; };
-			CVB00091 /* PeerConnectionsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsWindowController.swift */; };
+			CVB00091 /* PeerConnectionsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsController.swift */; };
 			CVB00092 /* PeerRelayBannerPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00092 /* PeerRelayBannerPresenter.swift */; };
 			CVB00093 /* RemoteHostStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00093 /* RemoteHostStore.swift */; };
 			CGL00001 /* RemoteLiveProject.swift in Sources */ = {isa = PBXBuildFile; fileRef = CGL00002 /* RemoteLiveProject.swift */; };
@@ -296,6 +298,7 @@
 				CRT00002 /* CardRingGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CRT00001 /* CardRingGeometryTests.swift */; };
 				PPO00002 /* PanePaddingConfigOrderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = PPO00001 /* PanePaddingConfigOrderTests.swift */; };
 				CSI00002 /* CursorShellIntegrationOverrideTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CSI00001 /* CursorShellIntegrationOverrideTests.swift */; };
+				TAT00002 /* TerminalAgentIconsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TAT00001 /* TerminalAgentIconsTests.swift */; };
 				NLT00002 /* NotificationLapPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = NLT00001 /* NotificationLapPolicyTests.swift */; };
 			4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4704CF490000000000000001 /* RenderTokenProbeTests.swift */; };
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */; };
@@ -494,6 +497,7 @@
 			A15100000000000000000038 /* RemotePasteTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePasteTransfer.swift; sourceTree = "<group>"; };
 			A15100000000000000000006 /* WorkspaceRetrievalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStore.swift; sourceTree = "<group>"; };
 			A15100000000000000000007 /* WorkspaceRetrievalViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalViews.swift; sourceTree = "<group>"; };
+			A151000000000000000000D7 /* ActivityWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityWindow.swift; sourceTree = "<group>"; };
 			A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStoreTests.swift; sourceTree = "<group>"; };
 			CVS00010 /* AppearanceSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceSettings.swift; sourceTree = "<group>"; };
 			CVS00039 /* TerminalSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSettings.swift; sourceTree = "<group>"; };
@@ -514,6 +518,7 @@
 		CCH00001 /* CardChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardChrome.swift; sourceTree = "<group>"; };
 		FCB00001 /* FontFamilyComboBox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FontFamilyComboBox.swift; sourceTree = "<group>"; };
 		PGS00001 /* PaneGapSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaneGapSettings.swift; sourceTree = "<group>"; };
+		TAI00001 /* TerminalAgentIcons.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalAgentIcons.swift; sourceTree = "<group>"; };
 		CRV00001 /* CardRingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardRingView.swift; sourceTree = "<group>"; };
 		NLP00001 /* NotificationLapPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationLapPolicy.swift; sourceTree = "<group>"; };
 		WBE00001 /* WorkerBuildEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkerBuildEnvironment.swift; sourceTree = "<group>"; };
@@ -537,7 +542,7 @@
 			CVS00089 /* PeerFederationSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerFederationSettings.swift; sourceTree = "<group>"; };
 			CVS00950 /* PeerKeepAwake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerKeepAwake.swift; sourceTree = "<group>"; };
 			CVS00090 /* PeerRelayBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBanner.swift; sourceTree = "<group>"; };
-			CVS00091 /* PeerConnectionsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsWindowController.swift; sourceTree = "<group>"; };
+			CVS00091 /* PeerConnectionsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsController.swift; sourceTree = "<group>"; };
 			CVS00092 /* PeerRelayBannerPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBannerPresenter.swift; sourceTree = "<group>"; };
 			CVS00093 /* RemoteHostStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostStore.swift; sourceTree = "<group>"; };
 			CGL00002 /* RemoteLiveProject.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLiveProject.swift; sourceTree = "<group>"; };
@@ -717,6 +722,7 @@
 			CRT00001 /* CardRingGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardRingGeometryTests.swift; sourceTree = "<group>"; };
 			PPO00001 /* PanePaddingConfigOrderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PanePaddingConfigOrderTests.swift; sourceTree = "<group>"; };
 			CSI00001 /* CursorShellIntegrationOverrideTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorShellIntegrationOverrideTests.swift; sourceTree = "<group>"; };
+			TAT00001 /* TerminalAgentIconsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalAgentIconsTests.swift; sourceTree = "<group>"; };
 			NLT00001 /* NotificationLapPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationLapPolicyTests.swift; sourceTree = "<group>"; };
 			4704CF490000000000000001 /* RenderTokenProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderTokenProbeTests.swift; sourceTree = "<group>"; };
 			F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMEArrowKeyTests.swift; sourceTree = "<group>"; };
@@ -953,6 +959,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 					A15100000000000000000038 /* RemotePasteTransfer.swift */,
 					A15100000000000000000006 /* WorkspaceRetrievalStore.swift */,
 					A15100000000000000000007 /* WorkspaceRetrievalViews.swift */,
+					A151000000000000000000D7 /* ActivityWindow.swift */,
 					CVS00010 /* AppearanceSettings.swift */,
 					CVS00039 /* TerminalSettings.swift */,
 					CVS00011 /* Logging.swift */,
@@ -972,6 +979,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				CCH00001 /* CardChrome.swift */,
 				FCB00001 /* FontFamilyComboBox.swift */,
 				PGS00001 /* PaneGapSettings.swift */,
+				TAI00001 /* TerminalAgentIcons.swift */,
 				CRV00001 /* CardRingView.swift */,
 				NLP00001 /* NotificationLapPolicy.swift */,
 				WBE00001 /* WorkerBuildEnvironment.swift */,
@@ -995,7 +1003,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				CVS00089 /* PeerFederationSettings.swift */,
 				CVS00950 /* PeerKeepAwake.swift */,
 				CVS00090 /* PeerRelayBanner.swift */,
-				CVS00091 /* PeerConnectionsWindowController.swift */,
+				CVS00091 /* PeerConnectionsController.swift */,
 				CVS00092 /* PeerRelayBannerPresenter.swift */,
 				CVS00093 /* RemoteHostStore.swift */,
 				CGL00002 /* RemoteLiveProject.swift */,
@@ -1205,6 +1213,7 @@ A8180000000000000000000C /* TaskUncommittedCheck.swift */,
 				CRT00001 /* CardRingGeometryTests.swift */,
 				PPO00001 /* PanePaddingConfigOrderTests.swift */,
 				CSI00001 /* CursorShellIntegrationOverrideTests.swift */,
+				TAT00001 /* TerminalAgentIconsTests.swift */,
 				NLT00001 /* NotificationLapPolicyTests.swift */,
 				4704CF490000000000000001 /* RenderTokenProbeTests.swift */,
 				F5000001A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift */,
@@ -1487,6 +1496,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 					A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */,
 					A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */,
 					A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */,
+					A151000000000000000000D3 /* ActivityWindow.swift in Sources */,
 					CVB00010 /* AppearanceSettings.swift in Sources */,
 					CVB00039 /* TerminalSettings.swift in Sources */,
 					CVB00011 /* Logging.swift in Sources */,
@@ -1506,6 +1516,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				CCH00002 /* CardChrome.swift in Sources */,
 				FCB00002 /* FontFamilyComboBox.swift in Sources */,
 				PGS00002 /* PaneGapSettings.swift in Sources */,
+				TAI00002 /* TerminalAgentIcons.swift in Sources */,
 				CRV00002 /* CardRingView.swift in Sources */,
 				NLP00002 /* NotificationLapPolicy.swift in Sources */,
 				WBE00002 /* WorkerBuildEnvironment.swift in Sources */,
@@ -1529,7 +1540,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				CVB00089 /* PeerFederationSettings.swift in Sources */,
 				CVB00950 /* PeerKeepAwake.swift in Sources */,
 				CVB00090 /* PeerRelayBanner.swift in Sources */,
-				CVB00091 /* PeerConnectionsWindowController.swift in Sources */,
+				CVB00091 /* PeerConnectionsController.swift in Sources */,
 				CVB00092 /* PeerRelayBannerPresenter.swift in Sources */,
 				CVB00093 /* RemoteHostStore.swift in Sources */,
 				CGL00001 /* RemoteLiveProject.swift in Sources */,
@@ -1711,6 +1722,7 @@ A8180000000000000000000B /* TaskUncommittedCheck.swift in Sources */,
 				CRT00002 /* CardRingGeometryTests.swift in Sources */,
 				PPO00002 /* PanePaddingConfigOrderTests.swift in Sources */,
 				CSI00002 /* CursorShellIntegrationOverrideTests.swift in Sources */,
+				TAT00002 /* TerminalAgentIconsTests.swift in Sources */,
 				NLT00002 /* NotificationLapPolicyTests.swift in Sources */,
 				4704CF490000000000000002 /* RenderTokenProbeTests.swift in Sources */,
 				F5000000A1B2C3D4E5F60718 /* IMEArrowKeyTests.swift in Sources */,

@@ -100,8 +100,7 @@ final class WorkspaceRemoteRetrievalModelsTests: XCTestCase {
         XCTAssertFalse(RemotePaneLifecycleState.closed.canTransition(to: .running))
     }
 
-    func test_defaultPresentation_isBottomDrawer() {
-        XCTAssertEqual(WorkspaceRetrievalPresentation.defaultPresentation, .drawer)
-        XCTAssertEqual(Set(WorkspaceRetrievalPresentation.allCases), [.sidebar, .drawer, .inspector])
+    func test_presentations_areSidebarAndInspector() {
+        XCTAssertEqual(Set(WorkspaceRetrievalPresentation.allCases), [.sidebar, .inspector])
     }
 }

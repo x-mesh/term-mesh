@@ -35,6 +35,11 @@ final class LargeTextSelectionSourceTests: XCTestCase {
             "the whole diagnostics bundle; Copy and Save already hand it over"
         ),
         (
+            "ActivityWindow.swift",
+            "Text(model.bundle)",
+            "the same diagnostics bundle in the Activity window; Copy hands it over"
+        ),
+        (
             "Panels/AgentPanelView.swift",
             ".frame(width: transcriptWidth, alignment: .leading)",
             "one selection scope over every mounted transcript row (Sentry TERM-MESH-3N, "

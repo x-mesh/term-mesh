@@ -526,6 +526,7 @@ async fn reader_loop(
                     seq_counter.clone(),
                     peer_id.clone(),
                     Arc::clone(&wants_workspace_roster),
+                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1),
                 ));
                 // Only for a client that advertised host.stats.v1; everyone
                 // else costs nothing. Aborted on teardown below rather than
@@ -1068,7 +1069,10 @@ async fn reader_loop(
             // immediately to address the workspace it just asked for
             // (e.g. a follow-up NewTabRequest.workspace_id).
             (HandshakeState::Ready, Payload::CreateWorkspaceRequest(req)) => {
-                let workspace_id = host.create_workspace(req.title);
+                let workspace_id = host.create_workspace_with_lifetime(
+                    req.title,
+                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1),
+                );
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
@@ -1119,7 +1123,11 @@ async fn reader_loop(
                 // the tree actually changed; an invalid or refused command
                 // (unknown ids, last-pane close, garbage orientation) is a
                 // silent no-op exactly like the Swift host's perform*.
-                host.apply_control(ctl);
+                host.apply_control_with_lifetime(
+                    ctl,
+                    peer_capabilities.has(capability::WORKSPACE_DURABLE_V1)
+                        && host.clients.all_clients_support_durable_workspace(),
+                );
             }
 
             (HandshakeState::Ready, Payload::AttachSurface(req)) => {
@@ -1493,6 +1501,7 @@ async fn reader_loop(
 
             (HandshakeState::Ready, Payload::DetachSurface(det)) => {
                 if let Some(entry) = attached.remove(&det.surface_id) {
+                    host.pty.note_detached(&det.surface_id);
                     reap_if_abandoned(&host, &det.surface_id);
                     entry.surface.drop_size_request(size_requester);
                     entry.cancel.notify_one();
@@ -1597,6 +1606,7 @@ async fn reader_loop(
     }
 
     for (surface_id, entry) in attached.drain() {
+        host.pty.note_detached(&surface_id);
         entry.surface.drop_size_request(size_requester);
         entry.cancel.notify_one();
         let _ = entry.task.await;
@@ -1647,6 +1657,8 @@ fn host_stats_from(snapshot: &SystemSnapshot) -> HostStats {
         // room. Zero total means the host could not measure it.
         disk_total_bytes: snapshot.disk_total_bytes,
         disk_available_bytes: snapshot.disk_available_bytes,
+        // Filled by the push loop, which has the host this snapshot lacks.
+        surface_agents: Vec::new(),
     }
 }
 
@@ -1667,6 +1679,7 @@ fn spawn_host_stats_push(
         return None;
     }
     let mut monitor_rx = host.monitor_receiver()?;
+    let host = Arc::clone(host);
 
     Some(tokio::spawn(async move {
         loop {
@@ -1676,9 +1689,11 @@ fn spawn_host_stats_push(
             if monitor_rx.changed().await.is_err() {
                 return; // monitor gone: daemon is shutting down
             }
-            let Some(stats) = monitor_rx.borrow_and_update().as_ref().map(host_stats_from) else {
+            let Some(mut stats) = monitor_rx.borrow_and_update().as_ref().map(host_stats_from)
+            else {
                 continue; // no sample taken yet
             };
+            stats.surface_agents = crate::peer::layout::surface_agents(&host);
             let env = Envelope {
                 seq: next_seq(&seq_counter),
                 correlation_id: 0,
@@ -1989,7 +2004,7 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
     if host.pty.attacher_count(surface_id) > 0 {
         return;
     }
-    if !host.pty.is_ephemeral(surface_id) {
+    if !host.pty.is_temporary(surface_id) {
         return;
     }
     // A published project manifest refers to this surface for as long as it
@@ -2009,7 +2024,7 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
         if host.pty.attacher_count(&sid) > 0 {
             return;
         }
-        if !host.pty.is_ephemeral(&sid) {
+        if !host.pty.is_temporary(&sid) {
             return;
         }
         // Re-checked with the count: a manifest published during the grace

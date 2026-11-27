@@ -46,6 +46,7 @@ PROTOCOL_VERSION = "1.0.0"
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 AUTH_METHOD = "ssh-passthrough"
 WORKSPACE_LIFECYCLE_CAPABILITY = "workspace.lifecycle.v1"
+WORKSPACE_DURABLE_CAPABILITY = "workspace.durable.v1"
 SURFACE_ENSURE_CAPABILITY = "surface.ensure.v1"
 SURFACE_TERMINATE_CAPABILITY = "surface.terminate.v1"
 
@@ -125,6 +126,7 @@ class PeerClient:
         self.display_name = display_name
         self.capabilities = list(capabilities) if capabilities is not None else [
             WORKSPACE_LIFECYCLE_CAPABILITY,
+            WORKSPACE_DURABLE_CAPABILITY,
             SURFACE_ENSURE_CAPABILITY,
             SURFACE_TERMINATE_CAPABILITY,
         ]
@@ -313,6 +315,20 @@ class PeerClient:
         connection, so `list_workspaces()` right after this call is
         enough to observe both effects -- see `_read_until`."""
         self._send(delete_workspace_request=pb.DeleteWorkspaceRequest(workspace_id=workspace_id))
+
+    def new_workspace_tab(self, workspace_id: bytes) -> None:
+        self._send(
+            workspace_control=pb.WorkspaceControl(
+                new_tab=pb.NewTabRequest(workspace_id=workspace_id)
+            )
+        )
+
+    def close_workspace_pane(self, surface_id: bytes) -> None:
+        self._send(
+            workspace_control=pb.WorkspaceControl(
+                close_pane=pb.ClosePaneRequest(pane_id=surface_id)
+            )
+        )
 
     def ping(self, nonce: int = 1, timeout_s: float = 5.0) -> None:
         self._send(ping=pb.Ping(nonce=nonce))

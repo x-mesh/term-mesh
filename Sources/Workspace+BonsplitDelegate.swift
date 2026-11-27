@@ -146,6 +146,7 @@ extension Workspace: BonsplitDelegate {
             currentDirectory = dir
         }
         gitBranch = panelGitBranches[panelId]
+        scheduleRemotePaneLocationRefresh(panelId: panelId, reason: .focused)
 
         // Post notification
         NotificationCenter.default.post(
@@ -365,8 +366,9 @@ extension Workspace: BonsplitDelegate {
                 panelId: panelId,
                 panel: panel,
                 title: resolvedPanelTitle(panelId: panelId, fallback: panel.displayTitle),
-                icon: panel.displayIcon,
-                iconImageData: browserPanel?.faviconPNGData,
+                icon: (panel as? TerminalPanel)?.agentCLI?.symbolName ?? panel.displayIcon,
+                iconImageData: browserPanel?.faviconPNGData
+                    ?? (panel as? TerminalPanel)?.agentCLI?.iconPNGData,
                 kind: surfaceKind(for: panel),
                 isLoading: browserPanel?.isLoading ?? false,
                 isPinned: pinnedPanelIds.contains(panelId),
@@ -395,6 +397,7 @@ extension Workspace: BonsplitDelegate {
         surfaceIdToPanelId.removeValue(forKey: tabId)
         panelDirectories.removeValue(forKey: panelId)
         panelGitBranches.removeValue(forKey: panelId)
+        forgetRemotePaneLocation(panelId: panelId)
         panelTitles.removeValue(forKey: panelId)
         panelCustomTitles.removeValue(forKey: panelId)
         panelProgramStatuses.removeValue(forKey: panelId)
@@ -413,6 +416,11 @@ extension Workspace: BonsplitDelegate {
         // Keep the workspace invariant: always retain at least one real panel.
         // This prevents runtime close callbacks from ever collapsing into a tabless workspace.
         if panels.isEmpty {
+            if isPeerMirror, peerMirror?.remoteLayoutIsEmpty == true {
+                scheduleTerminalGeometryReconcile()
+                scheduleFocusReconcile()
+                return
+            }
             let replacement = createReplacementTerminalPanel()
             if let replacementTabId = surfaceIdFromPanelId(replacement.id),
                let replacementPane = bonsplitController.allPaneIds.first {
@@ -533,6 +541,7 @@ extension Workspace: BonsplitDelegate {
                 panels.removeValue(forKey: panelId)
                 panelDirectories.removeValue(forKey: panelId)
                 panelGitBranches.removeValue(forKey: panelId)
+                forgetRemotePaneLocation(panelId: panelId)
                 panelTitles.removeValue(forKey: panelId)
                 panelCustomTitles.removeValue(forKey: panelId)
                 panelProgramStatuses.removeValue(forKey: panelId)
@@ -559,7 +568,9 @@ extension Workspace: BonsplitDelegate {
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
 
-        if let survivor = bonsplitController.focusedPaneId {
+        // A mirror reconcile collapses and rebuilds the whole tree; it glows
+        // the pane it spawned itself once the rebuild is done.
+        if !isApplyingPeerMirrorLayout, let survivor = bonsplitController.focusedPaneId {
             playPaneTransitionGlow(in: survivor, afterSlide: false)
         }
     }
@@ -625,7 +636,9 @@ extension Workspace: BonsplitDelegate {
 
     func splitTabBar(_ controller: BonsplitController, didSplitPane originalPane: PaneID, newPane: PaneID, orientation: SplitOrientation) {
         invalidateSidebarBranchDirectoryEntriesCache()
-        playPaneTransitionGlow(in: newPane, afterSlide: true)
+        if !isApplyingPeerMirrorLayout {
+            playPaneTransitionGlow(in: newPane, afterSlide: true)
+        }
 #if DEBUG
         let panelKindForTab: (TabID) -> String = { tabId in
             guard let panelId = self.panelIdFromSurfaceId(tabId),

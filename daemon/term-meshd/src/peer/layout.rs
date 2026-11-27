@@ -32,7 +32,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::persist::PersistedWorkspace;
 use super::surface::{
     surface_id_from_name, EnsureError, EnsureOutcome, PtyManager, PtySurface, SpawnSpec,
-    SurfaceKind, SurfaceSpec,
+    SurfaceKind, SurfaceLifetime, SurfaceSpec,
 };
 use crate::monitor::SystemSnapshot;
 
@@ -342,6 +342,20 @@ impl LayoutStore {
                 Err(LayoutError::LastPane)
             }
         }
+    }
+
+    pub fn close_pane_allow_empty(
+        &mut self,
+        pane_id: &[u8],
+    ) -> Result<Vec<SurfaceId>, LayoutError> {
+        if let Some(LayoutNode::Pane { tabs, .. }) = &self.root {
+            if tabs.len() == 1 && tabs[0] == pane_id {
+                let removed = tabs.clone();
+                self.root = None;
+                return Ok(removed);
+            }
+        }
+        self.close_pane(pane_id)
     }
 
     /// Sub-tab close semantics: when the pane has several tabs, closing a
@@ -710,6 +724,7 @@ struct RegisteredClient {
     /// including a viewer watching one pane, which had already been sent
     /// the scoped delta it actually needed.
     wants_roster: Arc<AtomicBool>,
+    supports_durable_workspace: bool,
 }
 
 struct PendingLeaderResponse {
@@ -802,7 +817,7 @@ impl Broadcaster {
         seq: Arc<AtomicU64>,
         peer_id: Vec<u8>,
     ) -> BroadcastGuard {
-        self.register_with_roster_flag(tx, seq, peer_id, Arc::new(AtomicBool::new(false)))
+        self.register_with_roster_flag(tx, seq, peer_id, Arc::new(AtomicBool::new(false)), false)
     }
 
     /// `register`, plus the handle the connection flips when it subscribes to
@@ -813,6 +828,7 @@ impl Broadcaster {
         seq: Arc<AtomicU64>,
         peer_id: Vec<u8>,
         wants_roster: Arc<AtomicBool>,
+        supports_durable_workspace: bool,
     ) -> BroadcastGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.clients.lock().unwrap().insert(
@@ -822,6 +838,7 @@ impl Broadcaster {
                 peer_id,
                 seq,
                 wants_roster,
+                supports_durable_workspace,
             },
         );
         self.client_changes.send_modify(|generation| {
@@ -847,6 +864,14 @@ impl Broadcaster {
             .unwrap()
             .values()
             .any(|client| client.wants_roster.load(Ordering::Relaxed))
+    }
+
+    pub fn all_clients_support_durable_workspace(&self) -> bool {
+        let clients = self.clients.lock().unwrap();
+        !clients.is_empty()
+            && clients
+                .values()
+                .all(|client| client.supports_durable_workspace)
     }
 
     /// Send only to connections that subscribed to the roster.
@@ -1095,6 +1120,9 @@ pub struct WorkspaceEntry {
     /// first entry if none is marked) and `PeerHost::remove_workspace`
     /// (refuses to remove the entry carrying this flag).
     pub is_default: bool,
+    /// Runtime-only marker for an intentionally empty durable session.
+    /// Persisted workspaces boot with this false and keep legacy seeding.
+    pub allows_empty: bool,
     pub store: LayoutStore,
 }
 
@@ -1408,6 +1436,49 @@ pub fn set_transcript_provider(provider: TranscriptProvider) {
     let _ = TRANSCRIPT_PROVIDER.set(provider);
 }
 
+/// `TERMMESH_PANEL_ID` → agent CLI for every pane process the daemon's pane
+/// tracker has found. A surface's panel id is its `hex_id`.
+pub type SurfaceAgentProvider = Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>;
+
+/// Installed once at boot, like the transcript reader and for the same
+/// reason: the pane tracker lives in the daemon, not in the peer server.
+static SURFACE_AGENT_PROVIDER: std::sync::OnceLock<SurfaceAgentProvider> =
+    std::sync::OnceLock::new();
+
+pub fn set_surface_agent_provider(provider: SurfaceAgentProvider) {
+    let _ = SURFACE_AGENT_PROVIDER.set(provider);
+}
+
+/// The agent CLI running in each of this host's surfaces, for `HostStats`.
+/// Empty when no provider is installed, which every test and embedder gets.
+pub fn surface_agents(host: &PeerHost) -> Vec<peer_proto::v1::SurfaceAgent> {
+    let Some(provider) = SURFACE_AGENT_PROVIDER.get() else {
+        return Vec::new();
+    };
+    surface_agents_from(&host.pty.list(), &provider())
+}
+
+/// Pure half of [`surface_agents`], so the pairing is testable without a
+/// running tracker.
+pub fn surface_agents_from(
+    surfaces: &[Arc<PtySurface>],
+    agents_by_panel_id: &HashMap<String, String>,
+) -> Vec<peer_proto::v1::SurfaceAgent> {
+    if agents_by_panel_id.is_empty() {
+        return Vec::new();
+    }
+    surfaces
+        .iter()
+        .filter_map(|surface| {
+            let cli = agents_by_panel_id.get(&super::surface::hex_id(&surface.surface_id))?;
+            Some(peer_proto::v1::SurfaceAgent {
+                surface_id: surface.surface_id.clone(),
+                cli: cli.clone(),
+            })
+        })
+        .collect()
+}
+
 pub struct PeerHost {
     pub pty: Arc<PtyManager>,
     /// Every workspace this host currently serves, keyed by workspace id.
@@ -1621,6 +1692,7 @@ impl PeerHost {
                     id: entry.id,
                     name: entry.name,
                     is_default: entry.is_default,
+                    allows_empty: false,
                     store,
                 },
             );
@@ -3015,31 +3087,15 @@ impl PeerHost {
     /// (debounced, empty-layout) `WorkspaceLayoutChanged` push under the
     /// new id so already-connected bystanders learn a new workspace_id
     /// exists — the "roster 반영 push" this RPC's contract calls for.
-    /// Seed a first pane into every workspace that boots empty. A
-    /// non-default workspace restored from `peer-workspaces.json` has
-    /// only {id, name} persisted (shells are daemon children, never
-    /// serialized), so it comes back with an empty tree — un-attachable,
-    /// which surfaced as "no panes" when a client opened it. Called once
-    /// after boot so every workspace is usable, exactly like a freshly
-    /// created one. The default keeps its static TERMMESH_PEER_SURFACES
-    /// shells and is skipped when already populated.
-    pub fn seed_empty_workspaces(self: &Arc<Self>) {
-        let empty_ids: Vec<Vec<u8>> = {
-            let workspaces = self.workspaces.lock().unwrap();
-            workspaces
-                .values()
-                .filter(|e| e.store.is_empty())
-                .map(|e| e.id.clone())
-                .collect()
-        };
-        for id in empty_ids {
-            if let Some(sid) = self.spawn_ephemeral(&[], &id) {
-                self.with_store(&id, |store| store.seed_first_pane(sid));
-            }
-        }
+    pub fn create_workspace(self: &Arc<Self>, title: String) -> Vec<u8> {
+        self.create_workspace_with_lifetime(title, false)
     }
 
-    pub fn create_workspace(self: &Arc<Self>, title: String) -> Vec<u8> {
+    pub fn create_workspace_with_lifetime(
+        self: &Arc<Self>,
+        title: String,
+        durable: bool,
+    ) -> Vec<u8> {
         let _persistence_guard = self.workspace_persistence.lock().unwrap();
         let id = super::connection::random_peer_bytes(16);
         {
@@ -3050,6 +3106,7 @@ impl PeerHost {
                     id: id.clone(),
                     name: title,
                     is_default: false,
+                    allows_empty: false,
                     store: LayoutStore {
                         root: None,
                         next_split_id: 1,
@@ -3073,7 +3130,7 @@ impl PeerHost {
                 hex_prefix(&id),
                 Self::MAX_PEER_SURFACES
             );
-        } else if let Some(sid) = self.spawn_ephemeral(&[], &id) {
+        } else if let Some(sid) = self.spawn_ephemeral(&[], &id, durable) {
             self.with_store(&id, |store| store.seed_first_pane(sid));
         }
         tracing::info!(
@@ -3083,6 +3140,24 @@ impl PeerHost {
         );
         self.schedule_layout_push(id.clone());
         id
+    }
+
+    /// Restored identities contain no layout. Keep legacy behavior at boot;
+    /// only a negotiated durable close may intentionally leave one empty.
+    pub fn seed_empty_workspaces(self: &Arc<Self>) {
+        let empty_ids: Vec<Vec<u8>> = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.store.is_empty() && !entry.allows_empty)
+            .map(|entry| entry.id.clone())
+            .collect();
+        for id in empty_ids {
+            if let Some(surface_id) = self.spawn_ephemeral(&[], &id, false) {
+                self.with_store(&id, |store| store.seed_first_pane(surface_id));
+            }
+        }
     }
 
     /// Rename an existing workspace's display name in place; its id
@@ -3181,6 +3256,10 @@ impl PeerHost {
     /// F1–F8 adversarial shapes) drops silently, exactly like the Swift
     /// host's `perform*` guards.
     pub fn apply_control(self: &Arc<Self>, ctl: WorkspaceControl) {
+        self.apply_control_with_lifetime(ctl, false);
+    }
+
+    pub fn apply_control_with_lifetime(self: &Arc<Self>, ctl: WorkspaceControl, durable: bool) {
         use workspace_control::Kind;
         // `Some(ws_id)` means the tree of workspace `ws_id` changed and
         // must be pushed; `None` covers both "nothing changed" and
@@ -3191,12 +3270,12 @@ impl PeerHost {
             // R10: the daemon has no keyboard focus to move, and the Swift
             // host deliberately no-ops this too.
             Some(Kind::FocusPane(_)) => None,
-            Some(Kind::SplitPane(req)) => self.split_pane(&req.pane_id, &req.orientation),
-            Some(Kind::ClosePane(req)) => self.close_pane(&req.pane_id),
+            Some(Kind::SplitPane(req)) => self.split_pane(&req.pane_id, &req.orientation, durable),
+            Some(Kind::ClosePane(req)) => self.close_pane(&req.pane_id, durable),
             Some(Kind::SetDivider(req)) => {
                 self.set_divider(&req.workspace_id, &req.split_id, req.ratio)
             }
-            Some(Kind::NewTab(req)) => self.new_tab(&req.pane_id, &req.workspace_id),
+            Some(Kind::NewTab(req)) => self.new_tab(&req.pane_id, &req.workspace_id, durable),
             Some(Kind::ActivateTab(req)) => self.activate_tab(&req.pane_id, &req.surface_id),
         };
         if let Some(ws_id) = changed_workspace {
@@ -3221,7 +3300,12 @@ impl PeerHost {
     /// invalid/unresolvable/no-op request (F4 garbage orientation, unknown
     /// pane, or the source pane's workspace vanishing between probe and
     /// insert).
-    fn split_pane(self: &Arc<Self>, pane_id: &[u8], orientation: &str) -> Option<Vec<u8>> {
+    fn split_pane(
+        self: &Arc<Self>,
+        pane_id: &[u8],
+        orientation: &str,
+        durable: bool,
+    ) -> Option<Vec<u8>> {
         let orientation = Orientation::parse(orientation)?; // F4
         if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
             return None;
@@ -3242,7 +3326,7 @@ impl PeerHost {
             // A dead source pane revives first, same as attach would do — the
             // user is clearly working in it. No-op when it is alive.
             self.pty.get_or_respawn(pane_id);
-            let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id)?;
+            let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id, durable)?;
             match self.with_store(&ws_id, |store| {
                 store.split_pane(pane_id, orientation, new_id.clone())
             }) {
@@ -3264,7 +3348,12 @@ impl PeerHost {
     /// documents for right after `CreateWorkspaceRequest`, when there is
     /// no pane_id to reference yet. Returns the workspace id whose tree
     /// changed, or `None` for a no-op/invalid request.
-    fn new_tab(self: &Arc<Self>, pane_id: &[u8], workspace_id: &[u8]) -> Option<Vec<u8>> {
+    fn new_tab(
+        self: &Arc<Self>,
+        pane_id: &[u8],
+        workspace_id: &[u8],
+        durable: bool,
+    ) -> Option<Vec<u8>> {
         if self.pty.list().len() >= Self::MAX_PEER_SURFACES {
             return None;
         }
@@ -3278,7 +3367,7 @@ impl PeerHost {
                 return self
                     .with_open_surface_admission(|| {
                         self.pty.get_or_respawn(pane_id);
-                        let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id)?;
+                        let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id, durable)?;
                         match self
                             .with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone()))
                         {
@@ -3307,9 +3396,14 @@ impl PeerHost {
         if !is_empty_target {
             return None;
         }
-        let new_id = self.spawn_ephemeral(&[], workspace_id)?;
+        let new_id = self.spawn_ephemeral(&[], workspace_id, durable)?;
         match self.with_store(workspace_id, |store| store.seed_first_pane(new_id.clone())) {
-            Some(true) => Some(workspace_id.to_vec()),
+            Some(true) => {
+                if let Some(entry) = self.workspaces.lock().unwrap().get_mut(workspace_id) {
+                    entry.allows_empty = false;
+                }
+                Some(workspace_id.to_vec())
+            }
             _ => {
                 self.pty.remove(&new_id);
                 self.surface_workspace.lock().unwrap().remove(&new_id);
@@ -3318,13 +3412,21 @@ impl PeerHost {
         }
     }
 
-    fn close_pane(self: &Arc<Self>, pane_id: &[u8]) -> Option<Vec<u8>> {
+    fn close_pane(self: &Arc<Self>, pane_id: &[u8], durable: bool) -> Option<Vec<u8>> {
         let ws_id = self.workspace_id_for_surface(pane_id)?;
-        let removed = match self.with_store(&ws_id, |store| store.close_pane(pane_id)) {
-            Some(Ok(removed)) => removed,
-            // LastPane / NotFound / workspace already gone: silent no-op —
-            // the client observes "nothing happened", same as the Swift host.
-            _ => return None,
+        let removed = {
+            let mut workspaces = self.workspaces.lock().unwrap();
+            let entry = workspaces.get_mut(&ws_id)?;
+            let result = if durable {
+                entry.store.close_pane_allow_empty(pane_id)
+            } else {
+                entry.store.close_pane(pane_id)
+            };
+            let removed = result.ok()?;
+            if durable {
+                entry.allows_empty = entry.store.is_empty();
+            }
+            removed
         };
         // PTYs die outside the layout lock. `PtyManager::remove` decides
         // spec fate: declared surfaces keep theirs (a restart brings them
@@ -3392,9 +3494,10 @@ impl PeerHost {
         self: &Arc<Self>,
         source_pane: &[u8],
         workspace_id: &[u8],
+        durable: bool,
     ) -> Option<SurfaceId> {
         self.with_open_surface_admission(|| {
-            self.spawn_ephemeral_unlocked(source_pane, workspace_id)
+            self.spawn_ephemeral_unlocked(source_pane, workspace_id, durable)
         })
         .flatten()
     }
@@ -3403,6 +3506,7 @@ impl PeerHost {
         self: &Arc<Self>,
         source_pane: &[u8],
         workspace_id: &[u8],
+        durable: bool,
     ) -> Option<SurfaceId> {
         let cwd = self
             .pty
@@ -3435,8 +3539,15 @@ impl PeerHost {
             kind: super::surface::SurfaceKind::Pty,
             agent_cli: String::new(),
         };
-        self.pty
-            .register_and_spawn_ephemeral(surface_id.clone(), spec);
+        self.pty.register_and_spawn_managed(
+            surface_id.clone(),
+            spec,
+            if durable {
+                SurfaceLifetime::Session
+            } else {
+                SurfaceLifetime::Temporary
+            },
+        );
         // register_and_spawn_ephemeral logs-and-continues on failure; only
         // report a surface that actually exists.
         let surface = self
@@ -3559,9 +3670,7 @@ impl PeerHost {
             ));
     }
 
-    /// Wire snapshot of any single workspace's tree by id — the generic
-    /// counterpart to `layout_snapshot` (default-workspace-only, and the
-    /// only one that carries the reseed special case below). Scoped
+    /// Wire snapshot of any single workspace's tree by id. Scoped
     /// `WorkspaceLayoutChanged` pushes (`schedule_layout_push`) and
     /// `list_workspaces` both go through this so a mutation to — or a
     /// listing of — a non-default workspace is reported under ITS id
@@ -3577,43 +3686,34 @@ impl PeerHost {
             .and_then(|entry| entry.store.snapshot_proto(&self.pty))
     }
 
-    /// Wire snapshot of the default workspace's tree. Reseeds first when
-    /// that tree is empty but surfaces exist — covers hosts whose manager
-    /// was populated after construction (the test harness does this;
-    /// production spawns surfaces before `PeerHost::new`).
+    /// Wire snapshot of the default workspace's tree. Only a negotiated
+    /// durable close may keep it empty; legacy and restored empty workspaces
+    /// retain the historical reseed behavior.
     pub fn layout_snapshot(&self) -> Option<WorkspaceLayout> {
-        // Captured once: a concurrent `remove_workspace` promotion could
-        // otherwise change the default mid-function, splitting the reseed
-        // check from the final read across two different workspaces.
         let default_id = self.default_id();
         let needs_reseed = self
             .workspaces
             .lock()
             .unwrap()
             .get(&default_id)
-            .map(|entry| entry.store.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|entry| entry.store.is_empty() && !entry.allows_empty);
         if needs_reseed {
-            // Reseed from PTY surfaces only — an empty default tree must
-            // not sweep an agent surface in through the back door (same
-            // contract as `ensure_surface`/`with_workspaces`).
             let surfaces: Vec<Arc<PtySurface>> = self
                 .pty
                 .list()
                 .into_iter()
-                .filter(|s| s.kind() == SurfaceKind::Pty)
+                .filter(|surface| surface.kind() == SurfaceKind::Pty)
                 .collect();
             if !surfaces.is_empty() {
-                {
-                    let mut workspaces = self.workspaces.lock().unwrap();
-                    if let Some(entry) = workspaces.get_mut(&default_id) {
-                        if entry.store.is_empty() {
-                            entry.store = LayoutStore::balanced_from_surfaces(&surfaces);
-                        }
+                let mut workspaces = self.workspaces.lock().unwrap();
+                if let Some(entry) = workspaces.get_mut(&default_id) {
+                    if entry.store.is_empty() && !entry.allows_empty {
+                        entry.store = LayoutStore::balanced_from_surfaces(&surfaces);
                     }
                 }
+                drop(workspaces);
                 let mut index = self.surface_workspace.lock().unwrap();
-                for surface in &surfaces {
+                for surface in surfaces {
                     index
                         .entry(surface.surface_id.clone())
                         .or_insert_with(|| default_id.clone());
@@ -4329,6 +4429,23 @@ mod tests {
         assert_eq!(store.surface_ids(), vec![sid("a")]);
     }
 
+    #[test]
+    fn durable_close_allows_an_empty_workspace_only_for_the_last_pane() {
+        let mut store = store_with(&["a"]);
+        assert_eq!(
+            store.close_pane_allow_empty(&sid("a")).unwrap(),
+            vec![sid("a")]
+        );
+        assert!(store.is_empty());
+
+        let mut split = store_with(&["a", "b"]);
+        assert_eq!(
+            split.close_pane_allow_empty(&sid("a")).unwrap(),
+            vec![sid("a")]
+        );
+        assert_eq!(split.surface_ids(), vec![sid("b")]);
+    }
+
     /// F1 regression: a single-pane workspace (root is a bare Pane, the
     /// common default — one declared surface, never split) grown to
     /// multiple tabs via add_tab must let non-last tabs close normally.
@@ -4723,6 +4840,7 @@ mod tests {
                     id: ws2_id.clone(),
                     name: "second".into(),
                     is_default: false,
+                    allows_empty: false,
                     store: store2,
                 },
             );
@@ -4766,6 +4884,7 @@ mod tests {
                     id: ws2_id.clone(),
                     name: "second".into(),
                     is_default: false,
+                    allows_empty: false,
                     store: store_with(&["x", "y"]),
                 },
             );
@@ -4870,6 +4989,7 @@ mod tests {
                     id: ws2_id.clone(),
                     name: "second".into(),
                     is_default: false,
+                    allows_empty: false,
                     store: store2,
                 },
             );
@@ -4880,7 +5000,7 @@ mod tests {
             .insert(sid("base-b"), ws2_id.clone());
 
         let ephemeral_id = host
-            .spawn_ephemeral(&sid("base-b"), &ws2_id)
+            .spawn_ephemeral(&sid("base-b"), &ws2_id, false)
             .expect("spawn ephemeral in ws2");
         {
             let mut workspaces = host.workspaces.lock().unwrap();
@@ -5280,6 +5400,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             vec![0xD1; 16],
             Arc::clone(&wants),
+            false,
         );
         wants.store(true, Ordering::Relaxed);
         assert!(host.clients.has_roster_subscriber());
@@ -5328,6 +5449,7 @@ mod tests {
                     id: ws2_id.clone(),
                     name: "second".into(),
                     is_default: false,
+                    allows_empty: false,
                     store: store2,
                 },
             );
@@ -5541,13 +5663,18 @@ mod tests {
         .is_empty());
     }
 
-    /// The reseed back door: an empty default tree repopulates from
-    /// `pty.list()` at snapshot time, which must not sweep an agent
-    /// surface in either.
+    /// An empty workspace is a real durable state. Snapshotting it must not
+    /// reseed from unrelated PTY surfaces.
     #[tokio::test]
-    async fn empty_default_reseed_skips_agent_surfaces() {
+    async fn empty_default_snapshot_does_not_reseed_from_pty_surfaces() {
         let manager = Arc::new(PtyManager::new());
         let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        host.workspaces
+            .lock()
+            .unwrap()
+            .get_mut(&host.default_id())
+            .expect("default workspace")
+            .allows_empty = true;
         let agent = host
             .ensure_surface("agent-reseed", &agent_spec("codex"))
             .expect("ensure agent");
@@ -5556,14 +5683,12 @@ mod tests {
         assert!(host.layout_snapshot().is_none());
         assert_eq!(host.workspace_id_for_surface(&agent.surface_id), None);
 
-        // A PTY appearing later reseeds exactly as before — without the agent.
+        // A PTY appearing later must not repopulate the intentionally empty
+        // workspace.
         let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
             .expect("spawn /bin/cat");
         manager.insert_surface(base);
-        let snapshot = host.layout_snapshot().expect("tree reseeds from the pty");
-        let mut ids = Vec::new();
-        collect_wire_surface_ids(Some(&snapshot), &mut ids);
-        assert_eq!(ids, vec![sid("base"), sid("base")], "one pane, one tab");
+        assert!(host.layout_snapshot().is_none());
         assert_eq!(host.workspace_id_for_surface(&agent.surface_id), None);
 
         assert!(host.terminate_surface(&agent.surface_id).unwrap());
@@ -5976,6 +6101,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             vec![3; 16],
             Arc::new(AtomicBool::new(true)),
+            false,
         );
         restarted.terminate_surface(&leader.surface_id).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -6215,6 +6341,7 @@ mod tests {
                     id: named_id.clone(),
                     name: "Project · aic".into(),
                     is_default: false,
+                    allows_empty: false,
                     store,
                 },
             );

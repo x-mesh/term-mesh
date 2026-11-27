@@ -254,6 +254,9 @@ struct ContentView: View {
     /// update is a measured hot path (TERM-MESH-1K/1N), so it may read
     /// finished strings but must not build them.
     @State private var titlebarHostStats: [PeerHostStats.Group] = []
+    /// Set while the focused pane is remote. The local branch and directory
+    /// describe this Mac then, so the titlebar shows the host's instead.
+    @State private var titlebarRemote: TitlebarRemoteContext? = nil
     @State private var titlebarPorts: [Int] = []
     @State private var titlebarSessionStart: Date? = nil
     @State private var titlebarTag: String? = nil
@@ -917,6 +920,67 @@ struct ContentView: View {
 
     private var titlebarBranchAndDirectory: some View {
         HStack(spacing: 8) {
+            if let remote = titlebarRemote {
+                titlebarRemoteChips(remote)
+            } else {
+                titlebarLocalBranchAndDirectory
+            }
+        }
+        .lineLimit(1)
+    }
+
+    /// The focused pane is remote: where it is, in the host's color, then
+    /// the host's branch when it reports one. No local branch or directory.
+    @ViewBuilder
+    private func titlebarRemoteChips(_ remote: TitlebarRemoteContext) -> some View {
+        let hostColor = Color(nsColor: PeerHostAccent.primaryColor(for: remote.hostKey))
+        let isLight = BonsplitCardPalette.cardBackground(for: cardChromeAppearance).isLightForTitlebar
+        let text = Workspace.tabHostBadge(for: remote.hostKey).labelRGB(onLightBackground: isLight)
+        let hostTextColor = Color(.sRGB, red: text.red, green: text.green, blue: text.blue, opacity: 1)
+        HStack(spacing: 5) {
+            Circle()
+                .fill(hostColor)
+                .frame(width: 6, height: 6)
+            // The host is what this chip is for; in a narrow titlebar the
+            // directory gives way first.
+            Text(remote.hostKey.shortLabel)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(hostTextColor)
+                .fixedSize()
+            if !remote.directory.isEmpty {
+                Text("·")
+                    .font(.system(size: 11))
+                    .foregroundColor(titlebarColor(opacity: 0.4))
+                    .fixedSize()
+                Text(remote.directory)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(titlebarColor(opacity: 0.85))
+                    .truncationMode(.middle)
+            }
+        }
+        .modifier(TitlebarChipBackground(appearance: cardChromeAppearance, shape: .rounded, tint: hostColor))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            remote.directory.isEmpty
+                ? "Remote host \(remote.hostKey.shortLabel)"
+                : "Remote host \(remote.hostKey.shortLabel), directory \(remote.directory)"
+        )
+        if !remote.branch.isEmpty {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(titlebarColor(opacity: 0.7))
+                Text(remote.branch)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(titlebarColor(opacity: 0.85))
+            }
+            .modifier(TitlebarChipBackground(appearance: cardChromeAppearance, shape: .rounded))
+        }
+        titlebarHostStatsFitting
+    }
+
+    private var titlebarLocalBranchAndDirectory: some View {
+        HStack(spacing: 8) {
             if !titlebarGitBranch.isEmpty {
                 HStack(spacing: 5) {
                     Image(systemName: titlebarIsWorktree ? "arrow.triangle.swap" : "arrow.triangle.branch")
@@ -963,16 +1027,19 @@ struct ContentView: View {
                 // narrow window drops whole groups from the right instead of
                 // cutting the last one mid-number. All of them rank below the
                 // branch and directory, which say where you are.
-                ViewThatFits(in: .horizontal) {
-                    titlebarHostStatsRow(titlebarHostStats[...])
-                    titlebarHostStatsRow(titlebarHostStats.dropLast(1))
-                    titlebarHostStatsRow(titlebarHostStats.dropLast(2))
-                    titlebarHostStatsRow(titlebarHostStats.dropLast(3))
-                    titlebarHostStatsRow(titlebarHostStats.prefix(0))
-                }
+                titlebarHostStatsFitting
             }
         }
-        .lineLimit(1)
+    }
+
+    private var titlebarHostStatsFitting: some View {
+        ViewThatFits(in: .horizontal) {
+            titlebarHostStatsRow(titlebarHostStats[...])
+            titlebarHostStatsRow(titlebarHostStats.dropLast(1))
+            titlebarHostStatsRow(titlebarHostStats.dropLast(2))
+            titlebarHostStatsRow(titlebarHostStats.dropLast(3))
+            titlebarHostStatsRow(titlebarHostStats.prefix(0))
+        }
     }
 
     /// One row of host readings, for `ViewThatFits` to accept or reject whole.
@@ -1478,6 +1545,7 @@ struct ContentView: View {
             if !titlebarDirBasename.isEmpty { titlebarDirBasename = "" }
             if titlebarHostKey != nil { titlebarHostKey = nil }
             if !titlebarHostStats.isEmpty { titlebarHostStats = [] }
+            if titlebarRemote != nil { titlebarRemote = nil }
             if !titlebarPorts.isEmpty { titlebarPorts = [] }
             if titlebarSessionStart != nil { titlebarSessionStart = nil }
             if titlebarTag != nil { titlebarTag = nil }
@@ -1516,7 +1584,24 @@ struct ContentView: View {
             dlog("titlebar.update focusedPanel=\(focusedPanelId?.uuidString.prefix(8) ?? "nil") gitBranch=\(branchState?.branch ?? "nil") panelBranches=\(snapPanelBranches.mapValues { $0.branch }) currentDir=\(snapCurrentDir) focusedDir=\(focusedDir) tty=\(focusedTTY ?? "nil") hasPanelDir=\(hasPanelDir) worktreeName=\(snapWorktreeName ?? "nil") hostKey=\(snapHostKey?.description ?? "nil")")
         }
         #endif
-        if let bs = branchState {
+        let remoteContext: TitlebarRemoteContext? = focusedPanelId.flatMap { panelId in
+            guard let hostKey = (tab.panels[panelId] as? TerminalPanel)?.remoteHostKey else { return nil }
+            let location = tab.remotePaneLocations[panelId]
+            return TitlebarRemoteContext(
+                hostKey: hostKey,
+                directory: location.map { ($0.directory as NSString).lastPathComponent } ?? "",
+                branch: location?.branch ?? ""
+            )
+        }
+        if titlebarRemote != remoteContext { titlebarRemote = remoteContext }
+        if remoteContext != nil, let focusedPanelId {
+            tab.scheduleRemotePaneLocationRefresh(panelId: focusedPanelId, reason: .shownInTitlebar)
+        }
+        if remoteContext != nil {
+            // The local lookup would answer for this Mac, and a late answer
+            // would overwrite the remote state; outdate any in flight.
+            titlebarGitFallbackGeneration &+= 1
+        } else if let bs = branchState {
             titlebarGitFallbackGeneration &+= 1
             let branch = bs.branch
             if titlebarGitBranch != branch { titlebarGitBranch = branch }
@@ -1588,7 +1673,7 @@ struct ContentView: View {
         if titlebarDirBasename != dirBase { titlebarDirBasename = dirBase }
 
         // Remote pane host chip — "keys go to a remote host" signal,
-        // same identity color as the sidebar row / pane strip.
+        // same identity color as the sidebar row and the tab's host chip.
         if titlebarHostKey != snapHostKey { titlebarHostKey = snapHostKey }
 
         // How loaded that host is. A dictionary lookup of an
@@ -1962,6 +2047,13 @@ struct ContentView: View {
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidSetTitle)) { notification in
             guard let tabId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID,
                   tabId == tabManager.selectedTabId else { return }
+            scheduleTitlebarTextRefresh()
+        })
+
+        // The titlebar's own tick skips an inactive app, and a remote host
+        // answers on its own schedule; redraw when it does.
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .remotePaneLocationDidChange)) { notification in
+            guard (notification.object as? Workspace)?.id == tabManager.selectedTabId else { return }
             scheduleTitlebarTextRefresh()
         })
 
@@ -5410,6 +5502,14 @@ private struct ReviewBoardTitlebarToggle: View {
 
 /// The white chip or capsule the titlebar groups sit in, drawn with the same
 /// card colors as the panes below so the strip reads as part of that surface.
+struct TitlebarRemoteContext: Equatable {
+    let hostKey: PeerPaneHostKey
+    /// Last path component of the remote shell's directory; empty when unknown.
+    let directory: String
+    /// Empty when the host reports none: not a git checkout, or an old daemon.
+    let branch: String
+}
+
 private struct TitlebarChipBackground: ViewModifier {
     enum Shape {
         case rounded
@@ -5422,10 +5522,14 @@ private struct TitlebarChipBackground: ViewModifier {
 
     let appearance: BonsplitConfiguration.Appearance
     let shape: Shape
+    /// A remote host's color, washed over the chip so it reads as that host.
+    var tint: Color? = nil
 
     func body(content: Content) -> some View {
-        let fill = Color(nsColor: BonsplitCardPalette.cardBackground(for: appearance))
-        let border = Color(nsColor: BonsplitCardPalette.cardBorder(for: appearance, isFocused: false))
+        let base = Color(nsColor: BonsplitCardPalette.cardBackground(for: appearance))
+        let fill: AnyShapeStyle = tint.map { AnyShapeStyle($0.opacity(0.16)) } ?? AnyShapeStyle(base)
+        let border = tint.map { $0.opacity(0.45) }
+            ?? Color(nsColor: BonsplitCardPalette.cardBorder(for: appearance, isFocused: false))
         content
             .padding(.horizontal, Self.horizontalPadding)
             .frame(height: Self.height)

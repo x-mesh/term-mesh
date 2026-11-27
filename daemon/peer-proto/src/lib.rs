@@ -55,6 +55,9 @@ pub mod capability {
     pub const WORKSPACE_LIFECYCLE_V1: &str = "workspace.lifecycle.v1";
     /// Complete workspace-roster snapshots pushed after a client subscribes.
     pub const WORKSPACE_LIST_SUBSCRIBE_V1: &str = "workspace.list.subscribe.v1";
+    /// Session panes created by a negotiated client survive detach while the
+    /// daemon remains alive, and a workspace may intentionally become empty.
+    pub const WORKSPACE_DURABLE_V1: &str = "workspace.durable.v1";
     /// The host can deterministically create or reuse a daemon-owned PTY
     /// surface from an explicit `EnsureSurfaceRequest` specification.
     pub const SURFACE_ENSURE_V1: &str = "surface.ensure.v1";
@@ -153,6 +156,7 @@ pub mod capability {
         WORKSPACE_CONTROL_V1,
         WORKSPACE_LIFECYCLE_V1,
         WORKSPACE_LIST_SUBSCRIBE_V1,
+        WORKSPACE_DURABLE_V1,
         SURFACE_ENSURE_V1,
         SURFACE_TERMINATE_V1,
         SURFACE_ENSURE_ENV_V1,

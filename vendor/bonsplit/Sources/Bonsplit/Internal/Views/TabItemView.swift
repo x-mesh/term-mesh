@@ -15,6 +15,21 @@ private enum TabControlShortcutHintDebugSettings {
     }
 }
 
+enum TabHostBadgeStyle {
+    static let labelFontSize: CGFloat = TabBarMetrics.titleFontSize - 1
+    static let dotSize: CGFloat = 6
+    static let height: CGFloat = 16
+    static let backgroundOpacity: Double = 0.18
+
+    /// The name is left out when the title already carries it — a shell that
+    /// titles itself `user@host: dir` would otherwise say the host twice.
+    static func showsLabel(title: String, badgeLabel: String) -> Bool {
+        let label = badgeLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty else { return false }
+        return !title.localizedCaseInsensitiveContains(label)
+    }
+}
+
 enum TabItemStyling {
     static func iconSaturation(hasRasterIcon: Bool, tabSaturation: Double) -> Double {
         hasRasterIcon ? 1.0 : tabSaturation
@@ -22,6 +37,15 @@ enum TabItemStyling {
 
     static func shouldShowHoverBackground(isHovered: Bool, isSelected: Bool) -> Bool {
         isHovered && !isSelected
+    }
+
+    /// The cached image only stands for the data it was decoded from. When
+    /// the tab's data has moved on — cleared, or replaced before the cache
+    /// caught up — the current data is drawn instead, so a stale cache can
+    /// never keep an icon the tab no longer has.
+    static func displayedFaviconImage(cachedImage: NSImage?, cachedData: Data?, currentData: Data?) -> NSImage? {
+        if let cachedImage, cachedData == currentData { return cachedImage }
+        return currentData.flatMap { NSImage(data: $0) }
     }
 
     static func resolvedFaviconImage(existing: NSImage?, incomingData: Data?) -> NSImage? {
@@ -72,7 +96,11 @@ struct TabItemView: View {
                 let iconTint = isSelected
                     ? TabBarColors.activeText(for: appearance)
                     : TabBarColors.inactiveText(for: appearance)
-                let faviconImage = renderedFaviconImage ?? tab.iconImageData.flatMap { NSImage(data: $0) }
+                let faviconImage = TabItemStyling.displayedFaviconImage(
+                    cachedImage: renderedFaviconImage,
+                    cachedData: renderedFaviconData,
+                    currentData: tab.iconImageData
+                )
 
                 Group {
                     if tab.isLoading {
@@ -104,7 +132,7 @@ struct TabItemView: View {
                 }
                 .frame(width: iconSlotSize, height: iconSlotSize, alignment: .center)
                 .onAppear {
-                    updateRenderedFaviconImage()
+                    updateRenderedFaviconImage(tab.iconImageData)
                     updateGlobeFallback()
                 }
                 .onDisappear {
@@ -112,21 +140,16 @@ struct TabItemView: View {
                     globeFallbackWorkItem = nil
                 }
                 .onChange(of: tab.isLoading) { _ in updateGlobeFallback() }
-                .onChange(of: tab.iconImageData) { _ in
-                    updateRenderedFaviconImage()
+                // The new value comes from the argument: inside this closure
+                // `tab` can still be the value from before the change, and
+                // caching that left a cleared logo on the tab for good.
+                .onChange(of: tab.iconImageData) { newData in
+                    updateRenderedFaviconImage(newData)
                     updateGlobeFallback()
                 }
                 .onChange(of: tab.icon) { _ in updateGlobeFallback() }
 
-                Text(tab.title)
-                    .font(.system(size: TabBarMetrics.titleFontSize))
-                    .lineLimit(1)
-                    .foregroundStyle(
-                        isSelected
-                            ? TabBarColors.activeText(for: appearance)
-                            : TabBarColors.inactiveText(for: appearance)
-                    )
-                    .saturation(saturation)
+                titleAndHostBadge
 
                 if showsZoomIndicator {
                     Button {
@@ -322,18 +345,86 @@ struct TabItemView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.90, execute: work)
     }
 
-    private func updateRenderedFaviconImage() {
-        guard renderedFaviconData != tab.iconImageData ||
-                (renderedFaviconImage == nil && tab.iconImageData != nil) else { return }
-        renderedFaviconData = tab.iconImageData
+    private func updateRenderedFaviconImage(_ data: Data?) {
+        guard renderedFaviconData != data ||
+                (renderedFaviconImage == nil && data != nil) else { return }
+        renderedFaviconData = data
         renderedFaviconImage = TabItemStyling.resolvedFaviconImage(
             existing: renderedFaviconImage,
-            incomingData: tab.iconImageData
+            incomingData: data
         )
+    }
+
+    private var titleText: some View {
+        Text(tab.title)
+            .font(.system(size: TabBarMetrics.titleFontSize))
+            .lineLimit(1)
+            .foregroundStyle(
+                isSelected
+                    ? TabBarColors.activeText(for: appearance)
+                    : TabBarColors.inactiveText(for: appearance)
+            )
+            .saturation(saturation)
+    }
+
+    /// The title, then the host chip. When the two do not fit, the chip drops
+    /// its name before the title is cut, so the tab keeps saying it is remote.
+    @ViewBuilder
+    private var titleAndHostBadge: some View {
+        if let badge = tab.hostBadge {
+            if TabHostBadgeStyle.showsLabel(title: tab.title, badgeLabel: badge.label) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: TabBarMetrics.contentSpacing) {
+                        titleText.fixedSize(horizontal: true, vertical: false)
+                        hostBadgeView(badge, showsLabel: true)
+                    }
+                    HStack(spacing: TabBarMetrics.contentSpacing) {
+                        titleText
+                        hostBadgeView(badge, showsLabel: false)
+                    }
+                }
+            } else {
+                HStack(spacing: TabBarMetrics.contentSpacing) {
+                    titleText
+                    hostBadgeView(badge, showsLabel: false)
+                }
+            }
+        } else {
+            titleText
+        }
+    }
+
+    private func hostBadgeView(_ badge: TabHostBadge, showsLabel: Bool) -> some View {
+        let color = Color(.sRGB, red: badge.red, green: badge.green, blue: badge.blue, opacity: 1)
+        let isLight = BonsplitCardPalette.cardBackground(for: appearance).isBonsplitLightColor
+        let text = badge.labelRGB(onLightBackground: isLight)
+        let labelColor = Color(.sRGB, red: text.red, green: text.green, blue: text.blue, opacity: 1)
+        return HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: TabHostBadgeStyle.dotSize, height: TabHostBadgeStyle.dotSize)
+            if showsLabel {
+                Text(badge.label)
+                    .font(.system(size: TabHostBadgeStyle.labelFontSize, weight: .semibold))
+                    .lineLimit(1)
+                    .foregroundStyle(labelColor)
+            }
+        }
+        .padding(.horizontal, showsLabel ? 6 : 4)
+        .frame(height: TabHostBadgeStyle.height)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(color.opacity(TabHostBadgeStyle.backgroundOpacity))
+        )
+        .fixedSize()
+        // Not desaturated with an inactive pane: which machine a tab runs on
+        // matters most when it is not the one being typed into.
+        .safeHelp(badge.label)
     }
 
     private var accessibilityValue: String {
         var parts: [String] = []
+        if let badge = tab.hostBadge { parts.append("On \(badge.label)") }
         if tab.isLoading { parts.append("Loading") }
         if tab.isPinned { parts.append("Pinned") }
         if tab.showsNotificationBadge { parts.append("Unread") }

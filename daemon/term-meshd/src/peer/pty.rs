@@ -118,6 +118,7 @@ pub fn spawn(
         // Child process: only async-signal-safe work from here on.
         unsafe {
             libc::close(exec_read_fd);
+            reset_signal_state();
             if let Some(cwd_ptr) = c_cwd.as_ref().map(|c| c.as_ptr()) {
                 if libc::chdir(cwd_ptr) != 0 {
                     let errno = current_errno();
@@ -202,6 +203,34 @@ fn build_child_env(overrides: &[(String, String)]) -> io::Result<Vec<CString>> {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "env entry contains NUL"))
         })
         .collect()
+}
+
+/// Highest signal number whose disposition a pane child resets. Real-time
+/// signals above it are not ones a launcher ignores.
+const LAST_STANDARD_SIGNAL: libc::c_int = 31;
+
+/// Give the pane a terminal's starting signal state: nothing blocked and
+/// every signal at its default action.
+///
+/// An ignored disposition and the blocked mask both survive `exec`. A daemon
+/// started with `nohup … &` ignores SIGHUP and SIGINT, so without this every
+/// pane shell inherits that: Ctrl-C cannot interrupt a command, and a closed
+/// pane's child shrugs off the SIGHUP that should end it.
+///
+/// Safety: called only in the forked child, between fork and exec;
+/// `sigprocmask` and `sigaction` are async-signal-safe.
+unsafe fn reset_signal_state() {
+    let mut empty: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut empty);
+    libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+
+    let mut default_action: libc::sigaction = std::mem::zeroed();
+    default_action.sa_sigaction = libc::SIG_DFL;
+    libc::sigemptyset(&mut default_action.sa_mask);
+    // SIGKILL and SIGSTOP reject the call; their action is fixed anyway.
+    for signal in 1..=LAST_STANDARD_SIGNAL {
+        libc::sigaction(signal, &default_action, std::ptr::null_mut());
+    }
 }
 
 /// Point the C library's `environ` at `envp`.
@@ -739,6 +768,46 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// Blocks SIGHUP only in this thread, which forks the child, so the test
+    /// does not change what any other test's child inherits.
+    #[test]
+    fn child_does_not_inherit_a_blocked_signal() {
+        let mut hangup: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut hangup);
+            libc::sigaddset(&mut hangup, libc::SIGHUP);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &hangup, &mut previous);
+        }
+        let spawned = spawn("/bin/cat", &[], 80, 24, None, &[]);
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        }
+        let child = spawned.expect("spawn cat");
+
+        unsafe {
+            libc::kill(child.pid, libc::SIGHUP);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut status = 0;
+        let mut reaped = 0;
+        while reaped == 0 && Instant::now() < deadline {
+            reaped = unsafe { libc::waitpid(child.pid, &mut status, libc::WNOHANG) };
+            if reaped == 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if reaped == 0 {
+            terminate_and_reap(child.pid);
+        }
+        unsafe {
+            libc::close(child.master_fd);
+        }
+        assert_eq!(reaped, child.pid, "cat kept SIGHUP blocked from its parent");
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGHUP);
     }
 
     #[test]

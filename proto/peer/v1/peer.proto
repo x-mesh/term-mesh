@@ -929,6 +929,17 @@ message HostStats {
   // nothing rather than a peer that looks 100% full.
   uint64 disk_total_bytes = 12;
   uint64 disk_available_bytes = 13;
+  // The surfaces of this host that run an agent CLI in their terminal's
+  // foreground, so a viewer can badge a remote pane the way it badges a
+  // local one. Only surfaces with a CLI are listed; an absent surface runs
+  // none. Empty on hosts that predate the field.
+  repeated SurfaceAgent surface_agents = 14;
+}
+
+message SurfaceAgent {
+  bytes surface_id = 1;
+  // "claude" or "codex".
+  string cli = 2;
 }
 
 // ============================================================

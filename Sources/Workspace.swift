@@ -31,7 +31,16 @@ import CoreText
 @Observable @MainActor
 final class Workspace: Identifiable {
     let id: UUID
-    @ObservationIgnored lazy var retrievalStore = WorkspaceRetrievalStore(workspaceID: id)
+    @ObservationIgnored lazy var retrievalStore: WorkspaceRetrievalStore = {
+        let store = WorkspaceRetrievalStore(workspaceID: id)
+        // The workspace is what can reach the host that knows a pane's live
+        // directory, and a checkpoint needs it whether or not any view is up.
+        store.remoteDirectoryProvider = { [weak self] pane in
+            guard let self else { return nil }
+            return await self.remoteDirectory(for: pane)
+        }
+        return store
+    }()
     var title: String
     var customTitle: String?
     var isPinned: Bool = false
@@ -141,7 +150,6 @@ final class Workspace: Identifiable {
     @ObservationIgnored var onClosedBrowserPanel: ((ClosedBrowserPanelRestoreSnapshot) -> Void)?
 
     /// The pane zoom transition waiting for bonsplit's settle signal.
-    @ObservationIgnored private weak var zoomTransitionHostedView: GhosttySurfaceScrollView?
     @ObservationIgnored private var zoomTransitionPaneId: PaneID?
     @ObservationIgnored private var zoomTransitionGeneration = 0
 
@@ -277,6 +285,15 @@ final class Workspace: Identifiable {
     @ObservationIgnored private var dominantRemoteHostKeyCache: PeerPaneHostKey??
     @ObservationIgnored private var dominantRemoteHostKeyCachedFocusedPanelId: UUID?
     @ObservationIgnored private(set) var dominantRemoteHostKeyComputationCount = 0
+    /// Where each remote pane's shell is on its host, keyed by panel.
+    ///
+    /// Kept apart from `panelDirectories` on purpose: focusing a pane copies
+    /// that map into `currentDirectory`, which new splits and the titlebar's
+    /// `git` lookup read as a path on this Mac.
+    var remotePaneLocations: [UUID: RemotePaneLocation] = [:]
+    @ObservationIgnored var remotePaneLocationRefreshes: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored var remotePaneLocationRefreshAgain: Set<UUID> = []
+    @ObservationIgnored var remotePaneLocationLastQuery: [UUID: ContinuousClock.Instant] = [:]
     var surfaceListeningPorts: [UUID: [Int]] = [:]
     var listeningPorts: [Int] = []
     @ObservationIgnored var surfaceTTYNames: [UUID: String] = [:]
@@ -388,6 +405,9 @@ final class Workspace: Identifiable {
                   let panelId = self.panelIdFromSurfaceId(tab.id),
                   let terminal = self.panels[panelId] as? TerminalPanel else { return }
             terminal.hostedView.playTransitionGlow(delay: delay)
+            #if DEBUG
+            dlog("pane.transitionGlow panel=\(panelId.uuidString.prefix(5)) mirror=\(self.isPeerMirror ? 1 : 0)")
+            #endif
             let hold = delay + CardRingView.transitionGlowDuration
             for case let other as TerminalPanel in self.panels.values where other !== terminal {
                 other.hostedView.holdNotificationRing(for: hold)
@@ -395,28 +415,25 @@ final class Workspace: Identifiable {
         }
     }
 
-    /// Stretches the terminal in `paneId` along its zoom slide, then restores
-    /// it and glows it once bonsplit reports every level of the slide stopped.
-    /// Called right after the toggle, before any layout has moved the pane.
+    /// The longest a zoom waits for bonsplit's settle signal: one lost with a
+    /// split view torn down mid-slide must not leave the siblings hidden. Well
+    /// above the slide itself, which a busy main thread can stretch past half
+    /// a second.
+    private static let zoomSettleTimeout: TimeInterval = 2.0
+
+    /// Glows the pane in `paneId` once bonsplit reports every level of its zoom
+    /// slide stopped. The terminal is resized with the pane on every frame of
+    /// the slide, so its columns grow and shrink along with it.
     private func startZoomTransition(in paneId: PaneID) {
         guard zoomSlidesAnimate else {
             playPaneTransitionGlow(in: paneId, afterSlide: false)
             return
         }
-        let hostedView = bonsplitController.selectedTab(inPane: paneId)
-            .flatMap { panelIdFromSurfaceId($0.id) }
-            .flatMap { panels[$0] as? TerminalPanel }?
-            .hostedView
-        if let previous = zoomTransitionHostedView, previous !== hostedView {
-            previous.endZoomSnapshot()
-        }
-        hostedView?.beginZoomSnapshot()
-        zoomTransitionHostedView = hostedView
         zoomTransitionPaneId = paneId
         zoomTransitionGeneration &+= 1
         let generation = zoomTransitionGeneration
-        // Same bound as the snapshot's own: a toggle that slid nothing never settles.
-        DispatchQueue.main.asyncAfter(deadline: .now() + GhosttySurfaceScrollView.zoomSnapshotTimeout) { [weak self] in
+        // A toggle that slid nothing never settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.zoomSettleTimeout) { [weak self] in
             guard let self, self.zoomTransitionGeneration == generation else { return }
             self.zoomSlideDidSettle()
         }
@@ -445,8 +462,6 @@ final class Workspace: Identifiable {
             // A toggle back into zoom before landing already re-hid the siblings.
             if !isPaneZoomed { revealAllTerminals() }
         }
-        zoomTransitionHostedView?.endZoomSnapshot()
-        zoomTransitionHostedView = nil
         if let paneId = zoomTransitionPaneId {
             zoomTransitionPaneId = nil
             playPaneTransitionGlow(in: paneId, afterSlide: false)
@@ -968,6 +983,38 @@ final class Workspace: Identifiable {
     }
 
 
+    /// Puts each terminal's foreground-app icon on its tab, and takes it off
+    /// once the app is gone. Only tabs whose app changed are touched.
+    func applyTerminalAgents(_ agents: [UUID: TerminalAgentCLI]) {
+        for (panelId, panel) in panels {
+            // A remote pane's CLI runs on its host; this Mac's daemon only
+            // ever sees the relay there and would clear what the host sent.
+            guard let terminal = panel as? TerminalPanel, terminal.remoteHostKey == nil else { continue }
+            setAgentCLI(agents[panelId], for: terminal, panelId: panelId)
+        }
+    }
+
+    /// The logo for a remote pane's agent CLI, as its host reports it.
+    func applyRemoteAgentCLI(_ cli: TerminalAgentCLI?, panelId: UUID) {
+        guard let terminal = panels[panelId] as? TerminalPanel else { return }
+        setAgentCLI(cli, for: terminal, panelId: panelId)
+    }
+
+    private func setAgentCLI(_ cli: TerminalAgentCLI?, for terminal: TerminalPanel, panelId: UUID) {
+        guard terminal.agentCLI != cli else { return }
+        terminal.agentCLI = cli
+        let tabId = surfaceIdFromPanelId(panelId)
+        #if DEBUG
+        dlog("tab.agentIcon panel=\(panelId.uuidString.prefix(5)) cli=\(cli?.rawValue ?? "none") tab=\(tabId == nil ? 0 : 1)")
+        #endif
+        guard let tabId else { return }
+        bonsplitController.updateTab(
+            tabId,
+            icon: .some(cli?.symbolName ?? terminal.displayIcon),
+            iconImageData: .some(cli?.iconPNGData)
+        )
+    }
+
     func installBrowserPanelSubscription(_ browserPanel: BrowserPanel) {
         let subscription = Publishers.CombineLatest3(
             browserPanel.$pageTitle.removeDuplicates(),
@@ -1064,6 +1111,26 @@ final class Workspace: Identifiable {
 
     func hasUnreadNotification(panelId: UUID) -> Bool {
         AppDelegate.shared?.notificationStore?.hasUnreadNotification(forTabId: id, surfaceId: panelId) ?? false
+    }
+
+    /// Shows the host a remote terminal runs on as a chip in its tab, and
+    /// removes it from a local one. The one place the badge is derived, so
+    /// every path that (re)creates a tab for an existing panel calls this.
+    func syncHostBadgeForPanel(_ panelId: UUID) {
+        guard let tabId = surfaceIdFromPanelId(panelId) else { return }
+        let badge = (panels[panelId] as? TerminalPanel)?.remoteHostKey.map(Self.tabHostBadge(for:))
+        bonsplitController.updateTab(tabId, hostBadge: .some(badge))
+    }
+
+    static func tabHostBadge(for hostKey: PeerPaneHostKey) -> TabHostBadge {
+        let color = PeerHostAccent.primaryColor(for: hostKey).usingColorSpace(.sRGB)
+            ?? PeerHostAccent.primaryColor(for: hostKey)
+        return TabHostBadge(
+            label: hostKey.shortLabel,
+            red: Double(color.redComponent),
+            green: Double(color.greenComponent),
+            blue: Double(color.blueComponent)
+        )
     }
 
     func syncUnreadBadgeStateForPanel(_ panelId: UUID) {
@@ -1861,10 +1928,14 @@ final class Workspace: Identifiable {
         // Live mirror: forward as a host-side new-tab (keyed by the
         // pane's selected panel), create nothing locally.
         if mirrorForwardsLocalActions {
-            if let tab = bonsplitController.selectedTab(inPane: paneId),
-               let panelId = panelIdFromSurfaceId(tab.id)
-            {
-                peerMirror?.forwardNewTab(panelId: panelId)
+            if let peerMirror {
+                if let tab = bonsplitController.selectedTab(inPane: paneId),
+                   let panelId = panelIdFromSurfaceId(tab.id)
+                {
+                    peerMirror.forwardNewTab(panelId: panelId)
+                } else if peerMirror.remoteLayoutIsEmpty {
+                    peerMirror.forwardNewTabForEmptyWorkspace()
+                }
             }
             return nil
         }
@@ -2816,6 +2887,8 @@ final class Workspace: Identifiable {
         }
         syncPinnedStateForTab(newTabId, panelId: detached.panelId)
         syncUnreadBadgeStateForPanel(detached.panelId)
+        syncHostBadgeForPanel(detached.panelId)
+        scheduleRemotePaneLocationRefresh(panelId: detached.panelId, reason: .attached)
         normalizePinnedTabs(in: paneId)
 
         if focus {
@@ -3434,6 +3507,11 @@ final class Workspace: Identifiable {
         return !peerMirror.isApplyingRemoteLayout && !peerMirror.isTornDown
     }
 
+    /// The mirror reconciler is rebuilding this workspace's split tree.
+    var isApplyingPeerMirrorLayout: Bool {
+        peerMirror?.isApplyingRemoteLayout == true
+    }
+
     /// Host key of this workspace's "dominant" remote pane, for the
     /// titlebar/sidebar host chip (pane-mixing model — a workspace can
     /// hold a mix of local and remote panes, unlike `peerMirror` above).
@@ -3664,10 +3742,11 @@ final class Workspace: Identifiable {
         // the handler refuses to engage until the host sends a typed
         // snapshot, so legacy hosts keep plain local scrolling).
         panel.hostedView.scrollbackBrowseHandler = session.relaySession
-        // Always-on host signal: 2pt strip in the host's accent color
-        // (the focused-pane titlebar gradient complements this).
-        panel.hostedView.setPeerHostStrip(
-            color: PeerHostAccent.primaryColor(for: session.lease.key)
+        syncHostBadgeForPanel(panel.id)
+        recordRemotePaneLocation(
+            panelId: panel.id,
+            directory: session.originSurface.cwd,
+            branch: session.originSurface.branch
         )
         let panelId = panel.id
         session.requestPaneClose = { [weak self] in
@@ -3781,6 +3860,9 @@ final class Workspace: Identifiable {
         }
         session.relaySession.onReconnected = { [weak panel] in
             panel?.hostedView.hidePeerDisconnectBanner()
+        }
+        session.relaySession.onRemoteAgentCLI = { [weak self] cli in
+            self?.applyRemoteAgentCLI(cli.flatMap(TerminalAgentCLI.init(rawValue:)), panelId: panelId)
         }
         session.relayStartupFailure = { error in
             let reason = "Remote leader relay failed to start: \(String(describing: error))"
@@ -4514,6 +4596,86 @@ final class Workspace: Identifiable {
     ///
     /// Costs a short-lived connection to the host, so this is for moments of
     /// intent (opening the binding sheet), not for anything that repeats.
+    enum RemotePaneLocationRefreshReason {
+        case focused
+        case attached
+        /// The titlebar is showing this pane. It redraws on its own tick and
+        /// whenever the pane retitles, so only the pane on screen is asked
+        /// about, however many remote panes keep retitling themselves.
+        case shownInTitlebar
+
+        /// Each query opens a host connection, and an agent CLI retitles its
+        /// pane every second. Focus and attach are rare and want the answer
+        /// now.
+        var minimumInterval: Duration {
+            switch self {
+            case .focused, .attached: .zero
+            case .shownInTitlebar: .seconds(5)
+            }
+        }
+    }
+
+    func recordRemotePaneLocation(panelId: UUID, directory: String, branch: String) {
+        let location = RemotePaneLocation(directory: directory, branch: branch)
+        guard remotePaneLocations[panelId] != location else { return }
+#if DEBUG
+        dlog(
+            "remote.location panel=\(panelId.uuidString.prefix(8)) " +
+            "dir=\(directory.isEmpty ? "-" : directory) branch=\(branch.isEmpty ? "-" : branch)"
+        )
+#endif
+        remotePaneLocations[panelId] = location
+        NotificationCenter.default.post(name: .remotePaneLocationDidChange, object: self)
+    }
+
+    func forgetRemotePaneLocation(panelId: UUID) {
+        remotePaneLocations.removeValue(forKey: panelId)
+        remotePaneLocationRefreshes.removeValue(forKey: panelId)?.cancel()
+        remotePaneLocationRefreshAgain.remove(panelId)
+        remotePaneLocationLastQuery.removeValue(forKey: panelId)
+    }
+
+    /// Re-reads where a remote pane's shell is. One query per pane at a time:
+    /// a request that arrives while one runs is folded into a single rerun.
+    /// A host that stops answering ends the query through the read timeout
+    /// of `PeerRelaySession.connectAndList`.
+    func scheduleRemotePaneLocationRefresh(panelId: UUID, reason: RemotePaneLocationRefreshReason) {
+        guard (panels[panelId] as? TerminalPanel)?.peerPaneSession != nil else { return }
+        if remotePaneLocationRefreshes[panelId] != nil {
+            remotePaneLocationRefreshAgain.insert(panelId)
+            return
+        }
+        let delay: Duration = {
+            guard let last = remotePaneLocationLastQuery[panelId] else { return .zero }
+            let remaining = reason.minimumInterval - (ContinuousClock.now - last)
+            return remaining > .zero ? remaining : .zero
+        }()
+        remotePaneLocationRefreshes[panelId] = Task { @MainActor [weak self] in
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled, let self else { return }
+            await self.queryRemotePaneLocation(panelId: panelId)
+            guard !Task.isCancelled else { return }
+            self.remotePaneLocationRefreshes[panelId] = nil
+            if self.remotePaneLocationRefreshAgain.remove(panelId) != nil {
+                self.scheduleRemotePaneLocationRefresh(panelId: panelId, reason: .shownInTitlebar)
+            }
+        }
+    }
+
+    private func queryRemotePaneLocation(panelId: UUID) async {
+        guard let session = (panels[panelId] as? TerminalPanel)?.peerPaneSession else { return }
+        remotePaneLocationLastQuery[panelId] = .now
+        let wanted = session.originSurface.surfaceID
+        do {
+            let surfaces = try await PeerPaneSession.listSurfaces(on: session.lease)
+            guard !Task.isCancelled, panels[panelId] != nil,
+                  let match = surfaces.first(where: { $0.surfaceID == wanted }) else { return }
+            recordRemotePaneLocation(panelId: panelId, directory: match.cwd, branch: match.branch)
+        } catch {
+            RemoteWorkLog.debug("location lookup for panel \(panelId.uuidString.prefix(8)) failed: \(error.localizedDescription)")
+        }
+    }
+
     func remoteDirectory(for pane: WorkspaceRemotePaneRecord) async -> String? {
         guard let panel = terminalPanel(for: pane.panelID),
               let session = panel.peerPaneSession else {

@@ -84,7 +84,7 @@ enum PeerHostAccent {
     /// a host: it is both the relay window's identity gradient and the
     /// sidebar's local selected-row gradient, so a host hashing onto it
     /// would be indistinguishable from local UI. One palette feeds every
-    /// per-host signal (sidebar row, pane host strip) so they always
+    /// per-host signal (sidebar row, tab host chip) so they always
     /// agree in hue.
     static func colors(for key: PeerPaneHostKey) -> [NSColor] {
         var hash: UInt64 = 5381
@@ -144,7 +144,7 @@ extension NSWindow {
 ///
 /// Decision (2026-07-15): the MAIN window titlebar stays at its default
 /// look — no per-host gradient. The "keys go to a remote host" signal
-/// lives in the per-pane 2pt host strip (always on) and the sidebar's
+/// lives in the tab's host chip (always on) and the sidebar's
 /// peer-accent row (see TabItemView.peerAccentNSColors). refresh() now
 /// only REMOVES accents so anything installed by an older build or a
 /// stale focus race is cleaned up on the next focus change. Standalone
