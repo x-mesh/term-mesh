@@ -294,6 +294,7 @@ patches and merges `ghostty-org/main` in dated stages.
 | 2 | `b58ef1d678` (2026-10-20, before #14519) | 0.16 | `e29bd7968` |
 | 3 | `cf5519b22f` (2026-11-08) | 0.17 | `2b65b2e243` |
 | 4 | `d4cf6ec225` (2026-11-16) | 0.17.1 | `f274207bd` |
+| 5 | `19da8d4c75` (2026-11-26) | 0.17.1 | `3c9f85e09` |
 
 Stage 1 resolution rules. Use the same rules in later stages.
 
@@ -418,6 +419,32 @@ Stage 4 adds these rules:
 Test reference for stage 4: `zig build test -Demit-macos-app=false` gives
 4569 passed, 32 skipped, 1 failed (the same OpenGL test).
 `zig build test-lib-vt` passes.
+
+Stage 5 adds these rules:
+
+- `src/Surface.zig` mouse mods: upstream `805b44a11` and `f07c80a7c` fix
+  the same bug as the cmux binding-mods comparison. Use the upstream code.
+- `src/font/shaper/run.zig`: keep the cmux bidi run iterator. Upstream's
+  trimming (`5749a0f67`, `7f8b1c956`, `6874ea6dd`) moved the row end into
+  `RunIterator.init`; the cmux iterator uses that `max` and no longer
+  computes its own in `resolveRowLayout`. The skin tone rule from
+  `7a1dbc215` is in `presentationForCell`; the fallback retry merged as is.
+- `src/font/shaper/coretext.zig`: keep the cmux tests and add upstream's
+  grid replacement test. `testGridWithFont` also maps the cmux `arabic` and
+  `julia_mono` test fonts.
+- `src/config/url.zig`: keep the cmux path branches. From `ff61ef60d`,
+  a path no longer ends in `;`, `!` or `?`, keeps the dots of a final `.`
+  or `..` segment, and does not continue across a space after `:`, `;`,
+  `!` or `?`. `no_trailing_colon` stays separate. The cmux exception that
+  lets a path end in `.` or `,` at the end of a line stays, so upstream's
+  cases that end a line with a period (`See /etc/hosts.`) run mid-line
+  here. At the end of a line the fork still matches `/etc/hosts.`.
+
+Test reference for stage 5: `zig build test -Demit-macos-app=false` gives
+4605 passed, 32 skipped, 1 failed (the same OpenGL test). The step also
+runs `xcodebuild test -scheme Ghostty`, which fails
+`KeyboardLayoutTests.characterAppliesModifiers` with the Korean 2-Set
+input source, as in stage 3. `zig build test-lib-vt` passes.
 
 ## Merge conflict notes
 
