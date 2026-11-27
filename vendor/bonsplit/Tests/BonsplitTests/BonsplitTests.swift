@@ -542,7 +542,7 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
-    func testDefaultSplitAnimatesExistingFirstPaneFromStartEdge() throws {
+    func testDefaultSplitAnimatesNewSecondPaneFromEndEdge() throws {
         let controller = BonsplitController().internalController
         let source = try XCTUnwrap(controller.focusedPaneId)
 
@@ -551,11 +551,11 @@ final class BonsplitTests: XCTestCase {
         guard case .split(let split) = controller.rootNode else {
             return XCTFail("Expected a split root")
         }
-        XCTAssertEqual(split.animationOrigin, .fromFirst)
+        XCTAssertEqual(split.animationOrigin, .fromSecond)
     }
 
     @MainActor
-    func testExplicitInsertionAnimatesExistingPaneFromOppositeEdge() throws {
+    func testExplicitInsertionAnimatesNewFirstPaneFromStartEdge() throws {
         let controller = BonsplitController().internalController
         let source = try XCTUnwrap(controller.focusedPaneId)
         let tab = TabItem(title: "Inserted", icon: nil)
@@ -565,7 +565,7 @@ final class BonsplitTests: XCTestCase {
         guard case .split(let split) = controller.rootNode else {
             return XCTFail("Expected a split root")
         }
-        XCTAssertEqual(split.animationOrigin, .fromSecond)
+        XCTAssertEqual(split.animationOrigin, .fromFirst)
     }
 
     @MainActor
