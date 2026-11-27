@@ -1130,6 +1130,9 @@ class GhosttyApp {
         keybind = shift+page_down=scroll_page_down
         keybind = shift+home=scroll_to_top
         keybind = shift+end=scroll_to_bottom
+        # Keep a shell prompt on screen while a split is dragged instead of
+        # blanking it on every resize step until the shell redraws it.
+        resize-keep-prompt = true
         # A colored row, such as a powerline prompt, extends its background
         # through the side padding to the card edge.
         window-padding-color = extend
