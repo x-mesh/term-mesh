@@ -8051,6 +8051,46 @@ final class RelayFrameByteBudgetTests: XCTestCase {
         lock.lock(); defer { lock.unlock() }
         XCTAssertEqual(outcome, false)
     }
+
+    func testWriterCompletionRecordsOutputLatencyForWriteAndFailure() async throws {
+        let stats = RelayOutputLatencyStats()
+        let wrote = expectation(description: "successful write completion")
+        let failed = expectation(description: "failed write completion")
+        let lock = NSLock()
+        var writeCount = 0
+        let writer = RelayFrameWriter(
+            writeFrame: { _, _ in
+                lock.lock()
+                defer { lock.unlock() }
+                writeCount += 1
+                if writeCount == 2 { throw RelayError.ioError("fixture write failure") }
+            },
+            onFailure: { _ in }
+        )
+        let receivedAt = DispatchTime.now().uptimeNanoseconds
+        try await writer.enqueue(type: 0x01, payload: Data([1])) { success in
+            stats.record(.init(
+                generation: 1,
+                receiveToFeedNs: DispatchTime.now().uptimeNanoseconds &- receivedAt,
+                outcome: success ? .written : .cancelled
+            ))
+            wrote.fulfill()
+        }
+        try await writer.enqueue(type: 0x01, payload: Data([2])) { success in
+            stats.record(.init(
+                generation: 1,
+                receiveToFeedNs: 1,
+                outcome: success ? .written : .cancelled
+            ))
+            failed.fulfill()
+        }
+        await fulfillment(of: [wrote, failed], timeout: 1)
+
+        let snapshot = stats.snapshot()
+        XCTAssertEqual(snapshot["cancelled_count"] as? UInt64, 1)
+        let timing = try XCTUnwrap(snapshot["receive_to_feed"] as? [String: Any])
+        XCTAssertEqual(timing["n"] as? Int, 1)
+    }
 }
 
 // MARK: - Relay input diagnostics
