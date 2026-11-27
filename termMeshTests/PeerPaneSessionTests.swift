@@ -8189,6 +8189,32 @@ final class RelayInputLatencyStatsTests: XCTestCase {
     }
 }
 
+final class RelayOutputLatencyStatsTests: XCTestCase {
+    func testEmptySnapshotDoesNotInventLatency() throws {
+        let stats = RelayOutputLatencyStats()
+        let timing = try XCTUnwrap(stats.snapshot()["receive_to_feed"] as? [String: Any])
+        XCTAssertEqual(timing["n"] as? Int, 0)
+        XCTAssertNil(timing["p50_ms"])
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: stats.snapshot()))
+    }
+
+    func testCurrentGenerationAndOverflowAreBounded() throws {
+        let stats = RelayOutputLatencyStats(capacity: 2)
+        stats.record(.init(generation: 1, receiveToFeedNs: 900_000_000, outcome: .written))
+        stats.record(.init(generation: 2, receiveToFeedNs: 2_000_000, outcome: .written))
+        stats.record(.init(generation: 2, receiveToFeedNs: 4_000_000, outcome: .cancelled))
+        stats.record(.init(generation: 2, receiveToFeedNs: 6_000_000, outcome: .written))
+
+        let snapshot = stats.snapshot()
+        XCTAssertEqual(snapshot["window_samples"] as? Int, 2)
+        XCTAssertGreaterThan(snapshot["sample_overflow_count"] as? UInt64 ?? 0, 0)
+        XCTAssertEqual(snapshot["cancelled_count"] as? UInt64, 1)
+        let timing = try XCTUnwrap(snapshot["receive_to_feed"] as? [String: Any])
+        XCTAssertEqual(timing["n"] as? Int, 1)
+        XCTAssertEqual(timing["p50_ms"] as? Double, 6)
+    }
+}
+
 // MARK: - Relay stall production logging
 
 /// The gate behind the release-build stall lines; sustained stalls remain

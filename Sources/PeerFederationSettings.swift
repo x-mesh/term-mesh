@@ -88,6 +88,7 @@ enum PeerFederationSettings {
     static let recentHostsKey    = "peerFederationRecentHosts"
     static let forceRedrawKey    = "peerFederationForceRedrawOnAttach"
     static let inputPathTelemetryKey = "peerFederationInputPathTelemetry"
+    static let outputPathTelemetryKey = "peerFederationOutputPathTelemetry"
     static let forwardDashboardKey = "peerFederationForwardDashboard"
     static let remoteDashboardPortKey = "peerFederationRemoteDashboardPort"
     static let keepAwakeKey = "peerFederationKeepAwakeWhileConnected"
@@ -240,6 +241,13 @@ enum PeerFederationSettings {
     /// The bundle identifier differs for Debug and `--tag` builds.
     static var inputPathTelemetryEnabled: Bool {
         UserDefaults.standard.bool(forKey: inputPathTelemetryKey)
+    }
+
+    /// Opt-in local output timing from a received live `PtyData` frame through
+    /// the completed write into the Ghostty relay helper. Samples are bounded,
+    /// numeric-only, and never retain terminal payload bytes.
+    static var outputPathTelemetryEnabled: Bool {
+        UserDefaults.standard.bool(forKey: outputPathTelemetryKey)
     }
 
     static func logInputLatencyLifecycle(_ event: String) {
