@@ -4,12 +4,13 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
-### Added
+## [0.296.1]
 
+- Keep durable peer relay sessions alive across viewer detach and support empty remote sessions.
+- Improve foreground terminal application icons and update latency.
+- Fix Light mode pane resize chrome and remote agent tab presentation.
+- Add payload-free relay output latency telemetry.
 - A terminal tab shows an icon for the program running in that pane, and the terminal icon again once it exits. Claude and Codex show their logos; Kiro, Gemini, OpenCode, Neovim and Vim, tmux, Zellij, Lazygit, K9s, btop and htop, Python and Node show a matching symbol. The tab changes within about half a second. A pane shown from another Mac shows the icon for what runs on that Mac, when that Mac runs this version too.
-
-### Fixed
-
 - With Pane Transition Animation on, splitting a pane in a workspace mirrored from another Mac glows only the new pane. Before, several panes of the mirror glowed at once, because the mirror rebuilds its whole layout after each change on the host.
 
 ## [0.296.0] - 2026-11-26
