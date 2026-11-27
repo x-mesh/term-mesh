@@ -147,6 +147,22 @@ def main() -> int:
             raise termmeshError(f"healthy relay lost input: {latency!r}")
         print("input_latency=" + json.dumps(latency, sort_keys=True))
 
+        # Output timing is opt-in and payload-free. The default test app leaves
+        # it disabled, so this asserts only the stable status contract: callers
+        # can always read a numeric, empty-window diagnostic without exposing
+        # terminal bytes or inventing a latency percentile.
+        output_latency = (c.peer_pane_status().get("pane_sessions") or [{}])[0].get("output_latency", {})
+        if output_latency.get("scope") != "active_live_ptydata_receive_to_relay_feed":
+            raise termmeshError(f"unexpected output latency scope: {output_latency!r}")
+        if output_latency.get("window_capacity", 0) <= 0:
+            raise termmeshError(f"invalid output latency capacity: {output_latency!r}")
+        timing = output_latency.get("receive_to_feed", {})
+        if not isinstance(timing.get("n"), int) or timing["n"] < 0:
+            raise termmeshError(f"invalid output latency sample count: {output_latency!r}")
+        if any(key in output_latency for key in ("payload", "bytes", "command", "cwd", "title")):
+            raise termmeshError(f"output latency exposed terminal metadata: {output_latency!r}")
+        print("output_latency=" + json.dumps(output_latency, sort_keys=True))
+
         # --- 3. closing the pane releases session + lease
         c.close_surface(panel_id)
 

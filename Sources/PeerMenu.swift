@@ -2363,6 +2363,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // means nothing ever arrived from the host.
                 row["io"] = session.relaySession.ioSnapshot
                 row["relay_telemetry"] = session.relaySession.relayTelemetrySnapshot
+                row["output_latency"] = session.relaySession.outputLatencySnapshot
                 if includeInputLatency {
                     row["input_latency"] = session.relaySession.inputLatencySnapshot
                 }
