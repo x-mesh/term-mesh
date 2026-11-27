@@ -193,7 +193,10 @@ final class SplitViewController {
                     // from an edge via animationOrigin, but the model should never represent a
                     // fully-collapsed pane (which can get stuck under view reparenting timing).
                     dividerPosition: 0.5,
-                    animationOrigin: .fromSecond  // New pane slides in from right/bottom
+                    // Keep the new pane on its own side and animate from that
+                    // edge. The renderer gives the divider a Natural landing,
+                    // so source, destination, and border settle together.
+                    animationOrigin: .fromSecond
                 )
 
                 // Focus the new pane

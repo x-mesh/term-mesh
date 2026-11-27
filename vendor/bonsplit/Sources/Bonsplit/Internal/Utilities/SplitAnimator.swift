@@ -143,6 +143,17 @@ final class SplitAnimator {
         return t * t * (3.0 - 2.0 * t)
     }
 
+    /// Rex Natural-style landing for pane geometry: travel reaches the target
+    /// quickly, passes it by a deliberately small amount, then settles. This
+    /// is used only for divider-driven pane open/close transitions. Zoom keeps
+    /// `eased(_:)` because reflowing a full terminal beyond its final bounds is
+    /// visually noisy.
+    private static func naturalDividerEased(_ progress: Double) -> Double {
+        let t = min(max(progress, 0.0), 1.0) - 1.0
+        let overshoot = 0.72
+        return 1.0 + t * t * ((overshoot + 1.0) * t + overshoot)
+    }
+
     // MARK: - Frame Update
 
     private func tick() {
@@ -157,7 +168,7 @@ final class SplitAnimator {
 
             let elapsed = currentTime - animation.startTime
             let progress = min(elapsed / animation.duration, 1.0)
-            let eased = progress == 1.0 ? 1.0 : 1.0 - pow(2.0, -10.0 * progress)
+            let eased = progress == 1.0 ? 1.0 : Self.naturalDividerEased(progress)
 
             let position = animation.startPosition + (animation.endPosition - animation.startPosition) * eased
 

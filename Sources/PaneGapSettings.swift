@@ -29,7 +29,9 @@ enum PaneTransitionAnimationSettings {
 
     /// Length of one split or zoom slide, in seconds.
     static let durationKey = "paneTransitionAnimationDuration"
-    static let defaultDuration: Double = 0.2
+    /// Rex Natural-style landing: fast enough for terminal work while leaving
+    /// room for source, destination, and divider to settle as one motion.
+    static let defaultDuration: Double = 0.28
     static let durationRange: ClosedRange<Double> = 0.1...0.6
 
     static var isEnabled: Bool {

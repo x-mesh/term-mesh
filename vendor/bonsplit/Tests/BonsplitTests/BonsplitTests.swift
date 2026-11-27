@@ -542,6 +542,33 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testDefaultSplitAnimatesNewSecondPaneFromEndEdge() throws {
+        let controller = BonsplitController().internalController
+        let source = try XCTUnwrap(controller.focusedPaneId)
+
+        controller.splitPane(source, orientation: .horizontal)
+
+        guard case .split(let split) = controller.rootNode else {
+            return XCTFail("Expected a split root")
+        }
+        XCTAssertEqual(split.animationOrigin, .fromSecond)
+    }
+
+    @MainActor
+    func testExplicitInsertionAnimatesNewFirstPaneFromStartEdge() throws {
+        let controller = BonsplitController().internalController
+        let source = try XCTUnwrap(controller.focusedPaneId)
+        let tab = TabItem(title: "Inserted", icon: nil)
+
+        controller.splitPaneWithTab(source, orientation: .vertical, tab: tab, insertFirst: true)
+
+        guard case .split(let split) = controller.rootNode else {
+            return XCTFail("Expected a split root")
+        }
+        XCTAssertEqual(split.animationOrigin, .fromFirst)
+    }
+
+    @MainActor
     func testSplitPaneWithOptionalTabPreservesCustomTitleFlag() {
         let controller = BonsplitController()
         _ = controller.createTab(title: "Base")
