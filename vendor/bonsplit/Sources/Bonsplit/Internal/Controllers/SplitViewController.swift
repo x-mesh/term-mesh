@@ -193,7 +193,11 @@ final class SplitViewController {
                     // from an edge via animationOrigin, but the model should never represent a
                     // fully-collapsed pane (which can get stuck under view reparenting timing).
                     dividerPosition: 0.5,
-                    animationOrigin: .fromSecond  // New pane slides in from right/bottom
+                    // Reveal the existing pane from the opposite edge. The new
+                    // pane keeps its right/bottom placement while the divider
+                    // moves left/top → centre, which reads as the source pane
+                    // making room instead of a second pane pushing it aside.
+                    animationOrigin: .fromFirst
                 )
 
                 // Focus the new pane
@@ -248,22 +252,24 @@ final class SplitViewController {
                 // Start with divider at the edge so there's no flash before animation
                 let splitState: SplitState
                 if insertFirst {
-                    // New pane goes first (left or top).
+                    // New pane goes first (left or top). Reveal the existing
+                    // second pane from the opposite edge.
                     splitState = SplitState(
                         orientation: orientation,
                         first: .pane(newPane),
                         second: .pane(paneState),
                         dividerPosition: 0.5,
-                        animationOrigin: .fromFirst
+                        animationOrigin: .fromSecond
                     )
                 } else {
-                    // New pane goes second (right or bottom).
+                    // New pane goes second (right or bottom). Reveal the
+                    // existing first pane from the opposite edge.
                     splitState = SplitState(
                         orientation: orientation,
                         first: .pane(paneState),
                         second: .pane(newPane),
                         dividerPosition: 0.5,
-                        animationOrigin: .fromSecond
+                        animationOrigin: .fromFirst
                     )
                 }
 
