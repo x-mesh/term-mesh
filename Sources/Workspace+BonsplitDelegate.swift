@@ -522,7 +522,9 @@ extension Workspace: BonsplitDelegate {
     func splitTabBar(_ controller: BonsplitController, didClosePane paneId: PaneID) {
         invalidateSidebarBranchDirectoryEntriesCache()
         let closedPanelIds = pendingPaneClosePanelIds.removeValue(forKey: paneId.id) ?? []
+        let frames = pendingPaneCloseFrames.removeValue(forKey: paneId.id) ?? [:]
 
+        var closeLanding: (panelId: UUID, oldFrame: NSRect)?
         if !closedPanelIds.isEmpty {
             for panelId in closedPanelIds {
                 unexposeForClosingPanel(panelId)
@@ -560,6 +562,10 @@ extension Workspace: BonsplitDelegate {
             if let focusedPane = bonsplitController.focusedPaneId,
                let focusedTabId = bonsplitController.selectedTab(inPane: focusedPane)?.id {
                 applyTabSelection(tabId: focusedTabId, inPane: focusedPane)
+                if let survivorPanelId = panelIdFromSurfaceId(focusedTabId),
+                   let oldFrame = frames[survivorPanelId] {
+                    closeLanding = (survivorPanelId, oldFrame)
+                }
             } else {
                 scheduleFocusReconcile()
             }
@@ -567,6 +573,18 @@ extension Workspace: BonsplitDelegate {
 
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
+        if let closeLanding {
+            // SwiftUI and the portal apply the survivor's final geometry on
+            // the next turn. Starting earlier would animate old → old.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let survivor = self.terminalPanel(for: closeLanding.panelId) else { return }
+                survivor.hostedView.reconcileGeometryNow()
+                survivor.hostedView.playNaturalCloseLanding(
+                    from: closeLanding.oldFrame,
+                    duration: PaneTransitionAnimationSettings.duration
+                )
+            }
+        }
 
         // A mirror reconcile collapses and rebuilds the whole tree; it glows
         // the pane it spawned itself once the rebuild is done.
@@ -631,6 +649,10 @@ extension Workspace: BonsplitDelegate {
             }
         }
         pendingPaneClosePanelIds[pane.id] = tabs.compactMap { panelIdFromSurfaceId($0.id) }
+        pendingPaneCloseFrames[pane.id] = panels.reduce(into: [:]) { frames, entry in
+            guard let terminal = entry.value as? TerminalPanel else { return }
+            frames[entry.key] = terminal.hostedView.frame
+        }
         return true
     }
 

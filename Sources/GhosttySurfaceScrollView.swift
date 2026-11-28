@@ -938,6 +938,48 @@ final class GhosttySurfaceScrollView: NSView {
         cardRingView.playTransitionGlow(delay: delay)
     }
 
+    /// After a sibling closes, keep this live terminal's model geometry at its
+    /// final size but animate its presentation layer from the old portal frame.
+    /// The removed pane is never retained, so terminal exit and peer detach
+    /// retain their synchronous close contract.
+    func playNaturalCloseLanding(from oldFrame: NSRect, duration: CFTimeInterval) {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let layer, oldFrame.width > 1, oldFrame.height > 1,
+              frame.width > 1, frame.height > 1, oldFrame != frame
+        else { return }
+
+        layer.removeAnimation(forKey: "term-mesh.pane-close-landing")
+        let target = frame
+        let overshoot = NSRect(
+            x: target.minX + (target.minX - oldFrame.minX) * 0.035,
+            y: target.minY + (target.minY - oldFrame.minY) * 0.035,
+            width: max(1, target.width + (target.width - oldFrame.width) * 0.035),
+            height: max(1, target.height + (target.height - oldFrame.height) * 0.035)
+        )
+        func center(of rect: NSRect) -> CGPoint {
+            CGPoint(x: rect.midX, y: rect.midY)
+        }
+        let position = CAKeyframeAnimation(keyPath: "position")
+        position.values = [center(of: oldFrame), center(of: overshoot), center(of: target)]
+        position.keyTimes = [0, 0.78, 1]
+
+        let bounds = CAKeyframeAnimation(keyPath: "bounds")
+        bounds.values = [
+            CGRect(origin: .zero, size: oldFrame.size),
+            CGRect(origin: .zero, size: overshoot.size),
+            CGRect(origin: .zero, size: target.size),
+        ]
+        bounds.keyTimes = [0, 0.78, 1]
+
+        let group = CAAnimationGroup()
+        group.animations = [position, bounds]
+        group.duration = duration
+        group.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.95, 0.25, 1.18)
+        group.fillMode = .both
+        group.isRemovedOnCompletion = true
+        layer.add(group, forKey: "term-mesh.pane-close-landing")
+    }
+
     func holdNotificationRing(for duration: CFTimeInterval) {
         cardRingView.holdNotificationRing(for: duration)
     }
