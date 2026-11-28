@@ -80,6 +80,34 @@ public final class BonsplitController {
         didSet { internalController.onZoomSlideSettled = onZoomSlideSettled }
     }
 
+    /// Asked when a split entry slide is about to start. Returning `true`
+    /// makes the split lay out at the slide's end first and call
+    /// `onSplitEntryTargetLaidOut`, so the host can record each pane's final
+    /// size before the slide moves the frames back to the edge.
+    @ObservationIgnored public var shouldHoldContentDuringSplitEntry: (() -> Bool)? {
+        didSet { internalController.shouldHoldContentDuringSplitEntry = shouldHoldContentDuringSplitEntry }
+    }
+
+    /// Called while the split is laid out at the end of an entry slide that
+    /// `shouldHoldContentDuringSplitEntry` accepted, before the slide moves
+    /// it back to the starting edge.
+    @ObservationIgnored public var onSplitEntryTargetLaidOut: (() -> Void)? {
+        didSet { internalController.onSplitEntryTargetLaidOut = onSplitEntryTargetLaidOut }
+    }
+
+    /// Called right after an accepted entry slide has moved the split back to
+    /// its starting edge, in the same main-loop turn as
+    /// `onSplitEntryTargetLaidOut`, so the host can follow before a frame draws.
+    @ObservationIgnored public var onSplitEntrySlideStarted: (() -> Void)? {
+        didSet { internalController.onSplitEntrySlideStarted = onSplitEntrySlideStarted }
+    }
+
+    /// Called once every accepted entry slide has stopped, whether it finished
+    /// or was cut off.
+    @ObservationIgnored public var onSplitEntrySettled: (() -> Void)? {
+        didSet { internalController.onSplitEntrySettled = onSplitEntrySettled }
+    }
+
     /// Handler for tab drops originating from another Bonsplit controller (e.g. another workspace/window).
     /// Return `true` when the drop has been handled by the host application.
     @ObservationIgnored public var onExternalTabDrop: ((ExternalTabDropRequest) -> Bool)?

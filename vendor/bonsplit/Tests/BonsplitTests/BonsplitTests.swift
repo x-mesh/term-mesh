@@ -542,6 +542,29 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testSplitEntryHoldSettlesOnlyAfterEveryOverlappingSlideEnds() {
+        let controller = BonsplitController()
+        var laidOut = 0
+        var settled = 0
+        controller.onSplitEntryTargetLaidOut = { laidOut += 1 }
+        controller.onSplitEntrySettled = { settled += 1 }
+        let internalController = controller.internalController
+        let first = UUID()
+        let second = UUID()
+
+        internalController.splitEntryHoldBegan(first)
+        internalController.splitEntryHoldBegan(second)
+        internalController.splitEntryHoldEnded(first)
+        XCTAssertEqual(settled, 0)
+
+        internalController.splitEntryHoldEnded(second)
+        internalController.splitEntryHoldEnded(second)
+        internalController.splitEntryHoldEnded(UUID())
+        XCTAssertEqual(laidOut, 2)
+        XCTAssertEqual(settled, 1)
+    }
+
+    @MainActor
     func testDefaultSplitAnimatesNewSecondPaneFromEndEdge() throws {
         let controller = BonsplitController().internalController
         let source = try XCTUnwrap(controller.focusedPaneId)

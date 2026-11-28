@@ -426,7 +426,15 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                         "available=\(Int(availableSize.rounded()))"
                     )
 #endif
-                    context.coordinator.setPositionSafely(startPosition, in: splitView, layout: true)
+                    // The entry animation starts at the edge. Clamping it to the
+                    // minimum pane size here shrinks the existing pane for a
+                    // frame, and `SplitAnimator` then puts it back at the edge.
+                    context.coordinator.setPositionSafely(
+                        startPosition,
+                        in: splitView,
+                        layout: true,
+                        clampToMinimumPaneSize: false
+                    )
 
                     // Wait for layout
                     DispatchQueue.main.async {
@@ -438,12 +446,32 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                             return
                         }
 
+                        let holdId = UUID()
+                        let holdsContent = controller.shouldHoldContentDuringSplitEntry?() ?? false
+                        if holdsContent {
+                            // Lay out at the end of the slide so the host can
+                            // record the final pane sizes. `animate` moves the
+                            // divider back to the edge in this same turn.
+                            // Rounded like the slide's last frame, so the held
+                            // size is the size the slide ends at.
+                            context.coordinator.setPositionSafely(
+                                targetPosition.rounded(),
+                                in: splitView,
+                                layout: true,
+                                clampToMinimumPaneSize: false
+                            )
+                            controller.splitEntryHoldBegan(holdId)
+                        }
+
                         SplitAnimator.shared.animate(
                             splitView: splitView,
                             from: startPosition,
                             to: targetPosition,
                             duration: duration
                         ) {
+                            if holdsContent {
+                                controller.splitEntryHoldEnded(holdId)
+                            }
                             context.coordinator.isAnimating = false
                             // Re-assert exact 0.5 ratio to prevent pixel-rounding drift
                             splitState.dividerPosition = 0.5
@@ -454,6 +482,9 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                                 "origin=\(animationOriginToken) finalRatio=\(String(format: "%.3f", splitState.dividerPosition))"
                             )
 #endif
+                        }
+                        if holdsContent {
+                            controller.splitEntrySlideStarted()
                         }
                     }
                 } else {
@@ -809,7 +840,12 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         }
 #endif
         /// Apply external position changes to the NSSplitView
-        func setPositionSafely(_ position: CGFloat, in splitView: NSSplitView, layout: Bool = true) {
+        func setPositionSafely(
+            _ position: CGFloat,
+            in splitView: NSSplitView,
+            layout: Bool = true,
+            clampToMinimumPaneSize: Bool = true
+        ) {
             guard (splitView as? ThemedSplitView)?.ownsChildLayout != true else { return }
             isSyncingProgrammatically = true
             splitContainerProgrammaticSyncDepth += 1
@@ -817,8 +853,10 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                 isSyncingProgrammatically = false
                 splitContainerProgrammaticSyncDepth = max(0, splitContainerProgrammaticSyncDepth - 1)
             }
-            let clampedPosition = clampedDividerPosition(position, in: splitView)
-            splitView.setPosition(clampedPosition, ofDividerAt: 0)
+            let appliedPosition = clampToMinimumPaneSize
+                ? clampedDividerPosition(position, in: splitView)
+                : position
+            splitView.setPosition(appliedPosition, ofDividerAt: 0)
             if layout {
                 splitView.layoutSubtreeIfNeeded()
             }

@@ -1498,6 +1498,12 @@ final class WindowTerminalPortal: NSObject {
         }
     }
 
+    /// Moves every hosted terminal to its anchor's current frame now, instead
+    /// of on the next frame-change notification.
+    func synchronizeAllHostedViewsNow() {
+        synchronizeAllHostedViews(excluding: nil)
+    }
+
     private func synchronizeAllHostedViews(
         excluding hostedIdToSkip: ObjectIdentifier?,
         installationPrepared: Bool = false
@@ -1909,6 +1915,10 @@ enum TerminalWindowPortalRegistry {
         nextPortal.bind(hostedView: hostedView, to: anchorView, visibleInUI: visibleInUI, zPriority: zPriority)
         hostedToWindowId[hostedId] = windowId
         pruneHostedMappings(for: windowId, validHostedIds: nextPortal.hostedIds())
+    }
+
+    static func synchronizeAllHostedViewsNow(in window: NSWindow) {
+        portal(for: window).synchronizeAllHostedViewsNow()
     }
 
     static func synchronizeForAnchor(

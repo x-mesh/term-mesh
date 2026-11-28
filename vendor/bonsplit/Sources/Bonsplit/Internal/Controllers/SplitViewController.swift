@@ -77,6 +77,27 @@ final class SplitViewController {
         }
     }
 
+    @ObservationIgnored var shouldHoldContentDuringSplitEntry: (() -> Bool)?
+    @ObservationIgnored var onSplitEntryTargetLaidOut: (() -> Void)?
+    @ObservationIgnored var onSplitEntrySlideStarted: (() -> Void)?
+    @ObservationIgnored var onSplitEntrySettled: (() -> Void)?
+
+    @ObservationIgnored private var splitEntriesInFlight: Set<UUID> = []
+
+    func splitEntryHoldBegan(_ id: UUID) {
+        splitEntriesInFlight.insert(id)
+        onSplitEntryTargetLaidOut?()
+    }
+
+    func splitEntrySlideStarted() {
+        onSplitEntrySlideStarted?()
+    }
+
+    func splitEntryHoldEnded(_ id: UUID) {
+        guard splitEntriesInFlight.remove(id) != nil, splitEntriesInFlight.isEmpty else { return }
+        onSplitEntrySettled?()
+    }
+
     /// During drop, SwiftUI may keep the source tab view alive briefly (default removal animation)
     /// even after we've updated the model. Hide it explicitly so it disappears immediately.
     var dragHiddenSourceTabId: UUID?

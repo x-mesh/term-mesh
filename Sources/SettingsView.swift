@@ -1239,7 +1239,7 @@ struct SettingsView: View {
 
                 SettingsCardRow(
                     "Pane Transition Animation",
-                    subtitle: "Slide panes when splitting or zooming, and briefly glow the pane that gets focus. Each slide resizes the terminal like dragging a divider."
+                    subtitle: "Slide panes when splitting or zooming, and briefly glow the pane that gets focus."
                 ) {
                     Toggle("", isOn: $paneTransitionAnimations)
                         .labelsHidden()
