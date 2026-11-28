@@ -31,7 +31,7 @@ enum PaneTransitionAnimationSettings {
     static let durationKey = "paneTransitionAnimationDuration"
     /// Rex Natural-style landing: fast enough for terminal work while leaving
     /// room for source, destination, and divider to settle as one motion.
-    static let defaultDuration: Double = 0.28
+    static let defaultDuration: Double = 0.32
     static let durationRange: ClosedRange<Double> = 0.1...0.6
 
     static var isEnabled: Bool {

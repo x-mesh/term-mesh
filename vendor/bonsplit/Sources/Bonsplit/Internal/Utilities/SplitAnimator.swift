@@ -150,7 +150,10 @@ final class SplitAnimator {
     /// visually noisy.
     private static func naturalDividerEased(_ progress: Double) -> Double {
         let t = min(max(progress, 0.0), 1.0) - 1.0
-        let overshoot = 0.72
+        // A smaller value extends the deceleration while reducing the final
+        // pass beyond the target. It gives terminal reflow more evenly spaced
+        // frame deltas than the tighter 280 ms landing.
+        let overshoot = 0.46
         return 1.0 + t * t * ((overshoot + 1.0) * t + overshoot)
     }
 
