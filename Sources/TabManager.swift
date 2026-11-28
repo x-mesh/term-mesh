@@ -124,6 +124,14 @@ class TabManager {
     @ObservationIgnored private var workspaceCycleGeneration: UInt64 = 0
     @ObservationIgnored private var workspaceCycleCooldownTask: Task<Void, Never>?
     @ObservationIgnored private var pendingWorkspaceUnfocusTarget: (tabId: UUID, panelId: UUID)?
+    private struct CloseConfirmationKey: Hashable {
+        let workspaceID: UUID
+        let panelID: UUID
+    }
+    /// A modal confirmation owns its pane until it resolves. Repeated Cmd+W
+    /// and runtime close callbacks must not slip around the sheet and close the
+    /// process the sheet is asking about.
+    @ObservationIgnored private var closeConfirmationsInFlight: Set<CloseConfirmationKey> = []
     @ObservationIgnored private let persistsSessionState: Bool
 #if DEBUG
     @ObservationIgnored private var debugWorkspaceSwitchCounter: UInt64 = 0
@@ -1294,6 +1302,18 @@ class TabManager {
         }
     }
 
+    /// Explicit emergency path for Option+Cmd+W. It bypasses only the
+    /// confirmation prompt; pane, workspace and last-pane semantics remain
+    /// identical to ordinary Cmd+W.
+    func closeCurrentPanelImmediately() {
+        guard let selectedId = selectedTabId,
+              let tab = tabs.first(where: { $0.id == selectedId }),
+              let focusedPanelId = tab.focusedPanelId else { return }
+        Task { @MainActor in
+            await closePanelWithConfirmation(tab: tab, panelId: focusedPanelId, bypassConfirmation: true)
+        }
+    }
+
     func closeCurrentWorkspaceWithConfirmation() {
 #if DEBUG
         UITestRecorder.incrementInt("closeTabInvocations")
@@ -1402,13 +1422,22 @@ class TabManager {
         }
     }
 
-    private func closePanelWithConfirmation(tab: Workspace, panelId: UUID) async {
+    private func closePanelWithConfirmation(
+        tab: Workspace, panelId: UUID, bypassConfirmation: Bool = false
+    ) async {
         // Each Cmd+W schedules its own task, and a confirmation sheet lets the
         // next one start before this one has closed anything. Without this the
         // second press acts on a panel that is already gone: harmless in the
         // ordinary branch, but in the last-pane branch below it would open a
         // second replacement terminal for a pane nobody asked to close twice.
         guard tab.panels[panelId] != nil else { return }
+        let key = CloseConfirmationKey(workspaceID: tab.id, panelID: panelId)
+        // Once a sheet owns this pane, every subsequent close request is a
+        // no-op, including the explicit bypass shortcut. Letting Option+Cmd+W
+        // close beneath an already-present sheet would leave an orphaned
+        // confirmation over a pane that no longer exists. The bypass applies
+        // only before a confirmation has begun.
+        if closeConfirmationsInFlight.contains(key) { return }
         // Cmd+W closes the focused Bonsplit tab (a "tab" in the UI). The last
         // tab in a workspace takes the workspace with it — but the last
         // workspace does NOT take the window. Cmd+W is the close-a-pane key;
@@ -1419,10 +1448,12 @@ class TabManager {
         let isLastTabInWorkspace = tab.panels.count <= 1
         if isLastTabInWorkspace {
             let isLastWorkspace = tabs.count <= 1
-            if workspaceNeedsConfirmClose(tab) {
+            if !bypassConfirmation, workspaceNeedsConfirmClose(tab) {
                 let message = isLastWorkspace
                     ? "This will close the last tab and start a new terminal."
                     : "This will close the last tab and close its workspace."
+                closeConfirmationsInFlight.insert(key)
+                defer { closeConfirmationsInFlight.remove(key) }
                 guard await confirmClose(
                     title: "Close tab?",
                     message: message,
@@ -1444,8 +1475,10 @@ class TabManager {
             return
         }
 
-        if let terminalPanel = tab.terminalPanel(for: panelId),
+        if !bypassConfirmation, let terminalPanel = tab.terminalPanel(for: panelId),
            terminalPanel.needsConfirmClose() {
+            closeConfirmationsInFlight.insert(key)
+            defer { closeConfirmationsInFlight.remove(key) }
             guard await confirmClose(
                 title: "Close tab?",
                 message: "This will close the current tab.",
@@ -1471,8 +1504,12 @@ class TabManager {
         guard tab.panels[surfaceId] != nil else { return }
 
         Task { @MainActor in
+            let key = CloseConfirmationKey(workspaceID: tab.id, panelID: surfaceId)
+            guard !closeConfirmationsInFlight.contains(key) else { return }
             if let terminalPanel = tab.terminalPanel(for: surfaceId),
                terminalPanel.needsConfirmClose() {
+                closeConfirmationsInFlight.insert(key)
+                defer { closeConfirmationsInFlight.remove(key) }
                 guard await confirmClose(
                     title: "Close tab?",
                     message: "This will close the current tab.",

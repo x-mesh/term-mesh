@@ -685,6 +685,13 @@ struct TermMeshApp: App {
                 }
                 .keyboardShortcut("w", modifiers: .command)
 
+                Button {
+                    activeTabManager.closeCurrentPanelImmediately()
+                } label: {
+                    commandLabel("Close Tab Without Confirmation")
+                }
+                .keyboardShortcut("w", modifiers: [.command, .option])
+
                 // Cmd+Shift+W closes the current workspace (with confirmation if needed). If this
                 // is the last workspace, it closes the window.
                 splitCommandButton(title: "Close Workspace", shortcut: closeWorkspaceMenuShortcut) {
