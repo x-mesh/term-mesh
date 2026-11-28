@@ -573,7 +573,11 @@ extension Workspace: BonsplitDelegate {
 
         scheduleTerminalGeometryReconcile()
         scheduleFocusReconcile()
-        if let closeLanding {
+        // The Settings toggle governs every pane transition. Keep close landing
+        // in the same policy as split and zoom so disabling animations also
+        // avoids this extra survivor geometry/presentation pass. Close teardown
+        // and focus cleanup above remain synchronous either way.
+        if PaneTransitionAnimationSettings.isEnabled, let closeLanding {
             // SwiftUI and the portal apply the survivor's final geometry on
             // the next turn. Starting earlier would animate old → old.
             DispatchQueue.main.async { [weak self] in
