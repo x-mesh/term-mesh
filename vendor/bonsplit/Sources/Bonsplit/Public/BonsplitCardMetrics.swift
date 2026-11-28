@@ -7,7 +7,7 @@ public enum BonsplitCardMetrics {
     /// Default for `BonsplitConfiguration.Appearance.cardGap`, which hosts may
     /// override; it is both the gap between cards and their margin to the
     /// window edges.
-    public static let gap: CGFloat = 8
+    public static let gap: CGFloat = 6
     public static let gapRange: ClosedRange<CGFloat> = 0...20
     /// The titlebar strip above already separates the cards from the window
     /// edge, so the top margin is only a hairline gap below it.
