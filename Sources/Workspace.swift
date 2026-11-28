@@ -452,6 +452,52 @@ final class Workspace: Identifiable {
         }
     }
 
+    /// Runs while bonsplit has the split laid out at the end of its entry
+    /// slide. Each terminal keeps that size until the slide settles.
+    private func holdTerminalSizesForSplitEntry() {
+        let terminals = panels.values.compactMap { $0 as? TerminalPanel }
+        if let window = terminals.lazy.compactMap({ $0.hostedView.window }).first {
+            TerminalWindowPortalRegistry.synchronizeAllHostedViewsNow(in: window)
+        }
+        for terminal in terminals where terminal.hostedView.window != nil {
+            terminal.hostedView.holdTerminalSizeForTransition()
+        }
+        splitEntryHoldGeneration &+= 1
+        let generation = splitEntryHoldGeneration
+#if DEBUG
+        dlog("split.entry.hold terminals=\(terminals.count) generation=\(generation)")
+#endif
+        // A split view torn down mid-slide never reports the end of its
+        // slide, and a held terminal would keep a size its pane no longer has.
+        let fallbackDelay = PaneTransitionAnimationSettings.duration + Self.splitEntryHoldFallbackMargin
+        DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay) { [weak self] in
+            guard let self, self.splitEntryHoldGeneration == generation else { return }
+            self.releaseTerminalSizesAfterSplitEntry()
+        }
+    }
+
+    /// The hold put the terminals at the slide's end frames. Move them back
+    /// with the panes before a frame draws them there.
+    private func followSplitEntrySlideStart() {
+        let window = panels.values.lazy
+            .compactMap { ($0 as? TerminalPanel)?.hostedView.window }
+            .first
+        guard let window else { return }
+        TerminalWindowPortalRegistry.synchronizeAllHostedViewsNow(in: window)
+    }
+
+    private static let splitEntryHoldFallbackMargin: TimeInterval = 0.5
+
+    private func releaseTerminalSizesAfterSplitEntry() {
+        splitEntryHoldGeneration &+= 1
+#if DEBUG
+        dlog("split.entry.release generation=\(splitEntryHoldGeneration)")
+#endif
+        for case let terminal as TerminalPanel in panels.values {
+            terminal.hostedView.releaseTerminalSizeHold()
+        }
+    }
+
     private func zoomSlideDidSettle() {
 #if DEBUG
         dlog("zoom.settle pane=\(zoomTransitionPaneId.map { String($0.id.uuidString.prefix(5)) } ?? "nil")")
@@ -588,6 +634,18 @@ final class Workspace: Identifiable {
         }
         bonsplitController.onZoomSlideSettled = { [weak self] in
             self?.zoomSlideDidSettle()
+        }
+        bonsplitController.shouldHoldContentDuringSplitEntry = {
+            PaneTransitionAnimationSettings.terminalContent == .once
+        }
+        bonsplitController.onSplitEntryTargetLaidOut = { [weak self] in
+            self?.holdTerminalSizesForSplitEntry()
+        }
+        bonsplitController.onSplitEntrySlideStarted = { [weak self] in
+            self?.followSplitEntrySlideStart()
+        }
+        bonsplitController.onSplitEntrySettled = { [weak self] in
+            self?.releaseTerminalSizesAfterSplitEntry()
         }
         configurePaneHeaderActions()
         observeRemoteExposures()
@@ -938,6 +996,9 @@ final class Workspace: Identifiable {
     /// alone uses its old frame as a Core Animation presentation start.
     @ObservationIgnored var pendingPaneCloseFrames: [UUID: [UUID: NSRect]] = [:]
     @ObservationIgnored var pendingClosedBrowserRestoreSnapshots: [TabID: ClosedBrowserPanelRestoreSnapshot] = [:]
+    /// Bumped on every split entry hold and release, so a fallback release
+    /// scheduled for an earlier slide leaves a later one alone.
+    @ObservationIgnored var splitEntryHoldGeneration: UInt64 = 0
     @ObservationIgnored var isApplyingTabSelection = false
     @ObservationIgnored var pendingTabSelection: (tabId: TabID, pane: PaneID)?
     @ObservationIgnored var isReconcilingFocusState = false

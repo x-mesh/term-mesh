@@ -45,6 +45,28 @@ enum PaneTransitionAnimationSettings {
     static var duration: Double {
         clampedDuration(UserDefaults.standard.object(forKey: durationKey) as? Double ?? defaultDuration)
     }
+
+    /// Hidden escape hatch, not shown in Settings: `everyFrame` restores the
+    /// per-frame terminal resize in case holding the size misbehaves somewhere
+    /// it has not been tried, such as a mirrored remote workspace.
+    static let terminalContentKey = "paneTransitionTerminalContent"
+    static let defaultTerminalContent: PaneTransitionTerminalContent = .once
+
+    static var terminalContent: PaneTransitionTerminalContent {
+        UserDefaults.standard.string(forKey: terminalContentKey)
+            .flatMap(PaneTransitionTerminalContent.init(rawValue:)) ?? defaultTerminalContent
+    }
+}
+
+/// How a terminal follows its pane while a split slides open.
+///
+/// A terminal grid changes in whole cells, so resizing it on every frame
+/// re-wraps its text and signals the running program on every frame.
+/// `.once` gives each terminal its final size when the slide starts and keeps
+/// it there while the pane frame moves, so the text re-wraps one time.
+enum PaneTransitionTerminalContent: String {
+    case everyFrame
+    case once
 }
 
 /// Space between a pane card's edge and the terminal grid.

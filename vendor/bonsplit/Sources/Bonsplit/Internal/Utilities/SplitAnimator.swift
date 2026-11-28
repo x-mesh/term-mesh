@@ -165,7 +165,10 @@ final class SplitAnimator {
 
         for (id, animation) in animations {
             guard let splitView = animation.splitView else {
+                // Still report the end: a caller may be holding state until
+                // the slide stops, and a torn-down split view stops it too.
                 completedIds.append(id)
+                animation.onComplete?()
                 continue
             }
 

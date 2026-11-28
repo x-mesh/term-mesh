@@ -326,6 +326,7 @@ final class GhosttySurfaceScrollView: NSView {
     private var activeDropZone: DropZone?
     private var pendingDropZone: DropZone?
     private var dropZoneOverlayAnimationGeneration: UInt64 = 0
+    private var transitionHeldTerminalSize: NSSize?
     // Intentionally no focus retry loops: rely on AppKit first-responder and bonsplit selection.
 #if DEBUG
     private var lastDropZoneOverlayLogSignature: String?
@@ -716,8 +717,9 @@ final class GhosttySurfaceScrollView: NSView {
         // The background still fills the whole area, so the padding shows the
         // terminal's own color around the grid.
         scrollView.frame = paddedTerminalFrame(in: terminalBounds)
-        surfaceView.frame.size = scrollView.bounds.size
-        documentView.frame.size.width = scrollView.bounds.width
+        let terminalSize = transitionHeldTerminalSize ?? scrollView.bounds.size
+        surfaceView.frame.size = terminalSize
+        documentView.frame.size.width = terminalSize.width
         inactiveOverlayView.frame = terminalBounds
         if let banner = peerDisconnectBannerView {
             let height: CGFloat = 32
@@ -978,6 +980,22 @@ final class GhosttySurfaceScrollView: NSView {
         group.fillMode = .both
         group.isRemovedOnCompletion = true
         layer.add(group, forKey: "term-mesh.pane-close-landing")
+    }
+
+    /// Keeps the terminal grid at the size this view has now while its frame
+    /// slides. The scroll view clips the grid while the frame is smaller and
+    /// shows the terminal background beside it while the frame is larger.
+    func holdTerminalSizeForTransition() {
+        transitionHeldTerminalSize = nil
+        synchronizeGeometryAndContent()
+        guard scrollView.bounds.width > 1, scrollView.bounds.height > 1 else { return }
+        transitionHeldTerminalSize = scrollView.bounds.size
+    }
+
+    func releaseTerminalSizeHold() {
+        guard transitionHeldTerminalSize != nil else { return }
+        transitionHeldTerminalSize = nil
+        synchronizeGeometryAndContent()
     }
 
     func holdNotificationRing(for duration: CFTimeInterval) {
@@ -2650,7 +2668,8 @@ final class GhosttySurfaceScrollView: NSView {
     /// Match upstream Ghostty behavior: use content area width (excluding non-content
     /// regions such as scrollbar space) when telling libghostty the terminal size.
     private func synchronizeCoreSurface() {
-        let width = scrollView.contentSize.width
+        let scrollerWidth = max(0, scrollView.bounds.width - scrollView.contentSize.width)
+        let width = transitionHeldTerminalSize.map { $0.width - scrollerWidth } ?? scrollView.contentSize.width
         let height = surfaceView.frame.height
         guard width > 0, height > 0 else { return }
         surfaceView.pushTargetSurfaceSize(CGSize(width: width, height: height))
