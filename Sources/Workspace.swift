@@ -933,6 +933,10 @@ final class Workspace: Identifiable {
     /// Panel IDs that were in a pane when a pane-close operation was approved.
     /// Bonsplit pane-close does not emit per-tab didClose callbacks.
     @ObservationIgnored var pendingPaneClosePanelIds: [UUID: [UUID]] = [:]
+    /// Portal frames immediately before an approved pane close. The close
+    /// lifecycle still tears the removed pane down synchronously; the survivor
+    /// alone uses its old frame as a Core Animation presentation start.
+    @ObservationIgnored var pendingPaneCloseFrames: [UUID: [UUID: NSRect]] = [:]
     @ObservationIgnored var pendingClosedBrowserRestoreSnapshots: [TabID: ClosedBrowserPanelRestoreSnapshot] = [:]
     @ObservationIgnored var isApplyingTabSelection = false
     @ObservationIgnored var pendingTabSelection: (tabId: TabID, pane: PaneID)?
